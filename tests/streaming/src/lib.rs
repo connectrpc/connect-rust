@@ -316,6 +316,87 @@ mod tests {
         assert_eq!(msg.data, "");
     }
 
+    /// Regression: `call_client_stream` must stream the request body
+    /// frame-by-frame instead of buffering the whole concatenated payload
+    /// into a single Frame. Each iterator item should produce its own body
+    /// frame (one envelope per channel push).
+    #[tokio::test]
+    async fn client_stream_request_body_is_streamed() {
+        use bytes::Bytes;
+        use connectrpc::client::{BoxFuture, ClientBody, ClientTransport};
+        use http::{Request, Response};
+        use http_body::Body;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct FrameCountingTransport {
+            frame_sizes: Arc<Mutex<Vec<usize>>>,
+        }
+
+        impl ClientTransport for FrameCountingTransport {
+            type ResponseBody = http_body_util::Empty<Bytes>;
+            type Error = ConnectError;
+
+            fn send(
+                &self,
+                request: Request<ClientBody>,
+            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+                let recorded = self.frame_sizes.clone();
+                Box::pin(async move {
+                    let mut body = request.into_body();
+                    let mut sizes = Vec::new();
+                    while let Some(frame) =
+                        std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                    {
+                        let frame: http_body::Frame<Bytes> = frame?;
+                        if let Ok(data) = frame.into_data() {
+                            sizes.push(data.len());
+                        }
+                    }
+                    *recorded.lock().unwrap() = sizes;
+                    // Short-circuit: the call will surface this as Unavailable.
+                    // The assertion is on the captured request framing.
+                    Err(ConnectError::unavailable("recorded; not forwarded"))
+                })
+            }
+        }
+
+        let frames: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let transport = FrameCountingTransport {
+            frame_sizes: frames.clone(),
+        };
+        let config = ClientConfig::new("http://localhost/".parse().unwrap());
+        let client = EchoServiceClient::new(transport, config);
+
+        let messages: Vec<EchoRequest> = (0..5)
+            .map(|i| EchoRequest {
+                sequence: i,
+                data: format!("msg-{i}"),
+                ..Default::default()
+            })
+            .collect();
+
+        // Expected to fail with the forced transport error. call_client_stream
+        // awaits the oneshot internally, so frames are fully captured by return.
+        let _ = client.client_stream(messages).await;
+
+        let captured = frames.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            5,
+            "expected one body frame per request message, got {} (sizes: {captured:?})",
+            captured.len(),
+        );
+        // Every envelope carries at minimum the 5-byte header.
+        for size in &captured {
+            assert!(
+                *size >= 5,
+                "envelope frame too small ({size} bytes) — header alone is 5 bytes",
+            );
+        }
+    }
+
     /// Tests bidi streaming at the server level by sending envelope-framed
     /// messages over raw HTTP. This verifies that the server-side bidi handler
     /// correctly receives and echoes all messages.

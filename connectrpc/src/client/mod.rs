@@ -139,8 +139,8 @@ pub type ClientBody = BoxBody<Bytes, ConnectError>;
 
 /// Wrap a fully-known buffer in a [`ClientBody`].
 ///
-/// Used by unary, server-streaming, and client-streaming calls where the
-/// complete request body is available before sending.
+/// Used by unary and server-streaming calls where the complete request body
+/// is available before sending.
 #[inline]
 pub fn full_body(b: Bytes) -> ClientBody {
     Full::new(b).map_err(|never| match never {}).boxed()
@@ -2160,9 +2160,10 @@ where
 
 /// A request body that pulls envelope-encoded frames from an mpsc channel.
 ///
-/// Used as the request body for bidirectional streaming calls. [`BidiStream::send`]
-/// pushes encoded envelopes to the channel's sender half; dropping the sender
-/// (via [`BidiStream::close_send`]) closes the body, signalling EOF to the server.
+/// Used as the request body for bidirectional and client-streaming calls.
+/// [`BidiStream::send`] pushes encoded envelopes to the channel's sender half;
+/// dropping the sender (via [`BidiStream::close_send`]) closes the body,
+/// signalling EOF to the server.
 struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, ConnectError>>,
 }
@@ -2529,6 +2530,11 @@ where
     // ChannelBody gets polled as sends happen, independent of when the
     // caller first calls message(). See RecvState doc for the deadlock
     // this avoids.
+    //
+    // Uses tokio::spawn directly (not spawn_detached) because
+    // RecvState::Pending needs JoinHandle<Result<...>>. If wasm32+client
+    // becomes supported, factor this into a spawn_with_result helper that
+    // bridges via oneshot on wasm.
     let response_fut = transport.send(http_request);
     let response_task = tokio::spawn(async move {
         response_fut
@@ -2558,6 +2564,13 @@ where
 /// Sends multiple request messages as envelope-framed data and receives a single
 /// envelope-framed response with END_STREAM. Returns a [`UnaryResponse`] containing
 /// the decoded response message along with headers and trailers.
+///
+/// The request body is streamed: each item from the iterator is encoded into
+/// an envelope and pushed to a bounded mpsc channel that backs the HTTP
+/// request body. The transport begins sending as soon as the first envelope
+/// is ready instead of waiting for the iterator to be fully drained, so peak
+/// memory stays around `channel_depth * envelope_size` rather than the full
+/// concatenated body.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
@@ -2583,7 +2596,11 @@ where
         .parse()
         .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
 
-    // Encode each request message as an envelope and concatenate
+    // Channel-backed request body. Depth 32 matches `call_bidi_stream` and
+    // gives natural backpressure on HTTP/2 flow control.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ConnectError>>(32);
+    let body: ClientBody = ChannelBody { rx }.boxed();
+
     let compression_for_encoder = config.request_compression.as_ref().map(|enc| {
         (
             std::sync::Arc::new(config.compression.clone()),
@@ -2594,22 +2611,6 @@ where
         compression_for_encoder,
         config.compression_policy.with_override(options.compress),
     );
-    let mut body_buf = BytesMut::new();
-    for request in requests {
-        let msg_bytes = match config.codec_format {
-            CodecFormat::Proto => request.encode_to_bytes(),
-            CodecFormat::Json => {
-                let buf = serde_json::to_vec(&request).map_err(|e| {
-                    ConnectError::internal(format!("failed to encode JSON request: {e}"))
-                })?;
-                Bytes::from(buf)
-            }
-        };
-
-        tokio_util::codec::Encoder::encode(&mut encoder, msg_bytes, &mut body_buf)?;
-    }
-
-    let request_body = body_buf.freeze();
 
     // Compute deadline BEFORE sending, matching Go's ctx.Deadline() semantics
     let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
@@ -2625,15 +2626,59 @@ where
     }
 
     let http_request = builder
-        .body(full_body(request_body))
+        .body(body)
         .map_err(|e| ConnectError::internal(format!("failed to build request: {e}")))?;
+
+    // Drive the transport send concurrently with the iterator drain below.
+    // Without this, a transport whose send() future contains the actual I/O
+    // would not read from the channel until awaited, deadlocking once the
+    // channel filled. The response is bridged back via a oneshot so the
+    // awaitee is uniform across architectures.
+    let response_fut = transport.send(http_request);
+    let (resp_tx, resp_rx) =
+        tokio::sync::oneshot::channel::<Result<Response<T::ResponseBody>, ConnectError>>();
+    let _ = crate::spawn_detached(async move {
+        let result = response_fut
+            .await
+            .map_err(|e| ConnectError::unavailable(format!("request failed: {e}")));
+        let _ = resp_tx.send(result);
+    });
 
     // Enforce client-side deadline on send + parse.
     with_deadline(deadline, async {
-        let response = transport
-            .send(http_request)
-            .await
-            .map_err(|e| ConnectError::unavailable(format!("request failed: {e}")))?;
+        // Drain the iterator, encoding each request and pushing its envelope
+        // into the channel. The iterator is synchronous, so the only awaits
+        // here are tx.send(...), which provides backpressure via the channel
+        // depth.
+        for request in requests {
+            let msg_bytes = match config.codec_format {
+                CodecFormat::Proto => request.encode_to_bytes(),
+                CodecFormat::Json => {
+                    let buf = serde_json::to_vec(&request).map_err(|e| {
+                        ConnectError::internal(format!("failed to encode JSON request: {e}"))
+                    })?;
+                    Bytes::from(buf)
+                }
+            };
+
+            let mut envelope_buf = BytesMut::new();
+            tokio_util::codec::Encoder::encode(&mut encoder, msg_bytes, &mut envelope_buf)?;
+
+            if tx.send(Ok(envelope_buf.freeze())).await.is_err() {
+                // Receiver dropped: the spawned send task has finished, either
+                // because the transport failed or the server responded before
+                // we finished sending. Stop draining and let the response
+                // task surface the actual error/result.
+                break;
+            }
+        }
+
+        drop(tx);
+
+        // Await the response now that the request body has been fully sent.
+        let response = resp_rx.await.map_err(|_| {
+            ConnectError::internal("transport send task dropped without producing a response")
+        })??;
 
         // For gRPC, the response is envelope-framed like a unary gRPC response
         // (single data envelope + trailers). Reuse parse_grpc_unary_response.
