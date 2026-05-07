@@ -171,6 +171,15 @@ pub mod client;
 #[cfg(feature = "server")]
 pub mod server;
 
+// Optional: TLS-aware `axum::serve` counterpart with peer-identity passthrough.
+//
+// Note: this module shadows the extern-prelude `axum` crate within the crate
+// root scope only. Don't add `use axum::...` here in `lib.rs`; use
+// `::axum::...` if a root-level reference to the external crate is ever needed.
+#[cfg(all(feature = "axum", feature = "server-tls"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server-tls"))))]
+pub mod axum;
+
 // ============================================================================
 // Primary exports - Tower-first API
 // ============================================================================

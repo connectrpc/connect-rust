@@ -102,6 +102,10 @@ server = [
     "dep:libc",
     "dep:tower-http",
     "tokio/net",
+    # The accept loop uses `tokio::select!`. Surfaced only when downstream
+    # consumers enable `server` without also enabling `tokio/macros`
+    # themselves; `--all-targets` (CI) hides it via dev-dep unification.
+    "tokio/macros",
 ]
 
 # HTTP client with connection pooling

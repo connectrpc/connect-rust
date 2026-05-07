@@ -1,0 +1,35 @@
+edition = "2023";
+
+package anthropic.connectrpc.mtls_identity.v1;
+
+// IdentityService demonstrates mTLS cert-SAN-based identity. The server
+// is hosted on axum behind connectrpc::axum::serve_tls, which terminates
+// TLS and stamps PeerAddr/PeerCerts into request extensions. The handler
+// parses the leaf cert's DNS SAN to derive a workload identity rather
+// than reading a bearer token, then enforces an ACL against it.
+service IdentityService {
+  // Echo back what the server knows about the caller from the TLS layer.
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+
+  // Read a secret, gated on the caller's cert-derived identity.
+  rpc GetSecret(GetSecretRequest) returns (GetSecretResponse);
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  // Workload identity parsed from the leaf cert's DNS SAN, e.g. "alice".
+  string identity = 1;
+  // Full DNS SAN as presented, e.g. "alice.workloads.example.com".
+  string san = 2;
+  // Caller's remote socket address as observed by the accept loop.
+  string remote_addr = 3;
+}
+
+message GetSecretRequest {
+  string name = 1;
+}
+
+message GetSecretResponse {
+  string value = 1;
+}

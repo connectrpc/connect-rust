@@ -62,8 +62,9 @@ use crate::service::ConnectRpcService;
 
 /// Remote socket address of the connected peer.
 ///
-/// Inserted into every request's extensions by the built-in server's accept
-/// loop. Handlers read it via `ctx.extensions.get::<PeerAddr>()`.
+/// Inserted into every request's extensions by the built-in [`Server`]'s
+/// accept loop and by `connectrpc::axum::serve_tls`. Handlers read it via
+/// `ctx.extensions.get::<PeerAddr>()`.
 ///
 /// Callers using a different HTTP stack (axum, raw hyper) in front of
 /// [`ConnectRpcService`] can insert this same type
@@ -73,11 +74,11 @@ pub struct PeerAddr(pub SocketAddr);
 
 /// TLS client certificate chain presented by the peer (leaf first).
 ///
-/// Inserted by the built-in server's TLS accept loop when the
-/// [`rustls::ServerConfig`] requests client authentication and the peer
-/// presents a valid chain. Absent on plaintext connections or when the
-/// client presents no certificate. Handlers read it via
-/// `ctx.extensions.get::<PeerCerts>()`.
+/// Inserted by the built-in [`Server`]'s TLS accept loop and by
+/// `connectrpc::axum::serve_tls` when the [`rustls::ServerConfig`] requests
+/// client authentication and the peer presents a valid chain. Absent on
+/// plaintext connections or when the client presents no certificate.
+/// Handlers read it via `ctx.extensions.get::<PeerCerts>()`.
 ///
 /// The `Arc` makes per-request insertion cheap: all requests on a
 /// connection share one chain, so this is a refcount bump, not a copy.
@@ -681,7 +682,7 @@ fn panic_handler(err: Box<dyn Any + Send + 'static>) -> Response<Full<Bytes>> {
 /// - `EMFILE` / `ENFILE`: Too many open files (file descriptor exhaustion)
 /// - `ECONNABORTED`: Connection was aborted before accept completed
 /// - `EINTR`: Interrupted system call
-fn is_transient_accept_error(err: &std::io::Error) -> bool {
+pub(crate) fn is_transient_accept_error(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
     matches!(

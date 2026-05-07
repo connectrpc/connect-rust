@@ -676,14 +676,33 @@ Server::new(connect_router)
     .await?;
 ```
 
-For the axum path, wrap the listener with `tokio_rustls::TlsAcceptor`
-yourself (this is what the eliza example does).
+For the axum path, `connectrpc::axum::serve_tls` (requires both the
+`axum` and `server-tls` features) is a drop-in replacement for
+`axum::serve` that owns the rustls accept loop and stamps `PeerAddr` /
+`PeerCerts` into request extensions exactly as the standalone `Server`
+does, so handler code that reads `ctx.extensions.get::<PeerCerts>()`
+is portable across both hosting paths:
+
+```rust
+let app = axum::Router::new()
+    .route("/health", axum::routing::get(|| async { "OK" }))
+    .fallback_service(connect_router.into_axum_service());
+
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+connectrpc::axum::serve_tls(listener, app, server_config)
+    .with_graceful_shutdown(shutdown_signal)
+    .await?;
+```
 
 The eliza example
 ([`examples/eliza/README.md`](../examples/eliza/README.md)) walks
 through generating self-signed certificates with openssl, configuring
 mTLS via `--client-ca`, and the rustls strict-PKI requirement that
-your CA cert must be distinct from the server leaf cert.
+your CA cert must be distinct from the server leaf cert. The
+mtls-identity example
+([`examples/mtls-identity/README.md`](../examples/mtls-identity/README.md))
+demonstrates `serve_tls` end-to-end with cert-SAN identity extraction
+and an ACL keyed on it.
 
 ## Clients
 
@@ -905,6 +924,7 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 |---|---|
 | [`streaming-tour/`](../examples/streaming-tour) | All four RPC types (unary, server stream, client stream, bidi) on a trivial NumberService. Smallest demo of handler signatures and client invocation patterns. |
 | [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::default_header` and `CallOptions::with_timeout`. |
+| [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
 | [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage. |
 | [`wasm-client/`](../examples/wasm-client) | Browser fetch transport: same generated client used from `wasm32-unknown-unknown` with a custom `ClientTransport` backed by `web-sys::fetch`. |

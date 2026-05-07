@@ -1,0 +1,50 @@
+[package]
+name = "mtls-identity-example"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "mtls_identity_example"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mtls-identity"
+path = "src/main.rs"
+
+[dependencies]
+connectrpc = { path = "../../connectrpc", features = ["axum", "client", "client-tls", "server-tls"] }
+
+# Protobuf
+buffa = { workspace = true }
+buffa-types = { workspace = true }
+
+# Serialization (for generated message types)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP types (for generated client bounds)
+http-body = { workspace = true }
+http = { workspace = true }
+
+# Async
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+
+# TLS (test PKI generated at runtime; no PEM files in the repo)
+rcgen = { workspace = true }
+rustls-pki-types = { workspace = true }
+# Parse the leaf cert's SubjectAlternativeName in the handler. Already in
+# the lockfile transitively via rcgen, so this adds nothing to the build.
+x509-parser = "0.18"
+
+[build-dependencies]
+connectrpc-build = { path = "../../connectrpc-build" }
+
+[lints]
+workspace = true
