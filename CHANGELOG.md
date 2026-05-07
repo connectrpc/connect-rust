@@ -12,16 +12,25 @@ increment the patch version.
 
 ## [0.4.2] - 2026-05-07
 
+### Added
+
+- **`connectrpc::axum::serve_tls`** ([#80]). Companion to `serve` that
+  hands off to the standalone `Server` for the TLS path — wrapping axum
+  with `tokio_rustls::TlsAcceptor` directly hangs on h2 ALPN
+  negotiation. Comes with an `examples/mtls-identity` example showing
+  client-cert extraction in a handler.
+
 ### Fixed
 
-- **`connectrpc`: `server` feature now enables `tokio/macros`.**
-  `Server::serve` uses `tokio::select!` to race accept against graceful
-  shutdown, but the `server` feature only enabled `tokio/net`. Crates
-  depending on `connectrpc = { features = ["server"] }` only compiled
-  when something else in the dependency closure enabled `tokio/macros`
-  for them — the conformance suite and examples always do (`tokio = {
-  features = ["macros", …] }` in dev-deps), which kept the gap hidden in
-  CI. The feature now declares its own requirement.
+- **`connectrpc`: `server` feature now enables `tokio/macros`** ([#80]).
+  The accept loop in `Server::serve` and the new `axum::serve_tls` both
+  use `tokio::select!`, but the `server` feature only enabled
+  `tokio/net`. Crates depending on `connectrpc = { features = ["server"]
+  }` only compiled when something else in the dependency closure enabled
+  `tokio/macros` for them. Our conformance suite and examples both have
+  `tokio = { features = ["macros", …] }` in dev-deps, which kept the gap
+  hidden in CI.
+
 - **`connectrpc-build`: generated `mod.rs` `#[allow(...)]` is now sourced
   from `buffa_codegen::ALLOW_LINTS`.** The hardcoded list had drifted
   behind buffa's: it was missing `clippy::uninlined_format_args` (which
@@ -248,6 +257,7 @@ rebuilds `OUT_DIR` automatically.
   `build.rs` context (e.g. from a Bazel genrule or standalone host tool).
   Default remains `true`.
 
+[#80]: https://github.com/anthropics/connect-rust/pull/80
 [#7]: https://github.com/anthropics/connect-rust/issues/7
 [#34]: https://github.com/anthropics/connect-rust/issues/34
 [#50]: https://github.com/anthropics/connect-rust/issues/50

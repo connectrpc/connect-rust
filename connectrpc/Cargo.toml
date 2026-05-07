@@ -102,11 +102,9 @@ server = [
     "dep:libc",
     "dep:tower-http",
     "tokio/net",
-    # `Server::serve` uses `tokio::select!` to race accept against
-    # graceful shutdown. Without the explicit feature, `server` only
-    # builds when something else in the dependency closure enables
-    # `tokio/macros` for us — which our own conformance/example crates
-    # always do, hiding the gap.
+    # The accept loop uses `tokio::select!`. Surfaced only when downstream
+    # consumers enable `server` without also enabling `tokio/macros`
+    # themselves; `--all-targets` (CI) hides it via dev-dep unification.
     "tokio/macros",
 ]
 
