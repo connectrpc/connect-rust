@@ -2285,38 +2285,6 @@ where
 /// data after a size-limit error or other decoder failure.
 const MAX_DRAIN_BYTES: usize = 1024 * 1024; // 1 MiB
 
-/// Spawn a detached background future on the ambient executor.
-///
-/// On native (non-wasm) targets this dispatches via `tokio::spawn` and returns
-/// the join handle. On `wasm32-unknown-unknown` (Cloudflare Workers, browsers,
-/// etc.) there is no tokio runtime, so the future is dispatched via
-/// `wasm_bindgen_futures::spawn_local`, which does not produce a joinable
-/// handle — the function returns `None` in that case.
-///
-/// On both targets the executor takes ownership of the future. Dropping the
-/// returned handle does not cancel the task; callers must not rely on
-/// `.abort()` either (see `_reader_task` for the HTTP/1.1 drain rationale).
-///
-/// The bound on `F` is `Send + 'static` on native (required by `tokio::spawn`)
-/// and `'static` on wasm32 (`spawn_local` runs on a single thread). Avoid
-/// non-`Send` state in futures that must compile on both targets.
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_detached<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    Some(tokio::spawn(future))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn spawn_detached<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
-where
-    F: std::future::Future<Output = ()> + 'static,
-{
-    wasm_bindgen_futures::spawn_local(future);
-    None
-}
-
 /// Spawn a background task that reads envelope-framed messages from an HTTP
 /// body and forwards them to a channel.
 ///
@@ -2430,7 +2398,7 @@ where
 
     // The reader runs detached — it has to outlive the response stream so it
     // can finish draining the request body.
-    let reader_task = spawn_detached(reader_future);
+    let reader_task = crate::spawn_detached(reader_future);
 
     let request_stream: BoxStream<Result<Bytes, ConnectError>> =
         Box::pin(futures::stream::unfold(rx, |mut rx| async {
