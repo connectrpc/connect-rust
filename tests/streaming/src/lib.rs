@@ -605,20 +605,25 @@ mod tests {
             &self,
             _ctx: RequestContext,
             mut requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
-        ) -> ServiceResult<ServiceStream<EchoResponse>> {
-            // Not exercised by this test; minimal pass-through.
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<EchoResponse, ConnectError>>(1);
+        ) -> ServiceResult<ServiceStream<connectrpc::PreEncoded<EchoResponse>>> {
+            // Echo each request back as a `PreEncoded` item — same
+            // build-view-encode-yield-bytes pattern as `server_stream`,
+            // exercising the bidi path through `BidiStreamingViewHandlerWrapper`.
+            let (tx, rx) = tokio::sync::mpsc::channel::<
+                Result<connectrpc::PreEncoded<EchoResponse>, ConnectError>,
+            >(1);
             tokio::spawn(async move {
                 while let Some(req) = requests.next().await {
                     match req {
                         Ok(req) => {
-                            let req = req.to_owned_message();
-                            let resp = EchoResponse {
+                            let data = format!("bidi-{}", req.data);
+                            let view = EchoResponseView {
                                 sequence: req.sequence,
-                                data: req.data,
+                                data: &data,
                                 ..Default::default()
                             };
-                            if tx.send(Ok(resp)).await.is_err() {
+                            let item = connectrpc::PreEncoded::from_view(&view);
+                            if tx.send(Ok(item)).await.is_err() {
                                 break;
                             }
                         }
@@ -672,6 +677,85 @@ mod tests {
                 (0, "pre-encoded-0".to_string()),
                 (1, "pre-encoded-1".to_string()),
                 (2, "pre-encoded-2".to_string()),
+            ]
+        );
+    }
+
+    /// Same as [`server_stream_pre_encoded_round_trip`] but for bidi —
+    /// covers the `BidiStreamingViewHandlerWrapper` → `EchoServiceServer`
+    /// → `ConnectRpcService` chain with `type Item = PreEncoded<…>`. Uses
+    /// the same raw-envelope client as
+    /// [`bidi_stream_server_echoes_messages`] (the generated `BidiStream`
+    /// stub needs HTTP/2; this exercises the server side over HTTP/1.1).
+    #[tokio::test]
+    async fn bidi_stream_pre_encoded_round_trip() {
+        use buffa::Message;
+        use bytes::{BufMut, BytesMut};
+
+        let server = EchoServiceServer::new(PreEncodedEchoService);
+        let service = ConnectRpcService::new(server);
+        let app = axum::Router::new().fallback_service(service);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let messages: Vec<EchoRequest> = (0..3)
+            .map(|i| EchoRequest {
+                sequence: i,
+                data: format!("m{i}"),
+                ..Default::default()
+            })
+            .collect();
+
+        // Encode messages as envelope frames.
+        let mut body = BytesMut::new();
+        for msg in &messages {
+            let data = msg.encode_to_vec();
+            body.put_u8(0); // flags: no compression
+            body.put_u32(data.len() as u32);
+            body.extend_from_slice(&data);
+        }
+
+        let client = HttpClient::plaintext();
+        let uri: http::Uri = format!("http://{addr}/{ECHO_SERVICE_SERVICE_NAME}/BidiStream")
+            .parse()
+            .unwrap();
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(uri)
+            .header("content-type", "application/connect+proto")
+            .header("connect-protocol-version", "1")
+            .body(connectrpc::client::full_body(body.freeze()))
+            .unwrap();
+
+        let response = client.send(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        use http_body_util::BodyExt;
+        let response_body = response.into_body().collect().await.unwrap().to_bytes();
+        let mut cursor = &response_body[..];
+        let mut got = Vec::new();
+        while cursor.len() >= 5 {
+            let flags = cursor[0];
+            let len = u32::from_be_bytes([cursor[1], cursor[2], cursor[3], cursor[4]]) as usize;
+            cursor = &cursor[5..];
+            if flags & 0x02 != 0 {
+                cursor = &cursor[len..];
+                continue;
+            }
+            let data = &cursor[..len];
+            cursor = &cursor[len..];
+            let resp = EchoResponse::decode_from_slice(data).unwrap();
+            got.push((resp.sequence, resp.data));
+        }
+        assert_eq!(
+            got,
+            vec![
+                (0, "bidi-m0".to_string()),
+                (1, "bidi-m1".to_string()),
+                (2, "bidi-m2".to_string()),
             ]
         );
     }
