@@ -263,7 +263,7 @@ impl<T: FortuneService> ::connectrpc::Dispatcher for FortuneServiceServer<T> {
 ///
 /// let uri: http::Uri = "http://localhost:8080".parse()?;
 /// let conn = Http2Connection::connect_plaintext(uri.clone()).await?.shared(1024);
-/// let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+/// let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
 ///
 /// let client = FortuneServiceClient::new(conn, config);
 /// let response = client.get_fortunes(request).await?;

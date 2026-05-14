@@ -282,8 +282,8 @@ picks them up automatically:
 
 ```rust
 let config = ClientConfig::new("http://localhost:8080".parse()?)
-    .default_timeout(Duration::from_secs(30))
-    .default_header("authorization", "Bearer ...");
+    .with_default_timeout(Duration::from_secs(30))
+    .with_default_header("authorization", "Bearer ...");
 
 let client = GreetServiceClient::new(http, config);
 

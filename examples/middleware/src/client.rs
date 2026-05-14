@@ -1,4 +1,4 @@
-//! Middleware-example client: demonstrates `ClientConfig::default_header`
+//! Middleware-example client: demonstrates `ClientConfig::with_default_header`
 //! for the per-call auth header and `CallOptions::with_timeout` for a
 //! per-call deadline.
 
@@ -23,8 +23,8 @@ async fn main() -> Result<(), BoxError> {
     // automatically. Set per-call defaults here for anything you want
     // applied to all RPCs (auth, tracing IDs, request budget).
     let config = ClientConfig::new(url.parse()?)
-        .default_header("authorization", format!("Bearer {token}"))
-        .default_timeout(Duration::from_secs(10));
+        .with_default_header("authorization", format!("Bearer {token}"))
+        .with_default_timeout(Duration::from_secs(10));
 
     let http = HttpClient::plaintext();
     let client = SecretServiceClient::new(http, config);

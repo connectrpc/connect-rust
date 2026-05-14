@@ -21,7 +21,7 @@
 //!
 //! let uri: http::Uri = "http://localhost:8080".parse()?;
 //! let conn = Http2Connection::connect_plaintext(uri.clone()).await?.shared(1024);
-//! let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+//! let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
 //!
 //! // Generated clients take any T: ClientTransport — shared handle is cheap to clone.
 //! let greet = GreetServiceClient::new(conn.clone(), config.clone());
@@ -488,35 +488,34 @@ impl ClientTransport for HttpClient {
 }
 
 /// Configuration for a ConnectRPC client.
+///
+/// Construct with [`ClientConfig::new`] and the `with_*` builder methods,
+/// then read settings back through the accessor methods of the same name:
+///
+/// ```rust
+/// use connectrpc::client::ClientConfig;
+/// use connectrpc::Protocol;
+///
+/// let config = ClientConfig::new("http://localhost:8080".parse().unwrap())
+///     .with_protocol(Protocol::Grpc);
+/// assert_eq!(config.protocol(), Protocol::Grpc);
+/// ```
+///
+/// `ClientConfig` is `#[non_exhaustive]`: new fields may be added in minor
+/// releases. Struct-literal and functional-update construction are not
+/// available outside the crate; use the builder methods.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ClientConfig {
-    /// The base URI for the service (e.g., "http://localhost:8080").
-    pub base_uri: Uri,
-    /// The wire protocol to use (Connect, gRPC, or gRPC-Web).
-    pub protocol: Protocol,
-    /// The codec format to use (proto or json).
-    pub codec_format: CodecFormat,
-    /// Compression registry for request/response compression.
-    pub compression: CompressionRegistry,
-    /// Request compression encoding (e.g., "gzip"). None means no compression.
-    pub request_compression: Option<String>,
-    /// Compression policy controlling when messages are compressed.
-    pub compression_policy: CompressionPolicy,
-    /// Default request timeout for all calls through this config.
-    ///
-    /// Per-call [`CallOptions::timeout`] overrides this when set.
-    pub default_timeout: Option<Duration>,
-    /// Default maximum decompressed response message size.
-    ///
-    /// Per-call [`CallOptions::max_message_size`] overrides this when set.
-    pub default_max_message_size: Option<usize>,
-    /// Headers applied to every request through this config.
-    ///
-    /// Useful for auth tokens, user-agent, tracing context.
-    /// Per-call [`CallOptions::headers`] with the same name **replace** these
-    /// (options win over config defaults).
-    pub default_headers: http::HeaderMap,
+    pub(crate) base_uri: Uri,
+    pub(crate) protocol: Protocol,
+    pub(crate) codec_format: CodecFormat,
+    pub(crate) compression: CompressionRegistry,
+    pub(crate) request_compression: Option<String>,
+    pub(crate) compression_policy: CompressionPolicy,
+    pub(crate) default_timeout: Option<Duration>,
+    pub(crate) default_max_message_size: Option<usize>,
+    pub(crate) default_headers: http::HeaderMap,
 }
 
 impl ClientConfig {
@@ -537,28 +536,34 @@ impl ClientConfig {
         }
     }
 
+    // ---- builders ---------------------------------------------------------
+
     /// Set the wire protocol (Connect, gRPC, or gRPC-Web).
+    ///
+    /// Read via [`Self::protocol`].
     #[must_use]
-    pub fn protocol(mut self, protocol: Protocol) -> Self {
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
         self
     }
 
     /// Set the codec format (proto or json).
+    ///
+    /// Read via [`Self::codec_format`].
     #[must_use]
-    pub fn codec_format(mut self, format: CodecFormat) -> Self {
+    pub fn with_codec_format(mut self, format: CodecFormat) -> Self {
         self.codec_format = format;
         self
     }
 
-    /// Use JSON encoding.
+    /// Use JSON encoding. Shorthand for `with_codec_format(CodecFormat::Json)`.
     #[must_use]
     pub fn json(mut self) -> Self {
         self.codec_format = CodecFormat::Json;
         self
     }
 
-    /// Use protobuf encoding.
+    /// Use protobuf encoding. Shorthand for `with_codec_format(CodecFormat::Proto)`.
     #[must_use]
     pub fn proto(mut self) -> Self {
         self.codec_format = CodecFormat::Proto;
@@ -566,13 +571,17 @@ impl ClientConfig {
     }
 
     /// Set the compression registry.
+    ///
+    /// Read via [`Self::compression`].
     #[must_use]
-    pub fn compression(mut self, registry: CompressionRegistry) -> Self {
+    pub fn with_compression(mut self, registry: CompressionRegistry) -> Self {
         self.compression = registry;
         self
     }
 
     /// Enable request compression with the specified encoding.
+    ///
+    /// Read via [`Self::request_compression`].
     #[must_use]
     pub fn compress_requests(mut self, encoding: impl Into<String>) -> Self {
         self.request_compression = Some(encoding.into());
@@ -580,26 +589,30 @@ impl ClientConfig {
     }
 
     /// Set the compression policy.
+    ///
+    /// Read via [`Self::compression_policy`].
     #[must_use]
-    pub fn compression_policy(mut self, policy: CompressionPolicy) -> Self {
+    pub fn with_compression_policy(mut self, policy: CompressionPolicy) -> Self {
         self.compression_policy = policy;
         self
     }
 
     /// Set a default request timeout for all calls through this config.
     ///
-    /// Per-call [`CallOptions::with_timeout`] overrides this.
+    /// Read via [`Self::default_timeout`]. Per-call
+    /// [`CallOptions::with_timeout`] overrides this.
     #[must_use]
-    pub fn default_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
     }
 
     /// Set a default maximum decompressed response message size.
     ///
-    /// Per-call [`CallOptions::with_max_message_size`] overrides this.
+    /// Read via [`Self::default_max_message_size`]. Per-call
+    /// [`CallOptions::with_max_message_size`] overrides this.
     #[must_use]
-    pub fn default_max_message_size(mut self, size: usize) -> Self {
+    pub fn with_default_max_message_size(mut self, size: usize) -> Self {
         self.default_max_message_size = Some(size);
         self
     }
@@ -607,10 +620,13 @@ impl ClientConfig {
     /// Add a default header applied to every request through this config.
     ///
     /// If the name or value cannot be converted to valid HTTP header components,
-    /// the header is silently ignored. Per-call [`CallOptions::headers`] with
-    /// the same name replace this value (options win over config defaults).
+    /// the header is silently ignored. Per-call [`CallOptions::with_header`]
+    /// entries with the same name **replace** this value (options win over
+    /// config defaults).
+    ///
+    /// Read via [`Self::default_headers`].
     #[must_use]
-    pub fn default_header(
+    pub fn with_default_header(
         mut self,
         name: impl TryInto<http::header::HeaderName>,
         value: impl TryInto<http::header::HeaderValue>,
@@ -622,10 +638,83 @@ impl ClientConfig {
     }
 
     /// Set all default headers at once (replaces any prior default headers).
+    ///
+    /// Read via [`Self::default_headers`].
     #[must_use]
-    pub fn default_headers(mut self, headers: http::HeaderMap) -> Self {
+    pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Self {
         self.default_headers = headers;
         self
+    }
+
+    // ---- accessors --------------------------------------------------------
+
+    /// The base URI for the service (e.g., `http://localhost:8080`).
+    ///
+    /// Set via [`Self::new`].
+    pub fn base_uri(&self) -> &Uri {
+        &self.base_uri
+    }
+
+    /// The wire protocol (Connect, gRPC, or gRPC-Web).
+    ///
+    /// Set via [`Self::with_protocol`].
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    /// The codec format (proto or json).
+    ///
+    /// Set via [`Self::with_codec_format`], [`Self::json`], or [`Self::proto`].
+    pub fn codec_format(&self) -> CodecFormat {
+        self.codec_format
+    }
+
+    /// The compression registry used for request/response compression.
+    ///
+    /// Set via [`Self::with_compression`].
+    pub fn compression(&self) -> &CompressionRegistry {
+        &self.compression
+    }
+
+    /// The request compression encoding (e.g., `"gzip"`), if enabled.
+    ///
+    /// Set via [`Self::compress_requests`].
+    pub fn request_compression(&self) -> Option<&str> {
+        self.request_compression.as_deref()
+    }
+
+    /// The compression policy controlling when messages are compressed.
+    ///
+    /// Set via [`Self::with_compression_policy`].
+    pub fn compression_policy(&self) -> CompressionPolicy {
+        self.compression_policy
+    }
+
+    /// The default request timeout for all calls through this config, if set.
+    ///
+    /// Set via [`Self::with_default_timeout`]. Per-call
+    /// [`CallOptions::with_timeout`] overrides this when set.
+    pub fn default_timeout(&self) -> Option<Duration> {
+        self.default_timeout
+    }
+
+    /// The default maximum decompressed response message size, if set.
+    ///
+    /// Set via [`Self::with_default_max_message_size`]. Per-call
+    /// [`CallOptions::with_max_message_size`] overrides this when set.
+    pub fn default_max_message_size(&self) -> Option<usize> {
+        self.default_max_message_size
+    }
+
+    /// The headers applied to every request through this config.
+    ///
+    /// Useful for auth tokens, user-agent, tracing context.
+    /// Per-call [`CallOptions::with_header`] entries with the same name
+    /// **replace** these (options win over config defaults).
+    ///
+    /// Set via [`Self::with_default_header`] / [`Self::with_default_headers`].
+    pub fn default_headers(&self) -> &http::HeaderMap {
+        &self.default_headers
     }
 }
 
@@ -633,6 +722,10 @@ impl ClientConfig {
 ///
 /// Provides per-call configuration such as additional headers and timeouts.
 /// Use [`CallOptions::default()`] for no additional options.
+///
+/// `CallOptions` is `#[non_exhaustive]`: new fields may be added in minor
+/// releases. Construct with [`CallOptions::default()`] and the `with_*`
+/// builder methods, then read settings back through the accessor methods.
 ///
 /// # Example
 ///
@@ -643,31 +736,24 @@ impl ClientConfig {
 /// let options = CallOptions::default()
 ///     .with_timeout(Duration::from_secs(5))
 ///     .with_header("x-request-id", "abc123");
-/// assert_eq!(options.timeout, Some(Duration::from_secs(5)));
-/// assert_eq!(options.headers.get("x-request-id").unwrap(), "abc123");
+/// assert_eq!(options.timeout(), Some(Duration::from_secs(5)));
+/// assert_eq!(options.headers().get("x-request-id").unwrap(), "abc123");
 /// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CallOptions {
-    /// Additional headers to include in the request.
-    ///
-    /// These are merged into the HTTP request after protocol headers,
-    /// allowing override of any header for advanced use cases.
-    pub headers: http::HeaderMap,
-    /// Request timeout, sent as `connect-timeout-ms`.
-    pub timeout: Option<Duration>,
-    /// Maximum decompressed message size in bytes.
-    ///
-    /// When set, messages exceeding this size after decompression will
-    /// result in a `ResourceExhausted` error. Applies per-message for streaming.
-    pub max_message_size: Option<usize>,
-    /// Per-call compression override. `Some(true)` forces compression,
-    /// `Some(false)` disables it, `None` defers to the policy.
-    pub compress: Option<bool>,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) max_message_size: Option<usize>,
+    pub(crate) compress: Option<bool>,
 }
 
 impl CallOptions {
+    // ---- builders ---------------------------------------------------------
+
     /// Set the request timeout.
+    ///
+    /// Read via [`Self::timeout`].
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -679,6 +765,8 @@ impl CallOptions {
     /// If the name or value cannot be converted to valid HTTP header components,
     /// the header is silently ignored. Use [`try_with_header`](Self::try_with_header)
     /// for fallible insertion.
+    ///
+    /// Read via [`Self::headers`].
     #[must_use]
     pub fn with_header(
         mut self,
@@ -692,6 +780,13 @@ impl CallOptions {
     }
 
     /// Add a request header, returning an error if the name or value is invalid.
+    ///
+    /// Read via [`Self::headers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::Internal`] if the name or value cannot be
+    /// converted to a valid HTTP header component.
     pub fn try_with_header(
         mut self,
         name: impl TryInto<http::header::HeaderName>,
@@ -708,6 +803,8 @@ impl CallOptions {
     }
 
     /// Add multiple request headers from an iterator.
+    ///
+    /// Read via [`Self::headers`].
     #[must_use]
     pub fn with_headers(
         mut self,
@@ -720,17 +817,60 @@ impl CallOptions {
     }
 
     /// Set the maximum decompressed message size in bytes.
+    ///
+    /// Read via [`Self::max_message_size`].
     #[must_use]
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = Some(size);
         self
     }
 
-    /// Override compression for this call.
+    /// Override compression for this call. `Some(true)` forces compression,
+    /// `Some(false)` disables it; not calling this defers to the configured
+    /// [`CompressionPolicy`].
+    ///
+    /// Read via [`Self::compress`].
     #[must_use]
-    pub fn with_compression(mut self, enabled: bool) -> Self {
+    pub fn with_compress(mut self, enabled: bool) -> Self {
         self.compress = Some(enabled);
         self
+    }
+
+    // ---- accessors --------------------------------------------------------
+
+    /// Additional headers to include in the request.
+    ///
+    /// These are merged into the HTTP request after protocol headers,
+    /// allowing override of any header for advanced use cases.
+    ///
+    /// Set via [`Self::with_header`] / [`Self::with_headers`].
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+
+    /// The request timeout, sent as `connect-timeout-ms` / `grpc-timeout`.
+    ///
+    /// Set via [`Self::with_timeout`].
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// The maximum decompressed message size in bytes.
+    ///
+    /// When set, messages exceeding this size after decompression will
+    /// result in a `ResourceExhausted` error. Applies per-message for streaming.
+    ///
+    /// Set via [`Self::with_max_message_size`].
+    pub fn max_message_size(&self) -> Option<usize> {
+        self.max_message_size
+    }
+
+    /// The per-call compression override. `Some(true)` forces compression,
+    /// `Some(false)` disables it, `None` defers to the policy.
+    ///
+    /// Set via [`Self::with_compress`].
+    pub fn compress(&self) -> Option<bool> {
+        self.compress
     }
 }
 
@@ -1669,10 +1809,10 @@ where
     /// Returns `Ok(Some(msg))` for each message, `Ok(None)` when the stream
     /// ends, or `Err(...)` on protocol/decode/deadline errors.
     ///
-    /// If a deadline was set on this call (via `CallOptions::timeout` or
-    /// `ClientConfig::default_timeout`), each `message()` poll is bounded by
-    /// it — gRPC deadline semantics are whole-call, so a hung server won't
-    /// block indefinitely (matching grpc-java and connect-go).
+    /// If a deadline was set on this call (via [`CallOptions::with_timeout`]
+    /// or [`ClientConfig::with_default_timeout`]), each `message()` poll is
+    /// bounded by it — gRPC deadline semantics are whole-call, so a hung
+    /// server won't block indefinitely (matching grpc-java and connect-go).
     ///
     /// After this returns `Ok(None)`, [`trailers()`](Self::trailers) and
     /// [`error()`](Self::error) become available.
@@ -3273,6 +3413,74 @@ mod tests {
         assert_eq!(config.request_compression, Some("gzip".to_string()));
     }
 
+    #[test]
+    fn client_config_builders_round_trip_through_accessors() {
+        // Each `with_*` builder must be readable back through the bare-name
+        // accessor — the public read contract that replaces direct field
+        // access (#90).
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-base", "v".parse().unwrap());
+
+        let config = ClientConfig::new("http://example.com:8080".parse().unwrap())
+            .with_protocol(Protocol::Grpc)
+            .with_codec_format(CodecFormat::Json)
+            .with_compression(CompressionRegistry::default())
+            .compress_requests("gzip")
+            .with_compression_policy(CompressionPolicy::default())
+            .with_default_timeout(Duration::from_secs(30))
+            .with_default_max_message_size(4096)
+            .with_default_headers(headers.clone())
+            .with_default_header("x-extra", "1");
+
+        assert_eq!(config.base_uri().to_string(), "http://example.com:8080/");
+        assert_eq!(config.protocol(), Protocol::Grpc);
+        assert_eq!(config.codec_format(), CodecFormat::Json);
+        assert_eq!(config.request_compression(), Some("gzip"));
+        assert_eq!(config.default_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(config.default_max_message_size(), Some(4096));
+        assert_eq!(config.default_headers().get("x-base").unwrap(), "v");
+        assert_eq!(config.default_headers().get("x-extra").unwrap(), "1");
+        // `compression()` and `compression_policy()` return references / copies
+        // of the registry/policy; they don't impl PartialEq, so we just exercise
+        // that the accessors compile and don't panic.
+        let _ = config.compression();
+        let _ = config.compression_policy();
+    }
+
+    #[test]
+    fn client_config_defaults() {
+        let config = ClientConfig::new("http://localhost".parse().unwrap());
+        assert_eq!(config.protocol(), Protocol::Connect);
+        assert_eq!(config.codec_format(), CodecFormat::Proto);
+        assert_eq!(config.request_compression(), None);
+        assert_eq!(config.default_timeout(), None);
+        assert_eq!(config.default_max_message_size(), None);
+        assert!(config.default_headers().is_empty());
+    }
+
+    #[test]
+    fn call_options_builders_round_trip_through_accessors() {
+        let options = CallOptions::default()
+            .with_timeout(Duration::from_secs(5))
+            .with_header("x-request-id", "abc")
+            .with_max_message_size(2048)
+            .with_compress(true);
+
+        assert_eq!(options.timeout(), Some(Duration::from_secs(5)));
+        assert_eq!(options.headers().get("x-request-id").unwrap(), "abc");
+        assert_eq!(options.max_message_size(), Some(2048));
+        assert_eq!(options.compress(), Some(true));
+    }
+
+    #[test]
+    fn call_options_defaults() {
+        let options = CallOptions::default();
+        assert!(options.headers().is_empty());
+        assert_eq!(options.timeout(), None);
+        assert_eq!(options.max_message_size(), None);
+        assert_eq!(options.compress(), None);
+    }
+
     #[cfg(feature = "client")]
     #[test]
     fn test_http_client_plaintext_creation() {
@@ -3639,20 +3847,20 @@ mod tests {
         let config = ClientConfig::new("http://localhost".parse().unwrap());
         assert_eq!(unary_request_content_type(&config), "application/proto");
 
-        let config = config.codec_format(CodecFormat::Json);
+        let config = config.with_codec_format(CodecFormat::Json);
         assert_eq!(unary_request_content_type(&config), "application/json");
     }
 
     #[test]
     fn test_unary_request_content_type_grpc() {
         let config =
-            ClientConfig::new("http://localhost".parse().unwrap()).protocol(Protocol::Grpc);
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
         assert_eq!(
             unary_request_content_type(&config),
             "application/grpc+proto"
         );
 
-        let config = config.codec_format(CodecFormat::Json);
+        let config = config.with_codec_format(CodecFormat::Json);
         assert_eq!(unary_request_content_type(&config), "application/grpc+json");
     }
 
@@ -3664,13 +3872,13 @@ mod tests {
             "application/connect+proto"
         );
 
-        let config = config.protocol(Protocol::Grpc);
+        let config = config.with_protocol(Protocol::Grpc);
         assert_eq!(
             streaming_request_content_type(&config),
             "application/grpc+proto"
         );
 
-        let config = config.protocol(Protocol::GrpcWeb);
+        let config = config.with_protocol(Protocol::GrpcWeb);
         assert_eq!(
             streaming_request_content_type(&config),
             "application/grpc-web+proto"
@@ -3730,7 +3938,7 @@ mod tests {
     #[test]
     fn test_add_unary_request_headers_grpc() {
         let config =
-            ClientConfig::new("http://localhost".parse().unwrap()).protocol(Protocol::Grpc);
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
         let builder = http::Request::builder();
         let builder = add_unary_request_headers(builder, &config, None, None);
         let req = builder.body(()).unwrap();
@@ -3745,7 +3953,7 @@ mod tests {
     #[test]
     fn test_add_unary_request_headers_grpc_web() {
         let config =
-            ClientConfig::new("http://localhost".parse().unwrap()).protocol(Protocol::GrpcWeb);
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
         let builder = http::Request::builder();
         let builder = add_unary_request_headers(builder, &config, None, None);
         let req = builder.body(()).unwrap();
@@ -3760,7 +3968,7 @@ mod tests {
     #[test]
     fn test_add_unary_request_headers_with_timeout() {
         let config =
-            ClientConfig::new("http://localhost".parse().unwrap()).protocol(Protocol::Grpc);
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
         let builder = http::Request::builder();
         let builder =
             add_unary_request_headers(builder, &config, Some(Duration::from_millis(500)), None);
@@ -3916,7 +4124,7 @@ mod tests {
     #[test]
     fn test_add_streaming_request_headers_grpc() {
         let config =
-            ClientConfig::new("http://localhost".parse().unwrap()).protocol(Protocol::Grpc);
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
         let builder = http::Request::builder();
         let builder = add_streaming_request_headers(builder, &config, None);
         let req = builder.body(()).unwrap();
@@ -3934,7 +4142,7 @@ mod tests {
     #[test]
     fn test_client_config_protocol() {
         let config =
-            ClientConfig::new("http://localhost".parse().unwrap()).protocol(Protocol::Grpc);
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
         assert_eq!(config.protocol, Protocol::Grpc);
     }
 
@@ -3950,7 +4158,7 @@ mod tests {
 
     fn headers_for(protocol: Protocol, applied_encoding: Option<&str>) -> http::HeaderMap {
         let config = ClientConfig::new("http://localhost".parse().unwrap())
-            .protocol(protocol)
+            .with_protocol(protocol)
             .compress_requests("gzip");
         let builder = http::Request::builder();
         add_unary_request_headers(builder, &config, None, applied_encoding)
@@ -3996,9 +4204,9 @@ mod tests {
     #[test]
     fn effective_options_uses_config_defaults_when_options_unset() {
         let config = test_config()
-            .default_timeout(Duration::from_secs(30))
-            .default_max_message_size(1024)
-            .default_header("x-trace-id", "cfg-trace");
+            .with_default_timeout(Duration::from_secs(30))
+            .with_default_max_message_size(1024)
+            .with_default_header("x-trace-id", "cfg-trace");
 
         let eff = effective_options(&config, CallOptions::default());
 
@@ -4010,8 +4218,8 @@ mod tests {
     #[test]
     fn effective_options_options_override_config_defaults() {
         let config = test_config()
-            .default_timeout(Duration::from_secs(30))
-            .default_max_message_size(1024);
+            .with_default_timeout(Duration::from_secs(30))
+            .with_default_max_message_size(1024);
 
         let options = CallOptions::default()
             .with_timeout(Duration::from_secs(5))
@@ -4026,7 +4234,7 @@ mod tests {
     #[test]
     fn effective_options_compress_has_no_config_default() {
         let config = test_config();
-        let options = CallOptions::default().with_compression(true);
+        let options = CallOptions::default().with_compress(true);
         let eff = effective_options(&config, options);
         assert_eq!(eff.compress, Some(true));
     }

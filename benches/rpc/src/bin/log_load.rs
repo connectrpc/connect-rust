@@ -29,7 +29,7 @@ async fn main() {
     let records_per_batch: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
 
     let uri: http::Uri = format!("http://{addr}").parse().unwrap();
-    let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+    let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
 
     // Pre-build the request once and clone per RPC. The cloning cost is
     // client-side only; the server's decode work is what we're profiling.

@@ -158,7 +158,7 @@ async fn start_server() -> std::net::SocketAddr {
 
 fn make_client(addr: std::net::SocketAddr, token: &str) -> SecretServiceClient<HttpClient> {
     let config = ClientConfig::new(format!("http://{addr}").parse().unwrap())
-        .default_header("authorization", format!("Bearer {token}"));
+        .with_default_header("authorization", format!("Bearer {token}"));
     SecretServiceClient::new(HttpClient::plaintext(), config)
 }
 

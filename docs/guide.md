@@ -740,9 +740,9 @@ use std::time::Duration;
 use connectrpc::client::ClientConfig;
 
 let config = ClientConfig::new("http://localhost:8080".parse()?)
-    .default_timeout(Duration::from_secs(30))
-    .default_header("authorization", "Bearer demo-token")
-    .default_header("x-trace-id", "trace-12345");
+    .with_default_timeout(Duration::from_secs(30))
+    .with_default_header("authorization", "Bearer demo-token")
+    .with_default_header("x-trace-id", "trace-12345");
 ```
 
 These defaults automatically apply to every call from that client.
@@ -923,7 +923,7 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 | Example | What it covers |
 |---|---|
 | [`streaming-tour/`](../examples/streaming-tour) | All four RPC types (unary, server stream, client stream, bidi) on a trivial NumberService. Smallest demo of handler signatures and client invocation patterns. |
-| [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::default_header` and `CallOptions::with_timeout`. |
+| [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
 | [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
 | [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage. |

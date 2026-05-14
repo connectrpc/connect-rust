@@ -1197,7 +1197,7 @@ use connectrpc::Protocol;
 
 let uri: http::Uri = "http://localhost:8080".parse()?;
 let conn = Http2Connection::connect_plaintext(uri.clone()).await?.shared(1024);
-let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
 
 let client = {client_name_str}::new(conn, config);
 let response = client.{example_method}(request).await?;

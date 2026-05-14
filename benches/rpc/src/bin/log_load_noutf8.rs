@@ -77,7 +77,7 @@ async fn main() {
     let records_per_batch: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
 
     let uri: http::Uri = format!("http://{addr}").parse().unwrap();
-    let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+    let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
 
     let request = build_request(records_per_batch);
     let approx_size = {

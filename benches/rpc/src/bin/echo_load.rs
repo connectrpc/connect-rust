@@ -26,7 +26,7 @@ async fn main() {
     let n_conns: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
 
     let uri: http::Uri = format!("http://{addr}").parse().unwrap();
-    let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+    let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
 
     eprintln!(
         "Generating load: {concurrency} tasks × {n_conns} connections for {duration}s against {addr}"

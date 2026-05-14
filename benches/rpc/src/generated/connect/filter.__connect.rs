@@ -267,7 +267,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
 ///
 /// let uri: http::Uri = "http://localhost:8080".parse()?;
 /// let conn = Http2Connection::connect_plaintext(uri.clone()).await?.shared(1024);
-/// let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+/// let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
 ///
 /// let client = FilterServiceClient::new(conn, config);
 /// let response = client.redact(request).await?;

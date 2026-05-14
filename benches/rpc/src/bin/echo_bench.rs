@@ -146,7 +146,7 @@ async fn bench_server(
     measurement: Duration,
 ) -> BenchResult {
     let config = ClientConfig::new(format!("http://{addr}").parse().expect("valid server URL"))
-        .protocol(protocol);
+        .with_protocol(protocol);
     let http = if protocol.requires_http2() {
         HttpClient::plaintext_http2_only()
     } else {
@@ -248,7 +248,7 @@ async fn bench_server_multiconn(
     measurement: Duration,
 ) -> BenchResult {
     let uri: http::Uri = format!("http://{addr}").parse().expect("valid server URL");
-    let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+    let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
 
     // Establish N connections eagerly so warmup doesn't include handshakes.
     let mut conns: Vec<SharedHttp2Connection> = Vec::with_capacity(n_conns);

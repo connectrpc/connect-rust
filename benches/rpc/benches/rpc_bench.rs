@@ -152,7 +152,7 @@ fn bench_unary_large(c: &mut Criterion) {
         for protocol in PROTOCOLS {
             let config =
                 connectrpc::client::ClientConfig::new(format!("http://{addr}").parse().unwrap())
-                    .protocol(protocol)
+                    .with_protocol(protocol)
                     .compress_requests(compression);
             let http = if protocol.requires_http2() {
                 HttpClient::plaintext_http2_only()

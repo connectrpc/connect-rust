@@ -60,13 +60,13 @@ impl Drop for ServerProcess {
 
 fn make_grpc_client(addr: SocketAddr) -> BenchServiceClient<HttpClient> {
     let config =
-        ClientConfig::new(format!("http://{addr}").parse().unwrap()).protocol(Protocol::Grpc);
+        ClientConfig::new(format!("http://{addr}").parse().unwrap()).with_protocol(Protocol::Grpc);
     BenchServiceClient::new(HttpClient::plaintext_http2_only(), config)
 }
 
 fn make_connect_client(addr: SocketAddr) -> BenchServiceClient<HttpClient> {
-    let config =
-        ClientConfig::new(format!("http://{addr}").parse().unwrap()).protocol(Protocol::Connect);
+    let config = ClientConfig::new(format!("http://{addr}").parse().unwrap())
+        .with_protocol(Protocol::Connect);
     BenchServiceClient::new(HttpClient::plaintext(), config)
 }
 
@@ -210,7 +210,7 @@ fn bench_unary_large_grpc(c: &mut Criterion) {
 
     for (impl_name, server) in IMPLS.iter().zip(servers.iter()) {
         let config = ClientConfig::new(format!("http://{}", server.addr()).parse().unwrap())
-            .protocol(Protocol::Grpc)
+            .with_protocol(Protocol::Grpc)
             .compress_requests("gzip");
         let client = BenchServiceClient::new(HttpClient::plaintext_http2_only(), config);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {

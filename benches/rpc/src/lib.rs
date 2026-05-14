@@ -170,8 +170,8 @@ pub fn make_client(
     codec_format: CodecFormat,
 ) -> BenchServiceClient<HttpClient> {
     let config = ClientConfig::new(format!("http://{addr}").parse().unwrap())
-        .protocol(protocol)
-        .codec_format(codec_format);
+        .with_protocol(protocol)
+        .with_codec_format(codec_format);
     let http = if protocol.requires_http2() {
         HttpClient::plaintext_http2_only()
     } else {

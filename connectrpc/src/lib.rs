@@ -92,7 +92,7 @@
 //!
 //! let uri: http::Uri = "http://localhost:8080".parse()?;
 //! let conn = Http2Connection::connect_plaintext(uri.clone()).await?.shared(1024);
-//! let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+//! let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
 //!
 //! let client = GreetServiceClient::new(conn, config);
 //! let response = client.greet(request).await?;
@@ -121,8 +121,8 @@
 //!
 //! ```rust,ignore
 //! let config = ClientConfig::new(uri)
-//!     .default_timeout(Duration::from_secs(30))
-//!     .default_header("authorization", "Bearer ...");
+//!     .with_default_timeout(Duration::from_secs(30))
+//!     .with_default_header("authorization", "Bearer ...");
 //!
 //! let client = GreetServiceClient::new(http, config);
 //! client.greet(req).await?;  // uses 30s timeout + auth header

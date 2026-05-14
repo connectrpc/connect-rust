@@ -141,8 +141,8 @@ fn build_servers() {
 }
 
 fn make_client(addr: SocketAddr) -> FilterServiceClient<HttpClient> {
-    let config =
-        ClientConfig::new(format!("http://{addr}").parse().unwrap()).protocol(Protocol::Connect);
+    let config = ClientConfig::new(format!("http://{addr}").parse().unwrap())
+        .with_protocol(Protocol::Connect);
     FilterServiceClient::new(HttpClient::plaintext(), config)
 }
 

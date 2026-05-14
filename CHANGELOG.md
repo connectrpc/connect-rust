@@ -86,6 +86,42 @@ need a one-line edit.
   directly need to turbofish `encode_response_stream::<Res, _, _>(s,
   format)`. We are not aware of any.
 
+### Changed
+
+- **`ClientConfig` and `CallOptions` fields are now `pub(crate)`.**
+  Both structs are `#[non_exhaustive]`, so struct-literal and
+  functional-update construction was already rejected by the compiler
+  outside the crate (E0639); the `pub` fields just made the rustdoc
+  suggest a path that didn't compile. Each field now has a same-named
+  read accessor (`config.protocol()`, `config.base_uri()`,
+  `options.timeout()`, `options.headers()`, …). To free the bare names
+  for accessors, the `ClientConfig` setter methods were renamed to the
+  `with_*` form already used by `CallOptions`, and one `CallOptions`
+  setter was renamed to match its field:
+
+  | Type | Before | After |
+  |---|---|---|
+  | `ClientConfig` | `.protocol(p)` | `.with_protocol(p)` |
+  | `ClientConfig` | `.codec_format(f)` | `.with_codec_format(f)` |
+  | `ClientConfig` | `.compression(r)` | `.with_compression(r)` |
+  | `ClientConfig` | `.compression_policy(p)` | `.with_compression_policy(p)` |
+  | `ClientConfig` | `.default_timeout(t)` | `.with_default_timeout(t)` |
+  | `ClientConfig` | `.default_max_message_size(s)` | `.with_default_max_message_size(s)` |
+  | `ClientConfig` | `.default_header(n, v)` | `.with_default_header(n, v)` |
+  | `ClientConfig` | `.default_headers(h)` | `.with_default_headers(h)` |
+  | `CallOptions` | `.with_compression(b)` | `.with_compress(b)` |
+
+  `ClientConfig::new(uri)`, `.json()`, `.proto()`, and
+  `.compress_requests(e)` are unchanged. The remaining `CallOptions`
+  builders (`with_timeout`, `with_header`, …) are unchanged. Migrating
+  reads: `config.protocol` → `config.protocol()`, `options.timeout` →
+  `options.timeout()`.
+
+  If you see `error[E0061]: this method takes 0 arguments but 1 argument
+  was supplied` on a `ClientConfig` builder call, you've hit the rename:
+  the same-named read accessor now occupies the old name. Prefix the
+  call with `with_` per the table above.
+
 ## [0.4.2] - 2026-05-07
 
 ### Added

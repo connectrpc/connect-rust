@@ -779,7 +779,7 @@ mod tests {
             .unwrap();
         let shared = conn.shared(64);
 
-        let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+        let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
         let client = EchoServiceClient::new(shared.clone(), config.clone());
 
         let resp = client
@@ -811,7 +811,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..16 {
             let c = shared.clone();
-            let cfg: ClientConfig = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+            let cfg: ClientConfig = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
             handles.push(tokio::spawn(async move {
                 let client = EchoServiceClient::new(c, cfg);
                 client
@@ -853,7 +853,7 @@ mod tests {
             .await
             .unwrap()
             .shared(64);
-        let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+        let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
         let client = EchoServiceClient::new(conn, config);
 
         let test = async {
@@ -996,7 +996,7 @@ mod tests {
             .unwrap()
             .shared(64);
 
-        let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+        let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
         let client = EchoServiceClient::new(conn, config);
 
         let resp = client

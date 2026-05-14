@@ -23,7 +23,8 @@ async fn main() {
         _ => Protocol::Connect,
     };
 
-    let config = ClientConfig::new(format!("http://{addr}").parse().unwrap()).protocol(protocol);
+    let config =
+        ClientConfig::new(format!("http://{addr}").parse().unwrap()).with_protocol(protocol);
     let http = if protocol.requires_http2() {
         HttpClient::plaintext_http2_only()
     } else {

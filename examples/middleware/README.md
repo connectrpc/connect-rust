@@ -16,7 +16,7 @@ writes a `x-served-by` response trailer via `Context::set_trailer()`.
 RUST_LOG=info,tower_http=debug \
     cargo run -p middleware-example --bin middleware-server
 
-# Terminal 2: client (sends auth header via ClientConfig::default_header)
+# Terminal 2: client (sends auth header via ClientConfig::with_default_header)
 cargo run -p middleware-example --bin middleware-client
 
 # Or with curl:
@@ -80,9 +80,9 @@ address.
 
 ### Client side (`src/client.rs`)
 
-- **`ClientConfig::default_header`** - sets the auth header once on
+- **`ClientConfig::with_default_header`** - sets the auth header once on
   the client config; every RPC call picks it up automatically.
-- **`ClientConfig::default_timeout`** - default deadline for every
+- **`ClientConfig::with_default_timeout`** - default deadline for every
   call.
 - **`CallOptions::with_timeout`** - per-call deadline override.
   `_with_options` variants let any RPC method take per-call options.

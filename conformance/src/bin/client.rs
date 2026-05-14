@@ -487,12 +487,12 @@ async fn do_unary_call(
     )
     .parse()?;
     let mut config = ClientConfig::new(base_uri)
-        .protocol(wire_protocol)
-        .codec_format(match codec {
+        .with_protocol(wire_protocol)
+        .with_codec_format(match codec {
             Codec::CODEC_JSON => CodecFormat::Json,
             _ => CodecFormat::Proto,
         })
-        .compression(registry);
+        .with_compression(registry);
     config = apply_compression(config, compression);
 
     // Build CallOptions: timeout, max_message_size, custom headers
@@ -699,12 +699,12 @@ async fn do_server_stream_call(
     )
     .parse()?;
     let mut config = ClientConfig::new(base_uri)
-        .protocol(wire_protocol)
-        .codec_format(match codec {
+        .with_protocol(wire_protocol)
+        .with_codec_format(match codec {
             Codec::CODEC_JSON => CodecFormat::Json,
             _ => CodecFormat::Proto,
         })
-        .compression(registry);
+        .with_compression(registry);
     config = apply_compression(config, compression);
 
     // Build CallOptions
@@ -1001,12 +1001,12 @@ async fn do_client_stream_call(
     )
     .parse()?;
     let mut config = ClientConfig::new(base_uri)
-        .protocol(wire_protocol)
-        .codec_format(match codec {
+        .with_protocol(wire_protocol)
+        .with_codec_format(match codec {
             Codec::CODEC_JSON => CodecFormat::Json,
             _ => CodecFormat::Proto,
         })
-        .compression(registry);
+        .with_compression(registry);
     config = apply_compression(config, compression);
 
     // Build CallOptions
@@ -1167,12 +1167,12 @@ async fn do_bidi_stream_call(
     )
     .parse()?;
     let mut config = ClientConfig::new(base_uri)
-        .protocol(wire_protocol)
-        .codec_format(match codec {
+        .with_protocol(wire_protocol)
+        .with_codec_format(match codec {
             Codec::CODEC_JSON => CodecFormat::Json,
             _ => CodecFormat::Proto,
         })
-        .compression(registry);
+        .with_compression(registry);
     config = apply_compression(config, compression);
 
     // Build CallOptions
@@ -1584,7 +1584,7 @@ fn apply_compression(config: ClientConfig, compression: Compression) -> ClientCo
     match compression_encoding_name(compression) {
         Some(enc) => config
             .compress_requests(enc)
-            .compression_policy(connectrpc::CompressionPolicy::default().min_size(0)),
+            .with_compression_policy(connectrpc::CompressionPolicy::default().min_size(0)),
         None => config,
     }
 }

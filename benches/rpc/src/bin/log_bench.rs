@@ -145,7 +145,7 @@ async fn bench_server(
     measurement: Duration,
 ) -> BenchResult {
     let uri: http::Uri = format!("http://{addr}").parse().expect("valid server URL");
-    let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+    let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
 
     let mut conns: Vec<SharedHttp2Connection> = Vec::with_capacity(n_conns);
     for _ in 0..n_conns {
@@ -245,7 +245,7 @@ async fn bench_server_noutf8(
     use rpc_bench::proto::bench::noutf8;
 
     let uri: http::Uri = format!("http://{addr}").parse().expect("valid server URL");
-    let config = ClientConfig::new(uri.clone()).protocol(Protocol::Grpc);
+    let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
 
     let mut conns: Vec<SharedHttp2Connection> = Vec::with_capacity(n_conns);
     for _ in 0..n_conns {

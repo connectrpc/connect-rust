@@ -431,7 +431,7 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
 ///
 /// let uri: http::Uri = "http://localhost:8080".parse()?;
 /// let conn = Http2Connection::connect_plaintext(uri.clone()).await?.shared(1024);
-/// let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+/// let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
 ///
 /// let client = ElizaServiceClient::new(conn, config);
 /// let response = client.say(request).await?;
