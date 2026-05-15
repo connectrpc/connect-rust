@@ -103,9 +103,9 @@ async fn auth_middleware(
         return unauthorized("invalid Bearer token");
     };
 
-    // The connect dispatcher forwards req.extensions() into
-    // Context::extensions verbatim, so the handler reads the UserId via
-    // ctx.extensions.get::<UserId>().
+    // The connect dispatcher forwards req.extensions() into the request
+    // context verbatim, so the handler reads the UserId via
+    // ctx.extensions().get::<UserId>().
     req.extensions_mut().insert(user);
     next.run(req).await
 }
@@ -140,9 +140,9 @@ impl SecretService for SecretServiceImpl {
         request: OwnedView<GetSecretRequestView<'static>>,
     ) -> ServiceResult<GetSecretResponse> {
         // The auth layer stamped UserId into the http::Request extensions,
-        // which the connect dispatcher then forwarded into ctx.extensions.
+        // which the connect dispatcher then forwarded into ctx.extensions().
         let user = ctx
-            .extensions
+            .extensions()
             .get::<UserId>()
             .ok_or_else(|| {
                 ConnectError::new(

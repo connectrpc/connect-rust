@@ -101,7 +101,7 @@ impl SecretService for SecretServiceImpl {
         request: OwnedView<GetSecretRequestView<'static>>,
     ) -> ServiceResult<GetSecretResponse> {
         let user = ctx
-            .extensions
+            .extensions()
             .get::<UserId>()
             .ok_or_else(|| ConnectError::new(ErrorCode::Internal, "auth layer misconfigured"))?
             .clone();

@@ -133,6 +133,27 @@ need a one-line edit.
   directly need to turbofish `encode_response_stream::<Res, _, _>(s,
   format)`. We are not aware of any.
 
+- **`RequestContext` is now `#[non_exhaustive]` with `pub(crate)` fields
+  and accessor methods.** Direct field reads — `ctx.headers`,
+  `ctx.deadline`, `ctx.extensions` — must move to `ctx.headers()`,
+  `ctx.deadline()`, `ctx.extensions()`. Construction via
+  `RequestContext::new(headers)` and the `with_*` builders is unchanged.
+  Locking the contract now lets future request-scoped metadata (method
+  name, RPC kind, negotiated protocol — wanted by interceptor and
+  observability work) ship as non-breaking additions instead of one
+  semver bump per field.
+
+  New (additive) accessors landed alongside the change:
+  - `ctx.time_remaining()` — saturating `Duration` until the deadline,
+    for budgeting downstream calls.
+  - `ctx.extensions_mut()` — mutable extensions, for tower middleware
+    that builds a `RequestContext` directly.
+  - `ctx.peer_addr()` (`server` feature) and `ctx.peer_certs()`
+    (`server-tls` feature) — typed extension lookups for the well-known
+    peer types. They return `None` when the transport didn't insert the
+    value, replacing the panic-prone
+    `ctx.extensions.get::<PeerAddr>().unwrap()` pattern.
+
 ### Changed
 
 - **`ClientConfig` and `CallOptions` fields are now `pub(crate)`.**

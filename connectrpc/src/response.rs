@@ -10,7 +10,7 @@
 
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use buffa::Message;
 use buffa::view::{MessageView, ViewEncode};
@@ -33,10 +33,17 @@ use crate::error::ConnectError;
 /// connection-scoped extensions (peer address, TLS certs, auth context)
 /// inserted by a tower layer in front of the service. Handlers do *not*
 /// return this; response-side metadata lives on [`Response`].
+///
+/// `RequestContext` is `#[non_exhaustive]`: construct it with
+/// [`RequestContext::new`] and the `with_*` builders, and read fields
+/// through the accessor methods (`headers()`, `deadline()`,
+/// `extensions()`, …). New request-scoped metadata can be added in minor
+/// releases without breaking downstream code.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RequestContext {
     /// Request headers (after protocol-prefix stripping).
-    pub headers: HeaderMap,
+    pub(crate) headers: HeaderMap,
     /// Absolute request deadline parsed from the protocol's timeout header,
     /// if any. Propagate to downstream calls.
     ///
@@ -44,15 +51,9 @@ pub struct RequestContext {
     /// service, this is the *moderated* value — clamped to the policy's
     /// `[min, max]` range, or the policy default when the client asserted
     /// nothing — not the raw client header.
-    pub deadline: Option<Instant>,
+    pub(crate) deadline: Option<Instant>,
     /// Request extensions carried from the underlying `http::Request`.
-    ///
-    /// This is the passthrough for connection-scoped metadata that a
-    /// tower layer in front of the service can attach — TLS peer
-    /// certificates, remote socket address, auth context, etc. The
-    /// dispatch path moves `parts.extensions` here verbatim; handlers
-    /// read it with `ctx.extensions.get::<T>()`.
-    pub extensions: http::Extensions,
+    pub(crate) extensions: http::Extensions,
 }
 
 impl RequestContext {
@@ -79,9 +80,113 @@ impl RequestContext {
         self
     }
 
+    /// Request headers (after protocol-prefix stripping).
+    ///
+    /// For a single header lookup, [`header`](Self::header) is simpler.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
     /// Get a request header value.
     pub fn header(&self, key: impl http::header::AsHeaderName) -> Option<&HeaderValue> {
         self.headers.get(key)
+    }
+
+    /// Absolute request deadline parsed from the protocol's timeout header
+    /// (`Connect-Timeout-Ms` or `grpc-timeout`), if the client asserted one.
+    ///
+    /// Propagate this to downstream calls so the whole call chain shares a
+    /// single budget. For the remaining budget as a `Duration`, see
+    /// [`time_remaining`](Self::time_remaining).
+    ///
+    /// If a [`DeadlinePolicy`](crate::DeadlinePolicy) is configured on the
+    /// service, this is the *moderated* value — clamped to the policy's
+    /// `[min, max]` range, or the policy default when the client asserted
+    /// nothing — not the raw client header.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Time remaining until the request deadline, saturating at zero.
+    ///
+    /// `None` if the client did not assert a timeout. Use this to budget
+    /// downstream calls — for example, subtract a margin before passing the
+    /// remainder as a downstream RPC's per-call timeout. See also issue
+    /// [#92](https://github.com/anthropics/connect-rust/issues/92) for
+    /// server-side deadline enforcement.
+    pub fn time_remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// Request extensions carried from the underlying `http::Request`.
+    ///
+    /// This is the passthrough for connection-scoped metadata that a tower
+    /// layer in front of the service can attach — TLS peer certificates,
+    /// remote socket address, auth context, etc. The dispatch path moves
+    /// `parts.extensions` here verbatim; handlers read it with
+    /// `ctx.extensions().get::<T>()`. For the well-known peer types, prefer
+    /// the typed accessors `peer_addr()` and `peer_certs()` (gated on the
+    /// `server` and `server-tls` features respectively) — they return
+    /// `None` instead of panicking when the transport didn't insert the
+    /// extension.
+    pub fn extensions(&self) -> &http::Extensions {
+        &self.extensions
+    }
+
+    /// Mutable access to the request extensions.
+    ///
+    /// Useful for code that constructs a `RequestContext` directly — e.g.
+    /// a custom dispatch shim or test fixture — and needs to insert
+    /// connection-scoped values before calling a handler.
+    ///
+    /// # Note
+    ///
+    /// Handlers receive `RequestContext` **by value**, so calling
+    /// `ctx.extensions_mut().insert(...)` inside a handler mutates a local
+    /// copy that the framework never sees again — it has no effect on the
+    /// dispatch path or on downstream layers. To pass values *into* a
+    /// handler from middleware, mutate `http::Request::extensions_mut()`
+    /// in the layer instead; the dispatcher moves request extensions into
+    /// `RequestContext` automatically before dispatch.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.extensions
+    }
+
+    /// Remote peer socket address, if the transport recorded one.
+    ///
+    /// Present when the request arrived through
+    /// [`Server::serve`](crate::server::Server::serve) (plain) or
+    /// `Server::with_tls(...)` (TLS), or any integration that inserts
+    /// [`PeerAddr`](crate::server::PeerAddr) into the request extensions
+    /// (`connectrpc::axum::serve_tls` does).
+    /// Returns `None` otherwise (e.g. an axum app without a layer that
+    /// captures the connect info), so prefer this over
+    /// `ctx.extensions().get::<PeerAddr>().unwrap()` — the latter compiles,
+    /// passes in unit tests, and panics in production behind a transport
+    /// that didn't insert it.
+    #[cfg(feature = "server")]
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.extensions
+            .get::<crate::server::PeerAddr>()
+            .map(|p| p.0)
+    }
+
+    /// TLS client certificate chain presented by the peer (leaf first), if any.
+    ///
+    /// Present only when the request arrived over a TLS listener that
+    /// requested a client certificate and the client presented one — see
+    /// [`Server::with_tls`](crate::server::Server::with_tls) and
+    /// `connectrpc::axum::serve_tls`. Returns `None` for plaintext
+    /// transports, for TLS without mutual auth, and for integrations that
+    /// don't insert [`PeerCerts`](crate::server::PeerCerts) into the
+    /// request extensions. Like [`peer_addr`](Self::peer_addr), prefer
+    /// this over a raw `extensions().get()` + `unwrap()`.
+    #[cfg(feature = "server-tls")]
+    pub fn peer_certs(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        self.extensions
+            .get::<crate::server::PeerCerts>()
+            .map(|p| &p.0[..])
     }
 }
 
@@ -813,14 +918,73 @@ mod tests {
             ctx.header(HeaderName::from_static("x-custom")).unwrap(),
             "v"
         );
-        assert!(ctx.deadline.is_none());
+        assert_eq!(ctx.headers().get("x-custom").unwrap(), "v");
+        assert!(ctx.deadline().is_none());
+        assert!(ctx.time_remaining().is_none());
+        assert!(ctx.extensions().is_empty());
     }
 
     #[test]
     fn request_context_with_deadline() {
         let d = Instant::now();
         let ctx = RequestContext::new(HeaderMap::new()).with_deadline(Some(d));
-        assert_eq!(ctx.deadline, Some(d));
+        assert_eq!(ctx.deadline(), Some(d));
+    }
+
+    #[test]
+    fn request_context_time_remaining_saturates_at_zero() {
+        // Deadline in the past — `time_remaining()` should clamp to zero,
+        // not underflow.
+        let past = Instant::now() - Duration::from_secs(60);
+        let ctx = RequestContext::new(HeaderMap::new()).with_deadline(Some(past));
+        assert_eq!(ctx.time_remaining(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn request_context_time_remaining_future() {
+        let future = Instant::now() + Duration::from_secs(60);
+        let ctx = RequestContext::new(HeaderMap::new()).with_deadline(Some(future));
+        let remaining = ctx.time_remaining().unwrap();
+        // Some elapsed time between `with_deadline` and the assertion is
+        // expected; just bound it.
+        assert!(remaining > Duration::from_secs(55));
+        assert!(remaining <= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn request_context_extensions_mut() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Tag(u8);
+        let mut ctx = RequestContext::new(HeaderMap::new());
+        ctx.extensions_mut().insert(Tag(1));
+        assert_eq!(ctx.extensions().get::<Tag>(), Some(&Tag(1)));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn request_context_peer_addr_absent() {
+        // No transport inserted `PeerAddr`; the typed accessor returns
+        // `None` rather than panicking.
+        let ctx = RequestContext::new(HeaderMap::new());
+        assert_eq!(ctx.peer_addr(), None);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn request_context_peer_addr_present() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let mut ext = http::Extensions::new();
+        ext.insert(crate::server::PeerAddr(addr));
+        let ctx = RequestContext::new(HeaderMap::new()).with_extensions(ext);
+        assert_eq!(ctx.peer_addr(), Some(addr));
+    }
+
+    #[cfg(feature = "server-tls")]
+    #[test]
+    fn request_context_peer_certs_absent() {
+        let ctx = RequestContext::new(HeaderMap::new());
+        assert!(ctx.peer_certs().is_none());
     }
 
     #[test]
@@ -1082,6 +1246,6 @@ mod tests {
         let mut ext = http::Extensions::new();
         ext.insert(Peer(7));
         let ctx = RequestContext::new(HeaderMap::new()).with_extensions(ext);
-        assert_eq!(ctx.extensions.get::<Peer>(), Some(&Peer(7)));
+        assert_eq!(ctx.extensions().get::<Peer>(), Some(&Peer(7)));
     }
 }

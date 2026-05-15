@@ -85,7 +85,7 @@ fn build_request_info(
     // Collect header values by name, merging duplicates into a single Header
     let mut header_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for (name, value) in ctx.headers.iter() {
+    for (name, value) in ctx.headers().iter() {
         header_map
             .entry(name.to_string())
             .or_default()
@@ -105,12 +105,12 @@ fn build_request_info(
     // Connect uses connect-timeout-ms (value in milliseconds).
     // gRPC/gRPC-Web uses grpc-timeout (value with unit suffix, e.g., "5000m").
     let timeout_ms = ctx
-        .headers
+        .headers()
         .get("connect-timeout-ms")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| {
-            ctx.headers
+            ctx.headers()
                 .get("grpc-timeout")
                 .and_then(|v| v.to_str().ok())
                 .and_then(grpc_timeout_to_ms)
@@ -449,7 +449,7 @@ impl ConformanceService for ConformanceServiceImpl {
         let request_headers: Vec<_> = {
             let mut header_map: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
-            for (name, value) in ctx.headers.iter() {
+            for (name, value) in ctx.headers().iter() {
                 header_map
                     .entry(name.to_string())
                     .or_default()
@@ -466,12 +466,12 @@ impl ConformanceService for ConformanceServiceImpl {
         };
 
         let timeout_ms = ctx
-            .headers
+            .headers()
             .get("connect-timeout-ms")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<i64>().ok())
             .or_else(|| {
-                ctx.headers
+                ctx.headers()
                     .get("grpc-timeout")
                     .and_then(|v| v.to_str().ok())
                     .and_then(grpc_timeout_to_ms)
@@ -595,7 +595,7 @@ impl ConformanceService for ConformanceServiceImpl {
         let request_headers: Vec<_> = {
             let mut header_map: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
-            for (name, value) in ctx.headers.iter() {
+            for (name, value) in ctx.headers().iter() {
                 header_map
                     .entry(name.to_string())
                     .or_default()
@@ -612,12 +612,12 @@ impl ConformanceService for ConformanceServiceImpl {
         };
 
         let timeout_ms = ctx
-            .headers
+            .headers()
             .get("connect-timeout-ms")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<i64>().ok())
             .or_else(|| {
-                ctx.headers
+                ctx.headers()
                     .get("grpc-timeout")
                     .and_then(|v| v.to_str().ok())
                     .and_then(grpc_timeout_to_ms)

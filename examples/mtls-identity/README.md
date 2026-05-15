@@ -12,7 +12,7 @@ and enforces an ACL against it.
 This is the mTLS twin of [`examples/middleware/`](../middleware): same
 secret-store-with-ACL shape, but the credential is a client certificate
 instead of a `Bearer` token. The handler-side code that reads
-`ctx.extensions.get::<T>()` is unchanged; only what the layer/accept
+`ctx.peer_certs()` is unchanged; only what the layer/accept
 loop puts into extensions differs.
 
 ## Run it
@@ -57,8 +57,8 @@ connectrpc::axum::serve_tls(listener, app, server_config)
     .await?;
 ```
 
-Handler code that reads `ctx.extensions.get::<PeerCerts>()` is then
-portable between the standalone `Server::with_tls` and an axum app.
+Handler code that reads `ctx.peer_certs()` is then portable
+between the standalone `Server::with_tls` and an axum app.
 
 ### Cert-SAN identity (`src/lib.rs::extract_identity`)
 

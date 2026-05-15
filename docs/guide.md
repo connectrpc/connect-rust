@@ -288,11 +288,35 @@ you need it.
 Request-side metadata lives on `RequestContext` (passed in);
 response-side metadata lives on `Response<B>` (returned):
 
-| `RequestContext` field | Purpose |
+`RequestContext` is `#[non_exhaustive]`; read it through the accessor
+methods (new request-scoped metadata can then be added in minor releases):
+
+| `RequestContext` accessor | Purpose |
 |---|---|
-| `headers` | Caller-supplied headers (read with `ctx.header(name)` or `ctx.headers.get(...)`) |
-| `deadline` | Absolute `Instant` if the caller set a timeout |
-| `extensions` | `http::Extensions` carried from the underlying `http::Request` |
+| `ctx.header(name)` / `ctx.headers()` | Caller-supplied headers (after protocol-prefix stripping) |
+| `ctx.deadline()` | Absolute `Instant` if the caller set a timeout |
+| `ctx.time_remaining()` | Saturating `Duration` until the deadline — budget downstream calls with this |
+| `ctx.extensions()` | `http::Extensions` carried from the underlying `http::Request` |
+| `ctx.peer_addr()` | Remote socket address (requires the `server` feature; `None` when the transport didn't insert it) |
+| `ctx.peer_certs()` | TLS client cert chain (requires the `server-tls` feature; `None` for plaintext or no client cert) |
+
+For example, propagating the caller's deadline to a downstream RPC and
+reading the peer cert chain:
+
+```rust,ignore
+// Budget downstream calls from the remaining time, leaving a margin
+// for response encoding and network round-trips.
+if let Some(remaining) = ctx.time_remaining() {
+    let budget = remaining.saturating_sub(Duration::from_millis(50));
+    options = options.with_timeout(budget);
+}
+
+// Typed peer lookup — returns None instead of panicking when the
+// request didn't arrive over mTLS.
+if let Some(certs) = ctx.peer_certs() {
+    authorize(certs)?;
+}
+```
 
 | `Response<B>` field | Purpose |
 |---|---|
@@ -317,12 +341,14 @@ async fn greet(
 }
 ```
 
-`RequestContext::extensions` is the passthrough channel for tower-layer state:
-a custom auth layer can stamp a `UserId` into the request's
-`http::Extensions`, and the dispatcher forwards that map verbatim into
-`RequestContext::extensions` for the handler to read with
-`ctx.extensions.get::<UserId>()`. See [Tower middleware](#tower-middleware)
-for the full pattern.
+`RequestContext::extensions()` is the passthrough channel for tower-layer
+state: a custom auth layer can stamp a `UserId` into the request's
+`http::Extensions`, and the dispatcher forwards that map verbatim into the
+request context for the handler to read with
+`ctx.extensions().get::<UserId>()`. For the well-known peer types, prefer
+the typed `ctx.peer_addr()` / `ctx.peer_certs()` accessors — they return
+`None` rather than panicking when the transport didn't insert them. See
+[Tower middleware](#tower-middleware) for the full pattern.
 
 ### What you see vs. what you write
 
@@ -592,12 +618,12 @@ ServiceBuilder accepts.
 
 ### Passing data from a layer to a handler
 
-The dispatch path moves the request's `http::Extensions` into
-`RequestContext::extensions` verbatim. So a middleware that inserts a value
-via `req.extensions_mut().insert(value)` makes that value available to
-the handler via `ctx.extensions.get::<T>()`. This is the canonical way
-to pass per-request state from middleware (auth identity, trace IDs,
-remote addr, TLS peer info) into the handler.
+The dispatch path moves the request's `http::Extensions` into the
+request context verbatim. So a middleware that inserts a value via
+`req.extensions_mut().insert(value)` makes that value available to the
+handler via `ctx.extensions().get::<T>()`. This is the canonical way to
+pass per-request state from middleware (auth identity, trace IDs, remote
+addr, TLS peer info) into the handler.
 
 The middleware example does exactly this with a `UserId`:
 
@@ -607,7 +633,7 @@ req.extensions_mut().insert(UserId(user.into()));
 next.run(req).await
 
 // In the handler:
-let user = ctx.extensions.get::<UserId>().unwrap();
+let user = ctx.extensions().get::<UserId>().unwrap();
 ```
 
 ### Short-circuit responses
@@ -680,8 +706,8 @@ For the axum path, `connectrpc::axum::serve_tls` (requires both the
 `axum` and `server-tls` features) is a drop-in replacement for
 `axum::serve` that owns the rustls accept loop and stamps `PeerAddr` /
 `PeerCerts` into request extensions exactly as the standalone `Server`
-does, so handler code that reads `ctx.extensions.get::<PeerCerts>()`
-is portable across both hosting paths:
+does, so handler code that reads `ctx.peer_certs()` is portable across
+both hosting paths:
 
 ```rust
 let app = axum::Router::new()
@@ -991,7 +1017,7 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 | Example | What it covers |
 |---|---|
 | [`streaming-tour/`](../examples/streaming-tour) | All four RPC types (unary, server stream, client stream, bidi) on a trivial NumberService. Smallest demo of handler signatures and client invocation patterns. |
-| [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
+| [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions()`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
 | [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
 | [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage. |

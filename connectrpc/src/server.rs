@@ -64,7 +64,8 @@ use crate::service::ConnectRpcService;
 ///
 /// Inserted into every request's extensions by the built-in [`Server`]'s
 /// accept loop and by `connectrpc::axum::serve_tls`. Handlers read it via
-/// `ctx.extensions.get::<PeerAddr>()`.
+/// [`RequestContext::peer_addr`](crate::RequestContext::peer_addr) (or
+/// `ctx.extensions().get::<PeerAddr>()`).
 ///
 /// Callers using a different HTTP stack (axum, raw hyper) in front of
 /// [`ConnectRpcService`] can insert this same type
@@ -78,7 +79,9 @@ pub struct PeerAddr(pub SocketAddr);
 /// `connectrpc::axum::serve_tls` when the [`rustls::ServerConfig`] requests
 /// client authentication and the peer presents a valid chain. Absent on
 /// plaintext connections or when the client presents no certificate.
-/// Handlers read it via `ctx.extensions.get::<PeerCerts>()`.
+/// Handlers read it via
+/// [`RequestContext::peer_certs`](crate::RequestContext::peer_certs) (or
+/// `ctx.extensions().get::<PeerCerts>()`).
 ///
 /// The `Arc` makes per-request insertion cheap: all requests on a
 /// connection share one chain, so this is a refcount bump, not a copy.
@@ -98,7 +101,7 @@ struct PeerInfo {
 impl PeerInfo {
     /// Insert this connection's peer info as public extension types
     /// ([`PeerAddr`], [`PeerCerts`]) so handlers can read them via
-    /// `ctx.extensions.get::<T>()`.
+    /// `ctx.peer_addr()` / `ctx.peer_certs()`.
     fn insert_into(&self, ext: &mut http::Extensions) {
         ext.insert(PeerAddr(self.addr));
         #[cfg(feature = "server-tls")]
@@ -516,7 +519,7 @@ type WrappedService<D> = tower_http::catch_panic::CatchPanic<
 ///
 /// `peer` is inserted into every request's extensions so handlers can read
 /// the remote address (and TLS client cert chain, if any) via
-/// `ctx.extensions.get::<PeerAddr>()` / `get::<PeerCerts>()`.
+/// `ctx.peer_addr()` / `ctx.peer_certs()`.
 async fn serve_accepted_stream<D, S>(
     io: S,
     peer: PeerInfo,
@@ -1037,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn peer_addr_reaches_handler() {
         // Handler stashes the PeerAddr it sees into a shared slot.
-        let captured: Arc<Mutex<Option<PeerAddr>>> = Arc::new(Mutex::new(None));
+        let captured: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
         let handler_captured = Arc::clone(&captured);
         let router = Router::new().route(
             "svc",
@@ -1046,7 +1049,7 @@ mod tests {
                 move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
                     let cap = Arc::clone(&handler_captured);
                     async move {
-                        *cap.lock().unwrap() = ctx.extensions.get::<PeerAddr>().cloned();
+                        *cap.lock().unwrap() = ctx.peer_addr();
                         crate::Response::ok(buffa_types::Empty::default())
                     }
                 },
@@ -1092,11 +1095,11 @@ mod tests {
             .take()
             .expect("handler should have captured PeerAddr");
         // The server sees the client's local_addr() as the remote peer.
-        assert_eq!(peer.0, client_local);
+        assert_eq!(peer, client_local);
     }
 
     /// End-to-end mTLS: client presents a cert; handler reads it from
-    /// `ctx.extensions.get::<PeerCerts>()` and the DER bytes round-trip.
+    /// `ctx.peer_certs()` and the DER bytes round-trip.
     #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn peer_certs_reach_handler() {
@@ -1154,7 +1157,8 @@ mod tests {
 
         let (server_cfg, client_cfg, expected_client_der) = pki();
 
-        let captured: Arc<Mutex<Option<PeerCerts>>> = Arc::new(Mutex::new(None));
+        type CapturedCerts = Vec<rustls::pki_types::CertificateDer<'static>>;
+        let captured: Arc<Mutex<Option<CapturedCerts>>> = Arc::new(Mutex::new(None));
         let handler_captured = Arc::clone(&captured);
         let router = Router::new().route(
             "svc",
@@ -1163,7 +1167,7 @@ mod tests {
                 move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
                     let cap = Arc::clone(&handler_captured);
                     async move {
-                        *cap.lock().unwrap() = ctx.extensions.get::<PeerCerts>().cloned();
+                        *cap.lock().unwrap() = ctx.peer_certs().map(<[_]>::to_vec);
                         crate::Response::ok(buffa_types::Empty::default())
                     }
                 },
@@ -1211,7 +1215,7 @@ mod tests {
             .take()
             .expect("handler should have captured PeerCerts");
         // The exact DER bytes the client presented.
-        assert_eq!(certs.0.len(), 1);
-        assert_eq!(certs.0[0].as_ref(), expected_client_der.as_ref());
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), expected_client_der.as_ref());
     }
 }

@@ -3468,7 +3468,7 @@ mod tests {
             crate::handler_fn(move |ctx: RequestContext, _req: buffa_types::Empty| {
                 let cap = Arc::clone(&handler_captured);
                 async move {
-                    *cap.lock().unwrap() = ctx.extensions.get::<PeerTag>().cloned();
+                    *cap.lock().unwrap() = ctx.extensions().get::<PeerTag>().cloned();
                     crate::Response::ok(buffa_types::Empty::default())
                 }
             }),

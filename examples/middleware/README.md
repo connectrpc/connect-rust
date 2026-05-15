@@ -74,7 +74,7 @@ address.
 
 - **Handler reading from `Context`** - the dispatch path moves the
   request's `http::Extensions` into `Context::extensions`. The handler
-  reads `UserId` via `ctx.extensions.get::<UserId>()`, performs its own
+  reads `UserId` via `ctx.extensions().get::<UserId>()`, performs its own
   permission check against the secret store, and writes the
   `x-served-by` response trailer via `ctx.set_trailer(...)`.
 

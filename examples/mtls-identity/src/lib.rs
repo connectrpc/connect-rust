@@ -4,21 +4,21 @@
 //! instead of an `axum::middleware::from_fn` reading an `Authorization`
 //! header, identity comes from the verified client certificate that
 //! `connectrpc::axum::serve_tls` captures during the TLS handshake and
-//! stamps into request extensions as [`PeerCerts`]. The handler parses
-//! the leaf cert's DNS SAN to derive a workload identity, then enforces
-//! an ACL against it.
+//! stamps into request extensions as [`connectrpc::PeerCerts`]. The
+//! handler reads it via [`RequestContext::peer_certs`], parses the leaf
+//! cert's DNS SAN to derive a workload identity, then enforces an ACL
+//! against it.
 //!
 //! The same handler code works unchanged on the standalone
-//! [`connectrpc::Server::with_tls`], which populates [`PeerCerts`] the
-//! same way — the hosting choice doesn't leak into authorization logic.
+//! [`connectrpc::Server::with_tls`], which populates
+//! [`connectrpc::PeerCerts`] the same way — the hosting choice doesn't
+//! leak into authorization logic.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use buffa::view::OwnedView;
-use connectrpc::{
-    ConnectError, ErrorCode, PeerAddr, PeerCerts, RequestContext, Router, ServiceResult,
-};
+use connectrpc::{ConnectError, ErrorCode, RequestContext, Router, ServiceResult};
 
 pub mod proto {
     connectrpc::include_generated!();
@@ -54,12 +54,15 @@ pub struct Identity {
 /// In a real deployment you'd typically match a SPIFFE ID
 /// (`spiffe://trust-domain/path`, a URI SAN) instead of a DNS SAN, or
 /// delegate this whole step to an authorization framework. The shape is
-/// the same: read [`PeerCerts`], parse the leaf, derive an identity.
-pub fn extract_identity(certs: Option<&PeerCerts>) -> Result<Identity, ConnectError> {
+/// the same: read [`RequestContext::peer_certs`], parse the leaf, derive
+/// an identity.
+pub fn extract_identity(
+    certs: Option<&[rustls_pki_types::CertificateDer<'static>]>,
+) -> Result<Identity, ConnectError> {
     use x509_parser::extensions::GeneralName;
     use x509_parser::prelude::{FromDer, X509Certificate};
 
-    let leaf = certs.and_then(|c| c.0.first()).ok_or_else(|| {
+    let leaf = certs.and_then(<[_]>::first).ok_or_else(|| {
         ConnectError::new(ErrorCode::Unauthenticated, "client certificate required")
     })?;
 
@@ -129,13 +132,11 @@ impl IdentityService for IdentityServiceImpl {
     ) -> ServiceResult<WhoAmIResponse> {
         // Both PeerCerts and PeerAddr are stamped per connection by
         // serve_tls; the dispatcher copies request extensions verbatim
-        // into ctx.extensions.
-        let id = extract_identity(ctx.extensions.get::<PeerCerts>())?;
-        let remote = ctx
-            .extensions
-            .get::<PeerAddr>()
-            .map(|a| a.0.to_string())
-            .unwrap_or_default();
+        // into the request context. Use the typed accessors rather than
+        // raw extension lookups so a missing transport insert is a clean
+        // `None` instead of a panic.
+        let id = extract_identity(ctx.peer_certs())?;
+        let remote = ctx.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         connectrpc::Response::ok(WhoAmIResponse {
             identity: Some(id.name),
             san: Some(id.san),
@@ -149,7 +150,7 @@ impl IdentityService for IdentityServiceImpl {
         ctx: RequestContext,
         request: OwnedView<GetSecretRequestView<'static>>,
     ) -> ServiceResult<GetSecretResponse> {
-        let id = extract_identity(ctx.extensions.get::<PeerCerts>())?;
+        let id = extract_identity(ctx.peer_certs())?;
         let name = request.name.unwrap_or("").to_owned();
         let (value, allowed) = self.store.get(&name).ok_or_else(|| {
             ConnectError::new(ErrorCode::NotFound, format!("no secret named {name:?}"))
@@ -315,8 +316,8 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair, SanType};
     use rustls_pki_types::CertificateDer;
 
-    /// Self-signed leaf with arbitrary DNS SANs, wrapped as PeerCerts.
-    fn peer_certs_with_dns_sans(sans: &[&str]) -> PeerCerts {
+    /// Self-signed leaf with arbitrary DNS SANs, as a chain.
+    fn peer_certs_with_dns_sans(sans: &[&str]) -> Vec<CertificateDer<'static>> {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
         params.subject_alt_names = sans
@@ -324,7 +325,7 @@ mod tests {
             .map(|s| SanType::DnsName((*s).try_into().unwrap()))
             .collect();
         let cert = params.self_signed(&key).unwrap();
-        PeerCerts(Arc::from(vec![CertificateDer::from(cert.der().to_vec())]))
+        vec![CertificateDer::from(cert.der().to_vec())]
     }
 
     #[test]

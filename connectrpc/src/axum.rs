@@ -9,15 +9,15 @@
 //! terminating TLS. The standalone [`Server`](crate::Server), by contrast,
 //! owns the rustls accept loop and so can capture [`PeerAddr`]/[`PeerCerts`]
 //! once per connection and inject them into every request's extensions for
-//! handlers to read via `ctx.extensions.get::<T>()`. Without help, an axum +
-//! mTLS deployment has to reimplement that accept loop and per-connection
-//! plumbing by hand for handlers to get the same view.
+//! handlers to read via `ctx.peer_addr()` / `ctx.peer_certs()`. Without
+//! help, an axum + mTLS deployment has to reimplement that accept loop and
+//! per-connection plumbing by hand for handlers to get the same view.
 //!
 //! [`serve_tls`] is that help: it serves an `axum::Router`, terminates TLS,
 //! captures peer identity, and stamps it into request extensions. Handler
-//! code that reads `ctx.extensions.get::<PeerCerts>()` is then portable
-//! between the standalone `Server` and an axum app — the hosting choice no
-//! longer leaks into your authorization logic.
+//! code that reads `ctx.peer_certs()` is then portable between the
+//! standalone `Server` and an axum app — the hosting choice no longer
+//! leaks into your authorization logic.
 //!
 //! ```rust,ignore
 //! // Plaintext: axum's built-in serve.
@@ -42,8 +42,7 @@
 //!   [`rustls::ServerConfig`] requests client authentication *and* the peer
 //!   presents a chain rustls verifies. With `with_no_client_auth()` (or a
 //!   permissive verifier and a client that sends no cert), only [`PeerAddr`]
-//!   is present. Handlers must treat `ctx.extensions.get::<PeerCerts>()` as
-//!   optional.
+//!   is present. Handlers must treat `ctx.peer_certs()` as optional.
 //! - **ALPN.** The TLS terminator speaks the protocol ALPN selects. To allow
 //!   HTTP/2 (required for gRPC; preferred for Connect streaming), set
 //!   `server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()]`
@@ -366,8 +365,10 @@ mod tests {
     async fn serve_tls_injects_peer_identity() {
         let (server_cfg, client_cfg, expected_client_der) = pki();
 
-        // The handler stashes whatever PeerAddr/PeerCerts it sees.
-        type Captured = Arc<Mutex<Option<(PeerAddr, Option<PeerCerts>)>>>;
+        // The handler stashes whatever peer identity it sees via the typed
+        // `RequestContext` accessors.
+        type CapturedCerts = Vec<rustls::pki_types::CertificateDer<'static>>;
+        type Captured = Arc<Mutex<Option<(std::net::SocketAddr, Option<CapturedCerts>)>>>;
         let captured: Captured = Arc::new(Mutex::new(None));
         let handler_captured = Arc::clone(&captured);
         let connect = ConnectRouter::new().route(
@@ -378,8 +379,8 @@ mod tests {
                     let cap = Arc::clone(&handler_captured);
                     async move {
                         *cap.lock().unwrap() = Some((
-                            ctx.extensions.get::<PeerAddr>().cloned().unwrap(),
-                            ctx.extensions.get::<PeerCerts>().cloned(),
+                            ctx.peer_addr().expect("serve_tls inserts PeerAddr"),
+                            ctx.peer_certs().map(<[_]>::to_vec),
                         ));
                         ConnectResponse::ok(buffa_types::Empty::default())
                     }
@@ -415,10 +416,10 @@ mod tests {
             .unwrap();
 
         let (peer_addr, peer_certs) = captured.lock().unwrap().take().expect("handler ran");
-        assert_eq!(peer_addr.0.ip(), addr.ip());
+        assert_eq!(peer_addr.ip(), addr.ip());
         let certs = peer_certs.expect("mTLS client should present a cert chain");
-        assert_eq!(certs.0.len(), 1);
-        assert_eq!(certs.0[0].as_ref(), expected_client_der.as_ref());
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), expected_client_der.as_ref());
     }
 
     /// Open a TLS+HTTP/1.1 connection, send `ECHO_REQ`, and return the raw
