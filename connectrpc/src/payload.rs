@@ -1,0 +1,450 @@
+//! Type-erased, lazily-decoded RPC message bodies.
+//!
+//! Interceptors run on every RPC and most of them never look inside the
+//! request or response message — they read the [`Spec`](crate::Spec),
+//! the headers, or the deadline and pass the call through. Decoding the
+//! message eagerly would tax every call to pay for the rare interceptor
+//! that inspects fields.
+//!
+//! [`Payload`] solves this by holding the wire bytes (always available,
+//! reference-counted) and decoding to a typed message on first access.
+//! Interceptors that want a typed message call [`Payload::message`]
+//! (owned, works for both proto and JSON wires) or [`Payload::view`]
+//! (zero-copy, proto only). Interceptors that want to *replace* the
+//! message call [`Payload::set_message`]; the dispatch path re-encodes
+//! the replacement on the way out.
+//!
+//! [`AnyMessage`] is the object-safe surface that lets a `Payload` cache
+//! a decoded message without knowing its concrete type. It has a blanket
+//! impl over every protobuf message, so user code never implements it
+//! directly.
+
+use std::any::Any;
+use std::fmt;
+use std::sync::OnceLock;
+
+use buffa::Message;
+use buffa::view::{MessageView, OwnedView};
+use bytes::Bytes;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::codec::{CodecFormat, decode_json, decode_proto, encode_json, encode_proto};
+use crate::error::ConnectError;
+
+/// Object-safe, type-erased RPC message.
+///
+/// `AnyMessage` is what a [`Payload`] caches once it has decoded its wire
+/// bytes — a `Box<dyn AnyMessage>` that can be downcast back to the
+/// concrete request/response type and re-encoded for the wire if an
+/// interceptor swaps it.
+///
+/// You will almost never implement this trait directly. A blanket
+/// implementation covers every type that is `Message + Serialize`, which
+/// includes every owned message the code generator emits. A manual impl
+/// must uphold a round-trip invariant: bytes returned by
+/// [`encode`](AnyMessage::encode)`(format)` must decode back to an
+/// equivalent value in that same format — the dispatch path relies on it
+/// when re-encoding a replacement set via [`Payload::set_message`].
+pub trait AnyMessage: Send + Sync + 'static {
+    /// Borrow the message as `dyn Any` for downcasting.
+    fn as_any(&self) -> &dyn Any;
+    /// Mutably borrow the message as `dyn Any` for downcasting.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// Serialize the message to wire bytes in the given format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails. Proto encoding is infallible
+    /// for valid messages; JSON encoding can fail on non-UTF-8 `bytes`
+    /// fields and similar serde edge cases.
+    fn encode(&self, format: CodecFormat) -> Result<Bytes, ConnectError>;
+    /// The concrete type's name, for diagnostics. The default uses
+    /// [`std::any::type_name`].
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
+impl<T> AnyMessage for T
+where
+    T: Message + Serialize + Send + Sync + 'static,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn encode(&self, format: CodecFormat) -> Result<Bytes, ConnectError> {
+        match format {
+            CodecFormat::Proto => encode_proto(self),
+            CodecFormat::Json => encode_json(self),
+        }
+    }
+}
+
+/// A lazily-decoded, replaceable RPC message body.
+///
+/// A `Payload` always holds the wire-encoded body bytes ([`Bytes`], so
+/// clones are reference-counted) and the [`CodecFormat`] they came in.
+/// Typed access happens on demand:
+///
+/// - [`message`](Payload::message) — decode once into an owned message,
+///   cache it, return a borrow. Works for both `Proto` and `Json` wires.
+/// - [`view`](Payload::view) — zero-copy view borrowing the wire bytes
+///   directly. `Proto` wires only; returns an error for `Json`.
+/// - [`set_message`](Payload::set_message) — replace the body. The
+///   replacement takes priority for all subsequent reads, and the
+///   dispatch path re-encodes it on the way out.
+/// - [`encoded`](Payload::encoded) — the wire bytes that will actually be
+///   sent: either the original `bytes` or the re-encoded replacement.
+///
+/// `Payload` is normally constructed by the dispatch path and received
+/// by user code through `UnaryRequest`/`UnaryResponse` (a future
+/// addition). [`Payload::new`] is `pub` so test fixtures and custom
+/// transports can build one directly.
+///
+/// `message` borrows the cached owned decode; `view` returns a fresh
+/// self-contained [`OwnedView`] (a [`Bytes`] refcount bump, not a copy)
+/// because a zero-copy view cannot be stored in the type-erased cache.
+///
+/// `Payload` is intentionally not `Clone`: a clone would either drop the
+/// decode cache (surprising) or duplicate it (defeating the laziness).
+/// Pass it by reference, or move it through the call chain.
+pub struct Payload {
+    bytes: Bytes,
+    format: CodecFormat,
+    decoded: OnceLock<Box<dyn AnyMessage>>,
+    replaced: Option<Box<dyn AnyMessage>>,
+}
+
+impl Payload {
+    /// Wrap wire bytes in a `Payload`. No decoding happens until a typed
+    /// accessor is called.
+    pub fn new(bytes: Bytes, format: CodecFormat) -> Self {
+        Self {
+            bytes,
+            format,
+            decoded: OnceLock::new(),
+            replaced: None,
+        }
+    }
+
+    /// The original wire bytes, regardless of any replacement.
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// The codec format the wire bytes are encoded in.
+    pub fn format(&self) -> CodecFormat {
+        self.format
+    }
+
+    /// Decode and cache the body as an owned `M`, returning a borrow.
+    ///
+    /// The decode runs at most once per `Payload`; subsequent calls
+    /// return the cached value. If a replacement has been set with
+    /// [`set_message`](Payload::set_message), that is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes fail to decode, if a replacement set
+    /// with [`set_message`](Payload::set_message) is not an `M`, or if a
+    /// previous `message::<N>()` cached a different message type than `M`.
+    /// The last two are programming bugs — interceptors and handlers for
+    /// the same RPC must agree on the message types — and the cache holds
+    /// whichever type decoded first.
+    pub fn message<M>(&self) -> Result<&M, ConnectError>
+    where
+        M: Message + Serialize + DeserializeOwned + 'static,
+    {
+        if let Some(replaced) = &self.replaced {
+            return replaced.as_any().downcast_ref::<M>().ok_or_else(|| {
+                ConnectError::internal(format!(
+                    "payload replacement is a {}, not a {}",
+                    replaced.type_name(),
+                    std::any::type_name::<M>()
+                ))
+            });
+        }
+        // `get_or_try_init` is unstable, so probe-then-set. Two threads
+        // racing decode the same bytes; only one `set` wins and the loser
+        // discards its copy. With the same `M` (the normal case), the loser
+        // still returns the winner's cached value. With *different* `M`
+        // (a caller-side type bug), only the winner's type is cached and
+        // the other caller gets the wrong-type error below.
+        if self.decoded.get().is_none() {
+            let m: M = match self.format {
+                CodecFormat::Proto => decode_proto(&self.bytes)?,
+                CodecFormat::Json => decode_json(&self.bytes)?,
+            };
+            let _ = self.decoded.set(Box::new(m));
+        }
+        // The `set` above (or a concurrent winner's) guarantees the cell is
+        // now populated. The downcast can still miss if a prior call cached
+        // a different `M`; that's a caller-side type mismatch, not a panic.
+        let cached = self.decoded.get().expect("decoded cell populated above");
+        cached.as_any().downcast_ref::<M>().ok_or_else(|| {
+            ConnectError::internal(format!(
+                "payload was previously decoded as a {}, not a {}",
+                cached.type_name(),
+                std::any::type_name::<M>()
+            ))
+        })
+    }
+
+    /// Decode the body as a zero-copy [`OwnedView`].
+    ///
+    /// Borrows directly from the wire bytes — no copy, no allocation
+    /// beyond the [`Bytes`] refcount bump. If a replacement has been set
+    /// with [`set_message`](Payload::set_message), it is encoded to proto
+    /// (regardless of [`format`](Payload::format)) and decoded as a view
+    /// — note this re-encodes on **every** call (unlike
+    /// [`message`](Payload::message), there is no cache for views). Hold
+    /// onto the returned `OwnedView` rather than re-fetching in a loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`failed_precondition`](ConnectError::failed_precondition)
+    /// for JSON-encoded wires: JSON cannot back a zero-copy proto view.
+    /// Use [`message`](Payload::message) instead. Also returns an error if
+    /// the bytes fail to decode as `V`.
+    pub fn view<V>(&self) -> Result<OwnedView<V>, ConnectError>
+    where
+        V: MessageView<'static>,
+    {
+        if let Some(replaced) = &self.replaced {
+            let bytes = replaced.encode(CodecFormat::Proto)?;
+            return OwnedView::decode(bytes).map_err(|e| {
+                ConnectError::internal(format!("failed to decode replacement as view: {e}"))
+            });
+        }
+        if self.format != CodecFormat::Proto {
+            return Err(ConnectError::failed_precondition(
+                "Payload::view requires a proto-encoded wire; use Payload::message for JSON",
+            ));
+        }
+        OwnedView::decode(self.bytes.clone()).map_err(|e| {
+            ConnectError::invalid_argument(format!("failed to decode payload as view: {e}"))
+        })
+    }
+
+    /// Replace the body with a new message.
+    ///
+    /// Subsequent [`message`](Payload::message) and
+    /// [`view`](Payload::view) calls return the replacement, and
+    /// [`encoded`](Payload::encoded) re-encodes it for the wire.
+    pub fn set_message<M>(&mut self, message: M)
+    where
+        M: AnyMessage,
+    {
+        self.replaced = Some(Box::new(message));
+        // The lazy-decode cache is now shadowed by `replaced`; drop it so
+        // the original message doesn't pin memory for the Payload's life.
+        self.decoded = OnceLock::new();
+    }
+
+    /// The wire bytes the dispatch path should actually send.
+    ///
+    /// Returns the original `bytes` (a cheap [`Bytes`] clone) unless a
+    /// replacement was set with [`set_message`](Payload::set_message),
+    /// in which case the replacement is re-encoded in the original
+    /// [`format`](Payload::format).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if re-encoding a replacement fails.
+    pub fn encoded(&self) -> Result<Bytes, ConnectError> {
+        match &self.replaced {
+            Some(r) => r.encode(self.format),
+            None => Ok(self.bytes.clone()),
+        }
+    }
+}
+
+impl fmt::Debug for Payload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Payload")
+            .field("len", &self.bytes.len())
+            .field("format", &self.format)
+            .field("decoded", &self.decoded.get().is_some())
+            .field("replaced", &self.replaced.is_some())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buffa_types::google::protobuf::__buffa::view::StringValueView;
+    use buffa_types::google::protobuf::StringValue;
+
+    fn proto_payload(value: &str) -> Payload {
+        let msg = StringValue {
+            value: value.into(),
+            ..Default::default()
+        };
+        Payload::new(encode_proto(&msg).unwrap(), CodecFormat::Proto)
+    }
+
+    #[test]
+    fn message_decodes_and_caches() {
+        let p = proto_payload("hello");
+        let m1: &StringValue = p.message().unwrap();
+        assert_eq!(m1.value, "hello");
+        // Second call returns the same cached value (same address).
+        let m2: &StringValue = p.message().unwrap();
+        assert!(std::ptr::eq(m1, m2), "second call should hit the cache");
+    }
+
+    #[test]
+    fn message_decodes_json() {
+        let bytes = encode_json(&StringValue {
+            value: "json".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let p = Payload::new(bytes, CodecFormat::Json);
+        let m: &StringValue = p.message().unwrap();
+        assert_eq!(m.value, "json");
+    }
+
+    #[test]
+    fn view_zero_copy_proto() {
+        let p = proto_payload("zero copy");
+        let v = p.view::<StringValueView>().unwrap();
+        assert_eq!(v.value, "zero copy");
+        // Borrows the payload's bytes — same backing storage.
+        let value_ptr = v.value.as_ptr() as usize;
+        let bytes_range =
+            p.bytes().as_ptr() as usize..p.bytes().as_ptr() as usize + p.bytes().len();
+        assert!(
+            bytes_range.contains(&value_ptr),
+            "view should borrow from the payload's wire bytes"
+        );
+    }
+
+    #[test]
+    fn view_errors_on_json() {
+        let bytes = encode_json(&StringValue {
+            value: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let p = Payload::new(bytes, CodecFormat::Json);
+        let err = p.view::<StringValueView>().unwrap_err();
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("requires a proto-encoded wire"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn set_message_round_trips() {
+        let mut p = proto_payload("before");
+        p.set_message(StringValue {
+            value: "after".into(),
+            ..Default::default()
+        });
+        // message() returns the replacement.
+        let m: &StringValue = p.message().unwrap();
+        assert_eq!(m.value, "after");
+        // view() re-encodes the replacement and views it.
+        let v = p.view::<StringValueView>().unwrap();
+        assert_eq!(v.value, "after");
+        // encoded() re-encodes for the original format.
+        let encoded = p.encoded().unwrap();
+        let rt: StringValue = decode_proto(&encoded).unwrap();
+        assert_eq!(rt.value, "after");
+        // bytes() is unchanged.
+        let orig: StringValue = decode_proto(p.bytes()).unwrap();
+        assert_eq!(orig.value, "before");
+    }
+
+    #[test]
+    fn set_message_round_trips_json_format() {
+        let bytes = encode_json(&StringValue {
+            value: "before".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut p = Payload::new(bytes, CodecFormat::Json);
+        p.set_message(StringValue {
+            value: "after".into(),
+            ..Default::default()
+        });
+        // encoded() re-encodes in the original (JSON) format.
+        let encoded = p.encoded().unwrap();
+        let rt: StringValue = decode_json(&encoded).unwrap();
+        assert_eq!(rt.value, "after");
+    }
+
+    #[test]
+    fn encoded_without_replacement_returns_original() {
+        let p = proto_payload("x");
+        // Same backing storage — refcounted Bytes clone, not a copy.
+        assert!(std::ptr::eq(
+            p.encoded().unwrap().as_ptr(),
+            p.bytes().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn message_wrong_type_errors() {
+        use buffa_types::google::protobuf::Int32Value;
+        let p = proto_payload("x");
+        // Cache as StringValue.
+        let _: &StringValue = p.message().unwrap();
+        // Now ask for a different type — downcast fails. The error names
+        // both types so the bug is locatable.
+        let err = p.message::<Int32Value>().unwrap_err();
+        let msg = err.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("previously decoded as a"), "{err:?}");
+        assert!(msg.contains("StringValue"), "{err:?}");
+        assert!(msg.contains("Int32Value"), "{err:?}");
+    }
+
+    #[test]
+    fn payload_debug_redacts_body() {
+        let p = proto_payload("secret");
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("secret"), "Debug must not leak body: {dbg}");
+        assert!(dbg.contains("Proto"), "{dbg}");
+    }
+
+    /// `Payload` and `Box<dyn AnyMessage>` cross task boundaries inside
+    /// the dispatch path; assert the auto-trait bounds hold.
+    #[test]
+    fn payload_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Payload>();
+        assert_send_sync::<Box<dyn AnyMessage>>();
+    }
+
+    /// Hammer the `OnceLock` probe-then-set race from multiple threads.
+    /// Same `M` everywhere: every thread must succeed and all returned
+    /// borrows must alias the same cache slot.
+    #[test]
+    fn message_concurrent_same_type() {
+        let p = proto_payload("race");
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let p = &p;
+                    // Return the cache slot's address as an integer so the
+                    // closure stays `Send` (raw pointers are not).
+                    s.spawn(move || p.message::<StringValue>().unwrap() as *const _ as usize)
+                })
+                .collect();
+            let addrs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(
+                addrs.iter().all(|&a| a == addrs[0]),
+                "all callers should observe the same cached value"
+            );
+        });
+    }
+}

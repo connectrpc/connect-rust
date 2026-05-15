@@ -68,6 +68,7 @@
 //! - [`router`] - Request routing and service registration
 //! - [`service`] - Tower service implementation (primary integration point)
 //! - [`spec`] - Static per-method metadata ([`Spec`], [`StreamType`])
+//! - [`payload`] - Lazily-decoded, type-erased message bodies ([`Payload`])
 //! - [`client`] - Tower-based HTTP client utilities (requires `client` feature)
 //! - [`server`] - Standalone hyper-based server (requires `server` feature)
 //!
@@ -188,6 +189,7 @@ pub mod envelope;
 pub mod error;
 pub(crate) mod grpc_status;
 pub mod handler;
+pub mod payload;
 pub mod protocol;
 pub mod response;
 pub mod router;
@@ -276,6 +278,10 @@ pub use spec::IdempotencyLevel;
 pub use spec::Spec;
 pub use spec::SpecOrigin;
 pub use spec::StreamType;
+
+// Type-erased message bodies for interceptors
+pub use payload::AnyMessage;
+pub use payload::Payload;
 
 // ============================================================================
 // Codec exports
