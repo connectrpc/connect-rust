@@ -599,6 +599,124 @@ impl<'a> ::buffa::ViewEncode<'a> for TestSuiteView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for TestSuiteView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.mode) {
+            __map.serialize_entry("mode", &self.mode)?;
+        }
+        if !self.test_cases.is_empty() {
+            __map.serialize_entry("testCases", &*self.test_cases)?;
+        }
+        if !self.relevant_protocols.is_empty() {
+            struct _WSeq<'__x>(&'__x [::buffa::EnumValue<super::super::Protocol>]);
+            impl ::serde::Serialize for _WSeq<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::repeated_enum::serialize(self.0, __s)
+                }
+            }
+            __map
+                .serialize_entry("relevantProtocols", &_WSeq(&self.relevant_protocols))?;
+        }
+        if !self.relevant_http_versions.is_empty() {
+            struct _WSeq<'__x>(&'__x [::buffa::EnumValue<super::super::HTTPVersion>]);
+            impl ::serde::Serialize for _WSeq<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::repeated_enum::serialize(self.0, __s)
+                }
+            }
+            __map
+                .serialize_entry(
+                    "relevantHttpVersions",
+                    &_WSeq(&self.relevant_http_versions),
+                )?;
+        }
+        if !self.relevant_codecs.is_empty() {
+            struct _WSeq<'__x>(&'__x [::buffa::EnumValue<super::super::Codec>]);
+            impl ::serde::Serialize for _WSeq<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::repeated_enum::serialize(self.0, __s)
+                }
+            }
+            __map.serialize_entry("relevantCodecs", &_WSeq(&self.relevant_codecs))?;
+        }
+        if !self.relevant_compressions.is_empty() {
+            struct _WSeq<'__x>(&'__x [::buffa::EnumValue<super::super::Compression>]);
+            impl ::serde::Serialize for _WSeq<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::repeated_enum::serialize(self.0, __s)
+                }
+            }
+            __map
+                .serialize_entry(
+                    "relevantCompressions",
+                    &_WSeq(&self.relevant_compressions),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(
+            &self.connect_version_mode,
+        ) {
+            __map.serialize_entry("connectVersionMode", &self.connect_version_mode)?;
+        }
+        if self.relies_on_tls {
+            __map.serialize_entry("reliesOnTls", &self.relies_on_tls)?;
+        }
+        if self.relies_on_tls_client_certs {
+            __map
+                .serialize_entry(
+                    "reliesOnTlsClientCerts",
+                    &self.relies_on_tls_client_certs,
+                )?;
+        }
+        if self.relies_on_connect_get {
+            __map.serialize_entry("reliesOnConnectGet", &self.relies_on_connect_get)?;
+        }
+        if self.relies_on_message_receive_limit {
+            __map
+                .serialize_entry(
+                    "reliesOnMessageReceiveLimit",
+                    &self.relies_on_message_receive_limit,
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for TestSuiteView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "TestSuite";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.TestSuite";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestSuite";
+}
 impl<'v> ::buffa::DefaultViewInstance for TestSuiteView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -979,6 +1097,63 @@ impl<'a> ::buffa::ViewEncode<'a> for TestCaseView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for TestCaseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.request.as_option() {
+                __map.serialize_entry("request", __v)?;
+            }
+        }
+        if !self.expand_requests.is_empty() {
+            __map.serialize_entry("expandRequests", &*self.expand_requests)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.expected_response.as_option()
+            {
+                __map.serialize_entry("expectedResponse", __v)?;
+            }
+        }
+        if !self.other_allowed_error_codes.is_empty() {
+            struct _WSeq<'__x>(&'__x [::buffa::EnumValue<super::super::Code>]);
+            impl ::serde::Serialize for _WSeq<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::repeated_enum::serialize(self.0, __s)
+                }
+            }
+            __map
+                .serialize_entry(
+                    "otherAllowedErrorCodes",
+                    &_WSeq(&self.other_allowed_error_codes),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for TestCaseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "TestCase";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.TestCase";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestCase";
+}
 impl<'v> ::buffa::DefaultViewInstance for TestCaseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1133,6 +1308,45 @@ pub mod test_case {
             }
             self.__buffa_unknown_fields.write_to(buf);
         }
+    }
+    /// Serializes this view as protobuf JSON.
+    ///
+    /// Implicit-presence fields with default values are omitted, `required`
+    /// fields are always emitted, explicit-presence (`optional`) fields are
+    /// emitted only when set, bytes fields are base64-encoded, and enum
+    /// values are their proto name strings.
+    ///
+    /// This impl uses `serialize_map(None)` because the number of emitted
+    /// fields depends on default-omission rules; serializers that require
+    /// known map lengths (e.g. `bincode`) will return a runtime error.
+    /// Use the owned message type for those formats.
+    impl<'__a> ::serde::Serialize for ExpandedSizeView<'__a> {
+        fn serialize<__S: ::serde::Serializer>(
+            &self,
+            __s: __S,
+        ) -> ::core::result::Result<__S::Ok, __S::Error> {
+            use ::serde::ser::SerializeMap as _;
+            let mut __map = __s.serialize_map(::core::option::Option::None)?;
+            if let ::core::option::Option::Some(__v) = self.size_relative_to_limit {
+                struct _W(i32);
+                impl ::serde::Serialize for _W {
+                    fn serialize<__S: ::serde::Serializer>(
+                        &self,
+                        __s: __S,
+                    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                        ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                    }
+                }
+                __map.serialize_entry("sizeRelativeToLimit", &_W(__v))?;
+            }
+            __map.end()
+        }
+    }
+    impl<'a> ::buffa::MessageName for ExpandedSizeView<'a> {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "TestCase.ExpandedSize";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.TestCase.ExpandedSize";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestCase.ExpandedSize";
     }
     impl<'v> ::buffa::DefaultViewInstance for ExpandedSizeView<'v> {
         fn default_view_instance<'a>() -> &'a Self

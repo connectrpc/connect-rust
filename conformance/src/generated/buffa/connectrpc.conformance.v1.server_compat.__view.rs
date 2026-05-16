@@ -349,6 +349,75 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerCompatRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ServerCompatRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.protocol) {
+            __map.serialize_entry("protocol", &self.protocol)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.http_version) {
+            __map.serialize_entry("httpVersion", &self.http_version)?;
+        }
+        if self.use_tls {
+            __map.serialize_entry("useTls", &self.use_tls)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_bytes(self.client_tls_cert) {
+            struct _W<'__x>(&'__x [u8]);
+            impl ::serde::Serialize for _W<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::bytes::serialize(self.0, __s)
+                }
+            }
+            __map.serialize_entry("clientTlsCert", &_W(self.client_tls_cert))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.message_receive_limit) {
+            struct _W(u32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                }
+            }
+            __map
+                .serialize_entry(
+                    "messageReceiveLimit",
+                    &_W(self.message_receive_limit),
+                )?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.server_creds.as_option() {
+                __map.serialize_entry("serverCreds", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ServerCompatRequestView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ServerCompatRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ServerCompatRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ServerCompatRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for ServerCompatRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -550,6 +619,60 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerCompatResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ServerCompatResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.host) {
+            __map.serialize_entry("host", self.host)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.port) {
+            struct _W(u32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("port", &_W(self.port))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_bytes(self.pem_cert) {
+            struct _W<'__x>(&'__x [u8]);
+            impl ::serde::Serialize for _W<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::bytes::serialize(self.0, __s)
+                }
+            }
+            __map.serialize_entry("pemCert", &_W(self.pem_cert))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ServerCompatResponseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ServerCompatResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ServerCompatResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ServerCompatResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for ServerCompatResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self

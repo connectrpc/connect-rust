@@ -242,6 +242,46 @@ impl<'a> ::buffa::ViewEncode<'a> for CreateEventRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CreateEventRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.occurred_at.as_option() {
+                __map.serialize_entry("occurredAt", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.duration.as_option() {
+                __map.serialize_entry("duration", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CreateEventRequestView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CreateEventRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CreateEventRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CreateEventRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for CreateEventRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -417,6 +457,38 @@ impl<'a> ::buffa::ViewEncode<'a> for CreateEventResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CreateEventResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.event.as_option() {
+                __map.serialize_entry("event", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CreateEventResponseView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CreateEventResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CreateEventResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CreateEventResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for CreateEventResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -758,6 +830,54 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for EventView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.id) {
+            __map.serialize_entry("id", self.id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.occurred_at.as_option() {
+                __map.serialize_entry("occurredAt", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.duration.as_option() {
+                __map.serialize_entry("duration", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.created_at.as_option() {
+                __map.serialize_entry("createdAt", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for EventView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "Event";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.Event";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.Event";
+}
 impl<'v> ::buffa::DefaultViewInstance for EventView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -991,6 +1111,43 @@ impl<'a> ::buffa::ViewEncode<'a> for CalculateDurationRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CalculateDurationRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.start.as_option() {
+                __map.serialize_entry("start", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.end.as_option() {
+                __map.serialize_entry("end", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CalculateDurationRequestView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CalculateDurationRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CalculateDurationRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CalculateDurationRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for CalculateDurationRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1171,6 +1328,38 @@ impl<'a> ::buffa::ViewEncode<'a> for CalculateDurationResponseView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CalculateDurationResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.duration.as_option() {
+                __map.serialize_entry("duration", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CalculateDurationResponseView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CalculateDurationResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CalculateDurationResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CalculateDurationResponse";
+}
 impl<'v> ::buffa::DefaultViewInstance for CalculateDurationResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1350,6 +1539,38 @@ impl<'a> ::buffa::ViewEncode<'a> for ProcessMetadataRequestView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ProcessMetadataRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.metadata.as_option() {
+                __map.serialize_entry("metadata", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ProcessMetadataRequestView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "ProcessMetadataRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.ProcessMetadataRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.ProcessMetadataRequest";
 }
 impl<'v> ::buffa::DefaultViewInstance for ProcessMetadataRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -1551,6 +1772,50 @@ impl<'a> ::buffa::ViewEncode<'a> for ProcessMetadataResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ProcessMetadataResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.metadata.as_option() {
+                __map.serialize_entry("metadata", __v)?;
+            }
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.field_count) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("fieldCount", &_W(self.field_count))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ProcessMetadataResponseView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "ProcessMetadataResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.ProcessMetadataResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.ProcessMetadataResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for ProcessMetadataResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self

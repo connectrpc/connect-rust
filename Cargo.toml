@@ -28,16 +28,15 @@ tokio-util = "0.7"
 futures = "0.3"
 pin-project = "1"
 
-# Protobuf.
-# `buffa-codegen >= 0.5.1` floor: connectrpc-build sources the generated
-# `mod.rs` `#[allow(...)]` list from `buffa_codegen::ALLOW_LINTS`, which
-# grew `unused_qualifications` in 0.5.1. (The conformance/example regen
-# is run against buffa 0.5.2 — Self:: in oneof serde, inlined format
-# args in enum serde — but those are codegen *output* changes, not API
-# changes, and don't affect this constraint.)
-buffa = { version = "0.5", features = ["json"] }
-buffa-types = { version = "0.5", features = ["json"] }
-buffa-codegen = { version = "0.5.1" }
+# Protobuf. The 0.6 floor matches the regen baseline for the checked-in
+# generated code: 0.6.0 adds `with_*` setters for explicit-presence fields,
+# `MessageName`/`Serialize` impls on view types, and stops emitting empty
+# `__oneof`/`__ext`/`__view_oneof` ancillary files. (connectrpc-build also
+# sources the generated `mod.rs` `#[allow(...)]` list from
+# `buffa_codegen::ALLOW_LINTS`, present since 0.5.1.)
+buffa = { version = "0.6", features = ["json"] }
+buffa-types = { version = "0.6", features = ["json"] }
+buffa-codegen = { version = "0.6" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

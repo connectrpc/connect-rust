@@ -58,6 +58,12 @@ impl ::buffa::DefaultInstance for CreateEventRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for CreateEventRequest {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CreateEventRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CreateEventRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CreateEventRequest";
+}
 impl ::buffa::Message for CreateEventRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -253,6 +259,12 @@ impl ::buffa::DefaultInstance for CreateEventResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for CreateEventResponse {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CreateEventResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CreateEventResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CreateEventResponse";
+}
 impl ::buffa::Message for CreateEventResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -435,6 +447,12 @@ impl ::buffa::DefaultInstance for Event {
         static VALUE: ::buffa::__private::OnceBox<Event> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for Event {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "Event";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.Event";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.Event";
 }
 impl ::buffa::Message for Event {
     /// Returns the total encoded size in bytes.
@@ -696,6 +714,12 @@ impl ::buffa::DefaultInstance for CalculateDurationRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for CalculateDurationRequest {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CalculateDurationRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CalculateDurationRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CalculateDurationRequest";
+}
 impl ::buffa::Message for CalculateDurationRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -871,6 +895,12 @@ impl ::buffa::DefaultInstance for CalculateDurationResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for CalculateDurationResponse {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "CalculateDurationResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.CalculateDurationResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.CalculateDurationResponse";
+}
 impl ::buffa::Message for CalculateDurationResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -1013,6 +1043,12 @@ impl ::buffa::DefaultInstance for ProcessMetadataRequest {
         static VALUE: ::buffa::__private::OnceBox<ProcessMetadataRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ProcessMetadataRequest {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "ProcessMetadataRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.ProcessMetadataRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.ProcessMetadataRequest";
 }
 impl ::buffa::Message for ProcessMetadataRequest {
     /// Returns the total encoded size in bytes.
@@ -1167,6 +1203,12 @@ impl ::buffa::DefaultInstance for ProcessMetadataResponse {
         static VALUE: ::buffa::__private::OnceBox<ProcessMetadataResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ProcessMetadataResponse {
+    const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
+    const NAME: &'static str = "ProcessMetadataResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.wkt.v1.ProcessMetadataResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.wkt.v1.ProcessMetadataResponse";
 }
 impl ::buffa::Message for ProcessMetadataResponse {
     /// Returns the total encoded size in bytes.

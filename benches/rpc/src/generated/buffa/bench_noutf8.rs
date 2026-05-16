@@ -34,6 +34,12 @@ impl ::buffa::DefaultInstance for LogRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for LogRequest {
+    const PACKAGE: &'static str = "bench.noutf8.v1";
+    const NAME: &'static str = "LogRequest";
+    const FULL_NAME: &'static str = "bench.noutf8.v1.LogRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogRequest";
+}
 impl ::buffa::Message for LogRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -238,11 +244,86 @@ impl LogRecord {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogRecord";
 }
+impl LogRecord {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::timestamp_nanos`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_timestamp_nanos(mut self, value: i64) -> Self {
+        self.timestamp_nanos = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::service_name`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_service_name(
+        mut self,
+        value: impl Into<::buffa::alloc::vec::Vec<u8>>,
+    ) -> Self {
+        self.service_name = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::instance_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_instance_id(
+        mut self,
+        value: impl Into<::buffa::alloc::vec::Vec<u8>>,
+    ) -> Self {
+        self.instance_id = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::severity`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_severity(
+        mut self,
+        value: impl Into<::buffa::EnumValue<log_record::Severity>>,
+    ) -> Self {
+        self.severity = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::message`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_message(
+        mut self,
+        value: impl Into<::buffa::alloc::vec::Vec<u8>>,
+    ) -> Self {
+        self.message = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::trace_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_trace_id(
+        mut self,
+        value: impl Into<::buffa::alloc::vec::Vec<u8>>,
+    ) -> Self {
+        self.trace_id = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::span_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_span_id(
+        mut self,
+        value: impl Into<::buffa::alloc::vec::Vec<u8>>,
+    ) -> Self {
+        self.span_id = Some(value.into());
+        self
+    }
+}
 impl ::buffa::DefaultInstance for LogRecord {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<LogRecord> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for LogRecord {
+    const PACKAGE: &'static str = "bench.noutf8.v1";
+    const NAME: &'static str = "LogRecord";
+    const FULL_NAME: &'static str = "bench.noutf8.v1.LogRecord";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogRecord";
 }
 impl ::buffa::Message for LogRecord {
     /// Returns the total encoded size in bytes.
@@ -805,11 +886,43 @@ impl LogSource {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogSource";
 }
+impl LogSource {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::file`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_file(mut self, value: impl Into<::buffa::alloc::vec::Vec<u8>>) -> Self {
+        self.file = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::line`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_line(mut self, value: i32) -> Self {
+        self.line = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::function`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_function(
+        mut self,
+        value: impl Into<::buffa::alloc::vec::Vec<u8>>,
+    ) -> Self {
+        self.function = Some(value.into());
+        self
+    }
+}
 impl ::buffa::DefaultInstance for LogSource {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<LogSource> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for LogSource {
+    const PACKAGE: &'static str = "bench.noutf8.v1";
+    const NAME: &'static str = "LogSource";
+    const FULL_NAME: &'static str = "bench.noutf8.v1.LogSource";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogSource";
 }
 impl ::buffa::Message for LogSource {
     /// Returns the total encoded size in bytes.
@@ -1012,11 +1125,47 @@ impl LogIngestResponse {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogIngestResponse";
 }
+impl LogIngestResponse {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::count`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_count(mut self, value: i32) -> Self {
+        self.count = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::total_message_bytes`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_total_message_bytes(mut self, value: i64) -> Self {
+        self.total_message_bytes = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::total_label_bytes`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_total_label_bytes(mut self, value: i64) -> Self {
+        self.total_label_bytes = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::max_severity`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_max_severity(mut self, value: i32) -> Self {
+        self.max_severity = Some(value);
+        self
+    }
+}
 impl ::buffa::DefaultInstance for LogIngestResponse {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<LogIngestResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for LogIngestResponse {
+    const PACKAGE: &'static str = "bench.noutf8.v1";
+    const NAME: &'static str = "LogIngestResponse";
+    const FULL_NAME: &'static str = "bench.noutf8.v1.LogIngestResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.noutf8.v1.LogIngestResponse";
 }
 impl ::buffa::Message for LogIngestResponse {
     /// Returns the total encoded size in bytes.

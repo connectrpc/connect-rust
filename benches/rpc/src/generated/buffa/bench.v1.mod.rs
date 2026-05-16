@@ -21,24 +21,6 @@ pub mod __buffa {
         use super::*;
         include!("bench.__view.rs");
         include!("echo_bloat.__view.rs");
-        pub mod oneof {
-            #[allow(unused_imports)]
-            use super::*;
-            include!("bench.__view_oneof.rs");
-            include!("echo_bloat.__view_oneof.rs");
-        }
-    }
-    pub mod oneof {
-        #[allow(unused_imports)]
-        use super::*;
-        include!("bench.__oneof.rs");
-        include!("echo_bloat.__oneof.rs");
-    }
-    pub mod ext {
-        #[allow(unused_imports)]
-        use super::*;
-        include!("bench.__ext.rs");
-        include!("echo_bloat.__ext.rs");
     }
     /// Register this package's `Any` type entries and extension entries.
     pub fn register_types(reg: &mut ::buffa::type_registry::TypeRegistry) {

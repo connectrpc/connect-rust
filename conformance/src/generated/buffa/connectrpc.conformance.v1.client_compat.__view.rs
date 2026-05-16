@@ -822,6 +822,149 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientCompatRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ClientCompatRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.test_name) {
+            __map.serialize_entry("testName", self.test_name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.http_version) {
+            __map.serialize_entry("httpVersion", &self.http_version)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.protocol) {
+            __map.serialize_entry("protocol", &self.protocol)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.codec) {
+            __map.serialize_entry("codec", &self.codec)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.compression) {
+            __map.serialize_entry("compression", &self.compression)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.host) {
+            __map.serialize_entry("host", self.host)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.port) {
+            struct _W(u32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("port", &_W(self.port))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_bytes(self.server_tls_cert) {
+            struct _W<'__x>(&'__x [u8]);
+            impl ::serde::Serialize for _W<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::bytes::serialize(self.0, __s)
+                }
+            }
+            __map.serialize_entry("serverTlsCert", &_W(self.server_tls_cert))?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.client_tls_creds.as_option()
+            {
+                __map.serialize_entry("clientTlsCreds", __v)?;
+            }
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.message_receive_limit) {
+            struct _W(u32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                }
+            }
+            __map
+                .serialize_entry(
+                    "messageReceiveLimit",
+                    &_W(self.message_receive_limit),
+                )?;
+        }
+        if let ::core::option::Option::Some(__v) = self.service {
+            __map.serialize_entry("service", __v)?;
+        }
+        if let ::core::option::Option::Some(__v) = self.method {
+            __map.serialize_entry("method", __v)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.stream_type) {
+            __map.serialize_entry("streamType", &self.stream_type)?;
+        }
+        if self.use_get_http_method {
+            __map.serialize_entry("useGetHttpMethod", &self.use_get_http_method)?;
+        }
+        if !self.request_headers.is_empty() {
+            __map.serialize_entry("requestHeaders", &*self.request_headers)?;
+        }
+        if !self.request_messages.is_empty() {
+            __map.serialize_entry("requestMessages", &*self.request_messages)?;
+        }
+        if let ::core::option::Option::Some(__v) = self.timeout_ms {
+            struct _W(u32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("timeoutMs", &_W(__v))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.request_delay_ms) {
+            struct _W(u32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("requestDelayMs", &_W(self.request_delay_ms))?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.cancel.as_option() {
+                __map.serialize_entry("cancel", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.raw_request.as_option() {
+                __map.serialize_entry("rawRequest", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ClientCompatRequestView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientCompatRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientCompatRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for ClientCompatRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1107,6 +1250,70 @@ pub mod client_compat_request {
             }
             self.__buffa_unknown_fields.write_to(buf);
         }
+    }
+    /// Serializes this view as protobuf JSON.
+    ///
+    /// Implicit-presence fields with default values are omitted, `required`
+    /// fields are always emitted, explicit-presence (`optional`) fields are
+    /// emitted only when set, bytes fields are base64-encoded, and enum
+    /// values are their proto name strings.
+    ///
+    /// This impl uses `serialize_map(None)` because the number of emitted
+    /// fields depends on default-omission rules; serializers that require
+    /// known map lengths (e.g. `bincode`) will return a runtime error.
+    /// Use the owned message type for those formats.
+    impl<'__a> ::serde::Serialize for CancelView<'__a> {
+        fn serialize<__S: ::serde::Serializer>(
+            &self,
+            __s: __S,
+        ) -> ::core::result::Result<__S::Ok, __S::Error> {
+            use ::serde::ser::SerializeMap as _;
+            let mut __map = __s.serialize_map(::core::option::Option::None)?;
+            if let ::core::option::Option::Some(ref __ov) = self.cancel_timing {
+                match __ov {
+                    super::super::super::__buffa::view::oneof::client_compat_request::cancel::CancelTiming::BeforeCloseSend(
+                        v,
+                    ) => {
+                        __map.serialize_entry("beforeCloseSend", v)?;
+                    }
+                    super::super::super::__buffa::view::oneof::client_compat_request::cancel::CancelTiming::AfterCloseSendMs(
+                        v,
+                    ) => {
+                        struct _W(u32);
+                        impl ::serde::Serialize for _W {
+                            fn serialize<__S: ::serde::Serializer>(
+                                &self,
+                                __s: __S,
+                            ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                                ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                            }
+                        }
+                        __map.serialize_entry("afterCloseSendMs", &_W(*v))?;
+                    }
+                    super::super::super::__buffa::view::oneof::client_compat_request::cancel::CancelTiming::AfterNumResponses(
+                        v,
+                    ) => {
+                        struct _W(u32);
+                        impl ::serde::Serialize for _W {
+                            fn serialize<__S: ::serde::Serializer>(
+                                &self,
+                                __s: __S,
+                            ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                                ::buffa::json_helpers::uint32::serialize(&self.0, __s)
+                            }
+                        }
+                        __map.serialize_entry("afterNumResponses", &_W(*v))?;
+                    }
+                }
+            }
+            __map.end()
+        }
+    }
+    impl<'a> ::buffa::MessageName for CancelView<'a> {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "ClientCompatRequest.Cancel";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientCompatRequest.Cancel";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatRequest.Cancel";
     }
     impl<'v> ::buffa::DefaultViewInstance for CancelView<'v> {
         fn default_view_instance<'a>() -> &'a Self
@@ -1397,6 +1604,50 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientCompatResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ClientCompatResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.test_name) {
+            __map.serialize_entry("testName", self.test_name)?;
+        }
+        if let ::core::option::Option::Some(ref __ov) = self.result {
+            match __ov {
+                super::super::__buffa::view::oneof::client_compat_response::Result::Response(
+                    v,
+                ) => {
+                    __map.serialize_entry("response", v)?;
+                }
+                super::super::__buffa::view::oneof::client_compat_response::Result::Error(
+                    v,
+                ) => {
+                    __map.serialize_entry("error", v)?;
+                }
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ClientCompatResponseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientCompatResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientCompatResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for ClientCompatResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -1812,6 +2063,74 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientResponseResultView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ClientResponseResultView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !self.response_headers.is_empty() {
+            __map.serialize_entry("responseHeaders", &*self.response_headers)?;
+        }
+        if !self.payloads.is_empty() {
+            __map.serialize_entry("payloads", &*self.payloads)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.error.as_option() {
+                __map.serialize_entry("error", __v)?;
+            }
+        }
+        if !self.response_trailers.is_empty() {
+            __map.serialize_entry("responseTrailers", &*self.response_trailers)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.num_unsent_requests) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("numUnsentRequests", &_W(self.num_unsent_requests))?;
+        }
+        if let ::core::option::Option::Some(__v) = self.http_status_code {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("httpStatusCode", &_W(__v))?;
+        }
+        if !self.feedback.is_empty() {
+            __map.serialize_entry("feedback", &*self.feedback)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ClientResponseResultView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientResponseResult";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientResponseResult";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientResponseResult";
+}
 impl<'v> ::buffa::DefaultViewInstance for ClientResponseResultView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1964,6 +2283,36 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientErrorResultView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ClientErrorResultView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.message) {
+            __map.serialize_entry("message", self.message)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ClientErrorResultView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientErrorResult";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientErrorResult";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientErrorResult";
 }
 impl<'v> ::buffa::DefaultViewInstance for ClientErrorResultView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -2255,6 +2604,57 @@ impl<'a> ::buffa::ViewEncode<'a> for WireDetailsView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for WireDetailsView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.actual_status_code) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("actualStatusCode", &_W(self.actual_status_code))?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.connect_error_raw.as_option()
+            {
+                __map.serialize_entry("connectErrorRaw", __v)?;
+            }
+        }
+        if !self.actual_http_trailers.is_empty() {
+            __map.serialize_entry("actualHttpTrailers", &*self.actual_http_trailers)?;
+        }
+        if let ::core::option::Option::Some(__v) = self.actual_grpcweb_trailers {
+            __map.serialize_entry("actualGrpcwebTrailers", __v)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for WireDetailsView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "WireDetails";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.WireDetails";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.WireDetails";
 }
 impl<'v> ::buffa::DefaultViewInstance for WireDetailsView<'v> {
     fn default_view_instance<'a>() -> &'a Self

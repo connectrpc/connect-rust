@@ -19,21 +19,6 @@ pub mod __buffa {
         #[allow(unused_imports)]
         use super::*;
         include!("anthropic.connectrpc.greet.v1.greet.__view.rs");
-        pub mod oneof {
-            #[allow(unused_imports)]
-            use super::*;
-            include!("anthropic.connectrpc.greet.v1.greet.__view_oneof.rs");
-        }
-    }
-    pub mod oneof {
-        #[allow(unused_imports)]
-        use super::*;
-        include!("anthropic.connectrpc.greet.v1.greet.__oneof.rs");
-    }
-    pub mod ext {
-        #[allow(unused_imports)]
-        use super::*;
-        include!("anthropic.connectrpc.greet.v1.greet.__ext.rs");
     }
     /// Register this package's `Any` type entries and extension entries.
     pub fn register_types(reg: &mut ::buffa::type_registry::TypeRegistry) {

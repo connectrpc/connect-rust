@@ -170,6 +170,12 @@ impl ::buffa::DefaultInstance for BloatEcho {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for BloatEcho {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "BloatEcho";
+    const FULL_NAME: &'static str = "bench.v1.BloatEcho";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.BloatEcho";
+}
 impl ::buffa::Message for BloatEcho {
     /// Returns the total encoded size in bytes.
     ///
@@ -728,6 +734,12 @@ impl ::buffa::DefaultInstance for BloatHeader {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for BloatHeader {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "BloatHeader";
+    const FULL_NAME: &'static str = "bench.v1.BloatHeader";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.BloatHeader";
+}
 impl ::buffa::Message for BloatHeader {
     /// Returns the total encoded size in bytes.
     ///
@@ -1070,6 +1082,12 @@ impl ::buffa::DefaultInstance for ScalarHeavy {
         static VALUE: ::buffa::__private::OnceBox<ScalarHeavy> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ScalarHeavy {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "ScalarHeavy";
+    const FULL_NAME: &'static str = "bench.v1.ScalarHeavy";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.ScalarHeavy";
 }
 impl ::buffa::Message for ScalarHeavy {
     /// Returns the total encoded size in bytes.
@@ -1573,6 +1591,12 @@ impl ::buffa::DefaultInstance for FewLargeStrings {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for FewLargeStrings {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "FewLargeStrings";
+    const FULL_NAME: &'static str = "bench.v1.FewLargeStrings";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.FewLargeStrings";
+}
 impl ::buffa::Message for FewLargeStrings {
     /// Returns the total encoded size in bytes.
     ///
@@ -1815,6 +1839,12 @@ impl ::buffa::DefaultInstance for NestL5 {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for NestL5 {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "NestL5";
+    const FULL_NAME: &'static str = "bench.v1.NestL5";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.NestL5";
+}
 impl ::buffa::Message for NestL5 {
     /// Returns the total encoded size in bytes.
     ///
@@ -1982,6 +2012,12 @@ impl ::buffa::DefaultInstance for NestL4 {
         static VALUE: ::buffa::__private::OnceBox<NestL4> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for NestL4 {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "NestL4";
+    const FULL_NAME: &'static str = "bench.v1.NestL4";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.NestL4";
 }
 impl ::buffa::Message for NestL4 {
     /// Returns the total encoded size in bytes.
@@ -2183,6 +2219,12 @@ impl ::buffa::DefaultInstance for NestL3 {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for NestL3 {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "NestL3";
+    const FULL_NAME: &'static str = "bench.v1.NestL3";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.NestL3";
+}
 impl ::buffa::Message for NestL3 {
     /// Returns the total encoded size in bytes.
     ///
@@ -2383,6 +2425,12 @@ impl ::buffa::DefaultInstance for NestL2 {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for NestL2 {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "NestL2";
+    const FULL_NAME: &'static str = "bench.v1.NestL2";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.NestL2";
+}
 impl ::buffa::Message for NestL2 {
     /// Returns the total encoded size in bytes.
     ///
@@ -2582,6 +2630,12 @@ impl ::buffa::DefaultInstance for NestL1 {
         static VALUE: ::buffa::__private::OnceBox<NestL1> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for NestL1 {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "NestL1";
+    const FULL_NAME: &'static str = "bench.v1.NestL1";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.NestL1";
 }
 impl ::buffa::Message for NestL1 {
     /// Returns the total encoded size in bytes.
@@ -2784,6 +2838,12 @@ impl ::buffa::DefaultInstance for DeepNested {
         static VALUE: ::buffa::__private::OnceBox<DeepNested> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for DeepNested {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "DeepNested";
+    const FULL_NAME: &'static str = "bench.v1.DeepNested";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.DeepNested";
 }
 impl ::buffa::Message for DeepNested {
     /// Returns the total encoded size in bytes.
@@ -2990,6 +3050,12 @@ impl ::buffa::DefaultInstance for MapDominated {
         static VALUE: ::buffa::__private::OnceBox<MapDominated> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for MapDominated {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "MapDominated";
+    const FULL_NAME: &'static str = "bench.v1.MapDominated";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.MapDominated";
 }
 impl ::buffa::Message for MapDominated {
     /// Returns the total encoded size in bytes.

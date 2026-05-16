@@ -1027,6 +1027,12 @@ impl ::buffa::DefaultInstance for Config {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for Config {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "Config";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.Config";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.Config";
+}
 impl ::buffa::Message for Config {
     /// Returns the total encoded size in bytes.
     ///
@@ -1366,11 +1372,68 @@ impl Features {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.Features";
 }
+impl Features {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_h2c`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_h2c(mut self, value: bool) -> Self {
+        self.supports_h2c = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_tls`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_tls(mut self, value: bool) -> Self {
+        self.supports_tls = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_tls_client_certs`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_tls_client_certs(mut self, value: bool) -> Self {
+        self.supports_tls_client_certs = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_trailers`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_trailers(mut self, value: bool) -> Self {
+        self.supports_trailers = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_half_duplex_bidi_over_http1`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_half_duplex_bidi_over_http1(mut self, value: bool) -> Self {
+        self.supports_half_duplex_bidi_over_http1 = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_connect_get`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_connect_get(mut self, value: bool) -> Self {
+        self.supports_connect_get = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::supports_message_receive_limit`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_supports_message_receive_limit(mut self, value: bool) -> Self {
+        self.supports_message_receive_limit = Some(value);
+        self
+    }
+}
 impl ::buffa::DefaultInstance for Features {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<Features> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for Features {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "Features";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.Features";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.Features";
 }
 impl ::buffa::Message for Features {
     /// Returns the total encoded size in bytes.
@@ -2023,11 +2086,40 @@ impl ConfigCase {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ConfigCase";
 }
+impl ConfigCase {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::use_tls`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_use_tls(mut self, value: bool) -> Self {
+        self.use_tls = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::use_tls_client_certs`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_use_tls_client_certs(mut self, value: bool) -> Self {
+        self.use_tls_client_certs = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::use_message_receive_limit`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_use_message_receive_limit(mut self, value: bool) -> Self {
+        self.use_message_receive_limit = Some(value);
+        self
+    }
+}
 impl ::buffa::DefaultInstance for ConfigCase {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<ConfigCase> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ConfigCase {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ConfigCase";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ConfigCase";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ConfigCase";
 }
 impl ::buffa::Message for ConfigCase {
     /// Returns the total encoded size in bytes.
@@ -2346,6 +2438,12 @@ impl ::buffa::DefaultInstance for TLSCreds {
         static VALUE: ::buffa::__private::OnceBox<TLSCreds> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for TLSCreds {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "TLSCreds";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.TLSCreds";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TLSCreds";
 }
 impl ::buffa::Message for TLSCreds {
     /// Returns the total encoded size in bytes.

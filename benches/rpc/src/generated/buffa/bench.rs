@@ -174,6 +174,12 @@ impl ::buffa::DefaultInstance for EchoRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for EchoRequest {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "EchoRequest";
+    const FULL_NAME: &'static str = "bench.v1.EchoRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.EchoRequest";
+}
 impl ::buffa::Message for EchoRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -302,6 +308,12 @@ impl ::buffa::DefaultInstance for EchoResponse {
         static VALUE: ::buffa::__private::OnceBox<EchoResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for EchoResponse {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "EchoResponse";
+    const FULL_NAME: &'static str = "bench.v1.EchoResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.EchoResponse";
 }
 impl ::buffa::Message for EchoResponse {
     /// Returns the total encoded size in bytes.
@@ -448,6 +460,12 @@ impl ::buffa::DefaultInstance for BenchRequest {
         static VALUE: ::buffa::__private::OnceBox<BenchRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for BenchRequest {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "BenchRequest";
+    const FULL_NAME: &'static str = "bench.v1.BenchRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.BenchRequest";
 }
 impl ::buffa::Message for BenchRequest {
     /// Returns the total encoded size in bytes.
@@ -605,6 +623,12 @@ impl ::buffa::DefaultInstance for BenchResponse {
         static VALUE: ::buffa::__private::OnceBox<BenchResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for BenchResponse {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "BenchResponse";
+    const FULL_NAME: &'static str = "bench.v1.BenchResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.BenchResponse";
 }
 impl ::buffa::Message for BenchResponse {
     /// Returns the total encoded size in bytes.
@@ -879,6 +903,12 @@ impl ::buffa::DefaultInstance for Payload {
         static VALUE: ::buffa::__private::OnceBox<Payload> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for Payload {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "Payload";
+    const FULL_NAME: &'static str = "bench.v1.Payload";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.Payload";
 }
 impl ::buffa::Message for Payload {
     /// Returns the total encoded size in bytes.
@@ -1452,6 +1482,12 @@ impl ::buffa::DefaultInstance for Metadata {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for Metadata {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "Metadata";
+    const FULL_NAME: &'static str = "bench.v1.Metadata";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.Metadata";
+}
 impl ::buffa::Message for Metadata {
     /// Returns the total encoded size in bytes.
     ///
@@ -1720,6 +1756,12 @@ impl ::buffa::DefaultInstance for LogRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for LogRequest {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogRequest";
+    const FULL_NAME: &'static str = "bench.v1.LogRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogRequest";
+}
 impl ::buffa::Message for LogRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -1856,6 +1898,12 @@ impl ::buffa::DefaultInstance for LogResponse {
         static VALUE: ::buffa::__private::OnceBox<LogResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for LogResponse {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogResponse";
+    const FULL_NAME: &'static str = "bench.v1.LogResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogResponse";
 }
 impl ::buffa::Message for LogResponse {
     /// Returns the total encoded size in bytes.
@@ -2055,6 +2103,12 @@ impl ::buffa::DefaultInstance for LogRecord {
         static VALUE: ::buffa::__private::OnceBox<LogRecord> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for LogRecord {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogRecord";
+    const FULL_NAME: &'static str = "bench.v1.LogRecord";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogRecord";
 }
 impl ::buffa::Message for LogRecord {
     /// Returns the total encoded size in bytes.
@@ -2613,6 +2667,12 @@ impl ::buffa::DefaultInstance for LogSource {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for LogSource {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogSource";
+    const FULL_NAME: &'static str = "bench.v1.LogSource";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogSource";
+}
 impl ::buffa::Message for LogSource {
     /// Returns the total encoded size in bytes.
     ///
@@ -2820,6 +2880,12 @@ impl ::buffa::DefaultInstance for LogIngestResponse {
         static VALUE: ::buffa::__private::OnceBox<LogIngestResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for LogIngestResponse {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogIngestResponse";
+    const FULL_NAME: &'static str = "bench.v1.LogIngestResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogIngestResponse";
 }
 impl ::buffa::Message for LogIngestResponse {
     /// Returns the total encoded size in bytes.
