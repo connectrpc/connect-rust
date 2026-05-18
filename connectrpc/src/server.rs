@@ -86,6 +86,7 @@ pub struct PeerAddr(pub SocketAddr);
 /// The `Arc` makes per-request insertion cheap: all requests on a
 /// connection share one chain, so this is a refcount bump, not a copy.
 #[cfg(feature = "server-tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
 #[derive(Clone, Debug)]
 pub struct PeerCerts(pub Arc<[rustls::pki_types::CertificateDer<'static>]>);
 
@@ -121,6 +122,7 @@ impl PeerInfo {
 /// Override via [`Server::with_tls_handshake_timeout`] or
 /// [`BoundServer::with_tls_handshake_timeout`].
 #[cfg(feature = "server-tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// ConnectRPC server built on hyper.
@@ -179,6 +181,7 @@ impl Server {
     ///     .serve(addr).await?;
     /// ```
     #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
         self.tls_config = Some(config);
@@ -191,6 +194,7 @@ impl Server {
     /// that connects via TCP but does not complete the TLS handshake within
     /// this duration is disconnected.
     #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
     pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tls_handshake_timeout = timeout;
@@ -361,6 +365,7 @@ impl BoundServer {
 
     /// Enable TLS with the given rustls server configuration.
     #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
         self.tls_config = Some(config);
@@ -371,6 +376,7 @@ impl BoundServer {
     ///
     /// Defaults to [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] (10 seconds).
     #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
     pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tls_handshake_timeout = timeout;

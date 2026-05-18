@@ -2780,6 +2780,7 @@ impl ConnectError {
 ///
 /// Available when the `axum` feature is enabled.
 #[cfg(feature = "axum")]
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 pub mod axum_integration {
     use super::*;
     use axum::body::Body;

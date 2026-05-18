@@ -71,10 +71,12 @@ use crate::error::ConnectError;
 
 /// A boxed async reader for streaming compression/decompression.
 #[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send>>;
 
 /// A boxed async buffered reader for streaming input.
 #[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub type BoxedAsyncBufRead = Pin<Box<dyn AsyncBufRead + Send>>;
 
 /// Trait for compression algorithm implementations.
@@ -151,6 +153,7 @@ pub trait CompressionProvider: Send + Sync + 'static {
 ///
 /// Available when the `streaming` feature is enabled (default).
 #[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub trait StreamingCompressionProvider: CompressionProvider {
     /// Create a streaming decompressor.
     ///
@@ -363,6 +366,7 @@ impl CompressionRegistry {
     ///
     /// Available when the `streaming` feature is enabled.
     #[cfg(feature = "streaming")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
     #[must_use]
     pub fn register_streaming<P: StreamingCompressionProvider>(mut self, provider: P) -> Self {
         let name = provider.name();
@@ -383,12 +387,14 @@ impl CompressionRegistry {
     ///
     /// Returns `None` if no streaming provider is registered for the given name.
     #[cfg(feature = "streaming")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
     pub fn get_streaming(&self, name: &str) -> Option<Arc<dyn StreamingCompressionProvider>> {
         self.streaming_providers.get(name).cloned()
     }
 
     /// Check if streaming compression is supported for the given encoding name.
     #[cfg(feature = "streaming")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
     pub fn supports_streaming(&self, name: &str) -> bool {
         self.streaming_providers.contains_key(name)
     }
@@ -398,6 +404,7 @@ impl CompressionRegistry {
     /// Returns an `AsyncRead` that decompresses data from the input reader.
     /// Returns an error if the encoding is not supported for streaming.
     #[cfg(feature = "streaming")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
     pub fn decompress_stream(
         &self,
         encoding: &str,
@@ -422,6 +429,7 @@ impl CompressionRegistry {
     /// Returns an `AsyncRead` that compresses data from the input reader.
     /// Returns an error if the encoding is not supported for streaming.
     #[cfg(feature = "streaming")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
     pub fn compress_stream(
         &self,
         encoding: &str,
@@ -593,6 +601,7 @@ impl Default for CompressionRegistry {
 ///
 /// Available when the `gzip` feature is enabled (default).
 #[cfg(feature = "gzip")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gzip")))]
 pub struct GzipProvider {
     /// Compression level (0-9, default is 1).
     level: u32,
@@ -601,6 +610,7 @@ pub struct GzipProvider {
 }
 
 #[cfg(feature = "gzip")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gzip")))]
 impl std::fmt::Debug for GzipProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GzipProvider")
@@ -618,6 +628,7 @@ impl std::fmt::Debug for GzipProvider {
 }
 
 #[cfg(feature = "gzip")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gzip")))]
 impl Default for GzipProvider {
     fn default() -> Self {
         Self::with_level(Self::DEFAULT_LEVEL)
@@ -625,6 +636,7 @@ impl Default for GzipProvider {
 }
 
 #[cfg(feature = "gzip")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gzip")))]
 impl GzipProvider {
     /// Default compression level: 1 (fastest).
     ///
@@ -868,6 +880,7 @@ fn gzip_header_len(data: &[u8]) -> Result<usize, ConnectError> {
 }
 
 #[cfg(feature = "gzip")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gzip")))]
 impl CompressionProvider for GzipProvider {
     fn name(&self) -> &'static str {
         "gzip"
@@ -896,6 +909,7 @@ impl CompressionProvider for GzipProvider {
 }
 
 #[cfg(all(feature = "gzip", feature = "streaming"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "gzip", feature = "streaming"))))]
 impl StreamingCompressionProvider for GzipProvider {
     fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
         Box::pin(async_compression::tokio::bufread::GzipDecoder::new(reader))
@@ -920,6 +934,7 @@ impl StreamingCompressionProvider for GzipProvider {
 ///
 /// Available when the `zstd` feature is enabled (default).
 #[cfg(feature = "zstd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
 pub struct ZstdProvider {
     /// Compression level (1-22, default is 3).
     level: i32,
@@ -927,6 +942,7 @@ pub struct ZstdProvider {
 }
 
 #[cfg(feature = "zstd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
 impl std::fmt::Debug for ZstdProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZstdProvider")
@@ -940,6 +956,7 @@ impl std::fmt::Debug for ZstdProvider {
 }
 
 #[cfg(feature = "zstd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
 impl ZstdProvider {
     /// Default compression level: 3 (the zstd library default).
     pub const DEFAULT_LEVEL: i32 = 3;
@@ -962,6 +979,7 @@ impl ZstdProvider {
 }
 
 #[cfg(feature = "zstd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
 impl Default for ZstdProvider {
     fn default() -> Self {
         Self {
@@ -1044,6 +1062,7 @@ impl ZstdProvider {
 }
 
 #[cfg(feature = "zstd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
 impl CompressionProvider for ZstdProvider {
     fn name(&self) -> &'static str {
         "zstd"
@@ -1074,6 +1093,7 @@ impl CompressionProvider for ZstdProvider {
 }
 
 #[cfg(all(feature = "zstd", feature = "streaming"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "zstd", feature = "streaming"))))]
 impl StreamingCompressionProvider for ZstdProvider {
     fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
         Box::pin(async_compression::tokio::bufread::ZstdDecoder::new(reader))

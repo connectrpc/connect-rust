@@ -414,6 +414,7 @@ impl Http2Connection {
     /// Returns an error (surfaced from the first `poll_ready`) if the URI
     /// scheme is `http://` — use [`lazy_plaintext`](Self::lazy_plaintext).
     #[cfg(feature = "client-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
     pub fn lazy_tls(uri: Uri, tls_config: Arc<rustls::ClientConfig>) -> Self {
         Self {
             inner: Reconnect::new(MakeSendRequest::new_tls(tls_config), uri, true),
@@ -427,6 +428,7 @@ impl Http2Connection {
     /// Returns an error if the URI scheme is `http://`, if the TCP/TLS
     /// handshake fails, or if the server doesn't negotiate h2 via ALPN.
     #[cfg(feature = "client-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
     pub async fn connect_tls(
         uri: Uri,
         tls_config: Arc<rustls::ClientConfig>,
@@ -447,6 +449,7 @@ impl Http2Connection {
     /// first `poll_ready`. See [`lazy_tls`](Self::lazy_tls) for ALPN and
     /// cert rotation details.
     #[cfg(feature = "client-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
     pub fn with_builder_tls(
         uri: Uri,
         builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,

@@ -231,8 +231,10 @@ where
 #[cfg(feature = "client")]
 mod http2;
 #[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub use http2::Http2Connection;
 #[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub use http2::SharedHttp2Connection;
 
 /// General-purpose HTTP client supporting both HTTP/1.1 and HTTP/2.
@@ -262,6 +264,7 @@ pub use http2::SharedHttp2Connection;
 ///
 /// Available when the `client` feature is enabled.
 #[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 #[derive(Clone)]
 pub struct HttpClient {
     inner: HttpClientInner,
@@ -270,6 +273,7 @@ pub struct HttpClient {
 // Manual impl: hyper's `Client` doesn't impl `Debug`. Print the mode so
 // tests can identify which transport variant unexpectedly succeeded.
 #[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 impl std::fmt::Debug for HttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mode = match self.inner {
@@ -308,6 +312,7 @@ enum HttpClientInner {
 }
 
 #[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 impl HttpClient {
     /// Create a **plaintext** HTTP client. Only for `http://` URIs.
     ///
@@ -393,6 +398,7 @@ impl HttpClient {
     /// let client = GreetServiceClient::new(http, config);
     /// ```
     #[cfg(feature = "client-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
     pub fn with_tls(tls_config: std::sync::Arc<rustls::ClientConfig>) -> Self {
         use hyper_util::client::legacy::Client;
         use hyper_util::client::legacy::connect::HttpConnector;
@@ -434,6 +440,7 @@ impl HttpClient {
 // explicitly choose plaintext() or with_tls().
 
 #[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 impl ClientTransport for HttpClient {
     type ResponseBody = hyper::body::Incoming;
     type Error = ConnectError;
