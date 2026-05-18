@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     /// A client that opens a TCP connection to a TLS server but never sends a
-    /// ClientHello should be disconnected after `tls_handshake_timeout`.
+    /// ClientHello should be disconnected after `with_tls_handshake_timeout`.
     #[tokio::test]
     async fn tls_handshake_timeout_disconnects_stalled_client() {
         use connectrpc::Server;
@@ -1090,7 +1090,7 @@ mod tests {
             .await
             .expect("bind")
             .with_tls(server_cfg)
-            .tls_handshake_timeout(handshake_timeout);
+            .with_tls_handshake_timeout(handshake_timeout);
         let addr = bound.local_addr().expect("local_addr");
         let _server = tokio::spawn(async move {
             bound.serve(router).await.unwrap();

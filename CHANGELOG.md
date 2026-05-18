@@ -68,6 +68,21 @@ increment the patch version.
   durations. Per-route deadline policy is a planned follow-up coupled
   to the typed routing surface (#91).
 
+- **`Server` proxies for `ConnectRpcService` dispatch config** —
+  `Server::with_limits`, `Server::with_compression`, and
+  `Server::with_compression_policy` delegate to the same-named
+  `ConnectRpcService` builders, so a `Server::new(router)` user no longer
+  has to drop down to `Server::from_service(...)` to set request limits
+  or compression. (`Server` already held the inner `ConnectRpcService`;
+  the proxies just expose the existing surface.)
+
+- **`Server::with_http1_keep_alive`** — `Server` already had an
+  `http1_keep_alive` field (used by `serve`/`serve_with_graceful_shutdown`)
+  but no builder to set it; only `BoundServer` did. Adds the missing
+  builder so a one-step `Server::new(router).serve(addr)` user can disable
+  HTTP/1.1 keep-alive without switching to the `bind`/`from_listener`
+  two-step path.
+
 ### Breaking
 
 These are breaking under semver but the practical blast radius is
@@ -174,6 +189,15 @@ need a one-line edit.
   was supplied` on a `ClientConfig` builder call, you've hit the rename:
   the same-named read accessor now occupies the old name. Prefix the
   call with `with_` per the table above.
+
+- **`Server` / `BoundServer` / `ServeTls` builders renamed to `with_*`** —
+  `tls_handshake_timeout(...)` is now `with_tls_handshake_timeout(...)`
+  (on `Server`, `BoundServer`, and `axum::ServeTls`) and
+  `BoundServer::http1_keep_alive(...)` is now
+  `with_http1_keep_alive(...)`. This matches the `with_tls(...)` /
+  `with_graceful_shutdown(...)` siblings that were already `with_*` and
+  the `ConnectRpcService`/`ClientConfig` convention. Migration: prefix
+  the call with `with_`. `with_tls(...)` is unchanged.
 
 ## [0.4.2] - 2026-05-07
 

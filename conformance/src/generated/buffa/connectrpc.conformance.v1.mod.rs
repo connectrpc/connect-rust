@@ -30,30 +30,15 @@ pub mod __buffa {
         pub mod oneof {
             #[allow(unused_imports)]
             use super::*;
-            include!("connectrpc.conformance.v1.config.__view_oneof.rs");
             include!("connectrpc.conformance.v1.service.__view_oneof.rs");
             include!("connectrpc.conformance.v1.client_compat.__view_oneof.rs");
-            include!("connectrpc.conformance.v1.server_compat.__view_oneof.rs");
-            include!("connectrpc.conformance.v1.suite.__view_oneof.rs");
         }
     }
     pub mod oneof {
         #[allow(unused_imports)]
         use super::*;
-        include!("connectrpc.conformance.v1.config.__oneof.rs");
         include!("connectrpc.conformance.v1.service.__oneof.rs");
         include!("connectrpc.conformance.v1.client_compat.__oneof.rs");
-        include!("connectrpc.conformance.v1.server_compat.__oneof.rs");
-        include!("connectrpc.conformance.v1.suite.__oneof.rs");
-    }
-    pub mod ext {
-        #[allow(unused_imports)]
-        use super::*;
-        include!("connectrpc.conformance.v1.config.__ext.rs");
-        include!("connectrpc.conformance.v1.service.__ext.rs");
-        include!("connectrpc.conformance.v1.client_compat.__ext.rs");
-        include!("connectrpc.conformance.v1.server_compat.__ext.rs");
-        include!("connectrpc.conformance.v1.suite.__ext.rs");
     }
     /// Register this package's `Any` type entries and extension entries.
     pub fn register_types(reg: &mut ::buffa::type_registry::TypeRegistry) {

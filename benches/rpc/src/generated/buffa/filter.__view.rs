@@ -362,6 +362,72 @@ impl<'a> ::buffa::ViewEncode<'a> for RecordView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for RecordView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.id) {
+            __map.serialize_entry("id", self.id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.description) {
+            __map.serialize_entry("description", self.description)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.email) {
+            __map.serialize_entry("email", self.email)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.ssn) {
+            __map.serialize_entry("ssn", self.ssn)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.notes) {
+            __map.serialize_entry("notes", self.notes)?;
+        }
+        if !self.tags.is_empty() {
+            __map.serialize_entry("tags", &*self.tags)?;
+        }
+        if !self.attributes.is_empty() {
+            struct _WM<'__a, '__x>(&'__x ::buffa::MapView<'__x, &'__a str, &'__a str>);
+            impl<'__a> ::serde::Serialize for _WM<'__a, '_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    use ::serde::ser::SerializeMap as _;
+                    let mut __m = __s
+                        .serialize_map(::core::option::Option::Some(self.0.len()))?;
+                    for (k, v) in self.0.iter_unique() {
+                        __m.serialize_entry(k, v)?;
+                    }
+                    __m.end()
+                }
+            }
+            __map.serialize_entry("attributes", &_WM(&self.attributes))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for RecordView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.filter.v1";
+    const NAME: &'static str = "Record";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.filter.v1.Record";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.filter.v1.Record";
+}
 impl<'v> ::buffa::DefaultViewInstance for RecordView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where

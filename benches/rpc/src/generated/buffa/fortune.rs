@@ -27,6 +27,12 @@ impl ::buffa::DefaultInstance for GetFortunesRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for GetFortunesRequest {
+    const PACKAGE: &'static str = "fortune.v1";
+    const NAME: &'static str = "GetFortunesRequest";
+    const FULL_NAME: &'static str = "fortune.v1.GetFortunesRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/fortune.v1.GetFortunesRequest";
+}
 impl ::buffa::Message for GetFortunesRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -133,6 +139,12 @@ impl ::buffa::DefaultInstance for GetFortunesResponse {
         static VALUE: ::buffa::__private::OnceBox<GetFortunesResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for GetFortunesResponse {
+    const PACKAGE: &'static str = "fortune.v1";
+    const NAME: &'static str = "GetFortunesResponse";
+    const FULL_NAME: &'static str = "fortune.v1.GetFortunesResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/fortune.v1.GetFortunesResponse";
 }
 impl ::buffa::Message for GetFortunesResponse {
     /// Returns the total encoded size in bytes.
@@ -280,6 +292,12 @@ impl ::buffa::DefaultInstance for Fortune {
         static VALUE: ::buffa::__private::OnceBox<Fortune> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for Fortune {
+    const PACKAGE: &'static str = "fortune.v1";
+    const NAME: &'static str = "Fortune";
+    const FULL_NAME: &'static str = "fortune.v1.Fortune";
+    const TYPE_URL: &'static str = "type.googleapis.com/fortune.v1.Fortune";
 }
 impl ::buffa::Message for Fortune {
     /// Returns the total encoded size in bytes.

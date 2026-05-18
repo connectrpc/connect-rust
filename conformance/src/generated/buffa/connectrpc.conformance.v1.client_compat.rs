@@ -268,11 +268,46 @@ impl ClientCompatRequest {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatRequest";
 }
+impl ClientCompatRequest {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::service`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_service(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.service = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::method`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_method(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.method = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::timeout_ms`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_timeout_ms(mut self, value: u32) -> Self {
+        self.timeout_ms = Some(value);
+        self
+    }
+}
 impl ::buffa::DefaultInstance for ClientCompatRequest {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<ClientCompatRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ClientCompatRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientCompatRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientCompatRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatRequest";
 }
 impl ::buffa::Message for ClientCompatRequest {
     /// Returns the total encoded size in bytes.
@@ -892,6 +927,12 @@ pub mod client_compat_request {
             VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
         }
     }
+    impl ::buffa::MessageName for Cancel {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "ClientCompatRequest.Cancel";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientCompatRequest.Cancel";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatRequest.Cancel";
+    }
     impl ::buffa::Message for Cancel {
         /// Returns the total encoded size in bytes.
         ///
@@ -1262,6 +1303,12 @@ impl ::buffa::DefaultInstance for ClientCompatResponse {
         static VALUE: ::buffa::__private::OnceBox<ClientCompatResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ClientCompatResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientCompatResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientCompatResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientCompatResponse";
 }
 impl ::buffa::Message for ClientCompatResponse {
     /// Returns the total encoded size in bytes.
@@ -1683,11 +1730,26 @@ impl ClientResponseResult {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientResponseResult";
 }
+impl ClientResponseResult {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::http_status_code`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_http_status_code(mut self, value: i32) -> Self {
+        self.http_status_code = Some(value);
+        self
+    }
+}
 impl ::buffa::DefaultInstance for ClientResponseResult {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<ClientResponseResult> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ClientResponseResult {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientResponseResult";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientResponseResult";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientResponseResult";
 }
 impl ::buffa::Message for ClientResponseResult {
     /// Returns the total encoded size in bytes.
@@ -1989,6 +2051,12 @@ impl ::buffa::DefaultInstance for ClientErrorResult {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for ClientErrorResult {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientErrorResult";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientErrorResult";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientErrorResult";
+}
 impl ::buffa::Message for ClientErrorResult {
     /// Returns the total encoded size in bytes.
     ///
@@ -2162,11 +2230,29 @@ impl WireDetails {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.WireDetails";
 }
+impl WireDetails {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::actual_grpcweb_trailers`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_actual_grpcweb_trailers(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.actual_grpcweb_trailers = Some(value.into());
+        self
+    }
+}
 impl ::buffa::DefaultInstance for WireDetails {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<WireDetails> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for WireDetails {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "WireDetails";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.WireDetails";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.WireDetails";
 }
 impl ::buffa::Message for WireDetails {
     /// Returns the total encoded size in bytes.

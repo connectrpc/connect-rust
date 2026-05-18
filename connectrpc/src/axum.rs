@@ -83,7 +83,7 @@ use crate::server::{
 ///
 /// Like the standalone server, the TLS handshake is bounded by a
 /// [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] to prevent slowloris-style connection
-/// exhaustion; tune it with [`ServeTls::tls_handshake_timeout`].
+/// exhaustion; tune it with [`ServeTls::with_tls_handshake_timeout`].
 ///
 /// The returned [`ServeTls`] resolves once the listener stops accepting and
 /// in-flight connections drain (after [`ServeTls::with_graceful_shutdown`]'s
@@ -150,7 +150,7 @@ impl ServeTls {
     /// [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`]). Set generously; clients on
     /// high-latency links need a few round trips to complete the handshake.
     #[must_use = "ServeTls does nothing unless `.await`ed"]
-    pub fn tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.tls_handshake_timeout = timeout;
         self
     }
@@ -447,7 +447,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(
             serve_tls(listener, app, server_cfg)
-                .tls_handshake_timeout(Duration::from_millis(100))
+                .with_tls_handshake_timeout(Duration::from_millis(100))
                 .with_graceful_shutdown(async {
                     rx.await.ok();
                 })

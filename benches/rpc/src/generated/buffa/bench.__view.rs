@@ -129,6 +129,36 @@ impl<'a> ::buffa::ViewEncode<'a> for EchoRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for EchoRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.message) {
+            __map.serialize_entry("message", self.message)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for EchoRequestView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "EchoRequest";
+    const FULL_NAME: &'static str = "bench.v1.EchoRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.EchoRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for EchoRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -274,6 +304,36 @@ impl<'a> ::buffa::ViewEncode<'a> for EchoResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for EchoResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.message) {
+            __map.serialize_entry("message", self.message)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for EchoResponseView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "EchoResponse";
+    const FULL_NAME: &'static str = "bench.v1.EchoResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.EchoResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for EchoResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -476,6 +536,50 @@ impl<'a> ::buffa::ViewEncode<'a> for BenchRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for BenchRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.response_count) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("responseCount", &_W(self.response_count))?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.payload.as_option() {
+                __map.serialize_entry("payload", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for BenchRequestView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "BenchRequest";
+    const FULL_NAME: &'static str = "bench.v1.BenchRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.BenchRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for BenchRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -648,6 +752,38 @@ impl<'a> ::buffa::ViewEncode<'a> for BenchResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for BenchResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.payload.as_option() {
+                __map.serialize_entry("payload", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for BenchResponseView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "BenchResponse";
+    const FULL_NAME: &'static str = "bench.v1.BenchResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.BenchResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for BenchResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -1249,6 +1385,158 @@ impl<'a> ::buffa::ViewEncode<'a> for PayloadView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for PayloadView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.id) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("id", &_W(self.id))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.timestamp_nanos) {
+            struct _W(i64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int64::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("timestampNanos", &_W(self.timestamp_nanos))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.latitude) {
+            struct _W(f64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::double::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("latitude", &_W(self.latitude))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.longitude) {
+            struct _W(f64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::double::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("longitude", &_W(self.longitude))?;
+        }
+        if self.active {
+            __map.serialize_entry("active", &self.active)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.trace_id) {
+            struct _W(u64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::uint64::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("traceId", &_W(self.trace_id))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.description) {
+            __map.serialize_entry("description", self.description)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.region) {
+            __map.serialize_entry("region", self.region)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_bytes(self.data) {
+            struct _W<'__x>(&'__x [u8]);
+            impl ::serde::Serialize for _W<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::bytes::serialize(self.0, __s)
+                }
+            }
+            __map.serialize_entry("data", &_W(self.data))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.status) {
+            __map.serialize_entry("status", &self.status)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.metadata.as_option() {
+                __map.serialize_entry("metadata", __v)?;
+            }
+        }
+        if !self.scores.is_empty() {
+            struct _WSeq<'__x>(&'__x [i32]);
+            impl ::serde::Serialize for _WSeq<'_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::proto_seq::serialize(self.0, __s)
+                }
+            }
+            __map.serialize_entry("scores", &_WSeq(&self.scores))?;
+        }
+        if !self.tags.is_empty() {
+            __map.serialize_entry("tags", &*self.tags)?;
+        }
+        if !self.attributes.is_empty() {
+            struct _WM<'__a, '__x>(&'__x ::buffa::MapView<'__x, &'__a str, &'__a str>);
+            impl<'__a> ::serde::Serialize for _WM<'__a, '_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    use ::serde::ser::SerializeMap as _;
+                    let mut __m = __s
+                        .serialize_map(::core::option::Option::Some(self.0.len()))?;
+                    for (k, v) in self.0.iter_unique() {
+                        __m.serialize_entry(k, v)?;
+                    }
+                    __m.end()
+                }
+            }
+            __map.serialize_entry("attributes", &_WM(&self.attributes))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for PayloadView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "Payload";
+    const FULL_NAME: &'static str = "bench.v1.Payload";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.Payload";
+}
 impl<'v> ::buffa::DefaultViewInstance for PayloadView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1527,6 +1815,69 @@ impl<'a> ::buffa::ViewEncode<'a> for MetadataView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for MetadataView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.request_id) {
+            __map.serialize_entry("requestId", self.request_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.user_agent) {
+            __map.serialize_entry("userAgent", self.user_agent)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.created_at) {
+            struct _W(i64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int64::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("createdAt", &_W(self.created_at))?;
+        }
+        if !self.headers.is_empty() {
+            struct _WM<'__a, '__x>(&'__x ::buffa::MapView<'__x, &'__a str, &'__a str>);
+            impl<'__a> ::serde::Serialize for _WM<'__a, '_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    use ::serde::ser::SerializeMap as _;
+                    let mut __m = __s
+                        .serialize_map(::core::option::Option::Some(self.0.len()))?;
+                    for (k, v) in self.0.iter_unique() {
+                        __m.serialize_entry(k, v)?;
+                    }
+                    __m.end()
+                }
+            }
+            __map.serialize_entry("headers", &_WM(&self.headers))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for MetadataView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "Metadata";
+    const FULL_NAME: &'static str = "bench.v1.Metadata";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.Metadata";
+}
 impl<'v> ::buffa::DefaultViewInstance for MetadataView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1700,6 +2051,36 @@ impl<'a> ::buffa::ViewEncode<'a> for LogRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for LogRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !self.records.is_empty() {
+            __map.serialize_entry("records", &*self.records)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for LogRequestView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogRequest";
+    const FULL_NAME: &'static str = "bench.v1.LogRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for LogRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -1842,6 +2223,45 @@ impl<'a> ::buffa::ViewEncode<'a> for LogResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for LogResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.count) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("count", &_W(self.count))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for LogResponseView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogResponse";
+    const FULL_NAME: &'static str = "bench.v1.LogResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for LogResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -2276,6 +2696,86 @@ impl<'a> ::buffa::ViewEncode<'a> for LogRecordView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for LogRecordView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.timestamp_nanos) {
+            struct _W(i64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int64::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("timestampNanos", &_W(self.timestamp_nanos))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.service_name) {
+            __map.serialize_entry("serviceName", self.service_name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.instance_id) {
+            __map.serialize_entry("instanceId", self.instance_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.severity) {
+            __map.serialize_entry("severity", &self.severity)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.message) {
+            __map.serialize_entry("message", self.message)?;
+        }
+        if !self.labels.is_empty() {
+            struct _WM<'__a, '__x>(&'__x ::buffa::MapView<'__x, &'__a str, &'__a str>);
+            impl<'__a> ::serde::Serialize for _WM<'__a, '_> {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    use ::serde::ser::SerializeMap as _;
+                    let mut __m = __s
+                        .serialize_map(::core::option::Option::Some(self.0.len()))?;
+                    for (k, v) in self.0.iter_unique() {
+                        __m.serialize_entry(k, v)?;
+                    }
+                    __m.end()
+                }
+            }
+            __map.serialize_entry("labels", &_WM(&self.labels))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.trace_id) {
+            __map.serialize_entry("traceId", self.trace_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.span_id) {
+            __map.serialize_entry("spanId", self.span_id)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.source.as_option() {
+                __map.serialize_entry("source", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for LogRecordView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogRecord";
+    const FULL_NAME: &'static str = "bench.v1.LogRecord";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogRecord";
+}
 impl<'v> ::buffa::DefaultViewInstance for LogRecordView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -2466,6 +2966,51 @@ impl<'a> ::buffa::ViewEncode<'a> for LogSourceView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for LogSourceView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.file) {
+            __map.serialize_entry("file", self.file)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.line) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("line", &_W(self.line))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.function) {
+            __map.serialize_entry("function", self.function)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for LogSourceView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogSource";
+    const FULL_NAME: &'static str = "bench.v1.LogSource";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogSource";
 }
 impl<'v> ::buffa::DefaultViewInstance for LogSourceView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -2685,6 +3230,81 @@ impl<'a> ::buffa::ViewEncode<'a> for LogIngestResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for LogIngestResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.count) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("count", &_W(self.count))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.total_message_bytes) {
+            struct _W(i64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int64::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("totalMessageBytes", &_W(self.total_message_bytes))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.total_label_bytes) {
+            struct _W(i64);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int64::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("totalLabelBytes", &_W(self.total_label_bytes))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.max_severity) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("maxSeverity", &_W(self.max_severity))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for LogIngestResponseView<'a> {
+    const PACKAGE: &'static str = "bench.v1";
+    const NAME: &'static str = "LogIngestResponse";
+    const FULL_NAME: &'static str = "bench.v1.LogIngestResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/bench.v1.LogIngestResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for LogIngestResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self

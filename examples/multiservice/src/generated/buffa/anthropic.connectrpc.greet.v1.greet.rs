@@ -37,6 +37,12 @@ impl ::buffa::DefaultInstance for GreetRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for GreetRequest {
+    const PACKAGE: &'static str = "anthropic.connectrpc.greet.v1";
+    const NAME: &'static str = "GreetRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.greet.v1.GreetRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.greet.v1.GreetRequest";
+}
 impl ::buffa::Message for GreetRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -168,6 +174,12 @@ impl ::buffa::DefaultInstance for GreetResponse {
         static VALUE: ::buffa::__private::OnceBox<GreetResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for GreetResponse {
+    const PACKAGE: &'static str = "anthropic.connectrpc.greet.v1";
+    const NAME: &'static str = "GreetResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.greet.v1.GreetResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.greet.v1.GreetResponse";
 }
 impl ::buffa::Message for GreetResponse {
     /// Returns the total encoded size in bytes.

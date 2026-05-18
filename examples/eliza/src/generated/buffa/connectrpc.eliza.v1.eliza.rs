@@ -35,6 +35,12 @@ impl ::buffa::DefaultInstance for SayRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for SayRequest {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "SayRequest";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.SayRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.SayRequest";
+}
 impl ::buffa::Message for SayRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -164,6 +170,12 @@ impl ::buffa::DefaultInstance for SayResponse {
         static VALUE: ::buffa::__private::OnceBox<SayResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for SayResponse {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "SayResponse";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.SayResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.SayResponse";
 }
 impl ::buffa::Message for SayResponse {
     /// Returns the total encoded size in bytes.
@@ -296,6 +308,12 @@ impl ::buffa::DefaultInstance for ConverseRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for ConverseRequest {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "ConverseRequest";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.ConverseRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.ConverseRequest";
+}
 impl ::buffa::Message for ConverseRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -427,6 +445,12 @@ impl ::buffa::DefaultInstance for ConverseResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for ConverseResponse {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "ConverseResponse";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.ConverseResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.ConverseResponse";
+}
 impl ::buffa::Message for ConverseResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -557,6 +581,12 @@ impl ::buffa::DefaultInstance for IntroduceRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for IntroduceRequest {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "IntroduceRequest";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.IntroduceRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.IntroduceRequest";
+}
 impl ::buffa::Message for IntroduceRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -686,6 +716,12 @@ impl ::buffa::DefaultInstance for IntroduceResponse {
         static VALUE: ::buffa::__private::OnceBox<IntroduceResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for IntroduceResponse {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "IntroduceResponse";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.IntroduceResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.IntroduceResponse";
 }
 impl ::buffa::Message for IntroduceResponse {
     /// Returns the total encoded size in bytes.

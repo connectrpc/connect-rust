@@ -82,6 +82,12 @@ impl ::buffa::DefaultInstance for UnaryResponseDefinition {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for UnaryResponseDefinition {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "UnaryResponseDefinition";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.UnaryResponseDefinition";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.UnaryResponseDefinition";
+}
 impl ::buffa::Message for UnaryResponseDefinition {
     /// Returns the total encoded size in bytes.
     ///
@@ -627,6 +633,12 @@ impl ::buffa::DefaultInstance for StreamResponseDefinition {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for StreamResponseDefinition {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "StreamResponseDefinition";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.StreamResponseDefinition";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.StreamResponseDefinition";
+}
 impl ::buffa::Message for StreamResponseDefinition {
     /// Returns the total encoded size in bytes.
     ///
@@ -916,6 +928,12 @@ impl ::buffa::DefaultInstance for UnaryRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for UnaryRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "UnaryRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.UnaryRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.UnaryRequest";
+}
 impl ::buffa::Message for UnaryRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -1078,6 +1096,12 @@ impl ::buffa::DefaultInstance for UnaryResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for UnaryResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "UnaryResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.UnaryResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.UnaryResponse";
+}
 impl ::buffa::Message for UnaryResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -1231,6 +1255,12 @@ impl ::buffa::DefaultInstance for IdempotentUnaryRequest {
         static VALUE: ::buffa::__private::OnceBox<IdempotentUnaryRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for IdempotentUnaryRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "IdempotentUnaryRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.IdempotentUnaryRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.IdempotentUnaryRequest";
 }
 impl ::buffa::Message for IdempotentUnaryRequest {
     /// Returns the total encoded size in bytes.
@@ -1396,6 +1426,12 @@ impl ::buffa::DefaultInstance for IdempotentUnaryResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for IdempotentUnaryResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "IdempotentUnaryResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.IdempotentUnaryResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.IdempotentUnaryResponse";
+}
 impl ::buffa::Message for IdempotentUnaryResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -1549,6 +1585,12 @@ impl ::buffa::DefaultInstance for ServerStreamRequest {
         static VALUE: ::buffa::__private::OnceBox<ServerStreamRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ServerStreamRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ServerStreamRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ServerStreamRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ServerStreamRequest";
 }
 impl ::buffa::Message for ServerStreamRequest {
     /// Returns the total encoded size in bytes.
@@ -1712,6 +1754,12 @@ impl ::buffa::DefaultInstance for ServerStreamResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for ServerStreamResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ServerStreamResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ServerStreamResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ServerStreamResponse";
+}
 impl ::buffa::Message for ServerStreamResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -1868,6 +1916,12 @@ impl ::buffa::DefaultInstance for ClientStreamRequest {
         static VALUE: ::buffa::__private::OnceBox<ClientStreamRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ClientStreamRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientStreamRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientStreamRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientStreamRequest";
 }
 impl ::buffa::Message for ClientStreamRequest {
     /// Returns the total encoded size in bytes.
@@ -2030,6 +2084,12 @@ impl ::buffa::DefaultInstance for ClientStreamResponse {
         static VALUE: ::buffa::__private::OnceBox<ClientStreamResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ClientStreamResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ClientStreamResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ClientStreamResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ClientStreamResponse";
 }
 impl ::buffa::Message for ClientStreamResponse {
     /// Returns the total encoded size in bytes.
@@ -2209,6 +2269,12 @@ impl ::buffa::DefaultInstance for BidiStreamRequest {
         static VALUE: ::buffa::__private::OnceBox<BidiStreamRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for BidiStreamRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "BidiStreamRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.BidiStreamRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.BidiStreamRequest";
 }
 impl ::buffa::Message for BidiStreamRequest {
     /// Returns the total encoded size in bytes.
@@ -2391,6 +2457,12 @@ impl ::buffa::DefaultInstance for BidiStreamResponse {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for BidiStreamResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "BidiStreamResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.BidiStreamResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.BidiStreamResponse";
+}
 impl ::buffa::Message for BidiStreamResponse {
     /// Returns the total encoded size in bytes.
     ///
@@ -2523,6 +2595,12 @@ impl ::buffa::DefaultInstance for UnimplementedRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for UnimplementedRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "UnimplementedRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.UnimplementedRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.UnimplementedRequest";
+}
 impl ::buffa::Message for UnimplementedRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -2622,6 +2700,12 @@ impl ::buffa::DefaultInstance for UnimplementedResponse {
         static VALUE: ::buffa::__private::OnceBox<UnimplementedResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for UnimplementedResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "UnimplementedResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.UnimplementedResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.UnimplementedResponse";
 }
 impl ::buffa::Message for UnimplementedResponse {
     /// Returns the total encoded size in bytes.
@@ -2744,6 +2828,12 @@ impl ::buffa::DefaultInstance for ConformancePayload {
         static VALUE: ::buffa::__private::OnceBox<ConformancePayload> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ConformancePayload {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ConformancePayload";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ConformancePayload";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload";
 }
 impl ::buffa::Message for ConformancePayload {
     /// Returns the total encoded size in bytes.
@@ -2953,11 +3043,26 @@ pub mod conformance_payload {
         /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
         pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload.RequestInfo";
     }
+    impl RequestInfo {
+        #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+        #[inline]
+        ///Sets [`Self::timeout_ms`] to `Some(value)`, consuming and returning `self`.
+        pub fn with_timeout_ms(mut self, value: i64) -> Self {
+            self.timeout_ms = Some(value);
+            self
+        }
+    }
     impl ::buffa::DefaultInstance for RequestInfo {
         fn default_instance() -> &'static Self {
             static VALUE: ::buffa::__private::OnceBox<RequestInfo> = ::buffa::__private::OnceBox::new();
             VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
         }
+    }
+    impl ::buffa::MessageName for RequestInfo {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "ConformancePayload.RequestInfo";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.ConformancePayload.RequestInfo";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload.RequestInfo";
     }
     impl ::buffa::Message for RequestInfo {
         /// Returns the total encoded size in bytes.
@@ -3184,6 +3289,12 @@ pub mod conformance_payload {
             VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
         }
     }
+    impl ::buffa::MessageName for ConnectGetInfo {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "ConformancePayload.ConnectGetInfo";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.ConformancePayload.ConnectGetInfo";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload.ConnectGetInfo";
+    }
     impl ::buffa::Message for ConnectGetInfo {
         /// Returns the total encoded size in bytes.
         ///
@@ -3346,11 +3457,29 @@ impl Error {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.Error";
 }
+impl Error {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::message`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_message(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.message = Some(value.into());
+        self
+    }
+}
 impl ::buffa::DefaultInstance for Error {
     fn default_instance() -> &'static Self {
         static VALUE: ::buffa::__private::OnceBox<Error> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for Error {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "Error";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.Error";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.Error";
 }
 impl ::buffa::Message for Error {
     /// Returns the total encoded size in bytes.
@@ -3555,6 +3684,12 @@ impl ::buffa::DefaultInstance for Header {
         static VALUE: ::buffa::__private::OnceBox<Header> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for Header {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "Header";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.Header";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.Header";
 }
 impl ::buffa::Message for Header {
     /// Returns the total encoded size in bytes.
@@ -3762,6 +3897,12 @@ impl ::buffa::DefaultInstance for RawHTTPRequest {
         static VALUE: ::buffa::__private::OnceBox<RawHTTPRequest> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for RawHTTPRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "RawHTTPRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.RawHTTPRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.RawHTTPRequest";
 }
 impl ::buffa::Message for RawHTTPRequest {
     /// Returns the total encoded size in bytes.
@@ -4334,6 +4475,12 @@ pub mod raw_http_request {
             VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
         }
     }
+    impl ::buffa::MessageName for EncodedQueryParam {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "RawHTTPRequest.EncodedQueryParam";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.RawHTTPRequest.EncodedQueryParam";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.RawHTTPRequest.EncodedQueryParam";
+    }
     impl ::buffa::Message for EncodedQueryParam {
         /// Returns the total encoded size in bytes.
         ///
@@ -4529,6 +4676,12 @@ impl ::buffa::DefaultInstance for MessageContents {
         static VALUE: ::buffa::__private::OnceBox<MessageContents> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for MessageContents {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "MessageContents";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.MessageContents";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.MessageContents";
 }
 impl ::buffa::Message for MessageContents {
     /// Returns the total encoded size in bytes.
@@ -4920,6 +5073,12 @@ impl ::buffa::DefaultInstance for StreamContents {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for StreamContents {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "StreamContents";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.StreamContents";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.StreamContents";
+}
 impl ::buffa::Message for StreamContents {
     /// Returns the total encoded size in bytes.
     ///
@@ -5075,11 +5234,26 @@ pub mod stream_contents {
         /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
         pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.StreamContents.StreamItem";
     }
+    impl StreamItem {
+        #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+        #[inline]
+        ///Sets [`Self::length`] to `Some(value)`, consuming and returning `self`.
+        pub fn with_length(mut self, value: u32) -> Self {
+            self.length = Some(value);
+            self
+        }
+    }
     impl ::buffa::DefaultInstance for StreamItem {
         fn default_instance() -> &'static Self {
             static VALUE: ::buffa::__private::OnceBox<StreamItem> = ::buffa::__private::OnceBox::new();
             VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
         }
+    }
+    impl ::buffa::MessageName for StreamItem {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "StreamContents.StreamItem";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.StreamContents.StreamItem";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.StreamContents.StreamItem";
     }
     impl ::buffa::Message for StreamItem {
         /// Returns the total encoded size in bytes.
@@ -5293,6 +5467,12 @@ impl ::buffa::DefaultInstance for RawHTTPResponse {
         static VALUE: ::buffa::__private::OnceBox<RawHTTPResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for RawHTTPResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "RawHTTPResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.RawHTTPResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.RawHTTPResponse";
 }
 impl ::buffa::Message for RawHTTPResponse {
     /// Returns the total encoded size in bytes.

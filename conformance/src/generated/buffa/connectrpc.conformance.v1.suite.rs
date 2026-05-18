@@ -182,6 +182,12 @@ impl ::buffa::DefaultInstance for TestSuite {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for TestSuite {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "TestSuite";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.TestSuite";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestSuite";
+}
 impl ::buffa::Message for TestSuite {
     /// Returns the total encoded size in bytes.
     ///
@@ -1099,6 +1105,12 @@ impl ::buffa::DefaultInstance for TestCase {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for TestCase {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "TestCase";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.TestCase";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestCase";
+}
 impl ::buffa::Message for TestCase {
     /// Returns the total encoded size in bytes.
     ///
@@ -1368,11 +1380,26 @@ pub mod test_case {
         /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
         pub const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestCase.ExpandedSize";
     }
+    impl ExpandedSize {
+        #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+        #[inline]
+        ///Sets [`Self::size_relative_to_limit`] to `Some(value)`, consuming and returning `self`.
+        pub fn with_size_relative_to_limit(mut self, value: i32) -> Self {
+            self.size_relative_to_limit = Some(value);
+            self
+        }
+    }
     impl ::buffa::DefaultInstance for ExpandedSize {
         fn default_instance() -> &'static Self {
             static VALUE: ::buffa::__private::OnceBox<ExpandedSize> = ::buffa::__private::OnceBox::new();
             VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
         }
+    }
+    impl ::buffa::MessageName for ExpandedSize {
+        const PACKAGE: &'static str = "connectrpc.conformance.v1";
+        const NAME: &'static str = "TestCase.ExpandedSize";
+        const FULL_NAME: &'static str = "connectrpc.conformance.v1.TestCase.ExpandedSize";
+        const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.TestCase.ExpandedSize";
     }
     impl ::buffa::Message for ExpandedSize {
         /// Returns the total encoded size in bytes.

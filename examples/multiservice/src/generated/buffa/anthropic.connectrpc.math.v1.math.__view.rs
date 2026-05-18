@@ -152,6 +152,57 @@ impl<'a> ::buffa::ViewEncode<'a> for AddRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for AddRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.a) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("a", &_W(self.a))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.b) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("b", &_W(self.b))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for AddRequestView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.math.v1";
+    const NAME: &'static str = "AddRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.math.v1.AddRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.math.v1.AddRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for AddRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -297,6 +348,45 @@ impl<'a> ::buffa::ViewEncode<'a> for AddResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for AddResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_i32(&self.result) {
+            struct _W(i32);
+            impl ::serde::Serialize for _W {
+                fn serialize<__S: ::serde::Serializer>(
+                    &self,
+                    __s: __S,
+                ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                    ::buffa::json_helpers::int32::serialize(&self.0, __s)
+                }
+            }
+            __map.serialize_entry("result", &_W(self.result))?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for AddResponseView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.math.v1";
+    const NAME: &'static str = "AddResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.math.v1.AddResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.math.v1.AddResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for AddResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self

@@ -46,6 +46,12 @@ impl ::buffa::DefaultInstance for AddRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for AddRequest {
+    const PACKAGE: &'static str = "anthropic.connectrpc.math.v1";
+    const NAME: &'static str = "AddRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.math.v1.AddRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.math.v1.AddRequest";
+}
 impl ::buffa::Message for AddRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -193,6 +199,12 @@ impl ::buffa::DefaultInstance for AddResponse {
         static VALUE: ::buffa::__private::OnceBox<AddResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for AddResponse {
+    const PACKAGE: &'static str = "anthropic.connectrpc.math.v1";
+    const NAME: &'static str = "AddResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.math.v1.AddResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.math.v1.AddResponse";
 }
 impl ::buffa::Message for AddResponse {
     /// Returns the total encoded size in bytes.

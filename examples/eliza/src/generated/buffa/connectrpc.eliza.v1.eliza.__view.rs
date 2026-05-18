@@ -130,6 +130,36 @@ impl<'a> ::buffa::ViewEncode<'a> for SayRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for SayRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.sentence) {
+            __map.serialize_entry("sentence", self.sentence)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for SayRequestView<'a> {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "SayRequest";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.SayRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.SayRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for SayRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -276,6 +306,36 @@ impl<'a> ::buffa::ViewEncode<'a> for SayResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for SayResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.sentence) {
+            __map.serialize_entry("sentence", self.sentence)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for SayResponseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "SayResponse";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.SayResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.SayResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for SayResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
@@ -425,6 +485,36 @@ impl<'a> ::buffa::ViewEncode<'a> for ConverseRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ConverseRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.sentence) {
+            __map.serialize_entry("sentence", self.sentence)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ConverseRequestView<'a> {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "ConverseRequest";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.ConverseRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.ConverseRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for ConverseRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -573,6 +663,36 @@ impl<'a> ::buffa::ViewEncode<'a> for ConverseResponseView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ConverseResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.sentence) {
+            __map.serialize_entry("sentence", self.sentence)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ConverseResponseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "ConverseResponse";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.ConverseResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.ConverseResponse";
+}
 impl<'v> ::buffa::DefaultViewInstance for ConverseResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -720,6 +840,36 @@ impl<'a> ::buffa::ViewEncode<'a> for IntroduceRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for IntroduceRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for IntroduceRequestView<'a> {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "IntroduceRequest";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.IntroduceRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.IntroduceRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for IntroduceRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -866,6 +1016,36 @@ impl<'a> ::buffa::ViewEncode<'a> for IntroduceResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for IntroduceResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.sentence) {
+            __map.serialize_entry("sentence", self.sentence)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for IntroduceResponseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.eliza.v1";
+    const NAME: &'static str = "IntroduceResponse";
+    const FULL_NAME: &'static str = "connectrpc.eliza.v1.IntroduceResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.eliza.v1.IntroduceResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for IntroduceResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self

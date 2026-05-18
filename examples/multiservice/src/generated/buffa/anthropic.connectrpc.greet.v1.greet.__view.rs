@@ -132,6 +132,36 @@ impl<'a> ::buffa::ViewEncode<'a> for GreetRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for GreetRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for GreetRequestView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.greet.v1";
+    const NAME: &'static str = "GreetRequest";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.greet.v1.GreetRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.greet.v1.GreetRequest";
+}
 impl<'v> ::buffa::DefaultViewInstance for GreetRequestView<'v> {
     fn default_view_instance<'a>() -> &'a Self
     where
@@ -280,6 +310,36 @@ impl<'a> ::buffa::ViewEncode<'a> for GreetResponseView<'a> {
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for GreetResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.message) {
+            __map.serialize_entry("message", self.message)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for GreetResponseView<'a> {
+    const PACKAGE: &'static str = "anthropic.connectrpc.greet.v1";
+    const NAME: &'static str = "GreetResponse";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.greet.v1.GreetResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.greet.v1.GreetResponse";
 }
 impl<'v> ::buffa::DefaultViewInstance for GreetResponseView<'v> {
     fn default_view_instance<'a>() -> &'a Self

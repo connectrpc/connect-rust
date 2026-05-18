@@ -140,6 +140,12 @@ impl ::buffa::DefaultInstance for ServerCompatRequest {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for ServerCompatRequest {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ServerCompatRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ServerCompatRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ServerCompatRequest";
+}
 impl ::buffa::Message for ServerCompatRequest {
     /// Returns the total encoded size in bytes.
     ///
@@ -427,6 +433,12 @@ impl ::buffa::DefaultInstance for ServerCompatResponse {
         static VALUE: ::buffa::__private::OnceBox<ServerCompatResponse> = ::buffa::__private::OnceBox::new();
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
+}
+impl ::buffa::MessageName for ServerCompatResponse {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "ServerCompatResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.ServerCompatResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.ServerCompatResponse";
 }
 impl ::buffa::Message for ServerCompatResponse {
     /// Returns the total encoded size in bytes.

@@ -118,8 +118,8 @@ impl PeerInfo {
 /// where a client opens a TCP connection and stalls the handshake indefinitely,
 /// holding a task and file descriptor per connection.
 ///
-/// Override via [`Server::tls_handshake_timeout`] or
-/// [`BoundServer::tls_handshake_timeout`].
+/// Override via [`Server::with_tls_handshake_timeout`] or
+/// [`BoundServer::with_tls_handshake_timeout`].
 #[cfg(feature = "server-tls")]
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -192,8 +192,22 @@ impl Server {
     /// this duration is disconnected.
     #[cfg(feature = "server-tls")]
     #[must_use]
-    pub fn tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// Enable or disable HTTP/1.1 keep-alive (default: enabled).
+    ///
+    /// When disabled, the server sends `Connection: close` and handles
+    /// only one request per TCP connection. This avoids stale-connection
+    /// races where the server closes an idle connection at the same time
+    /// the client sends a new request on it.
+    ///
+    /// HTTP/2 multiplexing is unaffected.
+    #[must_use]
+    pub fn with_http1_keep_alive(mut self, enabled: bool) -> Self {
+        self.http1_keep_alive = enabled;
         self
     }
 
@@ -208,6 +222,41 @@ impl Server {
     #[must_use]
     pub fn with_deadline_policy(mut self, policy: crate::DeadlinePolicy) -> Self {
         self.service = self.service.with_deadline_policy(policy);
+        self
+    }
+
+    /// Configure request limits on the underlying service.
+    ///
+    /// Delegates to [`ConnectRpcService::with_limits`]. See
+    /// [`Limits`](crate::Limits) for available options. Replaces any
+    /// previously configured limits.
+    #[must_use]
+    pub fn with_limits(mut self, limits: crate::Limits) -> Self {
+        self.service = self.service.with_limits(limits);
+        self
+    }
+
+    /// Configure the compression registry on the underlying service.
+    ///
+    /// Delegates to [`ConnectRpcService::with_compression`]. The
+    /// [`CompressionRegistry`](crate::CompressionRegistry) determines which
+    /// compression algorithms are available for request decompression and
+    /// response compression. Replaces any previously configured registry.
+    #[must_use]
+    pub fn with_compression(mut self, registry: crate::CompressionRegistry) -> Self {
+        self.service = self.service.with_compression(registry);
+        self
+    }
+
+    /// Configure the compression policy on the underlying service.
+    ///
+    /// Delegates to [`ConnectRpcService::with_compression_policy`]. The
+    /// [`CompressionPolicy`](crate::CompressionPolicy) controls when
+    /// compression is applied (e.g. minimum message size). Replaces any
+    /// previously configured policy.
+    #[must_use]
+    pub fn with_compression_policy(mut self, policy: crate::CompressionPolicy) -> Self {
+        self.service = self.service.with_compression_policy(policy);
         self
     }
 
@@ -323,12 +372,12 @@ impl BoundServer {
     /// Defaults to [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] (10 seconds).
     #[cfg(feature = "server-tls")]
     #[must_use]
-    pub fn tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tls_handshake_timeout = timeout;
         self
     }
 
-    /// Disable HTTP/1.1 keep-alive.
+    /// Enable or disable HTTP/1.1 keep-alive.
     ///
     /// When disabled, the server sends `Connection: close` and handles
     /// only one request per TCP connection. This avoids stale-connection
@@ -337,7 +386,7 @@ impl BoundServer {
     ///
     /// HTTP/2 multiplexing is unaffected.
     #[must_use]
-    pub fn http1_keep_alive(mut self, enabled: bool) -> Self {
+    pub fn with_http1_keep_alive(mut self, enabled: bool) -> Self {
         self.http1_keep_alive = enabled;
         self
     }
@@ -745,6 +794,32 @@ mod tests {
     fn test_server_creation() {
         let router = Router::new();
         let _server = Server::new(router);
+    }
+
+    /// `Server` proxies the dispatch-config builders so users don't have to
+    /// drop down to `Server::from_service(ConnectRpcService::new(...).with_*())`.
+    /// Exercises the chain and verifies the readable knobs (`limits()`, the
+    /// `http1_keep_alive` field) round-trip; the compression knobs have no
+    /// public read path so the test only confirms the builders compile and
+    /// chain.
+    #[test]
+    fn test_server_dispatch_config_proxies() {
+        use crate::service::Limits;
+        use crate::{CompressionPolicy, CompressionRegistry};
+
+        let limits = Limits {
+            max_request_body_size: 1024,
+            max_message_size: 512,
+        };
+        let server = Server::new(Router::new())
+            .with_limits(limits.clone())
+            .with_compression(CompressionRegistry::default())
+            .with_compression_policy(CompressionPolicy::default().min_size(8192))
+            .with_http1_keep_alive(false);
+
+        assert_eq!(server.service.limits().max_request_body_size, 1024);
+        assert_eq!(server.service.limits().max_message_size, 512);
+        assert!(!server.http1_keep_alive);
     }
 
     #[tokio::test]

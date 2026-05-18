@@ -97,6 +97,12 @@ impl ::buffa::DefaultInstance for Record {
         VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
     }
 }
+impl ::buffa::MessageName for Record {
+    const PACKAGE: &'static str = "anthropic.connectrpc.filter.v1";
+    const NAME: &'static str = "Record";
+    const FULL_NAME: &'static str = "anthropic.connectrpc.filter.v1.Record";
+    const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.filter.v1.Record";
+}
 impl ::buffa::Message for Record {
     /// Returns the total encoded size in bytes.
     ///
