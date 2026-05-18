@@ -453,14 +453,19 @@ mod tests {
             MethodDescriptor::unary(true)
         );
 
-        // `with_spec` attaches the spec and preserves the rest. The whole
-        // chain is `const`-evaluable so codegen output lands in `.rodata`.
+        // `with_spec` attaches the spec and preserves the rest.
         const SPEC: Spec = Spec::server("/pkg.Svc/M", StreamType::ServerStream);
-        const DESC: MethodDescriptor = MethodDescriptor::from_kind(MethodKind::ServerStreaming)
+        let desc = MethodDescriptor::from_kind(MethodKind::ServerStreaming)
             .with_idempotent(false)
             .with_spec(SPEC);
-        assert_eq!(DESC.kind, MethodKind::ServerStreaming);
-        assert!(!DESC.idempotent);
-        assert_eq!(DESC.spec, Some(SPEC));
+        assert_eq!(desc.kind, MethodKind::ServerStreaming);
+        assert!(!desc.idempotent);
+        assert_eq!(desc.spec, Some(SPEC));
+
+        // The whole builder chain is `const`-evaluable so codegen output
+        // lands in `.rodata`.
+        const _: MethodDescriptor = MethodDescriptor::from_kind(MethodKind::ServerStreaming)
+            .with_idempotent(false)
+            .with_spec(SPEC);
     }
 }
