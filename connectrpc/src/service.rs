@@ -1207,12 +1207,29 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// Interceptors apply to **unary** calls only in this release.
     /// Streaming calls bypass the chain.
+    ///
+    /// To share one interceptor instance across multiple services, use
+    /// [`with_interceptor_arc`](Self::with_interceptor_arc).
     #[must_use]
-    pub fn with_interceptor(mut self, interceptor: impl Interceptor) -> Self {
+    pub fn with_interceptor(self, interceptor: impl Interceptor) -> Self {
+        self.with_interceptor_arc(Arc::new(interceptor))
+    }
+
+    /// Append an already-`Arc`'d unary [`Interceptor`] to the chain.
+    ///
+    /// Same ordering and semantics as
+    /// [`with_interceptor`](Self::with_interceptor). Use this when one
+    /// interceptor instance is shared across multiple `ConnectRpcService`s
+    /// — e.g. an auth interceptor whose state (a connection pool, a token
+    /// cache) is process-wide and should not be duplicated per service.
+    /// Most callers want [`with_interceptor`](Self::with_interceptor),
+    /// which takes ownership and wraps for you.
+    #[must_use]
+    pub fn with_interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         // The Arc<[..]> is shared across cloned service handles; rebuild
         // it on registration. Registration is a cold path.
         let mut v: Vec<Arc<dyn Interceptor>> = self.interceptors.to_vec();
-        v.push(Arc::new(interceptor));
+        v.push(interceptor);
         self.interceptors = Arc::from(v);
         self
     }
@@ -3805,6 +3822,40 @@ mod tests {
             *handler_ran.lock().unwrap(),
             "handler must run after the interceptor passes through"
         );
+    }
+
+    /// `with_interceptor_arc` shares one interceptor across services.
+    /// `with_interceptor` would `Arc::new` a fresh allocation per call,
+    /// which is correct for unique state but wasteful (and surprising)
+    /// when the interceptor carries process-wide shared state — pin the
+    /// distinction with a strong-count check.
+    #[test]
+    fn with_interceptor_arc_shares_one_instance() {
+        use crate::interceptor::Interceptor;
+
+        struct Noop;
+        #[async_trait::async_trait]
+        impl Interceptor for Noop {}
+
+        let shared: Arc<dyn Interceptor> = Arc::new(Noop);
+        assert_eq!(Arc::strong_count(&shared), 1);
+
+        let svc_a = ConnectRpcService::new(Router::new()).with_interceptor_arc(Arc::clone(&shared));
+        let svc_b = ConnectRpcService::new(Router::new()).with_interceptor_arc(Arc::clone(&shared));
+
+        // The caller's handle plus one per service.
+        assert_eq!(
+            Arc::strong_count(&shared),
+            3,
+            "with_interceptor_arc must store the supplied Arc, not a fresh allocation"
+        );
+        // Cloning a service is one Arc<[..]> bump, not a per-interceptor bump.
+        let _svc_a2 = svc_a.clone();
+        assert_eq!(Arc::strong_count(&shared), 3);
+        drop(svc_a);
+        drop(svc_b);
+        drop(_svc_a2);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 
     // ========================================================================
