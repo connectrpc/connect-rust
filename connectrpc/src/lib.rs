@@ -286,11 +286,16 @@ pub use interceptor::async_trait;
 pub use payload::AnyMessage;
 pub use payload::Payload;
 
-// Unary RPC interceptors
+// RPC interceptors (unary and streaming)
 pub use interceptor::Interceptor;
 pub use interceptor::Next;
+pub use interceptor::NextStream;
+pub use interceptor::PayloadStream;
+pub use interceptor::StreamRequest;
+pub use interceptor::StreamResponse;
 pub use interceptor::UnaryRequest;
 pub use interceptor::UnaryResponse;
+pub use interceptor::streaming_interceptor;
 pub use interceptor::unary_interceptor;
 
 // ============================================================================

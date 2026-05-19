@@ -61,7 +61,10 @@ use crate::dispatcher::Dispatcher;
 use crate::envelope::Envelope;
 use crate::error::ConnectError;
 use crate::handler::BoxStream;
-use crate::interceptor::{Interceptor, call_unary_intercepted};
+use crate::interceptor::{
+    Interceptor, call_bidi_streaming_intercepted, call_client_streaming_intercepted,
+    call_server_streaming_intercepted, call_unary_intercepted,
+};
 use crate::protocol::Protocol;
 use crate::response::{EncodedResponse, RequestContext};
 use crate::router::MethodKind;
@@ -1205,8 +1208,10 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     /// to a build without this call — there is no per-request allocation
     /// or branch beyond a single `is_empty` check.
     ///
-    /// Interceptors apply to **unary** calls only in this release.
-    /// Streaming calls bypass the chain.
+    /// Interceptors run for unary and streaming calls alike. The unary
+    /// surface is [`Interceptor::intercept_unary`]; the streaming surface
+    /// (covering server-streaming, client-streaming, and bidi) is
+    /// [`Interceptor::intercept_streaming`].
     ///
     /// To share one interceptor instance across multiple services, use
     /// [`with_interceptor_arc`](Self::with_interceptor_arc).
@@ -2085,6 +2090,7 @@ where
             compression,
             compression_policy,
             deadline_policy,
+            interceptors,
         )
         .await;
     }
@@ -2103,6 +2109,7 @@ where
             limits,
             compression,
             compression_policy,
+            interceptors,
         )
         .await;
     }
@@ -2209,7 +2216,14 @@ where
     // For gRPC unary handlers, we wrap the single response in a one-item stream.
     let resp = match dispatch_kind {
         StreamingDispatchKind::ServerStreaming => {
-            let fut = dispatcher.call_server_streaming(&path, ctx, request_body, codec_format);
+            let fut = call_server_streaming_intercepted(
+                dispatcher,
+                interceptors,
+                &path,
+                ctx,
+                request_body,
+                codec_format,
+            );
             let handler_result = if let Some(timeout) = metadata.timeout {
                 match tokio::time::timeout(timeout, fut).await {
                     Ok(result) => result,
@@ -2334,6 +2348,7 @@ async fn handle_client_streaming_request<D, B>(
     limits: Limits,
     compression: Arc<CompressionRegistry>,
     compression_policy: &CompressionPolicy,
+    interceptors: &[Arc<dyn Interceptor>],
 ) -> Response<StreamingResponseBody>
 where
     D: Dispatcher,
@@ -2364,7 +2379,14 @@ where
     let handler_result = if let Some(timeout) = metadata.timeout {
         match tokio::time::timeout(
             timeout,
-            dispatcher.call_client_streaming(path, ctx, request_stream, codec_format),
+            call_client_streaming_intercepted(
+                dispatcher,
+                interceptors,
+                path,
+                ctx,
+                request_stream,
+                codec_format,
+            ),
         )
         .await
         {
@@ -2376,9 +2398,15 @@ where
             }
         }
     } else {
-        dispatcher
-            .call_client_streaming(path, ctx, request_stream, codec_format)
-            .await
+        call_client_streaming_intercepted(
+            dispatcher,
+            interceptors,
+            path,
+            ctx,
+            request_stream,
+            codec_format,
+        )
+        .await
     };
 
     let resp = match handler_result {
@@ -2586,6 +2614,7 @@ async fn handle_bidi_streaming_request<D, B>(
     compression: Arc<CompressionRegistry>,
     compression_policy: &CompressionPolicy,
     deadline_policy: &DeadlinePolicy,
+    interceptors: &[Arc<dyn Interceptor>],
 ) -> Response<StreamingResponseBody>
 where
     D: Dispatcher,
@@ -2614,7 +2643,14 @@ where
     let handler_result = if let Some(timeout) = metadata.timeout {
         match tokio::time::timeout(
             timeout,
-            dispatcher.call_bidi_streaming(path, ctx, request_stream, codec_format),
+            call_bidi_streaming_intercepted(
+                dispatcher,
+                interceptors,
+                path,
+                ctx,
+                request_stream,
+                codec_format,
+            ),
         )
         .await
         {
@@ -2626,9 +2662,15 @@ where
             }
         }
     } else {
-        dispatcher
-            .call_bidi_streaming(path, ctx, request_stream, codec_format)
-            .await
+        call_bidi_streaming_intercepted(
+            dispatcher,
+            interceptors,
+            path,
+            ctx,
+            request_stream,
+            codec_format,
+        )
+        .await
     };
 
     let resp = match handler_result {
