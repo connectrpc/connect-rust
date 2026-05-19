@@ -71,12 +71,23 @@ pub use async_trait::async_trait;
 ///         req: UnaryRequest,
 ///         next: Next<'_>,
 ///     ) -> Result<UnaryResponse, ConnectError> {
-///         // `ctx.spec` is `None` for dynamic `Router` dispatch — only
-///         // generated `FooServiceServer<T>` dispatchers supply one.
-///         let proc = req.ctx.spec().map(|s| s.procedure).unwrap_or("<dynamic>");
-///         tracing::info!(%proc, "rpc start");
+///         // `ctx.path()` is the requested procedure path. The dispatch
+///         // path always sets it before an interceptor runs, including
+///         // for dynamic `Router` routes (which never carry a `Spec`) —
+///         // the `expect` documents that invariant rather than hiding a
+///         // default. Use `ctx.spec()` for the *resolved* method's static
+///         // metadata (`stream_type`, `idempotency`), not the name.
+///         //
+///         // `to_owned()` because `path()` borrows `req.ctx`, and `req`
+///         // is moved into `next.run` below.
+///         let path = req
+///             .ctx
+///             .path()
+///             .expect("dispatch sets path before interceptors run")
+///             .to_owned();
+///         tracing::info!(%path, "rpc start");
 ///         let resp = next.run(req).await;
-///         tracing::info!(%proc, ok = resp.is_ok(), "rpc end");
+///         tracing::info!(%path, ok = resp.is_ok(), "rpc end");
 ///         resp
 ///     }
 /// }
@@ -476,7 +487,12 @@ mod tests {
                 _req: UnaryRequest,
                 _next: Next<'_>,
             ) -> Result<UnaryResponse, ConnectError> {
-                Err(ConnectError::permission_denied("nope"))
+                // Auth interceptors attach diagnostic headers (e.g. an
+                // operator-facing "which policy denied" hint) to the deny
+                // error. Those must reach the wire response.
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-deny-policy", "p1".parse().unwrap());
+                Err(ConnectError::permission_denied("nope").with_headers(headers))
             }
         }
         let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(Reject), Arc::new(Tagger("never"))];
@@ -487,6 +503,91 @@ mod tests {
         let err = Next::new(&chain, &terminal).run(req()).await.unwrap_err();
         assert_eq!(err.code, crate::ErrorCode::PermissionDenied);
         assert!(!*terminal.ran.lock().unwrap(), "terminal must not run");
+        // The chain must not strip response headers off a short-circuit
+        // error: they reach the dispatch path and the protocol-aware error
+        // renderers (`error_response`, `grpc_error_response`,
+        // `ConnectError::into_http_response`) walk `response_headers()`
+        // when building the wire response.
+        assert_eq!(
+            err.response_headers().get("x-deny-policy").unwrap(),
+            "p1",
+            "diagnostic headers on a short-circuit error must survive the chain"
+        );
+    }
+
+    /// `call_unary_intercepted` propagates a short-circuit error verbatim,
+    /// including response headers, so the caller's error renderer can put
+    /// them on the wire. Pinned because an auth interceptor relies on it.
+    #[tokio::test]
+    async fn call_unary_intercepted_propagates_error_headers() {
+        struct Reject;
+        #[async_trait::async_trait]
+        impl Interceptor for Reject {
+            async fn intercept_unary(
+                &self,
+                _req: UnaryRequest,
+                _next: Next<'_>,
+            ) -> Result<UnaryResponse, ConnectError> {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-deny-policy", "p1".parse().unwrap());
+                Err(ConnectError::permission_denied("nope").with_headers(headers))
+            }
+        }
+        struct PanickyDispatcher;
+        impl crate::Dispatcher for PanickyDispatcher {
+            fn lookup(&self, _: &str) -> Option<crate::dispatcher::MethodDescriptor> {
+                None
+            }
+            fn call_unary(
+                &self,
+                _: &str,
+                _: RequestContext,
+                _: Bytes,
+                _: CodecFormat,
+            ) -> crate::dispatcher::UnaryResult {
+                unreachable!("dispatcher must not be reached when an interceptor short-circuits")
+            }
+            fn call_server_streaming(
+                &self,
+                _: &str,
+                _: RequestContext,
+                _: Bytes,
+                _: CodecFormat,
+            ) -> crate::dispatcher::StreamingResult {
+                unreachable!()
+            }
+            fn call_client_streaming(
+                &self,
+                _: &str,
+                _: RequestContext,
+                _: crate::dispatcher::RequestStream,
+                _: CodecFormat,
+            ) -> crate::dispatcher::UnaryResult {
+                unreachable!()
+            }
+            fn call_bidi_streaming(
+                &self,
+                _: &str,
+                _: RequestContext,
+                _: crate::dispatcher::RequestStream,
+                _: CodecFormat,
+            ) -> crate::dispatcher::StreamingResult {
+                unreachable!()
+            }
+        }
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(Reject)];
+        let err = call_unary_intercepted(
+            &PanickyDispatcher,
+            &chain,
+            "p",
+            RequestContext::default(),
+            Bytes::new(),
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::ErrorCode::PermissionDenied);
+        assert_eq!(err.response_headers().get("x-deny-policy").unwrap(), "p1");
     }
 
     #[tokio::test]

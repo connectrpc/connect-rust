@@ -3698,6 +3698,81 @@ mod tests {
         );
     }
 
+    /// Interceptors must run on the Connect GET path. An idempotent unary
+    /// RPC accessed via HTTP GET must not bypass an authz interceptor —
+    /// every dispatch shape (Connect POST, Connect GET, gRPC fast path,
+    /// gRPC streaming-frame unary) routes through `call_unary_intercepted`.
+    /// A regression in any one of them is silent until a client uses that
+    /// shape, which for GET only happens for `idempotency_level =
+    /// NO_SIDE_EFFECTS` methods.
+    #[tokio::test]
+    async fn interceptor_runs_on_connect_get_request() {
+        use crate::interceptor::{Interceptor, Next, UnaryRequest, UnaryResponse};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let intercepted = Arc::new(AtomicBool::new(false));
+        let handler_ran = Arc::new(Mutex::new(false));
+
+        let handler_ran_inner = Arc::clone(&handler_ran);
+        let router = Router::new().route_idempotent(
+            "svc",
+            "Get",
+            crate::handler_fn(move |_ctx: RequestContext, _req: buffa_types::Empty| {
+                let h = Arc::clone(&handler_ran_inner);
+                async move {
+                    *h.lock().unwrap() = true;
+                    crate::Response::ok(buffa_types::Empty::default())
+                }
+            }),
+        );
+
+        struct Recorder(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl Interceptor for Recorder {
+            async fn intercept_unary(
+                &self,
+                req: UnaryRequest,
+                next: Next<'_>,
+            ) -> Result<UnaryResponse, ConnectError> {
+                self.0.store(true, Ordering::SeqCst);
+                next.run(req).await
+            }
+        }
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(Recorder(Arc::clone(&intercepted)))];
+
+        // A Connect GET request: empty proto message, base64-encoded
+        // (empty), encoding declared. Idempotent methods opt into GET so
+        // CDNs and browsers can cache them — those requests must still be
+        // intercepted.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/svc/Get?message=&encoding=proto&base64=1&connect=v1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        handle_unary_request(
+            &router,
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+            &chain,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert!(
+            intercepted.load(Ordering::SeqCst),
+            "interceptor must run on Connect GET requests"
+        );
+        assert!(
+            *handler_ran.lock().unwrap(),
+            "handler must run after the interceptor passes through"
+        );
+    }
+
     // ========================================================================
     // ConnectError::into_http_response tests
     // ========================================================================
