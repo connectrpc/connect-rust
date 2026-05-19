@@ -28,6 +28,15 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const FORTUNE_SERVICE_SERVICE_NAME: &str = "fortune.v1.FortuneService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `GetFortunes` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const FORTUNE_SERVICE_GET_FORTUNES_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/fortune.v1.FortuneService/GetFortunes",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Server trait for FortuneService.
 ///
 /// # Implementing handlers
@@ -171,7 +180,10 @@ impl<T: FortuneService> ::connectrpc::Dispatcher for FortuneServiceServer<T> {
         let method = path.strip_prefix("fortune.v1.FortuneService/")?;
         match method {
             "GetFortunes" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(FORTUNE_SERVICE_GET_FORTUNES_SPEC),
+                )
             }
             _ => None,
         }

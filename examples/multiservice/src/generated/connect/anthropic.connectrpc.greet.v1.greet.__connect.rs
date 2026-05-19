@@ -40,6 +40,15 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const GREET_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.greet.v1.GreetService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Greet` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const GREET_SERVICE_GREET_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.greet.v1.GreetService/Greet",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
 /// GreetService provides greeting functionality.
 ///
 /// # Implementing handlers
@@ -184,7 +193,10 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
         let method = path.strip_prefix("anthropic.connectrpc.greet.v1.GreetService/")?;
         match method {
             "Greet" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
+                        .with_spec(GREET_SERVICE_GREET_SPEC),
+                )
             }
             _ => None,
         }

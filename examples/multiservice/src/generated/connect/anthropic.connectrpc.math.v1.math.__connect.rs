@@ -32,6 +32,15 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const MATH_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.math.v1.MathService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Add` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const MATH_SERVICE_ADD_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.math.v1.MathService/Add",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// MathService provides basic math operations.
 ///
 /// # Implementing handlers
@@ -175,7 +184,10 @@ impl<T: MathService> ::connectrpc::Dispatcher for MathServiceServer<T> {
         let method = path.strip_prefix("anthropic.connectrpc.math.v1.MathService/")?;
         match method {
             "Add" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(MATH_SERVICE_ADD_SPEC),
+                )
             }
             _ => None,
         }

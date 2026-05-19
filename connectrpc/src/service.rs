@@ -1448,6 +1448,7 @@ where
                     let response = handle_grpc_unary_request(
                         &*dispatcher,
                         &path,
+                        desc.spec,
                         req,
                         rp.protocol,
                         rp.codec_format,
@@ -1621,7 +1622,9 @@ where
         .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
-        .with_extensions(extensions);
+        .with_extensions(extensions)
+        .with_spec(desc.spec)
+        .with_protocol(Some(Protocol::Connect));
 
     // Call the handler with the appropriate codec format, applying timeout if specified
     let resp: EncodedResponse = if let Some(timeout) = metadata.timeout {
@@ -1693,6 +1696,7 @@ where
 async fn handle_grpc_unary_request<D, B>(
     dispatcher: &D,
     path: &str,
+    spec: Option<crate::spec::Spec>,
     req: Request<B>,
     protocol: Protocol,
     codec_format: CodecFormat,
@@ -1835,7 +1839,9 @@ where
         .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
-        .with_extensions(extensions);
+        .with_extensions(extensions)
+        .with_spec(spec)
+        .with_protocol(Some(protocol));
 
     // Call the handler with timeout if configured
     let handler_result = if let Some(timeout) = metadata.timeout {
@@ -1999,6 +2005,7 @@ where
         return handle_bidi_streaming_request(
             dispatcher,
             &path,
+            method_desc.and_then(|d| d.spec),
             metadata,
             body,
             extensions,
@@ -2017,6 +2024,7 @@ where
         return handle_client_streaming_request(
             dispatcher,
             &path,
+            method_desc.and_then(|d| d.spec),
             metadata,
             body,
             extensions,
@@ -2122,7 +2130,9 @@ where
         .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
-        .with_extensions(extensions);
+        .with_extensions(extensions)
+        .with_spec(method_desc.and_then(|d| d.spec))
+        .with_protocol(Some(protocol));
 
     // Call the handler with the appropriate codec format.
     // For gRPC unary handlers, we wrap the single response in a one-item stream.
@@ -2237,6 +2247,7 @@ where
 async fn handle_client_streaming_request<D, B>(
     dispatcher: &D,
     path: &str,
+    spec: Option<crate::spec::Spec>,
     metadata: RequestMetadata,
     body: B,
     extensions: http::Extensions,
@@ -2263,7 +2274,9 @@ where
         .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
-        .with_extensions(extensions);
+        .with_extensions(extensions)
+        .with_spec(spec)
+        .with_protocol(Some(protocol));
 
     // Call the handler. On error paths, the reader task is left running
     // (detached) so it can finish draining the request body — aborting it
@@ -2484,6 +2497,7 @@ where
 async fn handle_bidi_streaming_request<D, B>(
     dispatcher: &D,
     path: &str,
+    spec: Option<crate::spec::Spec>,
     metadata: RequestMetadata,
     body: B,
     extensions: http::Extensions,
@@ -2512,7 +2526,9 @@ where
         .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
-        .with_extensions(extensions);
+        .with_extensions(extensions)
+        .with_spec(spec)
+        .with_protocol(Some(protocol));
 
     // Call the handler with timeout if configured
     let handler_result = if let Some(timeout) = metadata.timeout {

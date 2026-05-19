@@ -81,6 +81,14 @@ enum Method {
 ///
 /// The router maps service/method paths to their handlers and manages
 /// request dispatching.
+///
+/// `Router` is the *dynamic* dispatch path: method paths are owned `String`
+/// keys, so it cannot supply [`Spec::procedure`](crate::Spec::procedure)'s
+/// `&'static str` and handlers receive [`RequestContext::spec`] as `None`.
+/// Code that needs `Spec` (interceptors, OTel labels) should use the
+/// generated `FooServiceServer<T>` dispatcher instead.
+///
+/// [`RequestContext::spec`]: crate::RequestContext::spec
 #[derive(Default)]
 pub struct Router {
     /// Map from "service_name/method_name" to handler.
@@ -412,10 +420,7 @@ impl crate::dispatcher::Dispatcher for Router {
         use crate::dispatcher::MethodDescriptor;
         match self.methods.get(path)? {
             Method::Unary(m) => Some(MethodDescriptor::unary(m.idempotent)),
-            Method::Streaming(m) => Some(MethodDescriptor {
-                kind: m.kind,
-                idempotent: false,
-            }),
+            Method::Streaming(m) => Some(MethodDescriptor::from_kind(m.kind)),
             Method::ClientStreaming(_) => Some(MethodDescriptor::client_streaming()),
             Method::BidiStreaming(_) => Some(MethodDescriptor::bidi_streaming()),
         }

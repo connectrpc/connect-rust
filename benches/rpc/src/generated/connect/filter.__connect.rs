@@ -24,6 +24,15 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const FILTER_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.filter.v1.FilterService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Redact` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const FILTER_SERVICE_REDACT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.filter.v1.FilterService/Redact",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// A redaction proxy: returns the input record with sensitive fields
 /// scrubbed. Models a filtering/mutating handler where the common case
 /// (no sensitive data present) can return the request view unchanged.
@@ -169,7 +178,10 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
         let method = path.strip_prefix("anthropic.connectrpc.filter.v1.FilterService/")?;
         match method {
             "Redact" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(FILTER_SERVICE_REDACT_SPEC),
+                )
             }
             _ => None,
         }

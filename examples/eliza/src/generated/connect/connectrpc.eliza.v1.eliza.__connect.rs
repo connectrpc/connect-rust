@@ -84,6 +84,33 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const ELIZA_SERVICE_SERVICE_NAME: &str = "connectrpc.eliza.v1.ElizaService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Say` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const ELIZA_SERVICE_SAY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.eliza.v1.ElizaService/Say",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Converse` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const ELIZA_SERVICE_CONVERSE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.eliza.v1.ElizaService/Converse",
+        ::connectrpc::StreamType::BidiStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Introduce` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const ELIZA_SERVICE_INTRODUCE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.eliza.v1.ElizaService/Introduce",
+        ::connectrpc::StreamType::ServerStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// ElizaService provides a way to talk to Eliza, a port of the DOCTOR script
 /// for Joseph Weizenbaum's original ELIZA program. Created in the mid-1960s at
 /// the MIT Artificial Intelligence Laboratory, ELIZA demonstrates the
@@ -293,16 +320,21 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
         let method = path.strip_prefix("connectrpc.eliza.v1.ElizaService/")?;
         match method {
             "Say" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
+                        .with_spec(ELIZA_SERVICE_SAY_SPEC),
+                )
             }
             "Converse" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
+                        .with_spec(ELIZA_SERVICE_CONVERSE_SPEC),
                 )
             }
             "Introduce" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
+                        .with_spec(ELIZA_SERVICE_INTRODUCE_SPEC),
                 )
             }
             _ => None,

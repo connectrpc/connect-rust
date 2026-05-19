@@ -10,6 +10,47 @@ increment the patch version.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`MethodDescriptor` is now `#[non_exhaustive]`** ([#112]). It gains a
+  `spec: Option<Spec>` field and `from_kind` / `with_idempotent` /
+  `with_spec` const builders. Hand-rolled `impl Dispatcher` blocks that
+  constructed `MethodDescriptor` via struct literal must switch to the
+  builders (`MethodDescriptor::unary(idempotent)`,
+  `MethodDescriptor::from_kind(kind)`, …); destructuring patterns need a
+  trailing `..`. Reads of the existing `kind` / `idempotent` `pub` fields
+  are unaffected. **Consumers with checked-in `protoc-gen-connect-rust`
+  output must regenerate** — the generated `Dispatcher::lookup` references
+  per-method `Spec` constants emitted alongside the dispatcher.
+
+### Added
+
+- **`Spec` static method metadata** ([#112], refs [#87], [#110]). New
+  `connectrpc::spec` module with `Spec`, `StreamType`, `IdempotencyLevel`,
+  and `SpecOrigin` types describing a single RPC method: its
+  fully-qualified `procedure` path (`"/package.Service/Method"`), message
+  flow shape, proto-declared idempotency contract, and which generated
+  artifact (server or client) produced it. `Spec` is `Copy` and `'static`,
+  with `const fn` constructors (`Spec::server(...)`, `Spec::client(...)`)
+  so generated `Spec` constants live in `.rodata`. Code generation emits a
+  `pub const <SERVICE>_<METHOD>_SPEC: Spec` per method that user code can
+  reference directly. This is the registration-time half of the planned
+  interceptor surface; per-request state stays on `RequestContext`.
+
+- **`RequestContext::spec()` and `RequestContext::protocol()`** ([#112]).
+  Two new accessors and matching `with_spec` / `with_protocol` builders
+  surface the dispatched method's `Spec` and the negotiated `Protocol` on
+  every request handled by a code-generated `FooServiceServer<T>`
+  dispatcher. The dynamic [`Router`] can't supply a `Spec` (its method
+  paths are owned `String`s, not `&'static str`) and returns `None` —
+  switch to the generated dispatcher if you need `Spec` in handlers or
+  middleware.
+
+[#87]: https://github.com/anthropics/connect-rust/issues/87
+[#110]: https://github.com/anthropics/connect-rust/issues/110
+[#112]: https://github.com/anthropics/connect-rust/pull/112
+[`Router`]: https://docs.rs/connectrpc/latest/connectrpc/struct.Router.html
+
 ## [0.5.0] - 2026-05-18
 
 This release tracks **buffa 0.6.0** ([#108]) and lands the contract-locking

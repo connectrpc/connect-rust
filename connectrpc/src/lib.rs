@@ -67,6 +67,7 @@
 //! - [`handler`] - Async handler traits for implementing RPC methods
 //! - [`router`] - Request routing and service registration
 //! - [`service`] - Tower service implementation (primary integration point)
+//! - [`spec`] - Static per-method metadata ([`Spec`], [`StreamType`])
 //! - [`client`] - Tower-based HTTP client utilities (requires `client` feature)
 //! - [`server`] - Standalone hyper-based server (requires `server` feature)
 //!
@@ -191,6 +192,7 @@ pub mod protocol;
 pub mod response;
 pub mod router;
 pub mod service;
+pub mod spec;
 
 // Optional: HTTP client
 pub mod client;
@@ -268,6 +270,12 @@ pub use error::ErrorCode;
 // Protocol detection
 pub use protocol::Protocol;
 pub use protocol::RequestProtocol;
+
+// Static method metadata
+pub use spec::IdempotencyLevel;
+pub use spec::Spec;
+pub use spec::SpecOrigin;
+pub use spec::StreamType;
 
 // ============================================================================
 // Codec exports

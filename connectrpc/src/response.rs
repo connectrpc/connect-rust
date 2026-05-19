@@ -54,6 +54,10 @@ pub struct RequestContext {
     pub(crate) deadline: Option<Instant>,
     /// Request extensions carried from the underlying `http::Request`.
     pub(crate) extensions: http::Extensions,
+    /// Static metadata for the dispatched RPC method, when known.
+    pub(crate) spec: Option<crate::spec::Spec>,
+    /// The wire protocol negotiated for this request, when known.
+    pub(crate) protocol: Option<crate::Protocol>,
 }
 
 impl RequestContext {
@@ -63,6 +67,8 @@ impl RequestContext {
             headers,
             deadline: None,
             extensions: http::Extensions::new(),
+            spec: None,
+            protocol: None,
         }
     }
 
@@ -77,6 +83,20 @@ impl RequestContext {
     #[must_use]
     pub fn with_extensions(mut self, extensions: http::Extensions) -> Self {
         self.extensions = extensions;
+        self
+    }
+
+    /// Attach the static method metadata for the dispatched RPC.
+    #[must_use]
+    pub fn with_spec(mut self, spec: Option<crate::spec::Spec>) -> Self {
+        self.spec = spec;
+        self
+    }
+
+    /// Attach the negotiated wire protocol.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: Option<crate::Protocol>) -> Self {
+        self.protocol = protocol;
         self
     }
 
@@ -151,6 +171,24 @@ impl RequestContext {
     /// `RequestContext` automatically before dispatch.
     pub fn extensions_mut(&mut self) -> &mut http::Extensions {
         &mut self.extensions
+    }
+
+    /// Static metadata for the dispatched RPC method, when known.
+    ///
+    /// Populated by code-generated `FooServiceServer<T>` dispatchers;
+    /// `None` when the dynamic [`Router`](crate::Router) handled dispatch
+    /// (its method paths are owned `String`s and can't supply
+    /// [`Spec::procedure`](crate::Spec::procedure)'s `&'static str`).
+    pub fn spec(&self) -> Option<crate::spec::Spec> {
+        self.spec
+    }
+
+    /// The wire protocol negotiated for this request, when known.
+    ///
+    /// `None` if the runtime constructed the context outside the dispatch
+    /// path (e.g. unit tests calling handlers directly).
+    pub fn protocol(&self) -> Option<crate::Protocol> {
+        self.protocol
     }
 
     /// Remote peer socket address, if the transport recorded one.
@@ -1249,5 +1287,28 @@ mod tests {
         ext.insert(Peer(7));
         let ctx = RequestContext::new(HeaderMap::new()).with_extensions(ext);
         assert_eq!(ctx.extensions().get::<Peer>(), Some(&Peer(7)));
+    }
+
+    #[test]
+    fn request_context_with_spec_and_protocol() {
+        use crate::spec::{Spec, StreamType};
+
+        // Default-constructed context has neither.
+        let ctx = RequestContext::new(HeaderMap::new());
+        assert_eq!(ctx.spec(), None);
+        assert_eq!(ctx.protocol(), None);
+
+        // Both round-trip through the builders.
+        const SPEC: Spec = Spec::server("/pkg.Svc/M", StreamType::Unary);
+        let ctx = RequestContext::new(HeaderMap::new())
+            .with_spec(Some(SPEC))
+            .with_protocol(Some(crate::Protocol::Grpc));
+        assert_eq!(ctx.spec(), Some(SPEC));
+        assert_eq!(ctx.protocol(), Some(crate::Protocol::Grpc));
+
+        // Builders accept `None` to clear (matches `with_deadline`).
+        let ctx = ctx.with_spec(None).with_protocol(None);
+        assert_eq!(ctx.spec(), None);
+        assert_eq!(ctx.protocol(), None);
     }
 }

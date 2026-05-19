@@ -24,6 +24,15 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const BLOAT_ECHO_SERVICE_SERVICE_NAME: &str = "bench.v1.BloatEchoService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Echo` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BLOAT_ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BloatEchoService/Echo",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// String-heavy echo payload for measuring ViewEncode impact through
 /// the connect-rust codec layer. ~20 fields covering plain strings,
 /// repeated strings, a string map, two singular sub-messages, and a
@@ -170,7 +179,10 @@ impl<T: BloatEchoService> ::connectrpc::Dispatcher for BloatEchoServiceServer<T>
         let method = path.strip_prefix("bench.v1.BloatEchoService/")?;
         match method {
             "Echo" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(BLOAT_ECHO_SERVICE_ECHO_SPEC),
+                )
             }
             _ => None,
         }

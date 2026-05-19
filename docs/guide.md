@@ -297,6 +297,8 @@ methods (new request-scoped metadata can then be added in minor releases):
 | `ctx.deadline()` | Absolute `Instant` if the caller set a timeout |
 | `ctx.time_remaining()` | Saturating `Duration` until the deadline — budget downstream calls with this |
 | `ctx.extensions()` | `http::Extensions` carried from the underlying `http::Request` |
+| `ctx.spec()` | Static metadata for the dispatched RPC method ([`Spec`](#static-method-metadata-spec)) — `None` under the dynamic `Router` |
+| `ctx.protocol()` | The negotiated wire protocol for this request (`Connect` / `Grpc` / `GrpcWeb`) |
 | `ctx.peer_addr()` | Remote socket address (requires the `server` feature; `None` when the transport didn't insert it) |
 | `ctx.peer_certs()` | TLS client cert chain (requires the `server-tls` feature; `None` for plaintext or no client cert) |
 
@@ -635,6 +637,70 @@ next.run(req).await
 // In the handler:
 let user = ctx.extensions().get::<UserId>().unwrap();
 ```
+
+### Static method metadata (`Spec`)
+
+Handlers and middleware can read which RPC method is being invoked
+without re-parsing the request URL. `ctx.spec()` returns an
+`Option<Spec>` describing the dispatched method: its fully-qualified
+procedure path, message-flow shape, the proto-declared idempotency
+contract, and whether the spec came from a server-side dispatcher or a
+generated client.
+
+```rust
+async fn greet(
+    &self,
+    ctx: RequestContext,
+    req: OwnedView<GreetRequestView<'static>>,
+) -> ServiceResult<GreetResponse> {
+    if let Some(spec) = ctx.spec() {
+        tracing::info_span!(
+            "rpc",
+            "rpc.system" = "connect_rpc",
+            "rpc.service" = spec.service(),
+            "rpc.method" = spec.method(),
+        );
+    }
+    // ...
+}
+```
+
+`ctx.protocol()` is the per-request companion: it returns the negotiated
+wire protocol (`Connect`, `Grpc`, or `GrpcWeb`) so an observability
+layer can label spans with `rpc.system` correctly. `Spec` carries only
+**registration-time** facts that are the same for every request to that
+method; per-request state lives on `RequestContext`. This mirrors
+`connect-go`'s `Spec` / `Peer` split.
+
+`Spec` is `Copy`, contains only `'static` data, and is `#[non_exhaustive]`
+— destructure with a trailing `..`:
+
+```rust
+use connectrpc::{Spec, SpecOrigin, StreamType, IdempotencyLevel};
+
+let Spec { procedure, stream_type, origin, idempotency_level, .. } = spec;
+```
+
+Code generation also emits a `pub const <SERVICE>_<METHOD>_SPEC: Spec`
+per method that you can reference directly without a request in flight —
+useful for building static lookup tables, validating routing, or testing:
+
+```rust,ignore
+use crate::connect::greet::v1::GREET_SERVICE_GREET_SPEC;
+
+assert_eq!(GREET_SERVICE_GREET_SPEC.procedure, "/greet.v1.GreetService/Greet");
+assert_eq!(GREET_SERVICE_GREET_SPEC.stream_type, StreamType::Unary);
+assert_eq!(GREET_SERVICE_GREET_SPEC.origin, SpecOrigin::Server);
+```
+
+> **`Router` returns `None`.** `ctx.spec()` is only populated when the
+> request was dispatched through a code-generated `FooServiceServer<T>`.
+> The dynamic `Router` (used by `FooServiceExt::register(Router)`) keys
+> its method table on owned `String`s and cannot supply
+> `Spec::procedure`'s `&'static str`, so handlers registered through it
+> see `ctx.spec() == None`. If your tracing or auth layer reads
+> `ctx.spec()`, switch to the generated server dispatcher — it's also the
+> faster path (compile-time dispatch, no `HashMap` lookup).
 
 ### Short-circuit responses
 

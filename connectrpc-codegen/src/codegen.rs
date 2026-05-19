@@ -1234,6 +1234,11 @@ let owned = client.{example_method}(request).await?.into_owned();
     );
     let client_doc_tokens = doc_attrs(&client_doc);
 
+    // Per-method `Spec` constants. Stable, allocation-free metadata that the
+    // dispatcher threads into `RequestContext::spec` and that user code can
+    // reference directly (e.g. for tracing labels or routing tables).
+    let spec_consts = generate_spec_consts(&full_service_name, service);
+
     Ok(quote! {
         // -----------------------------------------------------------------------------
         // #service_name
@@ -1241,6 +1246,8 @@ let owned = client.{example_method}(request).await?.into_owned();
 
         /// Full service name for this service.
         pub const #service_name_const: &str = #full_service_name;
+
+        #(#spec_consts)*
 
         #service_doc_tokens
         #[allow(clippy::type_complexity)]
@@ -1309,6 +1316,73 @@ let owned = client.{example_method}(request).await?.into_owned();
     })
 }
 
+/// Construct the identifier for a per-method `Spec` constant.
+///
+/// The name is derived from the service and method names, e.g.
+/// `ELIZA_SERVICE_SAY_SPEC` for `ElizaService.Say`. Lives at module scope so
+/// both the server dispatcher and (later) the generated client can reference
+/// the same constant.
+fn method_spec_const_ident(service: &ServiceDescriptorProto, method_name: &str) -> Ident {
+    let service_name = service.name.as_deref().unwrap_or("");
+    format_ident!(
+        "{}_{}_SPEC",
+        service_name.to_snake_case().to_uppercase(),
+        method_name.to_snake_case().to_uppercase()
+    )
+}
+
+/// Emit one `pub const … : ::connectrpc::Spec` per method.
+///
+/// Each constant captures the method's procedure path, stream type, and
+/// idempotency level. Constructed via `Spec::server(...)` so
+/// `Spec::origin == SpecOrigin::Server`; a future generated client will
+/// emit a sibling constant via `Spec::client(...)`. The constants are
+/// referenced by the generated `Dispatcher::lookup` impl and are also
+/// stable public API for user code.
+fn generate_spec_consts(
+    full_service_name: &str,
+    service: &ServiceDescriptorProto,
+) -> Vec<TokenStream> {
+    service
+        .method
+        .iter()
+        .map(|m| {
+            let method_name = m.name.as_deref().unwrap_or("");
+            let spec_const = method_spec_const_ident(service, method_name);
+            let procedure = format!("/{full_service_name}/{method_name}");
+            let cs = m.client_streaming.unwrap_or(false);
+            let ss = m.server_streaming.unwrap_or(false);
+            let stream_type = match (cs, ss) {
+                (true, true) => quote! { ::connectrpc::StreamType::BidiStream },
+                (true, false) => quote! { ::connectrpc::StreamType::ClientStream },
+                (false, true) => quote! { ::connectrpc::StreamType::ServerStream },
+                (false, false) => quote! { ::connectrpc::StreamType::Unary },
+            };
+            let idempotency_level = match m.options.idempotency_level {
+                Some(IdempotencyLevel::NO_SIDE_EFFECTS) => {
+                    quote! { ::connectrpc::IdempotencyLevel::NoSideEffects }
+                }
+                Some(IdempotencyLevel::IDEMPOTENT) => {
+                    quote! { ::connectrpc::IdempotencyLevel::Idempotent }
+                }
+                _ => quote! { ::connectrpc::IdempotencyLevel::Unknown },
+            };
+            let doc = format!(
+                "Static [`Spec`](::connectrpc::Spec) for the server-side `{method_name}` RPC.\n\n\
+                 The dispatcher surfaces this on\n\
+                 [`RequestContext::spec`](::connectrpc::RequestContext::spec)."
+            );
+            let doc_tokens = doc_attrs(&doc);
+            quote! {
+                #doc_tokens
+                pub const #spec_const: ::connectrpc::Spec =
+                    ::connectrpc::Spec::server(#procedure, #stream_type)
+                        .with_idempotency_level(#idempotency_level);
+            }
+        })
+        .collect()
+}
+
 /// Generate a monomorphic `FooServiceServer<T>` struct and its `Dispatcher` impl.
 ///
 /// This is the fast-path alternative to `FooServiceExt::register(Router)`: instead
@@ -1339,6 +1413,7 @@ fn generate_service_server(
                 .idempotency_level
                 .map(|level| level == IdempotencyLevel::NO_SIDE_EFFECTS)
                 .unwrap_or(false);
+            let spec_const = method_spec_const_ident(service, method_name);
 
             let desc = if client_streaming && server_streaming {
                 quote! { ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming() }
@@ -1349,7 +1424,7 @@ fn generate_service_server(
             } else {
                 quote! { ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(#is_idempotent) }
             };
-            quote! { #method_name => Some(#desc), }
+            quote! { #method_name => Some(#desc.with_spec(#spec_const)), }
         })
         .collect();
 
@@ -3232,5 +3307,75 @@ mod tests {
         // No top-level `use` in either file.
         assert_no_top_level_use(&formatted_a, "service A");
         assert_no_top_level_use(&formatted_b, "service B");
+    }
+
+    /// `generate_spec_consts` emits one `pub const … : Spec` per method,
+    /// named `{SERVICE}_{METHOD}_SPEC`, with the right `StreamType`,
+    /// `IdempotencyLevel`, and procedure path.
+    #[test]
+    fn generate_spec_consts_per_method() {
+        use buffa_codegen::generated::descriptor::MethodOptions;
+
+        let m = |name: &str, cs: bool, ss: bool, idem: Option<IdempotencyLevel>| {
+            MethodDescriptorProto {
+                name: Some(name.into()),
+                input_type: Some(".pkg.Req".into()),
+                output_type: Some(".pkg.Resp".into()),
+                client_streaming: Some(cs),
+                server_streaming: Some(ss),
+                options: MethodOptions {
+                    idempotency_level: idem,
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            }
+        };
+        let service = ServiceDescriptorProto {
+            name: Some("EchoService".into()),
+            method: vec![
+                m("Say", false, false, Some(IdempotencyLevel::NO_SIDE_EFFECTS)),
+                m("Subscribe", false, true, Some(IdempotencyLevel::IDEMPOTENT)),
+                m("Upload", true, false, None),
+                m("Chat", true, true, None),
+            ],
+            ..Default::default()
+        };
+
+        // The const names follow `{SERVICE}_{METHOD}_SPEC`.
+        assert_eq!(
+            method_spec_const_ident(&service, "Say").to_string(),
+            "ECHO_SERVICE_SAY_SPEC"
+        );
+
+        let consts = generate_spec_consts("pkg.EchoService", &service);
+        assert_eq!(consts.len(), 4, "one const per method");
+
+        let render = |ts: &TokenStream| {
+            let file = syn::parse2::<syn::File>(ts.clone()).expect("const should parse");
+            prettyplease::unparse(&file)
+        };
+        let say = render(&consts[0]);
+        assert!(say.contains("pub const ECHO_SERVICE_SAY_SPEC"), "{say}");
+        assert!(say.contains(r#""/pkg.EchoService/Say""#), "{say}");
+        assert!(say.contains("StreamType::Unary"), "{say}");
+        assert!(say.contains("IdempotencyLevel::NoSideEffects"), "{say}");
+
+        let subscribe = render(&consts[1]);
+        assert!(
+            subscribe.contains("StreamType::ServerStream"),
+            "{subscribe}"
+        );
+        assert!(
+            subscribe.contains("IdempotencyLevel::Idempotent"),
+            "{subscribe}"
+        );
+
+        let upload = render(&consts[2]);
+        assert!(upload.contains("StreamType::ClientStream"), "{upload}");
+        assert!(upload.contains("IdempotencyLevel::Unknown"), "{upload}");
+
+        let chat = render(&consts[3]);
+        assert!(chat.contains("StreamType::BidiStream"), "{chat}");
     }
 }

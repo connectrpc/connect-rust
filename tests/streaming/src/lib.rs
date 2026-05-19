@@ -1138,4 +1138,155 @@ mod tests {
             "timeout took far longer than configured: {elapsed:?}"
         );
     }
+
+    /// Echo service whose unary handler reflects `ctx.spec()` and `ctx.protocol()`
+    /// back through the response `data` field, so an e2e test can assert the
+    /// runtime threaded them through.
+    struct SpecReflectingService;
+
+    impl EchoService for SpecReflectingService {
+        async fn echo(
+            &self,
+            ctx: RequestContext,
+            request: OwnedView<EchoRequestView<'static>>,
+        ) -> ServiceResult<EchoResponse> {
+            let proto = ctx
+                .protocol()
+                .map(|p| format!("{p:?}"))
+                .unwrap_or_else(|| "<none>".into());
+            let data = match ctx.spec() {
+                Some(s) => format!(
+                    "{}|{:?}|{proto}|{:?}|{:?}",
+                    s.procedure, s.stream_type, s.idempotency_level, s.origin
+                ),
+                None => format!("<none>|{proto}"),
+            };
+            Response::ok(EchoResponse {
+                sequence: request.sequence,
+                data,
+                ..Default::default()
+            })
+        }
+
+        async fn server_stream(
+            &self,
+            _ctx: RequestContext,
+            _request: OwnedView<EchoRequestView<'static>>,
+        ) -> ServiceResult<ServiceStream<EchoResponse>> {
+            unimplemented!()
+        }
+
+        async fn client_stream(
+            &self,
+            _ctx: RequestContext,
+            _requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+        ) -> ServiceResult<EchoResponse> {
+            unimplemented!()
+        }
+
+        async fn bidi_stream(
+            &self,
+            _ctx: RequestContext,
+            _requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+        ) -> ServiceResult<ServiceStream<EchoResponse>> {
+            unimplemented!()
+        }
+    }
+
+    /// End-to-end: the codegen dispatcher surfaces `Spec` and `Protocol` on
+    /// `RequestContext`, and the dynamic `Router` does not (no `'static` path).
+    #[tokio::test]
+    async fn handler_sees_spec_and_protocol() {
+        async fn round_trip(addr: std::net::SocketAddr) -> String {
+            make_client(addr)
+                .echo(EchoRequest {
+                    sequence: 1,
+                    data: String::new(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_view()
+                .data
+                .to_owned()
+        }
+
+        // Codegen dispatcher path → spec is populated.
+        let server = EchoServiceServer::new(SpecReflectingService);
+        let service = ConnectRpcService::new(server);
+        let app = axum::Router::new().fallback_service(service);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            round_trip(addr).await,
+            "/test.echo.v1.EchoService/Echo|Unary|Connect|Unknown|Server"
+        );
+
+        // Dynamic Router path → spec is None, protocol is still populated.
+        let router = Arc::new(SpecReflectingService).register(Router::new());
+        let app = router.into_axum_router();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(round_trip(addr).await, "<none>|Connect");
+    }
+
+    /// Codegen emits a per-method `Spec` const and the generated dispatcher
+    /// surfaces it through `Dispatcher::lookup`. The dynamic `Router` cannot
+    /// (its keys are owned `String`s), so it must return `spec: None`.
+    #[test]
+    fn codegen_specs_thread_through_lookup() {
+        use connectrpc::{Dispatcher, IdempotencyLevel, MethodKind, SpecOrigin, StreamType};
+
+        // The codegen const carries the proto-level metadata.
+        assert_eq!(
+            ECHO_SERVICE_ECHO_SPEC.procedure,
+            "/test.echo.v1.EchoService/Echo"
+        );
+        assert_eq!(ECHO_SERVICE_ECHO_SPEC.stream_type, StreamType::Unary);
+        assert_eq!(
+            ECHO_SERVICE_ECHO_SPEC.idempotency_level,
+            IdempotencyLevel::Unknown
+        );
+        const { assert!(matches!(ECHO_SERVICE_ECHO_SPEC.origin, SpecOrigin::Server)) };
+        assert_eq!(ECHO_SERVICE_ECHO_SPEC.service(), "test.echo.v1.EchoService");
+        assert_eq!(ECHO_SERVICE_ECHO_SPEC.method(), "Echo");
+        assert_eq!(
+            ECHO_SERVICE_BIDI_STREAM_SPEC.stream_type,
+            StreamType::BidiStream
+        );
+        assert_eq!(
+            ECHO_SERVICE_CLIENT_STREAM_SPEC.stream_type,
+            StreamType::ClientStream
+        );
+        assert_eq!(
+            ECHO_SERVICE_SERVER_STREAM_SPEC.stream_type,
+            StreamType::ServerStream
+        );
+
+        // The codegen dispatcher's `lookup` returns the spec; the spec's
+        // procedure round-trips through the route the dispatcher matched.
+        let server = EchoServiceServer::new(TestEchoService);
+        for (method, spec) in [
+            ("Echo", ECHO_SERVICE_ECHO_SPEC),
+            ("ServerStream", ECHO_SERVICE_SERVER_STREAM_SPEC),
+            ("ClientStream", ECHO_SERVICE_CLIENT_STREAM_SPEC),
+            ("BidiStream", ECHO_SERVICE_BIDI_STREAM_SPEC),
+        ] {
+            let path = format!("test.echo.v1.EchoService/{method}");
+            let desc = server.lookup(&path).expect("registered method");
+            assert_eq!(desc.spec, Some(spec), "lookup({path}) spec mismatch");
+            assert_eq!(MethodKind::from(spec.stream_type), desc.kind);
+            assert_eq!(spec.procedure.trim_start_matches('/'), path);
+        }
+        assert!(server.lookup("test.echo.v1.EchoService/Nope").is_none());
+
+        // The dynamic `Router` returns no spec.
+        let router = Arc::new(TestEchoService).register(Router::new());
+        let desc = router
+            .lookup("test.echo.v1.EchoService/Echo")
+            .expect("registered method");
+        assert!(desc.spec.is_none());
+    }
 }

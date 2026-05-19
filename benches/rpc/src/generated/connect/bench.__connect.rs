@@ -108,6 +108,60 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const BENCH_SERVICE_SERVICE_NAME: &str = "bench.v1.BenchService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Unary` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BENCH_SERVICE_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BenchService/Unary",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `ServerStream` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BENCH_SERVICE_SERVER_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BenchService/ServerStream",
+        ::connectrpc::StreamType::ServerStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `ClientStream` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BENCH_SERVICE_CLIENT_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BenchService/ClientStream",
+        ::connectrpc::StreamType::ClientStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `BidiStream` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BENCH_SERVICE_BIDI_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BenchService/BidiStream",
+        ::connectrpc::StreamType::BidiStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `LogUnary` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BENCH_SERVICE_LOG_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BenchService/LogUnary",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `LogUnaryOwned` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const BENCH_SERVICE_LOG_UNARY_OWNED_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.BenchService/LogUnaryOwned",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Server trait for BenchService.
 ///
 /// # Implementing handlers
@@ -394,28 +448,40 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
         let method = path.strip_prefix("bench.v1.BenchService/")?;
         match method {
             "Unary" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(BENCH_SERVICE_UNARY_SPEC),
+                )
             }
             "ServerStream" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
+                        .with_spec(BENCH_SERVICE_SERVER_STREAM_SPEC),
                 )
             }
             "ClientStream" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming()
+                        .with_spec(BENCH_SERVICE_CLIENT_STREAM_SPEC),
                 )
             }
             "BidiStream" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
+                        .with_spec(BENCH_SERVICE_BIDI_STREAM_SPEC),
                 )
             }
             "LogUnary" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(BENCH_SERVICE_LOG_UNARY_SPEC),
+                )
             }
             "LogUnaryOwned" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(BENCH_SERVICE_LOG_UNARY_OWNED_SPEC),
+                )
             }
             _ => None,
         }
@@ -867,6 +933,15 @@ where
 }
 /// Full service name for this service.
 pub const ECHO_SERVICE_SERVICE_NAME: &str = "bench.v1.EchoService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Echo` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.EchoService/Echo",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Minimal echo service for measuring pure framework overhead.
 /// No database, no spawn_blocking, no complex payloads — just
 /// dispatch + proto encode/decode of a single string.
@@ -1010,7 +1085,10 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
         let method = path.strip_prefix("bench.v1.EchoService/")?;
         match method {
             "Echo" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(ECHO_SERVICE_ECHO_SPEC),
+                )
             }
             _ => None,
         }
@@ -1199,6 +1277,15 @@ where
 }
 /// Full service name for this service.
 pub const LOG_INGEST_SERVICE_SERVICE_NAME: &str = "bench.v1.LogIngestService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Ingest` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.v1.LogIngestService/Ingest",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Server trait for LogIngestService.
 ///
 /// # Implementing handlers
@@ -1342,7 +1429,10 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
         let method = path.strip_prefix("bench.v1.LogIngestService/")?;
         match method {
             "Ingest" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(LOG_INGEST_SERVICE_INGEST_SPEC),
+                )
             }
             _ => None,
         }

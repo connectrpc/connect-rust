@@ -228,6 +228,60 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const CONFORMANCE_SERVICE_SERVICE_NAME: &str = "connectrpc.conformance.v1.ConformanceService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Unary` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const CONFORMANCE_SERVICE_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.conformance.v1.ConformanceService/Unary",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `ServerStream` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const CONFORMANCE_SERVICE_SERVER_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.conformance.v1.ConformanceService/ServerStream",
+        ::connectrpc::StreamType::ServerStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `ClientStream` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const CONFORMANCE_SERVICE_CLIENT_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.conformance.v1.ConformanceService/ClientStream",
+        ::connectrpc::StreamType::ClientStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `BidiStream` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const CONFORMANCE_SERVICE_BIDI_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.conformance.v1.ConformanceService/BidiStream",
+        ::connectrpc::StreamType::BidiStream,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Unimplemented` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.conformance.v1.ConformanceService/Unimplemented",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `IdempotentUnary` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/connectrpc.conformance.v1.ConformanceService/IdempotentUnary",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
 /// The service implemented by conformance test servers. This is implemented by
 /// the reference servers, used to test clients, and is expected to be implemented
 /// by test servers, since this is the service used by reference clients.
@@ -602,28 +656,40 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         let method = path.strip_prefix("connectrpc.conformance.v1.ConformanceService/")?;
         match method {
             "Unary" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(CONFORMANCE_SERVICE_UNARY_SPEC),
+                )
             }
             "ServerStream" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
+                        .with_spec(CONFORMANCE_SERVICE_SERVER_STREAM_SPEC),
                 )
             }
             "ClientStream" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming()
+                        .with_spec(CONFORMANCE_SERVICE_CLIENT_STREAM_SPEC),
                 )
             }
             "BidiStream" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming(),
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
+                        .with_spec(CONFORMANCE_SERVICE_BIDI_STREAM_SPEC),
                 )
             }
             "Unimplemented" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC),
+                )
             }
             "IdempotentUnary" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
+                        .with_spec(CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC),
+                )
             }
             _ => None,
         }

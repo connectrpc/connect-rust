@@ -28,6 +28,15 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const LOG_INGEST_SERVICE_SERVICE_NAME: &str = "bench.noutf8.v1.LogIngestService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Ingest` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/bench.noutf8.v1.LogIngestService/Ingest",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Server trait for LogIngestService.
 ///
 /// # Implementing handlers
@@ -171,7 +180,10 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
         let method = path.strip_prefix("bench.noutf8.v1.LogIngestService/")?;
         match method {
             "Ingest" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(LOG_INGEST_SERVICE_INGEST_SPEC),
+                )
             }
             _ => None,
         }

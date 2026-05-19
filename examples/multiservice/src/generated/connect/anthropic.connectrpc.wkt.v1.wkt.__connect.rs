@@ -120,6 +120,33 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.wkt.v1.WellKnownTypesService";
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `CreateEvent` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const WELL_KNOWN_TYPES_SERVICE_CREATE_EVENT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/CreateEvent",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `CalculateDuration` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/CalculateDuration",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `ProcessMetadata` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/ProcessMetadata",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// WellKnownTypesService provides operations using Timestamp, Duration, and Struct.
 ///
 /// # Implementing handlers
@@ -327,13 +354,22 @@ for WellKnownTypesServiceServer<T> {
             .strip_prefix("anthropic.connectrpc.wkt.v1.WellKnownTypesService/")?;
         match method {
             "CreateEvent" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(WELL_KNOWN_TYPES_SERVICE_CREATE_EVENT_SPEC),
+                )
             }
             "CalculateDuration" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC),
+                )
             }
             "ProcessMetadata" => {
-                Some(::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false))
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC),
+                )
             }
             _ => None,
         }
