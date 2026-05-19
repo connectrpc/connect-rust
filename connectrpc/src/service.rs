@@ -1624,7 +1624,11 @@ where
         .with_deadline(deadline)
         .with_extensions(extensions)
         .with_spec(desc.spec)
-        .with_protocol(Some(Protocol::Connect));
+        .with_protocol(Some(Protocol::Connect))
+        // The leading slash was stripped for the Dispatcher::lookup key;
+        // restore it so RequestContext::path() matches http::Uri::path()
+        // and Spec::procedure.
+        .with_path(format!("/{path}"));
 
     // Call the handler with the appropriate codec format, applying timeout if specified
     let resp: EncodedResponse = if let Some(timeout) = metadata.timeout {
@@ -1841,7 +1845,8 @@ where
         .with_deadline(deadline)
         .with_extensions(extensions)
         .with_spec(spec)
-        .with_protocol(Some(protocol));
+        .with_protocol(Some(protocol))
+        .with_path(format!("/{path}"));
 
     // Call the handler with timeout if configured
     let handler_result = if let Some(timeout) = metadata.timeout {
@@ -2132,7 +2137,8 @@ where
         .with_deadline(deadline)
         .with_extensions(extensions)
         .with_spec(method_desc.and_then(|d| d.spec))
-        .with_protocol(Some(protocol));
+        .with_protocol(Some(protocol))
+        .with_path(format!("/{path}"));
 
     // Call the handler with the appropriate codec format.
     // For gRPC unary handlers, we wrap the single response in a one-item stream.
@@ -2276,7 +2282,8 @@ where
         .with_deadline(deadline)
         .with_extensions(extensions)
         .with_spec(spec)
-        .with_protocol(Some(protocol));
+        .with_protocol(Some(protocol))
+        .with_path(format!("/{path}"));
 
     // Call the handler. On error paths, the reader task is left running
     // (detached) so it can finish draining the request body — aborting it
@@ -2528,7 +2535,8 @@ where
         .with_deadline(deadline)
         .with_extensions(extensions)
         .with_spec(spec)
-        .with_protocol(Some(protocol));
+        .with_protocol(Some(protocol))
+        .with_path(format!("/{path}"));
 
     // Call the handler with timeout if configured
     let handler_result = if let Some(timeout) = metadata.timeout {
@@ -3573,6 +3581,63 @@ mod tests {
             captured.lock().unwrap().take(),
             Some(PeerTag("10.0.0.1:54321")),
             "extension inserted on the http::Request must reach Context.extensions"
+        );
+    }
+
+    /// Prove that `RequestContext::path()` carries the request URI path
+    /// through the dispatch path, in the leading-slash form, *even when*
+    /// `RequestContext::spec()` is `None`.
+    ///
+    /// This test deliberately uses the dynamic [`Router`], which never
+    /// supplies a [`Spec`](crate::spec::Spec) — `path()` is the only
+    /// reliable source for the procedure name in that case, and it's the
+    /// one an auth interceptor or span builder must read.
+    #[tokio::test]
+    async fn path_flows_to_handler_context() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(None::<(Option<String>, bool)>));
+        let handler_captured = Arc::clone(&captured);
+        let router = Router::new().route(
+            "svc",
+            "Method",
+            crate::handler_fn(move |ctx: RequestContext, _req: buffa_types::Empty| {
+                let cap = Arc::clone(&handler_captured);
+                async move {
+                    *cap.lock().unwrap() =
+                        Some((ctx.path().map(str::to_owned), ctx.spec().is_some()));
+                    crate::Response::ok(buffa_types::Empty::default())
+                }
+            }),
+        );
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/svc/Method")
+            .header(header::CONTENT_TYPE, "application/proto")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        handle_unary_request(
+            &router,
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        let (path, spec_present) = captured.lock().unwrap().take().expect("handler ran");
+        assert_eq!(
+            path.as_deref(),
+            Some("/svc/Method"),
+            "path() must carry the leading-slash request URI path"
+        );
+        assert!(
+            !spec_present,
+            "dynamic Router supplies no Spec — path() must still be populated"
         );
     }
 
