@@ -58,6 +58,8 @@ pub struct RequestContext {
     pub(crate) spec: Option<crate::spec::Spec>,
     /// The wire protocol negotiated for this request, when known.
     pub(crate) protocol: Option<crate::Protocol>,
+    /// The procedure path the client requested, with a leading slash.
+    pub(crate) path: Option<String>,
 }
 
 impl RequestContext {
@@ -69,6 +71,7 @@ impl RequestContext {
             extensions: http::Extensions::new(),
             spec: None,
             protocol: None,
+            path: None,
         }
     }
 
@@ -97,6 +100,17 @@ impl RequestContext {
     #[must_use]
     pub fn with_protocol(mut self, protocol: Option<crate::Protocol>) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// Attach the procedure path the client requested. The dispatch path
+    /// always supplies the leading-slash form (`"/package.Service/Method"`),
+    /// matching [`Spec::procedure`](crate::Spec::procedure); custom
+    /// dispatch shims and test fixtures should do the same so consumers
+    /// of [`path()`](Self::path) see a consistent shape.
+    #[must_use]
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
         self
     }
 
@@ -179,6 +193,7 @@ impl RequestContext {
     /// `None` when the dynamic [`Router`](crate::Router) handled dispatch
     /// (its method paths are owned `String`s and can't supply
     /// [`Spec::procedure`](crate::Spec::procedure)'s `&'static str`).
+    /// See [`path`](Self::path) for the always-present procedure path.
     pub fn spec(&self) -> Option<crate::spec::Spec> {
         self.spec
     }
@@ -189,6 +204,35 @@ impl RequestContext {
     /// path (e.g. unit tests calling handlers directly).
     pub fn protocol(&self) -> Option<crate::Protocol> {
         self.protocol
+    }
+
+    /// The procedure path the client requested, `"/package.Service/Method"`.
+    ///
+    /// Always present when constructed by the dispatch path: it is taken
+    /// from the request URI, so it is populated whenever a handler is
+    /// dispatched — including dispatch through the dynamic
+    /// [`Router`](crate::Router), which does not supply a
+    /// [`Spec`](crate::Spec). `None` only for hand-built contexts (unit
+    /// tests calling handlers directly, custom dispatch shims). Code that
+    /// must label or gate every request — auth interceptors, span
+    /// builders, rate limiters — should read `path()`, not `spec()`, and
+    /// treat `None` as a misconfigured or synthetic context rather than a
+    /// real RPC.
+    ///
+    /// Compare [`spec()`](Self::spec): that is the registered method's
+    /// *static* metadata, populated only when a generated
+    /// `FooServiceServer<T>` dispatcher resolved the route, and
+    /// [`Spec::procedure`](crate::Spec::procedure) is its `&'static str`
+    /// procedure name. When both are present they are identical strings;
+    /// `path()` exists for the cases where `spec()` cannot be.
+    ///
+    /// The leading slash is included to match `Spec::procedure`, the
+    /// `connect-go` `Spec.Procedure` convention, and `http::Uri::path()`
+    /// for any HTTP request that reached the dispatch layer. To compare
+    /// against [`Dispatcher::lookup`](crate::Dispatcher::lookup) keys
+    /// (which omit it), use `path.strip_prefix('/').unwrap_or(path)`.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
     /// Remote peer socket address, if the transport recorded one.
@@ -1310,5 +1354,30 @@ mod tests {
         let ctx = ctx.with_spec(None).with_protocol(None);
         assert_eq!(ctx.spec(), None);
         assert_eq!(ctx.protocol(), None);
+    }
+
+    #[test]
+    fn request_context_with_path() {
+        // Hand-built contexts (tests, custom dispatchers) have no path.
+        let ctx = RequestContext::new(HeaderMap::new());
+        assert_eq!(ctx.path(), None);
+
+        // Round-trips through the builder.
+        let ctx = RequestContext::new(HeaderMap::new()).with_path("/pkg.Svc/M");
+        assert_eq!(ctx.path(), Some("/pkg.Svc/M"));
+
+        // The builder takes ownership (Into<String>) so callers can pass
+        // borrowed or owned without an extra clone.
+        let owned = String::from("/pkg.Svc/Other");
+        let ctx = RequestContext::new(HeaderMap::new()).with_path(owned);
+        assert_eq!(ctx.path(), Some("/pkg.Svc/Other"));
+
+        // The builder does not normalize or validate — `Some("")` is
+        // preserved verbatim. The dispatch path always supplies a non-empty
+        // leading-slash form; `Some("")` only reaches consumers from a
+        // misconfigured custom dispatch shim, which is a wiring bug they
+        // should surface rather than silently coerce to `None`.
+        let ctx = RequestContext::new(HeaderMap::new()).with_path("");
+        assert_eq!(ctx.path(), Some(""));
     }
 }
