@@ -529,6 +529,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                     })
                 },
             )
+            .with_spec(CONFORMANCE_SERVICE_UNARY_SPEC)
             .route_view_server_stream::<
                 _,
                 _,
@@ -544,6 +545,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                     }
                 }),
             )
+            .with_spec(CONFORMANCE_SERVICE_SERVER_STREAM_SPEC)
             .route_view_client_stream(
                 CONFORMANCE_SERVICE_SERVICE_NAME,
                 "ClientStream",
@@ -561,6 +563,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                     }
                 }),
             )
+            .with_spec(CONFORMANCE_SERVICE_CLIENT_STREAM_SPEC)
             .route_view_bidi_stream::<
                 _,
                 _,
@@ -576,6 +579,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                     }
                 }),
             )
+            .with_spec(CONFORMANCE_SERVICE_BIDI_STREAM_SPEC)
             .route_view(
                 CONFORMANCE_SERVICE_SERVICE_NAME,
                 "Unimplemented",
@@ -593,6 +597,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                     })
                 },
             )
+            .with_spec(CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC)
             .route_view_idempotent(
                 CONFORMANCE_SERVICE_SERVICE_NAME,
                 "IdempotentUnary",
@@ -610,6 +615,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                     })
                 },
             )
+            .with_spec(CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC)
     }
 }
 /// Monomorphic dispatcher for `ConformanceService`.

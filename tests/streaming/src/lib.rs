@@ -1262,8 +1262,12 @@ mod tests {
         assert_eq!(resp.into_view().sequence, 1007);
     }
 
-    /// End-to-end: the codegen dispatcher surfaces `Spec` and `Protocol` on
-    /// `RequestContext`, and the dynamic `Router` does not (no `'static` path).
+    /// End-to-end: both dispatch paths surface `Spec` and `Protocol` on
+    /// `RequestContext`. The codegen `FooServiceServer<T>` always did;
+    /// the dynamic `Router` now does too because the generated
+    /// `register()` chains `.with_spec(...)` after every route. Handlers
+    /// and interceptors should see identical metadata regardless of which
+    /// dispatch path the host wired up.
     #[tokio::test]
     async fn handler_sees_spec_and_protocol() {
         async fn round_trip(addr: std::net::SocketAddr) -> String {
@@ -1279,6 +1283,7 @@ mod tests {
                 .data
                 .to_owned()
         }
+        const EXPECT: &str = "/test.echo.v1.EchoService/Echo|Unary|Connect|Unknown|Server";
 
         // Codegen dispatcher path → spec is populated.
         let server = EchoServiceServer::new(SpecReflectingService);
@@ -1287,23 +1292,26 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        assert_eq!(
-            round_trip(addr).await,
-            "/test.echo.v1.EchoService/Echo|Unary|Connect|Unknown|Server"
-        );
+        assert_eq!(round_trip(addr).await, EXPECT);
 
-        // Dynamic Router path → spec is None, protocol is still populated.
+        // Dynamic Router path → spec is also populated (same Spec const,
+        // attached via `Router::with_spec` in the generated `register()`).
         let router = Arc::new(SpecReflectingService).register(Router::new());
         let app = router.into_axum_router();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        assert_eq!(round_trip(addr).await, "<none>|Connect");
+        assert_eq!(
+            round_trip(addr).await,
+            EXPECT,
+            "Router path must surface the same Spec as the codegen dispatcher"
+        );
     }
 
-    /// Codegen emits a per-method `Spec` const and the generated dispatcher
-    /// surfaces it through `Dispatcher::lookup`. The dynamic `Router` cannot
-    /// (its keys are owned `String`s), so it must return `spec: None`.
+    /// Codegen emits a per-method `Spec` const and *both* generated
+    /// dispatch paths surface it through `Dispatcher::lookup`: the
+    /// monomorphic `FooServiceServer<T>` and the dynamic `Router` (which
+    /// gets it via `Router::with_spec` chained in `register()`).
     #[test]
     fn codegen_specs_thread_through_lookup() {
         use connectrpc::{Dispatcher, IdempotencyLevel, MethodKind, SpecOrigin, StreamType};
@@ -1334,9 +1342,10 @@ mod tests {
             StreamType::ServerStream
         );
 
-        // The codegen dispatcher's `lookup` returns the spec; the spec's
-        // procedure round-trips through the route the dispatcher matched.
+        // Both dispatchers' `lookup` return the same spec; the spec's
+        // procedure round-trips through the route they matched.
         let server = EchoServiceServer::new(TestEchoService);
+        let router = Arc::new(TestEchoService).register(Router::new());
         for (method, spec) in [
             ("Echo", ECHO_SERVICE_ECHO_SPEC),
             ("ServerStream", ECHO_SERVICE_SERVER_STREAM_SPEC),
@@ -1344,18 +1353,21 @@ mod tests {
             ("BidiStream", ECHO_SERVICE_BIDI_STREAM_SPEC),
         ] {
             let path = format!("test.echo.v1.EchoService/{method}");
-            let desc = server.lookup(&path).expect("registered method");
-            assert_eq!(desc.spec, Some(spec), "lookup({path}) spec mismatch");
-            assert_eq!(MethodKind::from(spec.stream_type), desc.kind);
-            assert_eq!(spec.procedure.trim_start_matches('/'), path);
+            for (label, dispatcher) in [
+                ("FooServiceServer", &server as &dyn Dispatcher),
+                ("Router", &router as &dyn Dispatcher),
+            ] {
+                let desc = dispatcher.lookup(&path).expect("registered method");
+                assert_eq!(
+                    desc.spec,
+                    Some(spec),
+                    "{label}::lookup({path}) spec mismatch"
+                );
+                assert_eq!(MethodKind::from(spec.stream_type), desc.kind);
+                assert_eq!(spec.procedure.trim_start_matches('/'), path);
+            }
         }
         assert!(server.lookup("test.echo.v1.EchoService/Nope").is_none());
-
-        // The dynamic `Router` returns no spec.
-        let router = Arc::new(TestEchoService).register(Router::new());
-        let desc = router
-            .lookup("test.echo.v1.EchoService/Echo")
-            .expect("registered method");
-        assert!(desc.spec.is_none());
+        assert!(router.lookup("test.echo.v1.EchoService/Nope").is_none());
     }
 }

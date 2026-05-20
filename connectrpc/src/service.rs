@@ -1207,12 +1207,29 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// Interceptors apply to **unary** calls only in this release.
     /// Streaming calls bypass the chain.
+    ///
+    /// To share one interceptor instance across multiple services, use
+    /// [`with_interceptor_arc`](Self::with_interceptor_arc).
     #[must_use]
-    pub fn with_interceptor(mut self, interceptor: impl Interceptor) -> Self {
+    pub fn with_interceptor(self, interceptor: impl Interceptor) -> Self {
+        self.with_interceptor_arc(Arc::new(interceptor))
+    }
+
+    /// Append an already-`Arc`'d unary [`Interceptor`] to the chain.
+    ///
+    /// Same ordering and semantics as
+    /// [`with_interceptor`](Self::with_interceptor). Use this when one
+    /// interceptor instance is shared across multiple `ConnectRpcService`s
+    /// — e.g. an auth interceptor whose state (a connection pool, a token
+    /// cache) is process-wide and should not be duplicated per service.
+    /// Most callers want [`with_interceptor`](Self::with_interceptor),
+    /// which takes ownership and wraps for you.
+    #[must_use]
+    pub fn with_interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         // The Arc<[..]> is shared across cloned service handles; rebuild
         // it on registration. Registration is a cold path.
         let mut v: Vec<Arc<dyn Interceptor>> = self.interceptors.to_vec();
-        v.push(Arc::new(interceptor));
+        v.push(interceptor);
         self.interceptors = Arc::from(v);
         self
     }
@@ -3640,19 +3657,16 @@ mod tests {
         );
     }
 
-    /// Prove that `RequestContext::path()` carries the request URI path
-    /// through the dispatch path, in the leading-slash form, *even when*
-    /// `RequestContext::spec()` is `None`.
-    ///
-    /// This test deliberately uses the dynamic [`Router`], which never
-    /// supplies a [`Spec`](crate::spec::Spec) — `path()` is the only
-    /// reliable source for the procedure name in that case, and it's the
-    /// one an auth interceptor or span builder must read.
-    #[tokio::test]
-    async fn path_flows_to_handler_context() {
+    /// Register a `svc/Method` handler that captures
+    /// `(ctx.path(), ctx.spec())`, apply `finalize` (e.g. `with_spec`),
+    /// drive a request through `handle_unary_request`, and return the
+    /// captured tuple.
+    async fn capture_path_and_spec(
+        finalize: impl FnOnce(Router) -> Router,
+    ) -> (Option<String>, Option<crate::spec::Spec>) {
         use std::sync::Mutex;
 
-        let captured = Arc::new(Mutex::new(None::<(Option<String>, bool)>));
+        let captured = Arc::new(Mutex::new(None));
         let handler_captured = Arc::clone(&captured);
         let router = Router::new().route(
             "svc",
@@ -3660,12 +3674,12 @@ mod tests {
             crate::handler_fn(move |ctx: RequestContext, _req: buffa_types::Empty| {
                 let cap = Arc::clone(&handler_captured);
                 async move {
-                    *cap.lock().unwrap() =
-                        Some((ctx.path().map(str::to_owned), ctx.spec().is_some()));
+                    *cap.lock().unwrap() = Some((ctx.path().map(str::to_owned), ctx.spec()));
                     crate::Response::ok(buffa_types::Empty::default())
                 }
             }),
         );
+        let router = finalize(router);
 
         let req = Request::builder()
             .method(Method::POST)
@@ -3686,15 +3700,52 @@ mod tests {
         .await
         .expect("dispatch should succeed");
 
-        let (path, spec_present) = captured.lock().unwrap().take().expect("handler ran");
+        captured.lock().unwrap().take().expect("handler ran")
+    }
+
+    /// Prove that `RequestContext::path()` carries the request URI path
+    /// through the dispatch path, in the leading-slash form, *even when*
+    /// `RequestContext::spec()` is `None`.
+    ///
+    /// A `Router` route registered without [`Router::with_spec`] supplies
+    /// no [`Spec`](crate::spec::Spec) — `path()` is the only source for
+    /// the procedure name in that case, and it's the one an auth
+    /// interceptor or span builder must read.
+    #[tokio::test]
+    async fn path_flows_to_handler_context() {
+        let (path, spec) = capture_path_and_spec(|r| r).await;
         assert_eq!(
             path.as_deref(),
             Some("/svc/Method"),
             "path() must carry the leading-slash request URI path"
         );
         assert!(
-            !spec_present,
-            "dynamic Router supplies no Spec — path() must still be populated"
+            spec.is_none(),
+            "Router route without with_spec supplies no Spec — path() must still be populated"
+        );
+    }
+
+    /// `Router::with_spec` flows through the dispatch path to
+    /// `RequestContext::spec()`. A `Router` built through the generated
+    /// `register()` (which chains `.with_spec(...)` after every
+    /// `route_view*`) surfaces `Spec` to handlers and interceptors
+    /// exactly like the monomorphic `FooServiceServer<T>` dispatcher.
+    /// `path()` and `spec().procedure` must agree when both are present.
+    #[tokio::test]
+    async fn spec_flows_to_handler_context() {
+        use crate::spec::{Spec, StreamType};
+        const SPEC: Spec = Spec::server("/svc/Method", StreamType::Unary);
+
+        let (path, spec) = capture_path_and_spec(|r| r.with_spec(SPEC)).await;
+        assert_eq!(
+            spec,
+            Some(SPEC),
+            "Router::with_spec must flow to ctx.spec()"
+        );
+        assert_eq!(
+            path.as_deref(),
+            spec.map(|s| s.procedure),
+            "path() and spec().procedure must agree when both are present"
         );
     }
 
@@ -3771,6 +3822,40 @@ mod tests {
             *handler_ran.lock().unwrap(),
             "handler must run after the interceptor passes through"
         );
+    }
+
+    /// `with_interceptor_arc` shares one interceptor across services.
+    /// `with_interceptor` would `Arc::new` a fresh allocation per call,
+    /// which is correct for unique state but wasteful (and surprising)
+    /// when the interceptor carries process-wide shared state — pin the
+    /// distinction with a strong-count check.
+    #[test]
+    fn with_interceptor_arc_shares_one_instance() {
+        use crate::interceptor::Interceptor;
+
+        struct Noop;
+        #[async_trait::async_trait]
+        impl Interceptor for Noop {}
+
+        let shared: Arc<dyn Interceptor> = Arc::new(Noop);
+        assert_eq!(Arc::strong_count(&shared), 1);
+
+        let svc_a = ConnectRpcService::new(Router::new()).with_interceptor_arc(Arc::clone(&shared));
+        let svc_b = ConnectRpcService::new(Router::new()).with_interceptor_arc(Arc::clone(&shared));
+
+        // The caller's handle plus one per service.
+        assert_eq!(
+            Arc::strong_count(&shared),
+            3,
+            "with_interceptor_arc must store the supplied Arc, not a fresh allocation"
+        );
+        // Cloning a service is one Arc<[..]> bump, not a per-interceptor bump.
+        let _svc_a2 = svc_a.clone();
+        assert_eq!(Arc::strong_count(&shared), 3);
+        drop(svc_a);
+        drop(svc_b);
+        drop(_svc_a2);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 
     // ========================================================================

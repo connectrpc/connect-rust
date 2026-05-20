@@ -134,6 +134,7 @@ impl<S: LogIngestService> LogIngestServiceExt for S {
                     })
                 },
             )
+            .with_spec(LOG_INGEST_SERVICE_INGEST_SPEC)
     }
 }
 /// Monomorphic dispatcher for `LogIngestService`.

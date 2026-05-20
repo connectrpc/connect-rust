@@ -147,6 +147,7 @@ impl<S: GreetService> GreetServiceExt for S {
                     })
                 },
             )
+            .with_spec(GREET_SERVICE_GREET_SPEC)
     }
 }
 /// Monomorphic dispatcher for `GreetService`.

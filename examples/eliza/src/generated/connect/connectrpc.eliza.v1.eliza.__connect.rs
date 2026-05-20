@@ -244,6 +244,7 @@ impl<S: ElizaService> ElizaServiceExt for S {
                     })
                 },
             )
+            .with_spec(ELIZA_SERVICE_SAY_SPEC)
             .route_view_bidi_stream::<
                 _,
                 _,
@@ -259,6 +260,7 @@ impl<S: ElizaService> ElizaServiceExt for S {
                     }
                 }),
             )
+            .with_spec(ELIZA_SERVICE_CONVERSE_SPEC)
             .route_view_server_stream::<
                 _,
                 _,
@@ -274,6 +276,7 @@ impl<S: ElizaService> ElizaServiceExt for S {
                     }
                 }),
             )
+            .with_spec(ELIZA_SERVICE_INTRODUCE_SPEC)
     }
 }
 /// Monomorphic dispatcher for `ElizaService`.

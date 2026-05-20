@@ -327,6 +327,7 @@ impl<S: BenchService> BenchServiceExt for S {
                     })
                 },
             )
+            .with_spec(BENCH_SERVICE_UNARY_SPEC)
             .route_view_server_stream::<
                 _,
                 _,
@@ -342,6 +343,7 @@ impl<S: BenchService> BenchServiceExt for S {
                     }
                 }),
             )
+            .with_spec(BENCH_SERVICE_SERVER_STREAM_SPEC)
             .route_view_client_stream(
                 BENCH_SERVICE_SERVICE_NAME,
                 "ClientStream",
@@ -357,6 +359,7 @@ impl<S: BenchService> BenchServiceExt for S {
                     }
                 }),
             )
+            .with_spec(BENCH_SERVICE_CLIENT_STREAM_SPEC)
             .route_view_bidi_stream::<
                 _,
                 _,
@@ -372,6 +375,7 @@ impl<S: BenchService> BenchServiceExt for S {
                     }
                 }),
             )
+            .with_spec(BENCH_SERVICE_BIDI_STREAM_SPEC)
             .route_view(
                 BENCH_SERVICE_SERVICE_NAME,
                 "LogUnary",
@@ -387,6 +391,7 @@ impl<S: BenchService> BenchServiceExt for S {
                     })
                 },
             )
+            .with_spec(BENCH_SERVICE_LOG_UNARY_SPEC)
             .route_view(
                 BENCH_SERVICE_SERVICE_NAME,
                 "LogUnaryOwned",
@@ -402,6 +407,7 @@ impl<S: BenchService> BenchServiceExt for S {
                     })
                 },
             )
+            .with_spec(BENCH_SERVICE_LOG_UNARY_OWNED_SPEC)
     }
 }
 /// Monomorphic dispatcher for `BenchService`.
@@ -1039,6 +1045,7 @@ impl<S: EchoService> EchoServiceExt for S {
                     })
                 },
             )
+            .with_spec(ECHO_SERVICE_ECHO_SPEC)
     }
 }
 /// Monomorphic dispatcher for `EchoService`.
@@ -1383,6 +1390,7 @@ impl<S: LogIngestService> LogIngestServiceExt for S {
                     })
                 },
             )
+            .with_spec(LOG_INGEST_SERVICE_INGEST_SPEC)
     }
 }
 /// Monomorphic dispatcher for `LogIngestService`.

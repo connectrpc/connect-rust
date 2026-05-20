@@ -138,6 +138,7 @@ impl<S: MathService> MathServiceExt for S {
                     })
                 },
             )
+            .with_spec(MATH_SERVICE_ADD_SPEC)
     }
 }
 /// Monomorphic dispatcher for `MathService`.

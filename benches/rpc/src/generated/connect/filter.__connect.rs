@@ -132,6 +132,7 @@ impl<S: FilterService> FilterServiceExt for S {
                     })
                 },
             )
+            .with_spec(FILTER_SERVICE_REDACT_SPEC)
     }
 }
 /// Monomorphic dispatcher for `FilterService`.

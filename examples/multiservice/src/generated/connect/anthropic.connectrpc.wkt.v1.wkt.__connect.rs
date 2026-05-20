@@ -272,6 +272,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                     })
                 },
             )
+            .with_spec(WELL_KNOWN_TYPES_SERVICE_CREATE_EVENT_SPEC)
             .route_view(
                 WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
                 "CalculateDuration",
@@ -289,6 +290,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                     })
                 },
             )
+            .with_spec(WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC)
             .route_view(
                 WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
                 "ProcessMetadata",
@@ -306,6 +308,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                     })
                 },
             )
+            .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC)
     }
 }
 /// Monomorphic dispatcher for `WellKnownTypesService`.

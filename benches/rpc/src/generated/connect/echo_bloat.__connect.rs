@@ -133,6 +133,7 @@ impl<S: BloatEchoService> BloatEchoServiceExt for S {
                     })
                 },
             )
+            .with_spec(BLOAT_ECHO_SERVICE_ECHO_SPEC)
     }
 }
 /// Monomorphic dispatcher for `BloatEchoService`.

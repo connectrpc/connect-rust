@@ -134,6 +134,7 @@ impl<S: FortuneService> FortuneServiceExt for S {
                     })
                 },
             )
+            .with_spec(FORTUNE_SERVICE_GET_FORTUNES_SPEC)
     }
 }
 /// Monomorphic dispatcher for `FortuneService`.

@@ -1046,11 +1046,15 @@ fn generate_service(
         .map(|m| {
             let method_name = m.name.as_deref().unwrap_or("");
             let method_snake = make_field_ident(&method_name.to_snake_case());
+            // Attach the per-method `Spec` const so the dynamic `Router`
+            // surfaces `RequestContext::spec()` exactly like the
+            // monomorphic `FooServiceServer<T>` dispatcher does.
+            let spec_const = method_spec_const_ident(service, method_name);
 
             let client_streaming = m.client_streaming.unwrap_or(false);
             let server_streaming = m.server_streaming.unwrap_or(false);
 
-            if server_streaming && !client_streaming {
+            let route_call = if server_streaming && !client_streaming {
                 // Server streaming method. The trait method returns
                 // `ServiceStream<impl Encodable<Out>>`; `Res = Out` is no
                 // longer derivable from the opaque item type, so it must
@@ -1142,6 +1146,11 @@ fn generate_service(
                         },
                     )
                 }
+            };
+
+            quote! {
+                #route_call
+                .with_spec(#spec_const)
             }
         })
         .collect();

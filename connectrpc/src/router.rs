@@ -31,6 +31,8 @@ use crate::handler::ViewBidiStreamingHandler;
 use crate::handler::ViewClientStreamingHandler;
 use crate::handler::ViewHandler;
 use crate::handler::ViewStreamingHandler;
+use crate::spec::IdempotencyLevel;
+use crate::spec::Spec;
 
 /// The kind of RPC method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,22 +79,42 @@ enum Method {
     BidiStreaming(BidiStreamingMethod),
 }
 
+/// A registered method plus its optional static [`Spec`].
+///
+/// `spec` is `None` until [`Router::with_spec`] runs for the route. The
+/// generated `FooServiceExt::register` always chains `.with_spec(...)`
+/// after the `route_*` call; hand-written registrations may omit it
+/// (their paths are usually owned `String`s, not `&'static str`s, so
+/// they cannot construct a [`Spec`] anyway).
+struct RegisteredMethod {
+    method: Method,
+    spec: Option<Spec>,
+}
+
+impl From<Method> for RegisteredMethod {
+    fn from(method: Method) -> Self {
+        Self { method, spec: None }
+    }
+}
+
 /// Router for ConnectRPC services.
 ///
 /// The router maps service/method paths to their handlers and manages
 /// request dispatching.
 ///
 /// `Router` is the *dynamic* dispatch path: method paths are owned `String`
-/// keys, so it cannot supply [`Spec::procedure`](crate::Spec::procedure)'s
-/// `&'static str` and handlers receive [`RequestContext::spec`] as `None`.
-/// Code that needs `Spec` (interceptors, OTel labels) should use the
-/// generated `FooServiceServer<T>` dispatcher instead.
+/// keys. It can still carry a [`Spec`] when one is attached with
+/// [`with_spec`](Self::with_spec) — the generated
+/// `FooServiceExt::register` does this for every method, so a `Router`
+/// built through codegen surfaces [`RequestContext::spec`] just like the
+/// monomorphic `FooServiceServer<T>` dispatcher does. Hand-written
+/// `route_*` registrations without a `Spec` surface `None`.
 ///
 /// [`RequestContext::spec`]: crate::RequestContext::spec
 #[derive(Default)]
 pub struct Router {
     /// Map from "service_name/method_name" to handler.
-    methods: HashMap<String, Method>,
+    methods: HashMap<String, RegisteredMethod>,
 }
 
 impl Router {
@@ -180,7 +202,8 @@ impl Router {
             Method::Unary(UnaryMethod {
                 handler: Arc::new(wrapper),
                 idempotent,
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -219,7 +242,8 @@ impl Router {
             Method::Streaming(StreamingMethod {
                 handler: Arc::new(wrapper),
                 kind: MethodKind::ServerStreaming,
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -244,7 +268,8 @@ impl Router {
             path,
             Method::ClientStreaming(ClientStreamingMethod {
                 handler: Arc::new(wrapper),
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -269,7 +294,8 @@ impl Router {
             path,
             Method::BidiStreaming(BidiStreamingMethod {
                 handler: Arc::new(wrapper),
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -323,7 +349,8 @@ impl Router {
             Method::Unary(UnaryMethod {
                 handler: Arc::new(wrapper),
                 idempotent,
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -348,7 +375,8 @@ impl Router {
             Method::Streaming(StreamingMethod {
                 handler: Arc::new(wrapper),
                 kind: MethodKind::ServerStreaming,
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -371,7 +399,8 @@ impl Router {
             path,
             Method::ClientStreaming(ClientStreamingMethod {
                 handler: Arc::new(wrapper),
-            }),
+            })
+            .into(),
         );
         self
     }
@@ -395,8 +424,61 @@ impl Router {
             path,
             Method::BidiStreaming(BidiStreamingMethod {
                 handler: Arc::new(wrapper),
-            }),
+            })
+            .into(),
         );
+        self
+    }
+
+    /// Attach a [`Spec`] to the route registered at `spec.procedure`.
+    ///
+    /// The route must already exist — [`Spec::procedure`] is the lookup
+    /// key (with the leading slash stripped, matching the `route_*`
+    /// methods' `format!("{service}/{method}")` keying). Generated
+    /// `FooServiceExt::register` chains this after each `route_view*`
+    /// call so the dynamic `Router` carries the same per-method
+    /// metadata as the monomorphic `FooServiceServer<T>`. Hand-written
+    /// registrations may call it too when they have a `&'static`
+    /// procedure path:
+    ///
+    /// ```rust,ignore
+    /// const SAY_SPEC: Spec = Spec::server("/eliza.v1.Eliza/Say", StreamType::Unary);
+    /// let router = Router::new()
+    ///     .route_view_idempotent("eliza.v1.Eliza", "Say", handler)
+    ///     .with_spec(SAY_SPEC);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if no route is registered at `spec.procedure`,
+    /// or if the route is unary and `spec.idempotency_level` disagrees
+    /// with the `route` / `route_idempotent` choice. Both indicate a
+    /// programming error in `register()` (a typo, or calling `with_spec`
+    /// before the matching `route_*`); release builds skip the check and
+    /// silently drop the `Spec`.
+    #[must_use]
+    pub fn with_spec(mut self, spec: Spec) -> Self {
+        let key = spec.procedure.strip_prefix('/').unwrap_or(spec.procedure);
+        match self.methods.get_mut(key) {
+            Some(m) => {
+                if let Method::Unary(u) = &m.method {
+                    debug_assert_eq!(
+                        u.idempotent,
+                        spec.idempotency_level == IdempotencyLevel::NoSideEffects,
+                        "route {key:?} idempotency disagrees with Spec::idempotency_level — \
+                         pick `route` vs `route_idempotent` to match the Spec"
+                    );
+                }
+                m.spec = Some(spec);
+            }
+            None => {
+                debug_assert!(
+                    false,
+                    "Router::with_spec: no route registered at {key:?} — \
+                     call the matching `route_*` first"
+                );
+            }
+        }
         self
     }
 
@@ -418,12 +500,17 @@ impl Router {
 impl crate::dispatcher::Dispatcher for Router {
     fn lookup(&self, path: &str) -> Option<crate::dispatcher::MethodDescriptor> {
         use crate::dispatcher::MethodDescriptor;
-        match self.methods.get(path)? {
-            Method::Unary(m) => Some(MethodDescriptor::unary(m.idempotent)),
-            Method::Streaming(m) => Some(MethodDescriptor::from_kind(m.kind)),
-            Method::ClientStreaming(_) => Some(MethodDescriptor::client_streaming()),
-            Method::BidiStreaming(_) => Some(MethodDescriptor::bidi_streaming()),
+        let m = self.methods.get(path)?;
+        let mut desc = match &m.method {
+            Method::Unary(u) => MethodDescriptor::unary(u.idempotent),
+            Method::Streaming(s) => MethodDescriptor::from_kind(s.kind),
+            Method::ClientStreaming(_) => MethodDescriptor::client_streaming(),
+            Method::BidiStreaming(_) => MethodDescriptor::bidi_streaming(),
+        };
+        if let Some(spec) = m.spec {
+            desc = desc.with_spec(spec);
         }
+        Some(desc)
     }
 
     fn call_unary(
@@ -433,7 +520,7 @@ impl crate::dispatcher::Dispatcher for Router {
         request: crate::Payload,
         format: crate::codec::CodecFormat,
     ) -> crate::dispatcher::UnaryResult {
-        match self.methods.get(path) {
+        match self.methods.get(path).map(|m| &m.method) {
             Some(Method::Unary(m)) => m.handler.call_erased(ctx, request, format),
             _ => crate::dispatcher::unimplemented_unary(path),
         }
@@ -446,7 +533,7 @@ impl crate::dispatcher::Dispatcher for Router {
         request: bytes::Bytes,
         format: crate::codec::CodecFormat,
     ) -> crate::dispatcher::StreamingResult {
-        match self.methods.get(path) {
+        match self.methods.get(path).map(|m| &m.method) {
             Some(Method::Streaming(m)) => m.handler.call_erased(ctx, request, format),
             _ => crate::dispatcher::unimplemented_streaming(path),
         }
@@ -459,7 +546,7 @@ impl crate::dispatcher::Dispatcher for Router {
         requests: crate::dispatcher::RequestStream,
         format: crate::codec::CodecFormat,
     ) -> crate::dispatcher::UnaryResult {
-        match self.methods.get(path) {
+        match self.methods.get(path).map(|m| &m.method) {
             Some(Method::ClientStreaming(m)) => m.handler.call_erased(ctx, requests, format),
             _ => crate::dispatcher::unimplemented_unary(path),
         }
@@ -472,7 +559,7 @@ impl crate::dispatcher::Dispatcher for Router {
         requests: crate::dispatcher::RequestStream,
         format: crate::codec::CodecFormat,
     ) -> crate::dispatcher::StreamingResult {
-        match self.methods.get(path) {
+        match self.methods.get(path).map(|m| &m.method) {
             Some(Method::BidiStreaming(m)) => m.handler.call_erased(ctx, requests, format),
             _ => crate::dispatcher::unimplemented_streaming(path),
         }
@@ -491,6 +578,10 @@ pub fn merge_routers(routers: impl IntoIterator<Item = Router>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatcher::Dispatcher;
+    use crate::handler_fn;
+    use crate::spec::StreamType;
+    use buffa_types::Empty;
 
     #[test]
     fn test_router_registration() {
@@ -498,5 +589,81 @@ mod tests {
         // Full testing requires actual proto types
         let router = Router::new();
         assert!(!router.has_method("test.Service/Method"));
+    }
+
+    fn unary_handler() -> impl Handler<Empty, Empty> {
+        handler_fn(|_ctx, _req: Empty| async { crate::Response::ok(Empty::default()) })
+    }
+
+    /// `with_spec` attaches the `Spec` and `lookup` returns it. This is
+    /// the property the codegen relies on: a `Router` built through
+    /// `register()` should surface `RequestContext::spec` exactly like
+    /// the monomorphic `FooServiceServer<T>` dispatcher.
+    #[test]
+    fn with_spec_round_trips_through_lookup() {
+        const SPEC: Spec = Spec::server("/test.Svc/Method", StreamType::Unary);
+        let router = Router::new()
+            .route("test.Svc", "Method", unary_handler())
+            .with_spec(SPEC);
+
+        let desc = router.lookup("test.Svc/Method").expect("route exists");
+        assert_eq!(
+            desc.spec,
+            Some(SPEC),
+            "lookup must return the attached Spec"
+        );
+        assert_eq!(desc.kind, MethodKind::Unary);
+        assert!(!desc.idempotent);
+    }
+
+    /// A route registered without `with_spec` keeps the pre-existing
+    /// `spec: None` behavior — back-compat.
+    #[test]
+    fn route_without_with_spec_is_unchanged() {
+        let router = Router::new().route("test.Svc", "Method", unary_handler());
+        let desc = router.lookup("test.Svc/Method").expect("route exists");
+        assert_eq!(desc.spec, None);
+    }
+
+    /// `merge_routers` carries each route's `Spec` across the merge.
+    #[test]
+    fn merge_routers_preserves_specs() {
+        const A: Spec = Spec::server("/svc.A/M", StreamType::Unary);
+        const B: Spec = Spec::server("/svc.B/N", StreamType::Unary);
+        let merged = merge_routers([
+            Router::new()
+                .route("svc.A", "M", unary_handler())
+                .with_spec(A),
+            Router::new()
+                .route("svc.B", "N", unary_handler())
+                .with_spec(B),
+        ]);
+        assert_eq!(merged.lookup("svc.A/M").unwrap().spec, Some(A));
+        assert_eq!(merged.lookup("svc.B/N").unwrap().spec, Some(B));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no route registered")]
+    fn with_spec_unknown_route_panics_in_debug() {
+        const SPEC: Spec = Spec::server("/test.Svc/Nope", StreamType::Unary);
+        let _ = Router::new()
+            .route("test.Svc", "Method", unary_handler())
+            .with_spec(SPEC);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "idempotency disagrees")]
+    fn with_spec_idempotency_mismatch_panics_in_debug() {
+        // Spec declares NoSideEffects but the route was registered via
+        // `route` (idempotent: false). The `idempotent` flag is what the
+        // dispatch path consults to allow Connect GET, so a mismatch
+        // here would silently disable GET for an idempotent method.
+        const SPEC: Spec = Spec::server("/test.Svc/Method", StreamType::Unary)
+            .with_idempotency_level(IdempotencyLevel::NoSideEffects);
+        let _ = Router::new()
+            .route("test.Svc", "Method", unary_handler())
+            .with_spec(SPEC);
     }
 }
