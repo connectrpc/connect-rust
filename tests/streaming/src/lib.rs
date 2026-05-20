@@ -1262,6 +1262,188 @@ mod tests {
         assert_eq!(resp.into_view().sequence, 1007);
     }
 
+    /// End-to-end: a registered streaming interceptor wraps server-streaming,
+    /// client-streaming, and bidi calls. Each shape routes through
+    /// `intercept_streaming` exactly once at stream establishment, sees
+    /// `path()`, and can attach response metadata. An auth interceptor
+    /// running this hook is the security boundary for streaming RPCs — a
+    /// bypassed shape is a vulnerability, not a gap.
+    #[tokio::test]
+    async fn interceptor_wraps_streaming_calls() {
+        use connectrpc::{Interceptor, NextStream, PayloadStream, StreamRequest, StreamResponse};
+        use std::sync::Mutex;
+
+        /// Records the path of every streaming RPC it sees and stamps a
+        /// response header so the client can assert the interceptor ran.
+        #[derive(Clone)]
+        struct StreamRecorder(Arc<Mutex<Vec<String>>>);
+
+        #[connectrpc::async_trait]
+        impl Interceptor for StreamRecorder {
+            async fn intercept_streaming(
+                &self,
+                req: StreamRequest,
+                inbound: PayloadStream,
+                next: NextStream<'_>,
+            ) -> Result<StreamResponse, ConnectError> {
+                let path = req
+                    .ctx
+                    .path()
+                    .expect("dispatch sets path before interceptors run")
+                    .to_owned();
+                self.0.lock().unwrap().push(path.clone());
+                let resp = next.run(req, inbound).await?;
+                Ok(resp.with_header("x-stream-intercepted", path))
+            }
+        }
+
+        let recorder = StreamRecorder(Arc::new(Mutex::new(Vec::new())));
+        let server = EchoServiceServer::new(TestEchoService);
+        let service = ConnectRpcService::new(server).with_interceptor(recorder.clone());
+        let app = axum::Router::new().fallback_service(service);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = make_client(addr);
+
+        // Server streaming: 1 request → N responses.
+        let mut stream = client
+            .server_stream(EchoRequest {
+                sequence: 3,
+                data: "ss".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.headers().get("x-stream-intercepted").unwrap(),
+            "/test.echo.v1.EchoService/ServerStream"
+        );
+        let mut received = 0;
+        while stream.message().await.unwrap().is_some() {
+            received += 1;
+        }
+        assert_eq!(
+            received, 3,
+            "stream items must flow through the interceptor"
+        );
+
+        // Client streaming: N requests → 1 response.
+        let messages: Vec<EchoRequest> = (0..2)
+            .map(|i| EchoRequest {
+                sequence: i,
+                data: format!("cs-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let resp = client.client_stream(messages).await.unwrap();
+        assert_eq!(
+            resp.headers().get("x-stream-intercepted").unwrap(),
+            "/test.echo.v1.EchoService/ClientStream"
+        );
+        assert_eq!(
+            resp.into_view().sequence,
+            2,
+            "all items must reach the handler"
+        );
+
+        // Bidi streaming: N requests ↔ N responses (gRPC, full duplex).
+        {
+            use connectrpc::Protocol;
+            use connectrpc::client::Http2Connection;
+            let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+            let conn = Http2Connection::connect_plaintext(uri.clone())
+                .await
+                .unwrap()
+                .shared(8);
+            let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
+            let bidi_client = EchoServiceClient::new(conn, config);
+            let mut bidi = bidi_client.bidi_stream().await.unwrap();
+            bidi.send(EchoRequest {
+                sequence: 1,
+                data: "bidi".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            bidi.close_send();
+            let mut received = 0;
+            while bidi.message().await.unwrap().is_some() {
+                received += 1;
+            }
+            assert_eq!(received, 1);
+        }
+
+        // The interceptor saw all three streaming RPCs.
+        let seen = recorder.0.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                "/test.echo.v1.EchoService/ServerStream",
+                "/test.echo.v1.EchoService/ClientStream",
+                "/test.echo.v1.EchoService/BidiStream",
+            ]
+        );
+    }
+
+    /// A streaming interceptor that returns `Err` at establishment must
+    /// short-circuit before the handler runs, and the client must receive a
+    /// structured error in the streaming wire format — not a transport
+    /// failure.
+    #[tokio::test]
+    async fn streaming_interceptor_short_circuit_reaches_client() {
+        use connectrpc::{Interceptor, NextStream, PayloadStream, StreamRequest, StreamResponse};
+
+        struct DenyAll;
+        #[connectrpc::async_trait]
+        impl Interceptor for DenyAll {
+            async fn intercept_streaming(
+                &self,
+                _req: StreamRequest,
+                _inbound: PayloadStream,
+                _next: NextStream<'_>,
+            ) -> Result<StreamResponse, ConnectError> {
+                Err(ConnectError::permission_denied("not authorized"))
+            }
+        }
+
+        let server = EchoServiceServer::new(TestEchoService);
+        let service = ConnectRpcService::new(server).with_interceptor(DenyAll);
+        let app = axum::Router::new().fallback_service(service);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = make_client(addr);
+
+        // Server streaming: the deny is rendered as an EndStreamResponse
+        // envelope (HTTP 200, Connect protocol). The client surfaces it via
+        // `stream.error()` after `message()` returns `Ok(None)` — same as
+        // connect-go's `stream.Err()`.
+        let mut stream = client
+            .server_stream(EchoRequest {
+                sequence: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("Connect-streaming errors arrive via the envelope, not the headers");
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "deny means no items"
+        );
+        let err = stream
+            .error()
+            .expect("interceptor deny must surface on the stream");
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+
+        // Client streaming: the response is unary-shaped over a streaming
+        // wire, so the error surfaces from the call itself.
+        let err = client
+            .client_stream(vec![EchoRequest::default()])
+            .await
+            .expect_err("expected deny");
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+    }
+
     /// End-to-end: both dispatch paths surface `Spec` and `Protocol` on
     /// `RequestContext`. The codegen `FooServiceServer<T>` always did;
     /// the dynamic `Router` now does too because the generated
