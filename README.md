@@ -26,6 +26,7 @@ connectrpc provides:
 - **`connectrpc`** — A Tower-based runtime library implementing the Connect protocol
 - **`protoc-gen-connect-rust`** — A `protoc` plugin that generates service traits, clients, and message types
 - **`connectrpc-build`** — `build.rs` integration for generating code at build time
+- **`connectrpc-health`** — The standard `grpc.health.v1.Health` service, for `grpc_health_probe` / kubelet gRPC probes / service-mesh health checks
 
 The runtime is built on [`tower::Service`](https://docs.rs/tower/latest/tower/trait.Service.html), making it framework-agnostic. It integrates with any tower-compatible HTTP framework including [Axum](https://docs.rs/axum), [Hyper](https://docs.rs/hyper), and others.
 
@@ -221,6 +222,10 @@ use std::sync::Arc;
 let service = Arc::new(MyGreetService);
 let connect = service.register(ConnectRouter::new());
 
+// Plain HTTP liveness probe for `kubectl`'s httpGet style. For the
+// standard gRPC Health protocol (grpc_health_probe, kubelet `grpc:`
+// probes), mount `connectrpc_health::HealthService` on the Connect
+// router instead — see docs/guide.md#health-checking.
 let app = Router::new()
     .route("/health", get(|| async { "OK" }))
     .fallback_service(connect.into_axum_service());
@@ -301,6 +306,7 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 - **Interceptors** (typed, async per-RPC middleware for unary and streaming calls) - see [docs/guide.md#interceptors](docs/guide.md#interceptors). Interceptors see the resolved `Spec`, headers, deadline, and a lazily decoded message body, and can rewrite or short-circuit the call - the equivalent of `connect-go`'s `WithInterceptors`.
 - **Tower middleware on the server** (gzip, raw header rewriting, generic HTTP concerns below the RPC layer) - see [docs/guide.md#tower-middleware](docs/guide.md#tower-middleware) and [`examples/middleware/`](examples/middleware) for a custom auth layer that stamps caller identity into request extensions.
 - **TLS / mTLS** - see [docs/guide.md#tls](docs/guide.md#tls) and [`examples/eliza/README.md`](examples/eliza/README.md) for cert generation and `Server::with_tls` / `HttpClient::with_tls` patterns.
+- **gRPC health checking** (`grpc.health.v1.Health`, used by `grpc_health_probe`, kubelet `grpc:` probes, and service meshes) - see [docs/guide.md#health-checking](docs/guide.md#health-checking) and the [`connectrpc-health`](connectrpc-health/) crate.
 
 ## Feature Flags
 
