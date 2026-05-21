@@ -154,9 +154,9 @@ rebuilds `OUT_DIR` automatically.
 [#120]: https://github.com/anthropics/connect-rust/pull/120
 [#121]: https://github.com/anthropics/connect-rust/pull/121
 [#123]: https://github.com/anthropics/connect-rust/pull/123
-[`Spec`]: https://docs.rs/connectrpc/latest/connectrpc/struct.Spec.html
-[`Payload`]: https://docs.rs/connectrpc/latest/connectrpc/struct.Payload.html
-[`AnyMessage`]: https://docs.rs/connectrpc/latest/connectrpc/trait.AnyMessage.html
+[`Spec`]: https://docs.rs/connectrpc/latest/connectrpc/spec/struct.Spec.html
+[`Payload`]: https://docs.rs/connectrpc/latest/connectrpc/payload/struct.Payload.html
+[`AnyMessage`]: https://docs.rs/connectrpc/latest/connectrpc/payload/trait.AnyMessage.html
 
 ## [0.5.0] - 2026-05-18
 
