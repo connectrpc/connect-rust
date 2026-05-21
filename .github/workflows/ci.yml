@@ -85,6 +85,64 @@ jobs:
           components: rustfmt
       - run: cargo +nightly fmt --all -- --check
 
+  check-generated-code:
+    name: Check generated code
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (sha-pinned)
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0 (sha-pinned)
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1 (sha-pinned)
+        with:
+          setup_only: true
+      - uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2 (sha-pinned)
+      - name: Generate lockfile
+        run: cargo generate-lockfile
+      - name: Resolve locked buffa version
+        id: buffa-version
+        shell: bash
+        run: |
+          version="$(awk '
+            $0 == "[[package]]" { in_buffa = 0 }
+            $0 == "name = \"buffa\"" { in_buffa = 1 }
+            in_buffa && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.lock)"
+
+          if [ -z "$version" ]; then
+            echo "::error::Could not find the buffa package version in Cargo.lock"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: anthropics/buffa
+          ref: v${{ steps.buffa-version.outputs.version }}
+          path: buffa
+      - name: Link buffa sibling checkout
+        shell: bash
+        run: ln -sfn "$PWD/buffa" ../buffa
+      - run: task generate:all
+      - name: Verify checked-in generated code is current
+        run: |
+          if ! git diff --exit-code -- \
+            conformance/src/generated \
+            examples/eliza/src/generated \
+            examples/multiservice/src/generated \
+            benches/rpc/src/generated; then
+            echo "::error::Checked-in generated code is stale. Run 'task generate:all' and commit the diff."
+            exit 1
+          fi
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest
