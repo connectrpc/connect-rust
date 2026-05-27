@@ -15,7 +15,7 @@ categories = ["network-programming", "web-programming::http-server", "web-progra
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-bytes = { version = "1.5", features = ["serde"] }
+bytes = { version = "1.6", features = ["serde"] }
 
 # Tower service abstraction
 tower = { version = "0.5", features = ["util", "buffer"] }

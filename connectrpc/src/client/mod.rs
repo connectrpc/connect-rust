@@ -2992,8 +2992,45 @@ where
         .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
     let body = collect_body_bounded(response.into_body(), body_limit).await?;
 
+    let (data, trailers) = parse_connect_client_stream_envelopes(
+        body,
+        &config.compression,
+        encoding.as_deref(),
+        max_msg_size,
+        &resp_headers,
+    )?;
+    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+
+    Ok(UnaryResponse {
+        headers: resp_headers,
+        body: message,
+        trailers,
+    })
+}
+
+/// Scan a collected Connect client-streaming response body.
+///
+/// The body must contain exactly one data envelope. The END_STREAM envelope,
+/// if present, terminates the scan and supplies the trailers; a body that
+/// ends without one is still accepted (matching the previous behavior).
+/// Returns the (still encoded) message payload and any trailers carried in
+/// the END_STREAM metadata.
+///
+/// Scanning stops at the END_STREAM envelope — it is the protocol-level end
+/// of the response, so anything after it is ignored rather than decoded. A
+/// second data envelope is rejected before its payload is decompressed, so a
+/// response cannot make the client do per-envelope decompression work (or
+/// hold per-envelope decompressed buffers) beyond the single message the RPC
+/// shape allows.
+fn parse_connect_client_stream_envelopes(
+    body: Bytes,
+    compression: &crate::compression::CompressionRegistry,
+    encoding: Option<&str>,
+    max_msg_size: usize,
+    resp_headers: &http::HeaderMap,
+) -> Result<(Bytes, http::HeaderMap), ConnectError> {
     let mut buf = BytesMut::from(body.as_ref());
-    let mut data_envelopes: Vec<Bytes> = Vec::new();
+    let mut message: Option<Bytes> = None;
     let mut trailers = http::HeaderMap::new();
 
     while !buf.is_empty() {
@@ -3004,12 +3041,10 @@ where
 
         if envelope.is_end_stream() {
             let end_stream_data = if envelope.is_compressed() {
-                let enc = encoding.as_deref().ok_or_else(|| {
+                let enc = encoding.ok_or_else(|| {
                     ConnectError::internal("received compressed END_STREAM without encoding header")
                 })?;
-                config
-                    .compression
-                    .decompress_with_limit(enc, envelope.data, max_msg_size)?
+                compression.decompress_with_limit(enc, envelope.data, max_msg_size)?
             } else {
                 envelope.data
             };
@@ -3039,57 +3074,61 @@ where
                     err.message.unwrap_or_default(),
                 );
                 connect_error.details = err.details;
-                connect_error.set_response_headers(resp_headers);
+                connect_error.set_response_headers(resp_headers.clone());
                 connect_error.set_trailers(trailers);
                 return Err(connect_error);
             }
-        } else {
-            let data = if envelope.is_compressed() {
-                let enc = encoding.as_deref().ok_or_else(|| {
-                    ConnectError::internal("received compressed message without encoding header")
-                })?;
-                config
-                    .compression
-                    .decompress_with_limit(enc, envelope.data, max_msg_size)
-                    .map_err(|mut e| {
-                        if e.code == ErrorCode::Unimplemented {
-                            e.code = ErrorCode::Internal;
-                        }
-                        e
-                    })?
-            } else {
-                envelope.data
-            };
 
-            if data.len() > max_msg_size {
-                return Err(ConnectError::new(
-                    ErrorCode::ResourceExhausted,
-                    format!("message size {} exceeds limit {}", data.len(), max_msg_size),
-                ));
+            // END_STREAM is the end of the logical response stream; stop
+            // scanning so trailing bytes after it are ignored.
+            if !buf.is_empty() {
+                tracing::debug!(
+                    trailing_bytes = buf.len(),
+                    "ignoring response data after the END_STREAM envelope"
+                );
             }
-
-            data_envelopes.push(data);
+            break;
         }
+
+        // Reject a second data message before doing any further work on it —
+        // in particular before decompressing its payload.
+        if message.is_some() {
+            return Err(ConnectError::unimplemented(
+                "client streaming response contains multiple data messages",
+            ));
+        }
+
+        let data = if envelope.is_compressed() {
+            let enc = encoding.ok_or_else(|| {
+                ConnectError::internal("received compressed message without encoding header")
+            })?;
+            compression
+                .decompress_with_limit(enc, envelope.data, max_msg_size)
+                .map_err(|mut e| {
+                    if e.code == ErrorCode::Unimplemented {
+                        e.code = ErrorCode::Internal;
+                    }
+                    e
+                })?
+        } else {
+            envelope.data
+        };
+
+        if data.len() > max_msg_size {
+            return Err(ConnectError::new(
+                ErrorCode::ResourceExhausted,
+                format!("message size {} exceeds limit {}", data.len(), max_msg_size),
+            ));
+        }
+
+        message = Some(data);
     }
 
-    if data_envelopes.is_empty() {
-        return Err(ConnectError::unimplemented(
-            "client streaming response contains no data messages",
-        ));
-    }
-    if data_envelopes.len() > 1 {
-        return Err(ConnectError::unimplemented(
-            "client streaming response contains multiple data messages",
-        ));
-    }
-    let data = data_envelopes.into_iter().next().unwrap();
-    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+    let message = message.ok_or_else(|| {
+        ConnectError::unimplemented("client streaming response contains no data messages")
+    })?;
 
-    Ok(UnaryResponse {
-        headers: resp_headers,
-        body: message,
-        trailers,
-    })
+    Ok((message, trailers))
 }
 
 /// EndStreamResponse as received by the client.
@@ -4429,5 +4468,192 @@ mod tests {
             .decode(&encoded)
             .unwrap();
         assert_eq!(decoded, b"\xfa\xfb\xfc");
+    }
+
+    // ========================================================================
+    // parse_connect_client_stream_envelopes tests
+    // ========================================================================
+
+    /// A second data envelope is rejected before its payload is touched: the
+    /// second envelope here is flagged compressed but contains garbage, so if
+    /// the parser tried to decompress it the error would be a decompression
+    /// failure rather than the multiple-messages error asserted below.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn client_stream_response_rejects_second_message_before_decompression() {
+        let registry = crate::compression::CompressionRegistry::default();
+
+        let mut body = Envelope::data(Bytes::from_static(b"first"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(
+            &Envelope::compressed(Bytes::from_static(b"not gzip data")).encode(),
+        );
+        body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert!(
+            err.to_string().contains("multiple data messages"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Scanning stops at the END_STREAM envelope: the single message and the
+    /// metadata trailers are returned, and trailing bytes after END_STREAM
+    /// are ignored rather than decoded.
+    #[test]
+    fn client_stream_response_stops_at_end_stream() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(
+            &Envelope::end_stream(Bytes::from_static(b"{\"metadata\":{\"x-extra\":[\"1\"]}}"))
+                .encode(),
+        );
+        body.extend_from_slice(&[0xAA_u8; 256]);
+
+        let (message, trailers) = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap();
+        assert_eq!(&message[..], b"only");
+        assert_eq!(trailers.get("x-extra").unwrap(), "1");
+    }
+
+    /// An END_STREAM envelope carrying an error surfaces it with the response
+    /// headers and metadata trailers attached.
+    #[test]
+    fn client_stream_response_end_stream_error() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(
+            &Envelope::end_stream(Bytes::from_static(
+                b"{\"metadata\":{\"x-meta\":[\"m\"]},\"error\":{\"code\":\"resource_exhausted\",\"message\":\"too much\"}}",
+            ))
+            .encode(),
+        );
+
+        let mut resp_headers = http::HeaderMap::new();
+        resp_headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            None,
+            1024,
+            &resp_headers,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+        assert_eq!(err.message.as_deref(), Some("too much"));
+        assert_eq!(
+            err.response_headers().get("x-from-headers").unwrap(),
+            "yes",
+            "response headers must be attached to the END_STREAM error"
+        );
+        assert_eq!(
+            err.trailers().get("x-meta").unwrap(),
+            "m",
+            "END_STREAM metadata must be attached to the error as trailers"
+        );
+    }
+
+    /// A body with no data envelope (END_STREAM only) is rejected.
+    #[test]
+    fn client_stream_response_requires_a_message() {
+        let registry = crate::compression::CompressionRegistry::new();
+        let body = Envelope::end_stream(Bytes::from_static(b"{}")).encode();
+
+        let err = parse_connect_client_stream_envelopes(
+            body,
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert!(
+            err.to_string().contains("no data messages"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Compressed data and END_STREAM envelopes decompress through the
+    /// registry and behave like their uncompressed equivalents.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn client_stream_response_compressed_envelopes() {
+        use crate::compression::{CompressionProvider, GzipProvider};
+
+        let registry = crate::compression::CompressionRegistry::default();
+        let gzip = GzipProvider::default();
+
+        let mut body = Envelope::compressed(gzip.compress(b"only").unwrap())
+            .encode()
+            .to_vec();
+        let mut end_stream = Envelope::compressed(
+            gzip.compress(b"{\"metadata\":{\"x-extra\":[\"1\"]}}")
+                .unwrap(),
+        )
+        .encode()
+        .to_vec();
+        end_stream[0] |= 0x02; // also set the END_STREAM flag
+        body.extend_from_slice(&end_stream);
+
+        let (message, trailers) = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap();
+        assert_eq!(&message[..], b"only");
+        assert_eq!(trailers.get("x-extra").unwrap(), "1");
+    }
+
+    /// A data envelope that only appears after the END_STREAM envelope does
+    /// not count as the response message: the scan stops at END_STREAM, so
+    /// the response is rejected for having no data message.
+    #[test]
+    fn client_stream_response_data_after_end_stream_is_not_a_message() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::end_stream(Bytes::from_static(b"{}"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(&Envelope::data(Bytes::from_static(b"late")).encode());
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert!(
+            err.to_string().contains("no data messages"),
+            "unexpected error: {err}"
+        );
     }
 }
