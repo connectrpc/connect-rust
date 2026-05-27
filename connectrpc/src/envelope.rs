@@ -164,6 +164,17 @@ impl EnvelopeDecoder {
             done: false,
         }
     }
+
+    /// Returns `true` once an end-stream envelope has been decoded.
+    ///
+    /// After this point [`decode`](tokio_util::codec::Decoder::decode) always
+    /// returns `Ok(None)` — the decoder will never produce another message.
+    /// Callers must treat this as a terminal state and stop buffering body
+    /// bytes for the decoder; any further data is trailing garbage that
+    /// should be drained (bounded) or rejected, never accumulated.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
 }
 
 impl tokio_util::codec::Decoder for EnvelopeDecoder {
