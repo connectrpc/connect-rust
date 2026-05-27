@@ -104,8 +104,8 @@ task generate:all
 
 This rebuilds `protoc-gen-connect-rust` (and the sibling buffa plugins
 from `../buffa`) in release mode, then runs `buf generate` in each
-directory. CI does not have a separate stale-check job — stale generated
-code surfaces as compile errors in `Check`/`Test` instead.
+directory. CI runs a separate generated-code check that fails when these
+checked-in files are stale.
 
 ## Building Against a Local buffa Checkout
 
@@ -128,6 +128,8 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
 - **Test** — `cargo test --workspace`
 - **Clippy** — workspace, all targets, `-D warnings`
 - **Format** — nightly `cargo fmt --check`
+- **Check generated code** — runs `task generate:all` and verifies the
+  checked-in generated directories have no diff
 - **Documentation** — `cargo doc` with broken-intra-doc-links denied
 - **MSRV (1.88)** — `cargo check` on the pinned minimum toolchain
 - **Examples** — builds and runs the example crates
