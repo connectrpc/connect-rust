@@ -127,16 +127,7 @@ pub trait CompressionProvider: Send + Sync + 'static {
     fn decompress_with_limit(&self, data: &[u8], max_size: usize) -> Result<Bytes, ConnectError> {
         use std::io::Read;
         let reader = self.decompressor(data)?;
-        // Size the initial buffer from the compressed input rather than the
-        // limit: this buffer becomes the backing allocation of the returned
-        // `Bytes`, so a limit-sized allocation would stay resident for the
-        // lifetime of every (possibly tiny) message. `read_to_end` grows the
-        // buffer on demand and the `take` below still bounds the total.
-        let capacity = data
-            .len()
-            .saturating_mul(2)
-            .max(256)
-            .min(max_size.saturating_add(1));
+        let capacity = initial_decompress_capacity(data.len(), 2, Some(max_size));
         let mut buf = Vec::with_capacity(capacity);
         reader
             .take((max_size as u64).saturating_add(1))
@@ -757,16 +748,7 @@ impl GzipProvider {
         let deflate_start = gzip_header_len(data)?;
         let stream_data = &data[deflate_start..];
 
-        // Size the initial buffer from the compressed input rather than the
-        // limit: this buffer becomes the backing allocation of the returned
-        // `Bytes`, so a limit-sized allocation would stay resident for the
-        // lifetime of every (possibly tiny) message. The loop below grows
-        // the buffer on demand and enforces the limit as it grows.
-        let mut capacity = data.len().saturating_mul(2).max(256);
-        if let Some(limit) = max_size {
-            capacity = capacity.min(limit.saturating_add(1));
-        }
-        let mut output = Vec::with_capacity(capacity);
+        let mut output = Vec::with_capacity(initial_decompress_capacity(data.len(), 2, max_size));
 
         // Decompress the deflate stream, letting the decompressor find its
         // own end-of-stream marker rather than pre-slicing.
@@ -781,7 +763,16 @@ impl GzipProvider {
                         "decompressed size exceeds limit {limit}"
                     )));
                 }
-                output.reserve(output.len().max(4096));
+                // Grow on demand, but never reserve past `limit + 1`: once the
+                // buffer fills at that point the over-limit check above fires,
+                // so the peak allocation for an over-limit payload stays the
+                // same as it was with a limit-sized pre-allocation.
+                let mut additional = output.len().max(4096);
+                if let Some(limit) = max_size {
+                    additional =
+                        additional.min(limit.saturating_add(1).saturating_sub(output.capacity()));
+                }
+                output.reserve_exact(additional);
             }
             let status = decompressor
                 .decompress_vec(
@@ -1034,16 +1025,8 @@ impl ZstdProvider {
         let mut decoder = zstd::Decoder::new(data)
             .map_err(|e| ConnectError::internal(format!("zstd decompression failed: {e}")))?;
 
-        // Size the initial buffer from the compressed input rather than the
-        // limit: this buffer becomes the backing allocation of the returned
-        // `Bytes`, so a limit-sized allocation would stay resident for the
-        // lifetime of every (possibly tiny) message. `read_to_end` grows the
-        // buffer on demand and the `take` below still bounds the total.
-        let mut capacity = data.len().saturating_mul(4).max(256);
-        if let Some(limit) = max_size {
-            capacity = capacity.min(limit.saturating_add(1));
-        }
-        let mut decompressed = Vec::with_capacity(capacity);
+        let mut decompressed =
+            Vec::with_capacity(initial_decompress_capacity(data.len(), 4, max_size));
 
         match max_size {
             Some(limit) => {
@@ -1122,6 +1105,32 @@ impl StreamingCompressionProvider for ZstdProvider {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Initial output-buffer capacity for buffered decompression.
+///
+/// The output buffer becomes the backing allocation of the returned `Bytes`,
+/// so it is sized from the compressed input rather than from the configured
+/// limit — a limit-sized allocation would stay resident for the lifetime of
+/// every (possibly tiny) message. The guess is `input_len × multiplier`
+/// (gzip and the trait default use 2; zstd uses 4 because it typically
+/// achieves higher ratios on RPC payloads), with a 256-byte floor, capped at
+/// `limit + 1` so the initial allocation never exceeds what the limit allows.
+///
+/// Callers grow the buffer on demand and enforce the limit as it grows; the
+/// `read_to_end`-based callers may transiently reserve up to roughly twice
+/// the bytes actually written (amortized growth), still bounded by their
+/// `Read::take(limit + 1)` readers.
+fn initial_decompress_capacity(
+    input_len: usize,
+    multiplier: usize,
+    max_size: Option<usize>,
+) -> usize {
+    let mut capacity = input_len.saturating_mul(multiplier).max(256);
+    if let Some(limit) = max_size {
+        capacity = capacity.min(limit.saturating_add(1));
+    }
+    capacity
+}
 
 #[cfg(test)]
 mod tests {
@@ -1405,6 +1414,26 @@ mod tests {
             .capacity()
     }
 
+    /// Upper bound on the backing allocation accepted for a tiny decompressed
+    /// message. The sizing heuristic yields 256 bytes today; this leaves
+    /// headroom for modest changes while still failing if a limit-sized (or
+    /// even tens-of-KiB) buffer is retained per message.
+    const SMALL_MESSAGE_RETENTION_BOUND: usize = 4096;
+
+    /// `backing_capacity` must actually observe over-allocation — otherwise
+    /// the small-message tests below could pass vacuously if `Bytes::from`
+    /// ever started shrinking the allocation itself.
+    #[test]
+    fn test_backing_capacity_observes_overallocation() {
+        let mut vec = Vec::with_capacity(1024 * 1024);
+        vec.extend_from_slice(b"tiny payload");
+        let capacity = backing_capacity(Bytes::from(vec));
+        assert!(
+            capacity >= 1024 * 1024,
+            "expected the over-allocated backing buffer to be visible, got {capacity}"
+        );
+    }
+
     /// Decompressing a small gzip message must not retain a buffer sized by
     /// the configured limit: the returned `Bytes` should be backed by an
     /// allocation proportional to the actual message.
@@ -1419,7 +1448,7 @@ mod tests {
         assert_eq!(&out[..], b"tiny payload");
         let capacity = backing_capacity(out);
         assert!(
-            capacity < 64 * 1024,
+            capacity < SMALL_MESSAGE_RETENTION_BOUND,
             "small gzip message retained a {capacity}-byte backing buffer"
         );
     }
@@ -1436,7 +1465,7 @@ mod tests {
         assert_eq!(&out[..], b"tiny payload");
         let capacity = backing_capacity(out);
         assert!(
-            capacity < 64 * 1024,
+            capacity < SMALL_MESSAGE_RETENTION_BOUND,
             "small zstd message retained a {capacity}-byte backing buffer"
         );
     }
@@ -1453,7 +1482,7 @@ mod tests {
         assert_eq!(&out[..], b"tiny payload");
         let capacity = backing_capacity(out);
         assert!(
-            capacity < 64 * 1024,
+            capacity < SMALL_MESSAGE_RETENTION_BOUND,
             "small message retained a {capacity}-byte backing buffer via the default impl"
         );
     }
