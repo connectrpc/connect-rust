@@ -3010,9 +3010,11 @@ where
 
 /// Scan a collected Connect client-streaming response body.
 ///
-/// The body must contain exactly one data envelope followed by an END_STREAM
-/// envelope. Returns the (still encoded) message payload and any trailers
-/// carried in the END_STREAM metadata.
+/// The body must contain exactly one data envelope. The END_STREAM envelope,
+/// if present, terminates the scan and supplies the trailers; a body that
+/// ends without one is still accepted (matching the previous behavior).
+/// Returns the (still encoded) message payload and any trailers carried in
+/// the END_STREAM metadata.
 ///
 /// Scanning stops at the END_STREAM envelope — it is the protocol-level end
 /// of the response, so anything after it is ignored rather than decoded. A
@@ -3079,6 +3081,12 @@ fn parse_connect_client_stream_envelopes(
 
             // END_STREAM is the end of the logical response stream; stop
             // scanning so trailing bytes after it are ignored.
+            if !buf.is_empty() {
+                tracing::debug!(
+                    trailing_bytes = buf.len(),
+                    "ignoring response data after the END_STREAM envelope"
+                );
+            }
             break;
         }
 
@@ -4478,11 +4486,9 @@ mod tests {
         let mut body = Envelope::data(Bytes::from_static(b"first"))
             .encode()
             .to_vec();
-        let mut bogus = Envelope::data(Bytes::from_static(b"not gzip data"))
-            .encode()
-            .to_vec();
-        bogus[0] |= 0x01; // compressed flag
-        body.extend_from_slice(&bogus);
+        body.extend_from_slice(
+            &Envelope::compressed(Bytes::from_static(b"not gzip data")).encode(),
+        );
         body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
 
         let err = parse_connect_client_stream_envelopes(
@@ -4577,6 +4583,67 @@ mod tests {
 
         let err = parse_connect_client_stream_envelopes(
             body,
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert!(
+            err.to_string().contains("no data messages"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Compressed data and END_STREAM envelopes decompress through the
+    /// registry and behave like their uncompressed equivalents.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn client_stream_response_compressed_envelopes() {
+        use crate::compression::{CompressionProvider, GzipProvider};
+
+        let registry = crate::compression::CompressionRegistry::default();
+        let gzip = GzipProvider::default();
+
+        let mut body = Envelope::compressed(gzip.compress(b"only").unwrap())
+            .encode()
+            .to_vec();
+        let mut end_stream = Envelope::compressed(
+            gzip.compress(b"{\"metadata\":{\"x-extra\":[\"1\"]}}")
+                .unwrap(),
+        )
+        .encode()
+        .to_vec();
+        end_stream[0] |= 0x02; // also set the END_STREAM flag
+        body.extend_from_slice(&end_stream);
+
+        let (message, trailers) = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap();
+        assert_eq!(&message[..], b"only");
+        assert_eq!(trailers.get("x-extra").unwrap(), "1");
+    }
+
+    /// A data envelope that only appears after the END_STREAM envelope does
+    /// not count as the response message: the scan stops at END_STREAM, so
+    /// the response is rejected for having no data message.
+    #[test]
+    fn client_stream_response_data_after_end_stream_is_not_a_message() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::end_stream(Bytes::from_static(b"{}"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(&Envelope::data(Bytes::from_static(b"late")).encode());
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
             &registry,
             None,
             1024,
