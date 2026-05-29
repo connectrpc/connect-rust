@@ -1371,11 +1371,7 @@ mod tests {
             resp.headers().get("x-stream-intercepted").unwrap(),
             "/test.echo.v1.EchoService/ClientStream"
         );
-        assert_eq!(
-            resp.view().sequence,
-            2,
-            "all items must reach the handler"
-        );
+        assert_eq!(resp.view().sequence, 2, "all items must reach the handler");
 
         // Bidi streaming: N requests ↔ N responses (gRPC, full duplex).
         {
