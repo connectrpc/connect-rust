@@ -3205,8 +3205,7 @@ mod tests {
             &[],
         )
         .await
-        .err()
-        .expect("stalled body must exceed the request deadline");
+        .expect_err("stalled body must exceed the request deadline");
         assert_eq!(err.code, crate::error::ErrorCode::DeadlineExceeded);
     }
 
