@@ -3209,6 +3209,37 @@ mod tests {
         assert_eq!(err.code, crate::error::ErrorCode::DeadlineExceeded);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_server_streaming_deadline_bounds_stalled_body_collection() {
+        let router = Router::new();
+        let body = http_body_util::StreamBody::new(futures::stream::pending::<
+            Result<Frame<Bytes>, std::io::Error>,
+        >());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/svc/Method")
+            .body(body)
+            .unwrap();
+        let deadline_policy = DeadlinePolicy::new().with_default_timeout(Duration::from_millis(1));
+
+        let resp = handle_streaming_request(
+            &router,
+            req,
+            Protocol::Grpc,
+            CodecFormat::Proto,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &deadline_policy,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            resp.headers().get(&GRPC_STATUS).unwrap(),
+            &crate::ErrorCode::DeadlineExceeded.grpc_code().to_string()
+        );
+    }
+
     #[test]
     fn test_parse_get_query_params_basic() {
         let params = parse_get_query_params(Some("message=%7B%7D&encoding=json&connect=v1"))
