@@ -15,8 +15,9 @@
 
 use std::sync::Arc;
 
-use buffa::view::OwnedView;
-use connectrpc::{RequestContext, Response, Router, ServiceResult, ServiceStream};
+use connectrpc::{
+    RequestContext, Response, Router, ServiceRequest, ServiceResult, ServiceStream, StreamMessage,
+};
 use futures::StreamExt;
 
 pub mod proto {
@@ -27,11 +28,11 @@ use proto::anthropic::connectrpc::tour::v1::*;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// Local type aliases that flatten the streaming-handler signatures.
+// Local type alias that flattens the streaming-handler signatures.
 // The verbose `Pin<Box<dyn Stream<...> + Send>>` form is what the
-// generated traits expect today; these aliases are pure sugar at the
+// generated traits expect today; the alias is pure sugar at the
 // call site.
-type RequestStream<V> = ServiceStream<OwnedView<V>>;
+type RequestStream<M> = ServiceStream<StreamMessage<M>>;
 
 /// Trivial NumberService implementation. Each method demonstrates one
 /// of the four RPC patterns.
@@ -42,7 +43,7 @@ impl NumberService for NumberServiceImpl {
     async fn square(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<SquareRequestView<'static>>,
+        request: ServiceRequest<'_, SquareRequest>,
     ) -> ServiceResult<SquareResponse> {
         // Edition 2023 default presence is EXPLICIT, so scalar fields
         // are Option<T>. unwrap_or(0) treats unset as zero, mirroring
@@ -58,7 +59,7 @@ impl NumberService for NumberServiceImpl {
     async fn range(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<RangeRequestView<'static>>,
+        request: ServiceRequest<'_, RangeRequest>,
     ) -> ServiceResult<ServiceStream<RangeResponse>> {
         let start = request.start.unwrap_or(0);
         let count = request.count.unwrap_or(0).max(0);
@@ -75,11 +76,11 @@ impl NumberService for NumberServiceImpl {
     async fn sum(
         &self,
         _ctx: RequestContext,
-        mut requests: RequestStream<SumRequestView<'static>>,
+        mut requests: RequestStream<SumRequest>,
     ) -> ServiceResult<SumResponse> {
         let mut total: i64 = 0;
         while let Some(req) = requests.next().await {
-            total += req?.value.unwrap_or(0) as i64;
+            total += req?.value().unwrap_or(0) as i64;
         }
         Response::ok(SumResponse {
             total: Some(total),
@@ -91,13 +92,13 @@ impl NumberService for NumberServiceImpl {
     async fn running_sum(
         &self,
         _ctx: RequestContext,
-        requests: RequestStream<RunningSumRequestView<'static>>,
+        requests: RequestStream<RunningSumRequest>,
     ) -> ServiceResult<ServiceStream<RunningSumResponse>> {
         let response_stream =
             futures::stream::unfold((requests, 0i64), |(mut requests, mut total)| async move {
                 match requests.next().await? {
                     Ok(req) => {
-                        total += req.value.unwrap_or(0) as i64;
+                        total += req.value().unwrap_or(0) as i64;
                         Some((
                             Ok(RunningSumResponse {
                                 total: Some(total),

@@ -42,8 +42,10 @@ mod proto;
 use connect::connectrpc::eliza::v1::*;
 use proto::connectrpc::eliza::v1::*;
 
-use buffa::view::OwnedView;
-use connectrpc::{RequestContext, Response, Router as ConnectRouter, ServiceResult, ServiceStream};
+use connectrpc::{
+    RequestContext, Response, Router as ConnectRouter, ServiceRequest, ServiceResult,
+    ServiceStream, StreamMessage,
+};
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 
@@ -58,16 +60,15 @@ impl ElizaServer {
     }
 }
 
-// `OwnedView<FooView<'static>>` gives zero-copy borrowed access to request
+// `ServiceRequest<'_, Foo>` gives zero-copy borrowed access to request
 // fields (e.g. `request.sentence: &str` points into the decoded buffer).
-// The view can be held across `.await` points — `OwnedView` is auto-`Send`,
-// so `async fn` in the trait impl satisfies the `+ Send` bound on the
-// generated trait's return type directly.
+// The borrow can be held across `.await` points; anything that must outlive
+// the call takes owned data via `request.to_owned_message()`.
 impl ElizaService for ElizaServer {
     async fn say(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<SayRequestView<'static>>,
+        request: ServiceRequest<'_, SayRequest>,
     ) -> ServiceResult<SayResponse> {
         // `request.sentence` is a `&str` borrow into the decoded buffer.
         // No allocation, no copy — `eliza::reply` just reads it.
@@ -81,7 +82,7 @@ impl ElizaService for ElizaServer {
     async fn introduce(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<IntroduceRequestView<'static>>,
+        request: ServiceRequest<'_, IntroduceRequest>,
     ) -> ServiceResult<ServiceStream<IntroduceResponse>> {
         let delay = self.stream_delay;
 
@@ -119,7 +120,7 @@ impl ElizaService for ElizaServer {
     async fn converse(
         &self,
         _ctx: RequestContext,
-        requests: ServiceStream<OwnedView<ConverseRequestView<'static>>>,
+        requests: ServiceStream<StreamMessage<ConverseRequest>>,
     ) -> ServiceResult<ServiceStream<ConverseResponse>> {
         use futures::StreamExt;
 
@@ -137,11 +138,11 @@ impl ElizaService for ElizaServer {
                     None => None, // Client closed its send side.
                     Some(Err(e)) => Some((Err(e), (requests, true))),
                     Some(Ok(req)) => {
-                        // Each stream item is an `OwnedView`. `req.sentence`
+                        // Each stream item is a `StreamMessage`. `req.sentence()`
                         // borrows the item's buffer; the borrow is released
                         // when `req` drops at the end of this arm, well
                         // before the next `.next().await`.
-                        let (reply, end_session) = eliza::reply(req.sentence);
+                        let (reply, end_session) = eliza::reply(req.sentence());
                         Some((
                             Ok(ConverseResponse {
                                 sentence: reply,

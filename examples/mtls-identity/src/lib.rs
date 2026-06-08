@@ -17,8 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use buffa::view::OwnedView;
-use connectrpc::{ConnectError, ErrorCode, RequestContext, Router, ServiceResult};
+use connectrpc::{ConnectError, ErrorCode, RequestContext, Router, ServiceRequest, ServiceResult};
 
 pub mod proto {
     connectrpc::include_generated!();
@@ -128,7 +127,7 @@ impl IdentityService for IdentityServiceImpl {
     async fn who_am_i(
         &self,
         ctx: RequestContext,
-        _request: OwnedView<WhoAmIRequestView<'static>>,
+        _request: ServiceRequest<'_, WhoAmIRequest>,
     ) -> ServiceResult<WhoAmIResponse> {
         // Both PeerCerts and PeerAddr are stamped per connection by
         // serve_tls; the dispatcher copies request extensions verbatim
@@ -148,7 +147,7 @@ impl IdentityService for IdentityServiceImpl {
     async fn get_secret(
         &self,
         ctx: RequestContext,
-        request: OwnedView<GetSecretRequestView<'static>>,
+        request: ServiceRequest<'_, GetSecretRequest>,
     ) -> ServiceResult<GetSecretResponse> {
         let id = extract_identity(ctx.peer_certs())?;
         let name = request.name.unwrap_or("").to_owned();

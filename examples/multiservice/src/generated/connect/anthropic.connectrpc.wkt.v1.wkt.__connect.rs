@@ -34,6 +34,14 @@ pub type OwnedProcessMetadataResponseView = ::buffa::view::OwnedView<
         'static,
     >,
 >;
+///Shorthand for `OwnedView<EmptyView<'static>>`.
+pub type OwnedEmptyView = ::buffa::view::OwnedView<
+    ::buffa_types::google::protobuf::__buffa::view::EmptyView<'static>,
+>;
+///Shorthand for `OwnedView<TimestampView<'static>>`.
+pub type OwnedTimestampView = ::buffa::view::OwnedView<
+    ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
+>;
 impl ::connectrpc::Encodable<
     crate::proto::anthropic::connectrpc::wkt::v1::CreateEventResponse,
 >
@@ -144,6 +152,15 @@ pub const WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC: ::connectrpc::Spec =
 /// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
 pub const WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/ProcessMetadata",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Heartbeat` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/Heartbeat",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -266,6 +283,27 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
+    /// Heartbeat returns the server's current time. Exercises well-known
+    /// types as the direct RPC input (Empty) and output (Timestamp).
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn heartbeat<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<'_, ::buffa_types::google::protobuf::Empty>,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                ::buffa_types::google::protobuf::Timestamp,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -382,6 +420,35 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                 },
             )
             .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC)
+            .route_view(
+                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
+                "Heartbeat",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            ::buffa_types::google::protobuf::__buffa::view::EmptyView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                ::buffa_types::google::protobuf::Empty,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.heartbeat(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    ::buffa_types::google::protobuf::Timestamp,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC)
     }
 }
 /// Monomorphic dispatcher for `WellKnownTypesService`.
@@ -445,6 +512,12 @@ for WellKnownTypesServiceServer<T> {
                 Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC),
+                )
+            }
+            "Heartbeat" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC),
                 )
             }
             _ => None,
@@ -524,6 +597,25 @@ for WellKnownTypesServiceServer<T> {
                         .encode::<
                             crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
                         >(format)
+                })
+            }
+            "Heartbeat" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::unary_request_proto_bytes::<
+                        ::buffa_types::google::protobuf::Empty,
+                    >(request.encoded()?, format)?;
+                    let req: ::buffa_types::google::protobuf::__buffa::view::EmptyView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        ::buffa_types::google::protobuf::Empty,
+                    >::from_parts(&req, &body);
+                    svc.heartbeat(ctx, req)
+                        .await?
+                        .encode::<::buffa_types::google::protobuf::Timestamp>(format)
                 })
             }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_unary(path),
@@ -786,6 +878,47 @@ where
                 &self.config,
                 WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
                 "ProcessMetadata",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the Heartbeat RPC. Sends a request to /anthropic.connectrpc.wkt.v1.WellKnownTypesService/Heartbeat.
+    pub async fn heartbeat(
+        &self,
+        request: ::buffa_types::google::protobuf::Empty,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.heartbeat_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the Heartbeat RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn heartbeat_with_options(
+        &self,
+        request: ::buffa_types::google::protobuf::Empty,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
+                "Heartbeat",
                 request,
                 options,
             )

@@ -45,7 +45,7 @@ async fn main() -> Result<(), BoxError> {
         if !first {
             print!(", ");
         }
-        print!("{}", msg.value.unwrap_or_default());
+        print!("{}", msg.reborrow().value.unwrap_or_default());
         first = false;
     }
     println!("]");
@@ -79,7 +79,7 @@ async fn main() -> Result<(), BoxError> {
             if !first {
                 print!(", ");
             }
-            print!("{}", msg.total.unwrap_or_default());
+            print!("{}", msg.reborrow().total.unwrap_or_default());
             first = false;
         }
     }

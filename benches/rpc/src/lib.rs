@@ -19,11 +19,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use buffa::view::OwnedView;
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{
-    CodecFormat, ConnectError, Protocol, RequestContext, Response, Router, ServiceResult,
-    ServiceStream,
+    CodecFormat, ConnectError, Protocol, RequestContext, Response, Router, ServiceRequest,
+    ServiceResult, ServiceStream, StreamMessage,
 };
 use futures::StreamExt;
 
@@ -34,7 +33,7 @@ impl BenchService for BenchServiceImpl {
     async fn unary(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<BenchRequestView<'static>>,
+        req: ServiceRequest<'_, BenchRequest>,
     ) -> ServiceResult<BenchResponse> {
         let req = req.to_owned_message();
         Response::ok(BenchResponse {
@@ -46,7 +45,7 @@ impl BenchService for BenchServiceImpl {
     async fn server_stream(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<BenchRequestView<'static>>,
+        req: ServiceRequest<'_, BenchRequest>,
     ) -> ServiceResult<ServiceStream<BenchResponse>> {
         let req = req.to_owned_message();
         let count = req.response_count;
@@ -72,7 +71,7 @@ impl BenchService for BenchServiceImpl {
     async fn client_stream(
         &self,
         _ctx: RequestContext,
-        mut requests: ServiceStream<OwnedView<BenchRequestView<'static>>>,
+        mut requests: ServiceStream<StreamMessage<BenchRequest>>,
     ) -> ServiceResult<BenchResponse> {
         let mut last_payload = Default::default();
         while let Some(req) = requests.next().await {
@@ -88,7 +87,7 @@ impl BenchService for BenchServiceImpl {
     async fn log_unary(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<LogRequestView<'static>>,
+        req: ServiceRequest<'_, LogRequest>,
     ) -> ServiceResult<LogResponse> {
         // Realistic handler: iterate records, read string fields, compute aggregate.
         // All field access is zero-copy via &str borrows from the request buffer.
@@ -102,9 +101,9 @@ impl BenchService for BenchServiceImpl {
     async fn log_unary_owned(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<LogRequestView<'static>>,
+        req: ServiceRequest<'_, LogRequest>,
     ) -> ServiceResult<LogResponse> {
-        // Same handler logic but using owned types (pre-OwnedView path).
+        // Same handler logic but using owned types (pre-borrowed-view path).
         let req = req.to_owned_message();
         let count = process_log_records_owned(&req.records);
         Response::ok(LogResponse {
@@ -116,9 +115,10 @@ impl BenchService for BenchServiceImpl {
     async fn bidi_stream(
         &self,
         _ctx: RequestContext,
-        requests: ServiceStream<OwnedView<BenchRequestView<'static>>>,
+        requests: ServiceStream<StreamMessage<BenchRequest>>,
     ) -> ServiceResult<ServiceStream<BenchResponse>> {
-        // Map stream to owned types before spawning to satisfy Send bounds
+        // `StreamMessage` items are Send + 'static; convert to owned where the
+        // response construction needs the owned payload by value.
         let mut requests = Box::pin(requests.map(|r| r.map(|v| v.to_owned_message())));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<BenchResponse, ConnectError>>(1);
         tokio::spawn(async move {

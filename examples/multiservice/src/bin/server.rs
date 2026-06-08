@@ -14,18 +14,12 @@ use std::time::SystemTime;
 
 use axum::Router;
 use axum::routing::get;
-use buffa::view::OwnedView;
 // `value` (lowercase) is the oneof submodule for `Value`'s `kind`
 // oneof, re-exported at the natural path by buffa 0.5+.
 use buffa_types::google::protobuf::{Duration, Struct, Timestamp, Value, value};
 use connectrpc::ConnectError;
 use connectrpc::Router as ConnectRouter;
-use connectrpc::{RequestContext, Response, ServiceResult};
-use multiservice_example::proto::anthropic::connectrpc::greet::v1::GreetRequestView;
-use multiservice_example::proto::anthropic::connectrpc::math::v1::AddRequestView;
-use multiservice_example::proto::anthropic::connectrpc::wkt::v1::{
-    CalculateDurationRequestView, CreateEventRequestView, ProcessMetadataRequestView,
-};
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use multiservice_example::*;
 
 /// Implementation of the GreetService trait.
@@ -35,9 +29,10 @@ impl GreetService for MyGreetService {
     async fn greet(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<GreetRequestView<'static>>,
+        request: ServiceRequest<'_, GreetRequest>,
     ) -> ServiceResult<GreetResponse> {
-        let request = request.to_owned_message();
+        // Zero-copy reads: `request.name` is a &str borrowed from the
+        // decoded request buffer - no owned conversion needed.
         tracing::info!("Received greet request for: {}", request.name);
 
         if request.name.is_empty() {
@@ -59,9 +54,8 @@ impl MathService for MyMathService {
     async fn add(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<AddRequestView<'static>>,
+        request: ServiceRequest<'_, AddRequest>,
     ) -> ServiceResult<AddResponse> {
-        let request = request.to_owned_message();
         tracing::info!("Received add request: {} + {}", request.a, request.b);
 
         let result = request
@@ -85,7 +79,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
     async fn create_event(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<CreateEventRequestView<'static>>,
+        request: ServiceRequest<'_, CreateEventRequest>,
     ) -> ServiceResult<CreateEventResponse> {
         let request = request.to_owned_message();
         tracing::info!("Received create_event request: {:?}", request.name);
@@ -135,7 +129,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
     async fn calculate_duration(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<CalculateDurationRequestView<'static>>,
+        request: ServiceRequest<'_, CalculateDurationRequest>,
     ) -> ServiceResult<CalculateDurationResponse> {
         let request = request.to_owned_message();
         tracing::info!("Received calculate_duration request");
@@ -169,7 +163,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
     async fn process_metadata(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<ProcessMetadataRequestView<'static>>,
+        request: ServiceRequest<'_, ProcessMetadataRequest>,
     ) -> ServiceResult<ProcessMetadataResponse> {
         let request = request.to_owned_message();
         tracing::info!("Received process_metadata request");
@@ -207,6 +201,24 @@ impl WellKnownTypesService for MyWellKnownTypesService {
             ..Default::default()
         };
         Response::ok(response)
+    }
+
+    async fn heartbeat(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, buffa_types::google::protobuf::Empty>,
+    ) -> ServiceResult<Timestamp> {
+        // Well-known types as the direct RPC input and output: the request
+        // parameter and response type come from buffa-types via extern_path,
+        // wrapped in the same ServiceRequest surface as local types.
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        Response::ok(Timestamp {
+            seconds: now.as_secs() as i64,
+            nanos: now.subsec_nanos() as i32,
+            ..Default::default()
+        })
     }
 }
 

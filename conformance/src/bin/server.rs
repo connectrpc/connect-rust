@@ -11,7 +11,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use base64::Engine;
 use buffa::Message;
-use buffa::view::OwnedView;
 use buffa_types::google::protobuf::Any;
 use connectrpc::ConnectError;
 use connectrpc::ConnectRpcService;
@@ -20,7 +19,9 @@ use connectrpc::Router;
 use connectrpc::error::ErrorDetail;
 use connectrpc::rustls;
 use connectrpc::server::Server;
-use connectrpc::{RequestContext, Response, ServiceResult, ServiceStream};
+use connectrpc::{
+    RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream, StreamMessage,
+};
 use connectrpc_conformance::BidiStreamRequest;
 use connectrpc_conformance::BidiStreamResponse;
 use connectrpc_conformance::ClientStreamRequest;
@@ -43,8 +44,7 @@ use connectrpc_conformance::init_type_registry;
 use connectrpc_conformance::read_message;
 use connectrpc_conformance::write_message;
 use connectrpc_conformance::{
-    BidiStreamRequestView, ClientStreamRequestView, IdempotentUnaryRequestView,
-    ServerStreamRequestView, UnaryRequestView, UnimplementedRequestView,
+    IdempotentUnaryRequest, ServerStreamRequest, UnaryRequest, UnimplementedRequest,
 };
 use futures::StreamExt;
 use http::HeaderName;
@@ -190,7 +190,7 @@ impl ConformanceService for ConformanceServiceImpl {
     async fn unary(
         &self,
         ctx: RequestContext,
-        request: OwnedView<UnaryRequestView<'static>>,
+        request: ServiceRequest<'_, UnaryRequest>,
     ) -> ServiceResult<UnaryResponse> {
         tracing::debug!("Received unary request");
 
@@ -247,7 +247,7 @@ impl ConformanceService for ConformanceServiceImpl {
     async fn idempotent_unary(
         &self,
         ctx: RequestContext,
-        request: OwnedView<IdempotentUnaryRequestView<'static>>,
+        request: ServiceRequest<'_, IdempotentUnaryRequest>,
     ) -> ServiceResult<IdempotentUnaryResponse> {
         tracing::debug!("Received idempotent_unary request");
 
@@ -304,7 +304,7 @@ impl ConformanceService for ConformanceServiceImpl {
     async fn unimplemented(
         &self,
         _ctx: RequestContext,
-        _request: OwnedView<UnimplementedRequestView<'static>>,
+        _request: ServiceRequest<'_, UnimplementedRequest>,
     ) -> ServiceResult<UnimplementedResponse> {
         // This endpoint should always return unimplemented
         Err(ConnectError::unimplemented(
@@ -315,7 +315,7 @@ impl ConformanceService for ConformanceServiceImpl {
     async fn server_stream(
         &self,
         ctx: RequestContext,
-        request: OwnedView<ServerStreamRequestView<'static>>,
+        request: ServiceRequest<'_, ServerStreamRequest>,
     ) -> ServiceResult<ServiceStream<ServerStreamResponse>> {
         tracing::debug!("Received server_stream request");
 
@@ -427,7 +427,7 @@ impl ConformanceService for ConformanceServiceImpl {
     async fn client_stream(
         &self,
         ctx: RequestContext,
-        requests: ServiceStream<OwnedView<ClientStreamRequestView<'static>>>,
+        requests: ServiceStream<StreamMessage<ClientStreamRequest>>,
     ) -> ServiceResult<ClientStreamResponse> {
         tracing::debug!("Received client_stream request");
 
@@ -439,9 +439,9 @@ impl ConformanceService for ConformanceServiceImpl {
         let mut all_requests: Vec<(Vec<u8>, ClientStreamRequest)> = Vec::new();
         let mut requests = requests;
         while let Some(r) = requests.next().await {
-            let owned_view = r?;
-            let bytes = owned_view.bytes().to_vec();
-            let msg = owned_view.to_owned_message();
+            let item = r?;
+            let bytes = item.bytes().to_vec();
+            let msg = item.to_owned_message();
             all_requests.push((bytes, msg));
         }
 
@@ -545,17 +545,17 @@ impl ConformanceService for ConformanceServiceImpl {
     async fn bidi_stream(
         &self,
         ctx: RequestContext,
-        requests: ServiceStream<OwnedView<BidiStreamRequestView<'static>>>,
+        requests: ServiceStream<StreamMessage<BidiStreamRequest>>,
     ) -> ServiceResult<ServiceStream<BidiStreamResponse>> {
         tracing::debug!("Received bidi_stream request");
 
-        // Convert OwnedView items to owned types. The conformance protocol
+        // Convert StreamMessage items to owned types. The conformance protocol
         // requires per-message byte buffers for the response payload, so we
         // need the owned form here regardless.
         let mut requests = requests.map(|r| {
-            let owned_view = r?;
-            let bytes = owned_view.bytes().to_vec();
-            let msg = owned_view.to_owned_message();
+            let item = r?;
+            let bytes = item.bytes().to_vec();
+            let msg = item.to_owned_message();
             Ok((bytes, msg))
         });
 

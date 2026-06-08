@@ -193,8 +193,7 @@ pub mod proto {
 ### Implement the server
 
 ```rust
-use connectrpc::{Router, ConnectRpcService, Context, ConnectError};
-use buffa::OwnedView;
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use std::sync::Arc;
 
 struct MyGreetService;
@@ -202,16 +201,17 @@ struct MyGreetService;
 impl GreetService for MyGreetService {
     async fn greet(
         &self,
-        ctx: Context,
-        request: OwnedView<GreetRequestView<'static>>,
-    ) -> Result<(GreetResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, GreetRequest>,
+    ) -> ServiceResult<GreetResponse> {
         // `request` derefs to the view — string fields are borrowed `&str`
-        // directly from the request buffer (zero-copy).
-        let response = GreetResponse {
+        // directly from the request buffer (zero-copy). The borrow lives for
+        // the duration of the call; use `request.to_owned_message()` for
+        // anything that must outlive it (e.g. `tokio::spawn`).
+        Response::ok(GreetResponse {
             greeting: format!("Hello, {}!", request.name),
             ..Default::default()
-        };
-        Ok((response, ctx))
+        })
     }
 }
 ```

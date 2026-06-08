@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use buffa::view::OwnedView;
 use connectrpc::client::{ClientConfig, HttpClient};
-use connectrpc::{RequestContext, Response, Router, ServiceResult, ServiceStream};
+use connectrpc::{
+    RequestContext, Response, Router, ServiceRequest, ServiceResult, ServiceStream, StreamMessage,
+};
 use futures::StreamExt;
 
 pub mod proto {
@@ -15,7 +16,7 @@ pub mod proto {
 use proto::anthropic::connectrpc::tour::v1::*;
 
 // Local alias that flattens client/bidi-stream request parameters.
-type RequestStream<V> = ServiceStream<OwnedView<V>>;
+type RequestStream<M> = ServiceStream<StreamMessage<M>>;
 
 struct NumberServiceImpl;
 
@@ -23,7 +24,7 @@ impl NumberService for NumberServiceImpl {
     async fn square(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<SquareRequestView<'static>>,
+        request: ServiceRequest<'_, SquareRequest>,
     ) -> ServiceResult<SquareResponse> {
         let v = request.value.unwrap_or(0) as i64;
         Response::ok(SquareResponse {
@@ -35,7 +36,7 @@ impl NumberService for NumberServiceImpl {
     async fn range(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<RangeRequestView<'static>>,
+        request: ServiceRequest<'_, RangeRequest>,
     ) -> ServiceResult<ServiceStream<RangeResponse>> {
         let start = request.start.unwrap_or(0);
         let count = request.count.unwrap_or(0).max(0);
@@ -51,11 +52,11 @@ impl NumberService for NumberServiceImpl {
     async fn sum(
         &self,
         _ctx: RequestContext,
-        mut requests: RequestStream<SumRequestView<'static>>,
+        mut requests: RequestStream<SumRequest>,
     ) -> ServiceResult<SumResponse> {
         let mut total: i64 = 0;
         while let Some(req) = requests.next().await {
-            total += req?.value.unwrap_or(0) as i64;
+            total += req?.value().unwrap_or(0) as i64;
         }
         Response::ok(SumResponse {
             total: Some(total),
@@ -66,13 +67,13 @@ impl NumberService for NumberServiceImpl {
     async fn running_sum(
         &self,
         _ctx: RequestContext,
-        requests: RequestStream<RunningSumRequestView<'static>>,
+        requests: RequestStream<RunningSumRequest>,
     ) -> ServiceResult<ServiceStream<RunningSumResponse>> {
         let response_stream =
             futures::stream::unfold((requests, 0i64), |(mut requests, mut total)| async move {
                 match requests.next().await? {
                     Ok(req) => {
-                        total += req.value.unwrap_or(0) as i64;
+                        total += req.value().unwrap_or(0) as i64;
                         Some((
                             Ok(RunningSumResponse {
                                 total: Some(total),
@@ -134,7 +135,7 @@ async fn server_stream_range() {
         .unwrap();
     let mut got = Vec::new();
     while let Some(msg) = stream.message().await.unwrap() {
-        got.push(msg.value.unwrap());
+        got.push(msg.reborrow().value.unwrap());
     }
     assert_eq!(got, vec![10, 11, 12, 13, 14]);
 }
@@ -168,7 +169,7 @@ async fn bidi_stream_running_sum() {
         .await
         .unwrap();
         let msg = bidi.message().await.unwrap().unwrap();
-        got.push(msg.total.unwrap());
+        got.push(msg.reborrow().total.unwrap());
     }
     bidi.close_send();
     assert_eq!(got, vec![2, 6, 12, 20]);

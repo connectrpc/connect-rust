@@ -250,7 +250,7 @@ async fn run_conversation(
         })
         .await?;
     while let Some(msg) = intro.message().await? {
-        println!("Eliza> {}", msg.sentence);
+        println!("Eliza> {}", msg.reborrow().sentence);
     }
     if let Some(err) = intro.error() {
         return Err(err.clone().into());
@@ -273,7 +273,7 @@ async fn run_conversation(
             // EOF (Ctrl-D). Close our send side and drain any final messages.
             convo.close_send();
             while let Some(msg) = convo.message().await? {
-                println!("Eliza> {}", msg.sentence);
+                println!("Eliza> {}", msg.reborrow().sentence);
             }
             break;
         };
@@ -295,7 +295,7 @@ async fn run_conversation(
             loop {
                 match convo.message().await {
                     Ok(Some(msg)) => {
-                        println!("Eliza> {}", msg.sentence);
+                        println!("Eliza> {}", msg.reborrow().sentence);
                         got_reply = true;
                     }
                     Ok(None) => {
@@ -320,7 +320,7 @@ async fn run_conversation(
         // Receive the response; then peek for END_STREAM.
         match convo.message().await? {
             Some(msg) => {
-                println!("Eliza> {}", msg.sentence);
+                println!("Eliza> {}", msg.reborrow().sentence);
                 if peek_stream_closed(&mut convo).await? {
                     println!("\n(Eliza has ended the session.)");
                     break;
@@ -390,7 +390,7 @@ async fn peek_stream_closed(convo: &mut ConvoStream) -> Result<bool, BoxError> {
         // strictly 1:1) but valid for bidi streams in general. Print it and
         // report stream still open.
         Ok(Ok(Some(msg))) => {
-            println!("Eliza> {}", msg.sentence);
+            println!("Eliza> {}", msg.reborrow().sentence);
             Ok(false)
         }
 
