@@ -1,0 +1,6 @@
+# Local proto module configuration for connectrpc-health.
+# The generated code is checked into src/generated/.
+# To regenerate: task connectrpc-health:generate
+version: v2
+modules:
+  - path: proto

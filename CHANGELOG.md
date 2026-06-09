@@ -12,8 +12,36 @@ increment the patch version.
 
 ### Fixed
 
-- Connect streaming clients now report an error when a response body ends
-  without the required END_STREAM envelope ([#140]).
+- **The gRPC and gRPC-Web unary response parsers enforce the
+  single-message rule before decompressing, and gRPC-Web parsing stops at
+  the trailers frame** ([#147]). A second data envelope is rejected before
+  its payload is touched (matching the Connect client-streaming parser
+  from [#133]), and a gRPC-Web response now completes as soon as a
+  complete trailers frame is buffered instead of reading the body to EOF,
+  so well-formed responses finish even if the server keeps writing.
+- **Connect streaming clients report an error when a response body ends
+  without the required END_STREAM envelope** ([#140]). `message()` now
+  returns `Err` with code `unavailable` (matching connect-go) instead of
+  a clean `Ok(None)`, so a stream cut off mid-response is no longer
+  indistinguishable from a complete one. Streams that previously appeared
+  to drain cleanly against a known-good server may now error — if you see
+  this, suspect an intermediary (proxy or load balancer) stripping the
+  trailing envelope.
+
+### Changed
+
+- Malformed gzip and zstd compressed payloads now return `invalid_argument`
+  instead of `internal` ([#139]). For servers this attributes the failure
+  to the sender and moves it out of 5xx metrics (the Connect HTTP status
+  changes from 500 to 400) — update any alerting that keys on 5xx for
+  these events. On the client, where the corrupt payload is a *response*,
+  the error is remapped to `data_loss` so callers are not told their
+  request was invalid. The client-side remap deliberately diverges from
+  connect-go, which reports `invalid_argument` in both directions;
+  `data_loss` is more descriptive of what actually happened.
+
+[#140]: https://github.com/anthropics/connect-rust/issues/140
+[#147]: https://github.com/anthropics/connect-rust/pull/147
 
 ## [0.6.1] - 2026-05-27
 
@@ -53,7 +81,7 @@ now 1.6.
 [#131]: https://github.com/anthropics/connect-rust/pull/131
 [#132]: https://github.com/anthropics/connect-rust/pull/132
 [#133]: https://github.com/anthropics/connect-rust/pull/133
-[#140]: https://github.com/anthropics/connect-rust/issues/140
+[#139]: https://github.com/anthropics/connect-rust/issues/139
 
 ## [0.6.0] - 2026-05-20
 
