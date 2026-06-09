@@ -153,6 +153,32 @@ pub fn full_body(b: Bytes) -> ClientBody {
 /// under 8 KiB per header set.
 const RESPONSE_BUFFER_TRAILER_SLACK: usize = 64 * 1024;
 
+/// Return the end offset of a complete gRPC-Web trailer frame, if present.
+fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+
+    while data.len().saturating_sub(offset) >= crate::envelope::HEADER_SIZE {
+        let length = u32::from_be_bytes([
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+        ]) as usize;
+        let frame_end = offset
+            .checked_add(crate::envelope::HEADER_SIZE)?
+            .checked_add(length)?;
+        if frame_end > data.len() {
+            return None;
+        }
+        if data[offset] & 0x80 != 0 {
+            return Some(frame_end);
+        }
+        offset = frame_end;
+    }
+
+    None
+}
+
 /// Trait for types that can be used as ConnectRPC client transports.
 ///
 /// This is automatically implemented for any `tower::Service` that handles
@@ -1410,6 +1436,29 @@ where
     .await
 }
 
+/// Remap decompression error codes for payloads received from the server.
+///
+/// The compression providers classify malformed input as `invalid_argument`
+/// and unknown encodings as `unimplemented`, which is the right attribution
+/// when a server decompresses a request. On the client the payload is a
+/// response, so the fault lies with the server (or an intermediary), not
+/// with the caller:
+///
+/// - `unimplemented` (unknown encoding) becomes `internal`: the server
+///   chose an encoding the client never advertised.
+/// - `invalid_argument` (malformed payload) becomes `data_loss`: the bytes
+///   arrived but were corrupt. This deliberately diverges from connect-go,
+///   which reports `invalid_argument` in both directions; `data_loss`
+///   describes the failure without implying the request was at fault.
+fn map_response_decompression_error(mut e: ConnectError) -> ConnectError {
+    match e.code {
+        ErrorCode::Unimplemented => e.code = ErrorCode::Internal,
+        ErrorCode::InvalidArgument => e.code = ErrorCode::DataLoss,
+        _ => {}
+    }
+    e
+}
+
 /// Parse a Connect protocol unary response.
 async fn parse_connect_unary_response<B, RespView>(
     response: Response<B>,
@@ -1553,12 +1602,7 @@ where
         config
             .compression
             .decompress_with_limit(&encoding, body, max_message_size)
-            .map_err(|mut e| {
-                if e.code == ErrorCode::Unimplemented {
-                    e.code = ErrorCode::Internal;
-                }
-                e
-            })?
+            .map_err(map_response_decompression_error)?
     } else {
         body
     };
@@ -1660,12 +1704,20 @@ where
                         if !data.is_empty() {
                             has_body_data = true;
                         }
-                        if buf.len().saturating_add(data.len()) > max_buf_size {
+                        let remaining = max_buf_size.saturating_sub(buf.len());
+                        let append_len = data.len().min(remaining);
+                        buf.extend_from_slice(&data[..append_len]);
+                        if matches!(config.protocol, Protocol::GrpcWeb)
+                            && let Some(trailer_end) = grpc_web_trailer_frame_end(&buf)
+                        {
+                            buf.truncate(trailer_end);
+                            break;
+                        }
+                        if append_len < data.len() {
                             return Err(ConnectError::resource_exhausted(format!(
                                 "response body size exceeds limit {max_buf_size}"
                             )));
                         }
-                        buf.extend_from_slice(&data);
                     }
                 } else if frame.is_trailers()
                     && let Ok(trailers) = frame.into_trailers()
@@ -1718,6 +1770,14 @@ where
             }
         };
 
+        if message_count > 0 {
+            let mut err = ConnectError::unimplemented(
+                "received multiple response messages where exactly one was expected",
+            );
+            err.set_response_headers(resp_headers);
+            return Err(err);
+        }
+
         let data = if envelope.is_compressed() {
             let enc = response_encoding.as_deref().ok_or_else(|| {
                 ConnectError::internal("received compressed message without grpc-encoding header")
@@ -1729,7 +1789,8 @@ where
             }
             config
                 .compression
-                .decompress_with_limit(enc, envelope.data, grpc_max_msg)?
+                .decompress_with_limit(enc, envelope.data, grpc_max_msg)
+                .map_err(map_response_decompression_error)?
         } else {
             envelope.data
         };
@@ -1751,13 +1812,6 @@ where
     };
 
     if let Some(mut err) = parse_grpc_error_from_trailers(effective_trailers) {
-        err.set_response_headers(resp_headers);
-        return Err(err);
-    }
-
-    // Validate message count for unary/client-stream (expect exactly 1)
-    if message_count > 1 {
-        let mut err = ConnectError::unimplemented("received multiple messages for unary response");
         err.set_response_headers(resp_headers);
         return Err(err);
     }
@@ -1885,6 +1939,15 @@ where
     ///
     /// After this returns `Ok(None)`, [`trailers()`](Self::trailers) and
     /// [`error()`](Self::error) become available.
+    ///
+    /// # Errors
+    ///
+    /// For the Connect protocol, a response body that ends without the
+    /// required END_STREAM envelope returns `Err` with code `unavailable`
+    /// rather than `Ok(None)` — a stream cut off mid-response is not a
+    /// clean end. In that case (as with any returned `Err`)
+    /// [`trailers()`](Self::trailers) and [`error()`](Self::error) are not
+    /// populated; the returned error is the terminal outcome.
     pub async fn message(&mut self) -> Result<Option<OwnedView<RespView>>, ConnectError> {
         // Whole-call deadline enforcement: wrap the decode loop so every
         // body-poll is bounded. If the deadline has already passed, this
@@ -1978,6 +2041,11 @@ where
                     if !self.poll_body().await? {
                         // Body exhausted — check buffer for remaining trailer data
                         self.done = true;
+                        if matches!(self.protocol, Protocol::Connect) {
+                            return Err(ConnectError::unavailable(
+                                "Connect streaming response ended without END_STREAM envelope",
+                            ));
+                        }
                         if matches!(self.protocol, Protocol::GrpcWeb)
                             && !self.buf.is_empty()
                             && self.buf[0] & 0x80 != 0
@@ -2098,12 +2166,7 @@ where
                 .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
             self.compression
                 .decompress_with_limit(encoding, envelope.data, max_size)
-                .map_err(|mut e| {
-                    if e.code == ErrorCode::Unimplemented {
-                        e.code = ErrorCode::Internal;
-                    }
-                    e
-                })
+                .map_err(map_response_decompression_error)
         } else {
             Ok(envelope.data)
         }
@@ -3044,7 +3107,9 @@ fn parse_connect_client_stream_envelopes(
                 let enc = encoding.ok_or_else(|| {
                     ConnectError::internal("received compressed END_STREAM without encoding header")
                 })?;
-                compression.decompress_with_limit(enc, envelope.data, max_msg_size)?
+                compression
+                    .decompress_with_limit(enc, envelope.data, max_msg_size)
+                    .map_err(map_response_decompression_error)?
             } else {
                 envelope.data
             };
@@ -3104,12 +3169,7 @@ fn parse_connect_client_stream_envelopes(
             })?;
             compression
                 .decompress_with_limit(enc, envelope.data, max_msg_size)
-                .map_err(|mut e| {
-                    if e.code == ErrorCode::Unimplemented {
-                        e.code = ErrorCode::Internal;
-                    }
-                    e
-                })?
+                .map_err(map_response_decompression_error)?
         } else {
             envelope.data
         };
@@ -3651,6 +3711,84 @@ mod tests {
         assert_debug::<HttpClient>();
     }
 
+    #[tokio::test]
+    async fn connect_server_stream_truncated_after_data_errors() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let body = Full::new(Envelope::data(StringValue::from("hello").encode_to_bytes()).encode());
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers: http::HeaderMap::new(),
+            body,
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(1024),
+            deadline: None,
+            trailers: None,
+            error: None,
+            done: false,
+            _phantom: PhantomData,
+        };
+
+        let msg = stream
+            .message()
+            .await
+            .expect("first message should decode")
+            .expect("stream should yield the data envelope before EOF");
+        assert_eq!(msg.value, "hello");
+
+        let err = match stream.message().await {
+            Err(err) => err,
+            Ok(Some(_)) => panic!("truncated stream unexpectedly yielded another message"),
+            Ok(None) => panic!("truncated stream ended cleanly without END_STREAM"),
+        };
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(
+            err.to_string().contains("END_STREAM"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A Connect streaming response whose body is empty (zero envelopes,
+    /// immediate EOF) is also missing its END_STREAM envelope and must
+    /// error rather than report a clean end of stream.
+    #[tokio::test]
+    async fn connect_server_stream_empty_body_errors() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let body = Full::new(Bytes::new());
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers: http::HeaderMap::new(),
+            body,
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(1024),
+            deadline: None,
+            trailers: None,
+            error: None,
+            done: false,
+            _phantom: PhantomData,
+        };
+
+        let err = match stream.message().await {
+            Err(err) => err,
+            Ok(Some(_)) => panic!("empty body unexpectedly yielded a message"),
+            Ok(None) => panic!("empty body without END_STREAM ended cleanly"),
+        };
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(
+            err.to_string().contains("END_STREAM"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn http_client_plaintext_rejects_https() {
@@ -3975,6 +4113,80 @@ mod tests {
 
         let headers = parse_grpc_web_trailer_frame_with_compression(&frame, None).unwrap();
         assert_eq!(headers.get("grpc-status").unwrap().to_str().unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_rejects_second_message_before_decompression() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&Envelope::data(Bytes::new()).encode());
+        body.extend_from_slice(&Envelope::compressed(Bytes::from_static(b"not-gzip")).encode());
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("received multiple response messages where exactly one was expected")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_stops_reading_after_trailer_frame() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&Envelope::data(Bytes::from_static(b"\x0a\x02hi")).encode());
+        let trailer_payload = b"grpc-status: 0\r\n";
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(body.freeze())).await.unwrap();
+        tx.send(Ok(Bytes::from_static(b"server is still writing")))
+            .await
+            .unwrap();
+
+        // Keep the sender alive: a complete trailers frame must finish the
+        // response without waiting for EOF or consuming the queued bytes.
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc-web+proto")
+            .body(ChannelBody { rx })
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            parse_grpc_unary_response::<_, StringValueView<'static>>(
+                response,
+                &config,
+                &CallOptions::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("parser should stop after the gRPC-Web trailer frame")
+        .unwrap();
+        assert_eq!(
+            response.trailers().get("grpc-status").unwrap(),
+            http::HeaderValue::from_static("0")
+        );
     }
 
     // ========================================================================
@@ -4504,6 +4716,45 @@ mod tests {
             err.to_string().contains("multiple data messages"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A malformed compressed response payload surfaces as `data_loss` on
+    /// the client: the compression provider classifies malformed input as
+    /// `invalid_argument` (sender fault), and on the response path the
+    /// sender is the server, so the code is remapped rather than blaming
+    /// the caller.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn malformed_compressed_response_payload_is_data_loss() {
+        let registry = crate::compression::CompressionRegistry::default();
+
+        let mut body = Envelope::compressed(Bytes::from_static(b"not gzip data"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DataLoss, "unexpected error: {err}");
+    }
+
+    /// The response-path remap touches only the two decompression codes:
+    /// `invalid_argument` → `data_loss`, `unimplemented` → `internal`;
+    /// everything else passes through unchanged.
+    #[test]
+    fn response_decompression_error_remap() {
+        let e = map_response_decompression_error(ConnectError::invalid_argument("corrupt"));
+        assert_eq!(e.code, ErrorCode::DataLoss);
+        let e = map_response_decompression_error(ConnectError::unimplemented("unknown encoding"));
+        assert_eq!(e.code, ErrorCode::Internal);
+        let e = map_response_decompression_error(ConnectError::resource_exhausted("too big"));
+        assert_eq!(e.code, ErrorCode::ResourceExhausted);
     }
 
     /// Scanning stops at the END_STREAM envelope: the single message and the

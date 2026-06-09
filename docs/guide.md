@@ -525,6 +525,13 @@ async fn sum(
 }
 ```
 
+The request stream yields `Err(ConnectError)` if the upload fails partway
+— a truncated body or broken transport — so a partial stream is not
+mistaken for a complete one. The `req?` in the loop above propagates that
+error as the RPC's failure, which is the right default for handlers that
+aggregate inbound messages. Only a clean `None` means the client finished
+the stream.
+
 ### Bidirectional streaming
 
 Takes a request stream and returns a response stream. Both sides can
@@ -1082,10 +1089,14 @@ Why each knob:
 
 - **`with_max`** is the most important one for any service that accepts
   untrusted callers — without it a client controls how long a worker
-  stays busy. Set it to your longest acceptable handler runtime.
+  stays busy. Set it to your longest acceptable request — for unary and
+  server-streaming RPCs the capped budget covers receiving the request
+  body as well as handler execution, so size it for uploads, not just
+  handler runtime.
 - **`with_default_timeout`** matters because the timeout header is
   optional. A request that omits it has no bound at all unless you set
-  one. Set it to your SLA.
+  one. Set it to your SLA. For unary and server-streaming RPCs, the
+  budget includes receiving the request body as well as handler execution.
 - **`with_min`** protects against a misbehaving or adversarial client
   cancelling the handler before it can do anything (e.g. mid-write on a
   streaming response). A few milliseconds is usually enough.
