@@ -3744,7 +3744,7 @@ mod tests {
             .await
             .expect("first message should decode")
             .expect("stream should yield the data envelope before EOF");
-        assert_eq!(msg.value, "hello");
+        assert_eq!(msg.reborrow().value, "hello");
 
         let err = match stream.message().await {
             Err(err) => err,
