@@ -1001,12 +1001,10 @@ use connectrpc::Router;
 use connectrpc_health::{install_static, Status};
 
 // `install_static` registers every name with `Status::Serving`; use the
-// generated `*_SERVICE_NAME` constants so the registered name matches
-// exactly what clients ask for. The whole-process `""` entry is seeded
-// for you, so probes that don't pass a service name also work.
-# mod proto { pub mod greet { pub mod v1 {
-#     pub const GREET_SERVICE_SERVICE_NAME: &str = "greet.v1.GreetService";
-# } } }
+// generated `*_SERVICE_NAME` constants from your service stubs so the
+// registered name matches exactly what clients ask for. The
+// whole-process `""` entry is seeded for you, so probes that don't
+// pass a service name also work.
 let (router, health) = install_static(Router::new(), [
     proto::greet::v1::GREET_SERVICE_SERVICE_NAME,
 ]);
@@ -1021,7 +1019,6 @@ health
 // At shutdown, drain. `shutdown()` flips every registered service,
 // including the empty whole-process entry:
 health.shutdown();
-# drop(router);
 ```
 
 For custom logic (e.g. report `NotServing` while a database connection
