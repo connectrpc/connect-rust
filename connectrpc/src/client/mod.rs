@@ -1410,6 +1410,29 @@ where
     .await
 }
 
+/// Remap decompression error codes for payloads received from the server.
+///
+/// The compression providers classify malformed input as `invalid_argument`
+/// and unknown encodings as `unimplemented`, which is the right attribution
+/// when a server decompresses a request. On the client the payload is a
+/// response, so the fault lies with the server (or an intermediary), not
+/// with the caller:
+///
+/// - `unimplemented` (unknown encoding) becomes `internal`: the server
+///   chose an encoding the client never advertised.
+/// - `invalid_argument` (malformed payload) becomes `data_loss`: the bytes
+///   arrived but were corrupt. This deliberately diverges from connect-go,
+///   which reports `invalid_argument` in both directions; `data_loss`
+///   describes the failure without implying the request was at fault.
+fn map_response_decompression_error(mut e: ConnectError) -> ConnectError {
+    match e.code {
+        ErrorCode::Unimplemented => e.code = ErrorCode::Internal,
+        ErrorCode::InvalidArgument => e.code = ErrorCode::DataLoss,
+        _ => {}
+    }
+    e
+}
+
 /// Parse a Connect protocol unary response.
 async fn parse_connect_unary_response<B, RespView>(
     response: Response<B>,
@@ -1553,12 +1576,7 @@ where
         config
             .compression
             .decompress_with_limit(&encoding, body, max_message_size)
-            .map_err(|mut e| {
-                if e.code == ErrorCode::Unimplemented {
-                    e.code = ErrorCode::Internal;
-                }
-                e
-            })?
+            .map_err(map_response_decompression_error)?
     } else {
         body
     };
@@ -1729,7 +1747,8 @@ where
             }
             config
                 .compression
-                .decompress_with_limit(enc, envelope.data, grpc_max_msg)?
+                .decompress_with_limit(enc, envelope.data, grpc_max_msg)
+                .map_err(map_response_decompression_error)?
         } else {
             envelope.data
         };
@@ -2098,12 +2117,7 @@ where
                 .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
             self.compression
                 .decompress_with_limit(encoding, envelope.data, max_size)
-                .map_err(|mut e| {
-                    if e.code == ErrorCode::Unimplemented {
-                        e.code = ErrorCode::Internal;
-                    }
-                    e
-                })
+                .map_err(map_response_decompression_error)
         } else {
             Ok(envelope.data)
         }
@@ -3044,7 +3058,9 @@ fn parse_connect_client_stream_envelopes(
                 let enc = encoding.ok_or_else(|| {
                     ConnectError::internal("received compressed END_STREAM without encoding header")
                 })?;
-                compression.decompress_with_limit(enc, envelope.data, max_msg_size)?
+                compression
+                    .decompress_with_limit(enc, envelope.data, max_msg_size)
+                    .map_err(map_response_decompression_error)?
             } else {
                 envelope.data
             };
@@ -3104,12 +3120,7 @@ fn parse_connect_client_stream_envelopes(
             })?;
             compression
                 .decompress_with_limit(enc, envelope.data, max_msg_size)
-                .map_err(|mut e| {
-                    if e.code == ErrorCode::Unimplemented {
-                        e.code = ErrorCode::Internal;
-                    }
-                    e
-                })?
+                .map_err(map_response_decompression_error)?
         } else {
             envelope.data
         };
@@ -4504,6 +4515,45 @@ mod tests {
             err.to_string().contains("multiple data messages"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A malformed compressed response payload surfaces as `data_loss` on
+    /// the client: the compression provider classifies malformed input as
+    /// `invalid_argument` (sender fault), and on the response path the
+    /// sender is the server, so the code is remapped rather than blaming
+    /// the caller.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn malformed_compressed_response_payload_is_data_loss() {
+        let registry = crate::compression::CompressionRegistry::default();
+
+        let mut body = Envelope::compressed(Bytes::from_static(b"not gzip data"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DataLoss, "unexpected error: {err}");
+    }
+
+    /// The response-path remap touches only the two decompression codes:
+    /// `invalid_argument` → `data_loss`, `unimplemented` → `internal`;
+    /// everything else passes through unchanged.
+    #[test]
+    fn response_decompression_error_remap() {
+        let e = map_response_decompression_error(ConnectError::invalid_argument("corrupt"));
+        assert_eq!(e.code, ErrorCode::DataLoss);
+        let e = map_response_decompression_error(ConnectError::unimplemented("unknown encoding"));
+        assert_eq!(e.code, ErrorCode::Internal);
+        let e = map_response_decompression_error(ConnectError::resource_exhausted("too big"));
+        assert_eq!(e.code, ErrorCode::ResourceExhausted);
     }
 
     /// Scanning stops at the END_STREAM envelope: the single message and the

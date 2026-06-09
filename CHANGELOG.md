@@ -13,7 +13,14 @@ increment the patch version.
 ### Changed
 
 - Malformed gzip and zstd compressed payloads now return `invalid_argument`
-  instead of `internal` ([#139]).
+  instead of `internal` ([#139]). For servers this attributes the failure
+  to the sender and moves it out of 5xx metrics (the Connect HTTP status
+  changes from 500 to 400) — update any alerting that keys on 5xx for
+  these events. On the client, where the corrupt payload is a *response*,
+  the error is remapped to `data_loss` so callers are not told their
+  request was invalid. The client-side remap deliberately diverges from
+  connect-go, which reports `invalid_argument` in both directions;
+  `data_loss` is more descriptive of what actually happened.
 
 ## [0.6.1] - 2026-05-27
 
