@@ -525,6 +525,13 @@ async fn sum(
 }
 ```
 
+The request stream yields `Err(ConnectError)` if the upload fails partway
+— a truncated body or broken transport — so a partial stream is not
+mistaken for a complete one. The `req?` in the loop above propagates that
+error as the RPC's failure, which is the right default for handlers that
+aggregate inbound messages. Only a clean `None` means the client finished
+the stream.
+
 ### Bidirectional streaming
 
 Takes a request stream and returns a response stream. Both sides can
