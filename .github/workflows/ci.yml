@@ -89,8 +89,12 @@ jobs:
       # checked-in code overnight. Nightly is required at all because
       # format_generated_files=false in rustfmt.toml is a nightly-only
       # option. Keep in sync with the version named in CONTRIBUTING.md.
-      - uses: dtolnay/rust-toolchain@nightly-2026-02-27
+      # The action's @ref must be a tag of the action repo itself and only
+      # channel/version tags exist, so the dated nightly goes in the
+      # `toolchain` input and the action is sha-pinned instead.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-03-27 (sha-pinned)
         with:
+          toolchain: nightly-2026-02-27
           components: rustfmt
       - run: cargo +nightly-2026-02-27 fmt --all -- --check
 
