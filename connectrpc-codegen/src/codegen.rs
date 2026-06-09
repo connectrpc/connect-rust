@@ -57,13 +57,22 @@ pub struct Options {
     /// catch-all so every type resolves); it is ignored by
     /// [`generate_files`] (the unified `super::`-relative path).
     pub buffa: CodeGenConfig,
+
+    /// When `true`, prefix every emitted `FooClient<T>` struct and its
+    /// `impl` block with `#[cfg(feature = "client")]`. Opt in when
+    /// the consuming crate wants to give server-only deployments a way
+    /// to drop the client transport stack from their dependency graph.
+    pub gate_client_feature: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         let mut buffa = CodeGenConfig::default();
         buffa.generate_json = true;
-        Self { buffa }
+        Self {
+            buffa,
+            gate_client_feature: false,
+        }
     }
 }
 
@@ -83,6 +92,7 @@ fn emit_service_files(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
     resolver: &TypeResolver<'_>,
+    gate_client_feature: bool,
 ) -> Result<Vec<GeneratedFile>> {
     let mut out = Vec::new();
     // Dedup state shared across the whole batch, not per file:
@@ -94,6 +104,7 @@ fn emit_service_files(
     //   because the stitcher mounts sibling files into one module.
     let mut batch = BatchState {
         colliding_aliases: collect_alias_collisions(proto_file, file_to_generate),
+        gate_client_feature,
         ..BatchState::default()
     };
     for file_name in file_to_generate {
@@ -163,7 +174,12 @@ pub fn generate_files(
         .map_err(|e| anyhow::anyhow!("buffa-codegen failed: {e}"))?;
 
     let resolver = TypeResolver::new(proto_file, file_to_generate, &config, false);
-    let service_files = emit_service_files(proto_file, file_to_generate, &resolver)?;
+    let service_files = emit_service_files(
+        proto_file,
+        file_to_generate,
+        &resolver,
+        options.gate_client_feature,
+    )?;
 
     if config.file_per_package {
         // Under `file_per_package` buffa emits one `<dotted.pkg>.rs`
@@ -291,7 +307,12 @@ pub fn generate_services(
 
     let config = options.to_buffa_config();
     let resolver = TypeResolver::new(proto_file, file_to_generate, &config, true);
-    let mut files = emit_service_files(proto_file, file_to_generate, &resolver)?;
+    let mut files = emit_service_files(
+        proto_file,
+        file_to_generate,
+        &resolver,
+        options.gate_client_feature,
+    )?;
 
     if config.file_per_package {
         // Collapse the per-proto split into one `<dotted.pkg>.rs` per
@@ -423,6 +444,29 @@ pub fn generate_services(
 ///   `register_types(&mut TypeRegistry)` aggregator. See
 ///   [`CodeGenConfig::emit_register_fn`]. Ignored in this plugin (no message
 ///   types emitted); accepted for compatibility with the unified path.
+/// - `gate_client_feature` — prefix every emitted `FooClient<T>`
+///   struct and its `impl` block with `#[cfg(feature = "client")]`.
+///
+/// # Client-side cfg gate
+///
+/// When `gate_client_feature` is set, the consumer crate must declare
+/// a Cargo feature literally named `client`. Without it, the generated
+/// `FooClient` items will be absent from the crate namespace.
+///
+/// Two consumer patterns:
+///
+/// 1. **Dep-forwarding** (`client = ["connectrpc/client"]`, with
+///    `connectrpc = { ..., features = ["server"] }` and no `"client"`
+///    in that dep's feature list): turns the gate into a real
+///    server-only escape hatch. Disabling the feature drops
+///    `connectrpc/client` (and its transport stack) from the
+///    dependency graph entirely. This is the intended use; see
+///    `connectrpc-health` for the minimal example.
+///
+/// 2. **Marker** (`client = []`, no forwarding): satisfies the gate
+///    without slimming the dependency graph. Use only when you want
+///    the cfg infrastructure in place but aren't ready to gate the
+///    dep yet.
 pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse> {
     let mut options = Options::default();
 
@@ -467,12 +511,13 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                     "strict_utf8_mapping" => options.buffa.strict_utf8_mapping = true,
                     "no_json" => options.buffa.generate_json = false,
                     "no_register_fn" => options.buffa.emit_register_fn = false,
+                    "gate_client_feature" => options.gate_client_feature = true,
                     _ => {
                         return Err(anyhow::anyhow!(
                             "unknown plugin option: {opt:?}. Supported: \
                              buffa_module=<rust_path>, extern_path=<proto>=<rust>, \
                              file_per_package, strict_utf8_mapping, no_json, \
-                             no_register_fn"
+                             no_register_fn, gate_client_feature"
                         ));
                     }
                 }
@@ -699,6 +744,12 @@ struct BatchState {
     ///
     /// [#75]: https://github.com/anthropics/connect-rust/issues/75
     colliding_aliases: std::collections::BTreeSet<(String, String)>,
+    /// Mirrors [`Options::gate_client_feature`]. When `true`, prefix
+    /// each emitted `FooClient<T>` struct + `impl` with
+    /// `#[cfg(feature = "client")]`. Threaded here so it propagates
+    /// through the per-file emission loop without changing every
+    /// helper's signature.
+    gate_client_feature: bool,
 }
 
 fn generate_connect_services(
@@ -1242,6 +1293,18 @@ let owned = client.{example_method}(request).await?.into_owned();
 ```"#
     );
     let client_doc_tokens = doc_attrs(&client_doc);
+    // Opt-in `#[cfg(feature = "client")]` on every client-side item.
+    //
+    // INVARIANT: any future emission referencing
+    // `::connectrpc::client::*` (an additional `impl`, a free fn, a
+    // sibling trait, …) must also be prefixed with `#client_cfg_attr`.
+    // The `no_ungated_client_references` test enforces this by scanning
+    // the formatted output under the opt-in path.
+    let client_cfg_attr: TokenStream = if batch.gate_client_feature {
+        quote! { #[cfg(feature = "client")] }
+    } else {
+        TokenStream::new()
+    };
 
     // Per-method `Spec` constants. Stable, allocation-free metadata that the
     // dispatcher threads into `RequestContext::spec` and that user code can
@@ -1294,12 +1357,14 @@ let owned = client.{example_method}(request).await?.into_owned();
         #service_server
 
         #client_doc_tokens
+        #client_cfg_attr
         #[derive(Clone)]
         pub struct #client_name<T> {
             transport: T,
             config: ::connectrpc::client::ClientConfig,
         }
 
+        #client_cfg_attr
         impl<T> #client_name<T>
         where
             T: ::connectrpc::client::ClientTransport,
@@ -1926,6 +1991,7 @@ fn find_comment(source_info: &SourceCodeInfo, target_path: &[i32]) -> Option<Str
 mod tests {
     use super::*;
     use buffa_codegen::generated::descriptor::DescriptorProto;
+    use quote::ToTokens;
 
     #[test]
     fn doc_attrs_prefixes_space_for_prettyplease() {
@@ -3181,6 +3247,445 @@ mod tests {
         // Plugin path emits services only, so we can't observe the buffa
         // config directly — just make sure the option parses without error.
         generate(&request).expect("no_register_fn should be a recognized plugin option");
+    }
+
+    /// Format `generate_service` output for a single-service file using
+    /// the local `minimal_file` fixture. `gate_client_feature` selects
+    /// whether the opt-in cfg attr is emitted; shared by the `*_client_*`
+    /// tests below.
+    fn format_minimal_service(gate_client_feature: bool) -> String {
+        let file = minimal_file(
+            Some("example.v1"),
+            ".example.v1.PingReq",
+            ".example.v1.PingResp",
+            &["PingReq", "PingResp"],
+        );
+        let config = buffa_codegen::CodeGenConfig::default();
+        let target = file.name.clone().into_iter().collect::<Vec<_>>();
+        let resolver = TypeResolver::new(std::slice::from_ref(&file), &target, &config, false);
+        let service = &file.service[0];
+        let batch = BatchState {
+            colliding_aliases: collect_alias_collisions(std::slice::from_ref(&file), &target),
+            gate_client_feature,
+            ..BatchState::default()
+        };
+        format_token_stream(&generate_service(&file, service, &resolver, &batch).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn default_emission_has_no_client_cfg() {
+        // CRITICAL invariant: with the option unset, codegen emits zero
+        // `#[cfg(feature = "client")]` attrs. External users with their
+        // own protos must not be forced to declare a Cargo feature.
+        let out = format_minimal_service(false);
+        assert!(
+            !out.contains("#[cfg(feature ="),
+            "default emission must not emit any cfg attr — external \
+             consumers should not need to declare a `client` Cargo \
+             feature unless they explicitly opt in via the \
+             `gate_client_feature` plugin option:\n{out}"
+        );
+    }
+
+    #[test]
+    fn client_items_gated_when_opt_in() {
+        // When `gate_client_feature` is set, the `FooClient` struct +
+        // impl carry `#[cfg(feature = "client")]`. Exactly two attrs:
+        // one on the struct, one on the impl block. (All `_with_options`
+        // methods live inside the impl and inherit the gate.)
+        let out = format_minimal_service(true);
+        let cfg_count = out.matches("#[cfg(feature = \"client\")]").count();
+        assert_eq!(
+            cfg_count, 2,
+            "expected exactly two #[cfg(feature = \"client\")] attrs (one on \
+             `pub struct PingServiceClient`, one on its `impl<T>` block); got \
+             {cfg_count}:\n{out}"
+        );
+    }
+
+    #[test]
+    fn server_items_never_carry_client_cfg() {
+        // The trait, ext trait, and monomorphic dispatcher live on the
+        // server side; nothing about them should be feature-gated even
+        // under the opt-in path.
+        let out = format_minimal_service(true);
+        for marker in [
+            "pub trait PingService",
+            "pub trait PingServiceExt",
+            "pub struct PingServiceServer",
+            "pub const PING_SERVICE_SERVICE_NAME",
+        ] {
+            let idx = out
+                .find(marker)
+                .unwrap_or_else(|| panic!("expected `{marker}` in output:\n{out}"));
+            let prefix = &out[..idx];
+            assert!(
+                !prefix.trim_end().ends_with("#[cfg(feature = \"client\")]"),
+                "`{marker}` must not be preceded by a client cfg attr — \
+                 server-side items are always compiled in:\n{out}"
+            );
+        }
+    }
+
+    /// The strongest invariant: every reference to
+    /// `::connectrpc::client::*` (or the unqualified `connectrpc::client::`
+    /// — should not appear, but guard anyway) must live inside an item
+    /// (or ancestor module/item) carrying `#[cfg(feature = "client")]`.
+    /// Catches the missing-gate regression that a count-only test cannot
+    /// detect: e.g. a future `impl<T> Default for FooClient<T>` that the
+    /// contributor forgot to prefix.
+    ///
+    /// Walks recursively into `Item::Mod` bodies so a gate on a parent
+    /// module implicitly covers its children — avoids false-positives
+    /// where a wrapper `pub mod gated { #[cfg(...)] … }` would flag the
+    /// outer module just because its rendered body mentions
+    /// `::connectrpc::client::`.
+    #[test]
+    fn no_ungated_client_references() {
+        // Only relevant under the opt-in path — that's where the
+        // invariant ("every `::connectrpc::client::*` reference lives
+        // inside a gated item") is meaningful.
+        let out = format_minimal_service(true);
+        let parsed: syn::File = syn::parse_str(&out).expect("output parses");
+
+        let mut offenders: Vec<String> = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "every item that mentions `::connectrpc::client::*` must be \
+             prefixed with `#[cfg(feature = \"client\")]`. Offenders:\n{}\n\nFull output:\n{out}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Predicate: is this attribute `#[cfg(feature = "client")]`?
+    /// Stringifies the attr to avoid coupling to syn's parsed `Meta`
+    /// shape across versions.
+    fn is_client_feature_cfg(attr: &syn::Attribute) -> bool {
+        attr.path().is_ident("cfg")
+            && attr
+                .to_token_stream()
+                .to_string()
+                .contains("feature = \"client\"")
+    }
+
+    /// Render `ts` through prettyplease (matching the spacing of the
+    /// rest of the codegen test surface) and check for any reference
+    /// to `::connectrpc::client::` or `connectrpc :: client ::` (the
+    /// pre-prettyplease form, defensive).
+    fn mentions_connectrpc_client(ts: TokenStream) -> bool {
+        let rendered = format_token_stream(&ts).unwrap_or_default();
+        rendered.contains("::connectrpc::client::") || rendered.contains("connectrpc :: client ::")
+    }
+
+    /// Recursive walker for `no_ungated_client_references`. For each
+    /// item: if the item or any ancestor is `#[cfg(feature = "client")]`,
+    /// it's gated and we skip. Otherwise, if its rendered tokens
+    /// mention `::connectrpc::client::`, push an offender entry.
+    /// `Item::Mod` recurses into its children so a parent-level gate
+    /// implicitly covers them.
+    ///
+    /// Item kinds the codegen doesn't currently emit at top level
+    /// (`Use`, `Static`, `Macro`, `ForeignMod`, `Union`, `TraitAlias`,
+    /// `ExternCrate`, `Verbatim`, …) still go through the textual scan
+    /// via the fallthrough arm — they're not gated by anything we can
+    /// inspect, so if their token rendering mentions
+    /// `::connectrpc::client::` they're flagged. This is the defensive
+    /// shape: a future emission that introduces e.g. an ungated
+    /// `use ::connectrpc::client::ClientConfig;` at module scope must
+    /// not slip past the invariant test.
+    fn scan_items_for_ungated_client_refs(
+        items: &[syn::Item],
+        ancestor_gated: bool,
+        offenders: &mut Vec<String>,
+    ) {
+        for item in items {
+            // Extract attrs for the kinds we explicitly model. For
+            // everything else we treat the item as not self-gated and
+            // fall through to the textual scan — better a false
+            // positive on an exotic ungated emission than silently
+            // missing a real one.
+            let (attrs, ident): (&[syn::Attribute], String) = match item {
+                syn::Item::Struct(s) => (&s.attrs, s.ident.to_string()),
+                syn::Item::Impl(i) => (
+                    &i.attrs,
+                    format!("impl-block for {}", ToTokens::to_token_stream(&i.self_ty)),
+                ),
+                syn::Item::Fn(f) => (&f.attrs, f.sig.ident.to_string()),
+                syn::Item::Trait(t) => (&t.attrs, t.ident.to_string()),
+                syn::Item::Const(c) => (&c.attrs, c.ident.to_string()),
+                syn::Item::Type(t) => (&t.attrs, t.ident.to_string()),
+                syn::Item::Static(s) => (&s.attrs, s.ident.to_string()),
+                syn::Item::Use(u) => (&u.attrs, "use-item".to_string()),
+                syn::Item::ExternCrate(e) => (&e.attrs, e.ident.to_string()),
+                syn::Item::Macro(m) => (
+                    &m.attrs,
+                    m.ident
+                        .as_ref()
+                        .map(syn::Ident::to_string)
+                        .unwrap_or_else(|| "macro-item".to_string()),
+                ),
+                syn::Item::ForeignMod(f) => (&f.attrs, "extern-block".to_string()),
+                syn::Item::Union(u) => (&u.attrs, u.ident.to_string()),
+                syn::Item::TraitAlias(t) => (&t.attrs, t.ident.to_string()),
+                syn::Item::Enum(e) => (&e.attrs, e.ident.to_string()),
+                syn::Item::Mod(m) => {
+                    let self_gated = m.attrs.iter().any(is_client_feature_cfg);
+                    let gated = ancestor_gated || self_gated;
+                    if let Some((_brace, children)) = &m.content {
+                        scan_items_for_ungated_client_refs(children, gated, offenders);
+                    }
+                    // Don't fall through — the textual scan on a Mod's
+                    // tokens would render its children too and double-count.
+                    continue;
+                }
+                // `Item::Verbatim` and any future syn variant: we can't
+                // inspect attrs, so assume not self-gated and let the
+                // textual scan decide.
+                _ => (&[][..], "<unrecognized item>".to_string()),
+            };
+            let self_gated = attrs.iter().any(is_client_feature_cfg);
+            let gated = ancestor_gated || self_gated;
+            if gated {
+                continue;
+            }
+            if mentions_connectrpc_client(ToTokens::to_token_stream(item)) {
+                offenders.push(format!(
+                    "ungated reference to ::connectrpc::client in `{ident}`"
+                ));
+            }
+        }
+    }
+
+    /// Verify the recursive scanner: a parent module gated on `client`
+    /// covers its children (no false-positive); an ungated parent
+    /// containing an ungated child gets flagged via the child, not the
+    /// parent's textual rendering (no double-counting).
+    #[test]
+    fn ungated_scanner_handles_nested_modules() {
+        // Case 1: gated parent + ungated-looking child → no offenders.
+        let parsed: syn::File = syn::parse_str(
+            r#"
+            #[cfg(feature = "client")]
+            pub mod gated_parent {
+                pub struct WithClientRef {
+                    field: ::connectrpc::client::ClientConfig,
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let mut offenders = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "parent-level cfg must cover children: {offenders:?}"
+        );
+
+        // Case 2: ungated parent + ungated child referencing client → exactly
+        // ONE offender (the inner struct), not two (parent + child).
+        let parsed: syn::File = syn::parse_str(
+            r#"
+            pub mod ungated_parent {
+                pub struct WithClientRef {
+                    field: ::connectrpc::client::ClientConfig,
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let mut offenders = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert_eq!(
+            offenders.len(),
+            1,
+            "exactly one offender expected (the inner struct), not the wrapping \
+             module: {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains("WithClientRef"),
+            "offender should name the inner struct: {:?}",
+            offenders[0]
+        );
+
+        // Case 3: ungated parent containing a gated child → no offenders.
+        let parsed: syn::File = syn::parse_str(
+            r#"
+            pub mod outer {
+                #[cfg(feature = "client")]
+                pub struct GatedClient {
+                    field: ::connectrpc::client::ClientConfig,
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let mut offenders = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "self-gating child inside ungated module must be OK: {offenders:?}"
+        );
+    }
+
+    /// Regression: the scanner must not silently skip `syn::Item` variants
+    /// the codegen doesn't currently emit. A future ungated
+    /// `use ::connectrpc::client::ClientConfig;` or a `static`
+    /// referencing the client module would have slipped past the
+    /// earlier `_ => continue` catch-all; the expanded variant arms +
+    /// fallthrough textual scan catch it now.
+    #[test]
+    fn ungated_scanner_catches_use_and_static_items() {
+        // Item::Use, ungated → flagged.
+        let parsed: syn::File = syn::parse_str("use ::connectrpc::client::ClientConfig;").unwrap();
+        let mut offenders = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert_eq!(
+            offenders.len(),
+            1,
+            "ungated `use ::connectrpc::client::*` must be flagged: {offenders:?}"
+        );
+
+        // Item::Use, gated → OK.
+        let parsed: syn::File =
+            syn::parse_str("#[cfg(feature = \"client\")] use ::connectrpc::client::ClientConfig;")
+                .unwrap();
+        let mut offenders = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "gated `use ::connectrpc::client::*` must NOT be flagged: {offenders:?}"
+        );
+
+        // Item::Static, ungated, referencing client module → flagged.
+        let parsed: syn::File =
+            syn::parse_str("static FOO: &str = stringify!(::connectrpc::client::ClientConfig);")
+                .unwrap();
+        let mut offenders = Vec::new();
+        scan_items_for_ungated_client_refs(&parsed.items, false, &mut offenders);
+        assert_eq!(
+            offenders.len(),
+            1,
+            "ungated `static FOO` mentioning ::connectrpc::client must be flagged: \
+             {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn client_cfg_round_trips_through_prettyplease() {
+        // Sanity: prettyplease formats the cfg attr to exactly the
+        // canonical spelling we grep for in the count test. If a future
+        // formatting change reshapes the attribute (e.g. inserts spaces),
+        // the count test would silently report zero matches — make sure
+        // we'd notice.
+        let out = format_minimal_service(true);
+        // The exact rendered form prettyplease uses; if this assertion
+        // ever fails we need to update the other test's grep pattern.
+        assert!(
+            out.contains("#[cfg(feature = \"client\")]"),
+            "prettyplease no longer renders the cfg attr as expected; \
+             update the grep pattern in client_items_always_gated:\n{out}"
+        );
+    }
+
+    #[test]
+    fn multi_service_in_one_file_each_client_is_gated() {
+        // Two services in the same file → 4 cfg attrs (2 per FooClient).
+        // Catches a regression where the cfg interpolation accidentally
+        // moved outside the per-service token block.
+        let make_service = |name: &str| ServiceDescriptorProto {
+            name: Some(name.into()),
+            method: vec![MethodDescriptorProto {
+                name: Some("Ping".into()),
+                input_type: Some(".example.v1.PingReq".into()),
+                output_type: Some(".example.v1.PingResp".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("two.proto".into()),
+            package: Some("example.v1".into()),
+            service: vec![make_service("Alpha"), make_service("Beta")],
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("PingReq".into()),
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("PingResp".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let config = buffa_codegen::CodeGenConfig::default();
+        let target = vec!["two.proto".to_string()];
+        let resolver = TypeResolver::new(std::slice::from_ref(&file), &target, &config, false);
+        let mut batch = BatchState {
+            colliding_aliases: collect_alias_collisions(std::slice::from_ref(&file), &target),
+            gate_client_feature: true,
+            ..BatchState::default()
+        };
+        let ts = generate_connect_services(&file, &resolver, &mut batch).unwrap();
+        let out = format_token_stream(&ts).unwrap();
+        let cfg_count = out.matches("#[cfg(feature = \"client\")]").count();
+        assert_eq!(
+            cfg_count, 4,
+            "expected 4 client cfg attrs (2 per service * 2 services); got \
+             {cfg_count}:\n{out}"
+        );
+        // Both client structs are present, both gated.
+        for client_struct in ["pub struct AlphaClient", "pub struct BetaClient"] {
+            let idx = out
+                .find(client_struct)
+                .unwrap_or_else(|| panic!("expected `{client_struct}` in output:\n{out}"));
+            let prefix = &out[..idx];
+            assert!(
+                prefix.trim_end().ends_with("#[derive(Clone)]")
+                    || prefix.contains("#[cfg(feature = \"client\")]"),
+                "`{client_struct}` must have a client cfg attr in its \
+                 attribute cluster:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_accepts_gate_client_feature_flag() {
+        // The current option is a bare flag (no `=value`).
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,gate_client_feature".into()),
+            file_to_generate: vec![],
+            proto_file: vec![],
+            ..Default::default()
+        };
+        generate(&request).expect("gate_client_feature should be a recognized plugin option");
+    }
+
+    #[test]
+    fn plugin_rejects_old_client_feature_value_form() {
+        // The previous design used `client_feature=<name>` with an
+        // arbitrary feature name. That option was renamed to the bare
+        // flag `gate_client_feature` (the feature name is fixed as
+        // `client`). A stale buf.gen.yaml using the old form must fail
+        // loudly, not silently no-op.
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,client_feature=client".into()),
+            file_to_generate: vec![],
+            proto_file: vec![],
+            ..Default::default()
+        };
+        let err = generate(&request)
+            .expect_err("legacy `client_feature=…` option must now fail as unknown");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("client_feature"),
+            "error should name the offending option: {msg}"
+        );
+        assert!(
+            msg.contains("unknown plugin option"),
+            "error should say the option is unknown: {msg}"
+        );
     }
 
     #[test]
