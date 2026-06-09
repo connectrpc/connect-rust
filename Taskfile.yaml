@@ -122,6 +122,12 @@ tasks:
     cmds:
       - buf generate
 
+  connectrpc-health:generate:
+    desc: Regenerate connectrpc-health Rust code from the vendored grpc.health.v1 proto
+    dir: "{{.ROOT_DIR}}/connectrpc-health"
+    cmds:
+      - buf generate
+
   example:multiservice:server:
     desc: Run the multi-service server (greet, math, well-known types)
     cmds:
@@ -374,6 +380,7 @@ tasks:
       - task: example:multiservice:generate
       - task: conformance:generate
       - task: bench:generate
+      - task: connectrpc-health:generate
 
 
   # ===========================================================================

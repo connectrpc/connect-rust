@@ -59,7 +59,30 @@ toolchain and buffa ≥ 0.7.0.**
   google.protobuf.Timestamp` RPC exercising well-known types as direct RPC
   input and output ([#143]).
 
+### Fixed
+
+- **The gRPC and gRPC-Web unary response parsers enforce the
+  single-message rule before decompressing, and gRPC-Web parsing stops at
+  the trailers frame** ([#147]). A second data envelope is rejected before
+  its payload is touched (matching the Connect client-streaming parser
+  from [#133]), and a gRPC-Web response now completes as soon as a
+  complete trailers frame is buffered instead of reading the body to EOF,
+  so well-formed responses finish even if the server keeps writing.
+
+### Changed
+
+- Malformed gzip and zstd compressed payloads now return `invalid_argument`
+  instead of `internal` ([#139]). For servers this attributes the failure
+  to the sender and moves it out of 5xx metrics (the Connect HTTP status
+  changes from 500 to 400) — update any alerting that keys on 5xx for
+  these events. On the client, where the corrupt payload is a *response*,
+  the error is remapped to `data_loss` so callers are not told their
+  request was invalid. The client-side remap deliberately diverges from
+  connect-go, which reports `invalid_argument` in both directions;
+  `data_loss` is more descriptive of what actually happened.
+
 [#143]: https://github.com/anthropics/connect-rust/pull/143
+[#147]: https://github.com/anthropics/connect-rust/pull/147
 
 ## [0.6.1] - 2026-05-27
 
@@ -99,6 +122,7 @@ now 1.6.
 [#131]: https://github.com/anthropics/connect-rust/pull/131
 [#132]: https://github.com/anthropics/connect-rust/pull/132
 [#133]: https://github.com/anthropics/connect-rust/pull/133
+[#139]: https://github.com/anthropics/connect-rust/issues/139
 
 ## [0.6.0] - 2026-05-20
 
