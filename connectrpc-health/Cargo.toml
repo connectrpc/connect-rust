@@ -1,0 +1,42 @@
+[package]
+name = "connectrpc-health"
+version = "0.6.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "gRPC health-checking service for connectrpc (wire-compatible with grpc_health_v1)"
+keywords = ["connectrpc", "grpc", "health", "rpc"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[features]
+default = ["client"]
+# Pulls in `connectrpc/client` and exposes the generated `HealthClient`
+# re-export for callers that want to probe a health server (integration
+# tests, sidecar tooling, dev binaries). Server-only deployments opt out
+# with `default-features = false` to drop the client transport stack
+# from the dependency graph.
+client = ["connectrpc/client"]
+
+[dependencies]
+connectrpc = { path = "../connectrpc", version = "0.6", features = ["server"] }
+
+# Protobuf + serde (pulled in by the generated module paths)
+buffa = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+http-body = { workspace = true }
+
+# Async
+tokio = { workspace = true, features = ["sync", "macros"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+
+[dev-dependencies]
+connectrpc = { path = "../connectrpc", features = ["axum", "client", "server"] }
+tokio = { workspace = true, features = ["full"] }
+axum = { workspace = true, features = ["tokio", "http1"] }
+
+[lints]
+workspace = true
