@@ -486,6 +486,13 @@ pub type ServiceResult<B> = Result<Response<B>, ConnectError>;
 ///
 /// Used as the request type for client/bidi-streaming handlers and the
 /// body type for server/bidi-streaming responses.
+///
+/// For an inbound request stream, `None` means the client finished the
+/// stream cleanly; `Some(Err(..))` means the stream ended abnormally — a
+/// decode failure or a request body that failed mid-upload (truncated or
+/// broken transport). Treat only `None` as a complete stream; propagating
+/// the error with `?` fails the RPC, which is the right default for
+/// handlers that aggregate inbound messages.
 pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> + Send>>;
 
 // ---------------------------------------------------------------------------

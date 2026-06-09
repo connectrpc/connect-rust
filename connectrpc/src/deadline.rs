@@ -36,9 +36,11 @@ use crate::handler::BoxStream;
 /// mid-write — or an absurdly long one — holding server resources for
 /// hours. `DeadlinePolicy` clamps the client value to a server-controlled
 /// range, applies a server-side default when the client asserts nothing,
-/// and can extend enforcement to streaming bodies (whose initial setup is
-/// already bounded by the server's `tokio::time::timeout`, but whose item
-/// stream is unbounded by default).
+/// and can extend enforcement to streaming response bodies (whose request
+/// receipt and initial setup are already bounded by the server timeout, but
+/// whose item stream is unbounded by default). Client- and bidi-streaming
+/// handlers consume the request body inside the handler, so its receipt is
+/// already inside the handler's deadline.
 ///
 /// Construct via [`DeadlinePolicy::new`] and the `with_*` builders; the
 /// field set is `#[non_exhaustive]` so struct-literal construction is not
@@ -131,7 +133,10 @@ impl DeadlinePolicy {
     ///
     /// Protects server resources against a client asserting an
     /// unreasonably long timeout. There is no default cap — set one for
-    /// any service that accepts untrusted callers.
+    /// any service that accepts untrusted callers. For unary and
+    /// server-streaming RPCs the enforced budget covers request-body
+    /// receipt as well as handler execution, so size it for uploads,
+    /// not just handler runtime.
     #[must_use]
     pub fn with_max(mut self, max: Duration) -> Self {
         self.max = Some(max);
@@ -140,10 +145,13 @@ impl DeadlinePolicy {
 
     /// Set the timeout applied when the client asserts none.
     ///
-    /// Without a default, a request with no timeout header runs unbounded.
-    /// Setting this to your SLA is the cheapest hardening step a service
-    /// can take. The default is server-controlled and is not subject to
-    /// the `min`/`max` clamps — those guard against the *client*.
+    /// Without a default, a request with no timeout header runs unbounded
+    /// — including its body receipt: for unary and server-streaming RPCs
+    /// the budget set here covers receiving the request body as well as
+    /// handler execution. Setting this to your SLA is the cheapest
+    /// hardening step a service can take. The default is server-controlled
+    /// and is not subject to the `min`/`max` clamps — those guard against
+    /// the *client*.
     #[must_use]
     pub fn with_default_timeout(mut self, default: Duration) -> Self {
         self.default = Some(default);

@@ -17,6 +17,7 @@ with the [README quick start](../README.md#quick-start) and the
 - [Tower middleware](#tower-middleware)
 - [Interceptors](#interceptors)
 - [Hosting](#hosting)
+- [Health checking](#health-checking)
 - [Clients](#clients)
 - [Errors and status codes](#errors-and-status-codes)
 - [Compression](#compression)
@@ -31,6 +32,7 @@ with the [README quick start](../README.md#quick-start) and the
 | `connectrpc` | Tower-based runtime: server dispatcher, client transports, codec, compression |
 | `protoc-gen-connect-rust` (binary, in `connectrpc-codegen`) | `protoc` plugin that generates service stubs |
 | `connectrpc-build` | `build.rs` integration that runs the codegen at build time |
+| `connectrpc-health` | The standard `grpc.health.v1.Health` service for liveness / readiness probes ([Health checking](#health-checking)) |
 
 Add the runtime to your `Cargo.toml`:
 
@@ -523,6 +525,13 @@ async fn sum(
 }
 ```
 
+The request stream yields `Err(ConnectError)` if the upload fails partway
+— a truncated body or broken transport — so a partial stream is not
+mistaken for a complete one. The `req?` in the loop above propagates that
+error as the RPC's failure, which is the right default for handlers that
+aggregate inbound messages. Only a clean `None` means the client finished
+the stream.
+
 ### Bidirectional streaming
 
 Takes a request stream and returns a response stream. Both sides can
@@ -977,6 +986,82 @@ mtls-identity example
 demonstrates `serve_tls` end-to-end with cert-SAN identity extraction
 and an ACL keyed on it.
 
+## Health checking
+
+The `connectrpc-health` crate implements the standard
+`grpc.health.v1.Health` service. Mount it on your Connect router and
+clients like `grpc_health_probe`, kubelet's `grpc:` probe, and gRPC-aware
+service meshes (Linkerd, Istio) just work.
+
+This is the gRPC protocol — different from the plain HTTP `GET /health`
+route shown earlier in the [Hosting](#hosting) section. Keep the HTTP
+route for `httpGet:` probes; add the gRPC service for `grpc:` probes.
+
+```toml
+[dependencies]
+connectrpc = { version = "0.6", features = ["server"] }
+connectrpc-health = "0.6"
+```
+
+```rust,no_run
+use connectrpc::Router;
+use connectrpc_health::{install_static, Status};
+
+// `install_static` registers every name with `Status::Serving`; use the
+// generated `*_SERVICE_NAME` constants so the registered name matches
+// exactly what clients ask for. The whole-process `""` entry is seeded
+// for you, so probes that don't pass a service name also work.
+# mod proto { pub mod greet { pub mod v1 {
+#     pub const GREET_SERVICE_SERVICE_NAME: &str = "greet.v1.GreetService";
+# } } }
+let (router, health) = install_static(Router::new(), [
+    proto::greet::v1::GREET_SERVICE_SERVICE_NAME,
+]);
+
+// Flip status when something goes wrong. `set_status` errors on an
+// unknown name, so typos surface immediately instead of silently
+// shadowing the real entry.
+health
+    .set_status(proto::greet::v1::GREET_SERVICE_SERVICE_NAME, Status::NotServing)
+    .expect("registered above");
+
+// At shutdown, drain. `shutdown()` flips every registered service,
+// including the empty whole-process entry:
+health.shutdown();
+# drop(router);
+```
+
+For custom logic (e.g. report `NotServing` while a database connection
+is down), implement the `Checker` trait directly and wrap it in
+`HealthService::new(...)` or `HealthService::from_arc(...)`. The default
+`Checker::watch` body returns `Unimplemented`, which is fine for
+Check-only probes; override it if your probes call Watch.
+
+The `HealthClient` (for in-process probes, integration tests, sidecar
+tooling) is gated on a `client` Cargo feature that is **on by default**.
+Server-only deployments turn it off:
+
+```toml
+[dependencies]
+connectrpc = { version = "0.6", features = ["server"] }
+connectrpc-health = { version = "0.6", default-features = false }
+```
+
+That drops `connectrpc/client` (the HTTP/2 transport stack) from the
+dependency graph entirely. `use connectrpc_health::HealthClient` then
+becomes an unresolved import, but the binary stays lean.
+
+**Unknown services on `Watch`.** Non-empty unregistered services return
+`Err(ConnectError::not_found(_))` from both `Check` and `Watch`; the
+empty service auto-subscribes on `Watch` and returns `Serving` on
+`Check` by default. The gRPC Health spec additionally describes a
+`SERVICE_UNKNOWN` keep-stream-open flow for `Watch` that this crate
+does not implement, matching the Go `connectrpc.com/grpchealth`
+reference. Every probe that treats any error as a failure — kubelet's
+`grpc:` probe, `grpc_health_probe`, Linkerd, Istio — works unchanged.
+See `HealthService`'s `# Unknown services` section in the crate docs
+for the full context.
+
 ## Production hardening
 
 ### Deadline policy
@@ -1007,10 +1092,14 @@ Why each knob:
 
 - **`with_max`** is the most important one for any service that accepts
   untrusted callers — without it a client controls how long a worker
-  stays busy. Set it to your longest acceptable handler runtime.
+  stays busy. Set it to your longest acceptable request — for unary and
+  server-streaming RPCs the capped budget covers receiving the request
+  body as well as handler execution, so size it for uploads, not just
+  handler runtime.
 - **`with_default_timeout`** matters because the timeout header is
   optional. A request that omits it has no bound at all unless you set
-  one. Set it to your SLA.
+  one. Set it to your SLA. For unary and server-streaming RPCs, the
+  budget includes receiving the request body as well as handler execution.
 - **`with_min`** protects against a misbehaving or adversarial client
   cancelling the handler before it can do anything (e.g. mid-write on a
   streaming response). A few milliseconds is usually enough.

@@ -31,6 +31,7 @@
 //! ```
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -302,6 +303,39 @@ where
             }
         }
     }
+}
+
+/// Run a request future within an absolute server-side deadline.
+///
+/// Callers compute the deadline once after parsing headers so the same budget
+/// covers body receipt and handler execution.
+async fn with_request_deadline<F, T>(
+    deadline: Option<std::time::Instant>,
+    future: F,
+) -> Result<T, ConnectError>
+where
+    F: Future<Output = Result<T, ConnectError>>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
+            .await
+            .map_err(|_| ConnectError::deadline_exceeded("request timeout"))?,
+        None => future.await,
+    }
+}
+
+fn absolute_deadline(timeout: Option<Duration>) -> Option<std::time::Instant> {
+    timeout.and_then(|t| std::time::Instant::now().checked_add(t))
+}
+
+fn deadline_from_headers(
+    headers: &http::HeaderMap,
+    protocol: Protocol,
+    path: &str,
+    deadline_policy: &DeadlinePolicy,
+) -> Option<std::time::Instant> {
+    let timeout = RequestMetadata::from_headers(headers, protocol).timeout;
+    absolute_deadline(deadline_policy.moderate(timeout, path))
 }
 
 /// Decode the message from GET request query parameters.
@@ -1184,11 +1218,11 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// The default [`DeadlinePolicy::new`] is a no-op: the client's
     /// `Connect-Timeout-Ms` / `grpc-timeout` header is honored verbatim
-    /// and streaming bodies are not bounded by it (only the time-to-
-    /// first-response is). Set a policy to clamp client values to an
-    /// operationally sane range, supply a default when the client
-    /// asserts nothing, or extend enforcement to streaming bodies. See
-    /// [`DeadlinePolicy`] for details and recommendations.
+    /// for request receipt and handler execution, but streaming response
+    /// bodies are not bounded by it. Set a policy to clamp client values
+    /// to an operationally sane range, supply a default when the client
+    /// asserts nothing, or extend enforcement to streaming response
+    /// bodies. See [`DeadlinePolicy`] for details and recommendations.
     #[must_use]
     pub fn with_deadline_policy(mut self, policy: DeadlinePolicy) -> Self {
         self.deadline_policy = policy;
@@ -1444,12 +1478,27 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
+        let timeout_protocol = if ct.starts_with("application/grpc-web") {
+            Protocol::GrpcWeb
+        } else if ct.starts_with("application/grpc") {
+            Protocol::Grpc
+        } else {
+            Protocol::Connect
+        };
+        let deadline = deadline_from_headers(
+            req.headers(),
+            timeout_protocol,
+            req.uri().path(),
+            deadline_policy,
+        );
 
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        // Use Limited to cap the drain at max_request_body_size.
         let (_parts, body) = req.into_parts();
-        let limited = http_body_util::Limited::new(body, limits.max_request_body_size);
-        let _ = limited.collect().await;
+        let _ = with_request_deadline(
+            deadline,
+            collect_body_limited(body, limits.max_request_body_size),
+        )
+        .await;
 
         if ct.starts_with("application/grpc-web") {
             let err = ConnectError::internal("unsupported content type");
@@ -1484,9 +1533,18 @@ where
                     "gRPC-Web text mode (application/grpc-web-text) is not supported",
                 );
                 // Drain the body to preserve HTTP/1.1 keep-alive for the error response.
+                let deadline = deadline_from_headers(
+                    req.headers(),
+                    rp.protocol,
+                    req.uri().path(),
+                    deadline_policy,
+                );
                 let (_parts, body) = req.into_parts();
-                let limited = http_body_util::Limited::new(body, limits.max_request_body_size);
-                let _ = limited.collect().await;
+                let _ = with_request_deadline(
+                    deadline,
+                    collect_body_limited(body, limits.max_request_body_size),
+                )
+                .await;
                 let response = grpc_error_response(&err, Protocol::GrpcWeb, rp.codec_format);
                 return Ok(response.map(ConnectRpcBody::Streaming));
             }
@@ -1574,6 +1632,7 @@ where
     // Extract metadata from headers using the Connect protocol (unary is always Connect)
     let mut metadata = RequestMetadata::from_headers(req.headers(), Protocol::Connect);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
+    let deadline = absolute_deadline(metadata.timeout);
 
     // Split request to consume the body
     let (parts, body) = req.into_parts();
@@ -1584,7 +1643,11 @@ where
     // "broken pipe" errors because the client is still sending data.
     // collect_body_limited bounds allocation *during* the read, so an
     // oversized body is rejected before it is fully buffered.
-    let post_body = collect_body_limited(body, limits.max_request_body_size).await?;
+    let post_body = with_request_deadline(
+        deadline,
+        collect_body_limited(body, limits.max_request_body_size),
+    )
+    .await?;
 
     // Look up the method descriptor to check idempotency.
     // (Non-unary kinds are allowed through — they'll error at the dispatch call.)
@@ -1674,11 +1737,6 @@ where
     };
 
     // Create handler context with the request headers from metadata.
-    // Compute the absolute deadline once so handlers can propagate it;
-    // the tokio::time::timeout wrapper below still uses the relative duration.
-    let deadline = metadata
-        .timeout
-        .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -1689,17 +1747,12 @@ where
         // and Spec::procedure.
         .with_path(format!("/{path}"));
 
-    // Call the handler with the appropriate codec format, applying timeout if specified
-    let resp: EncodedResponse = if let Some(timeout) = metadata.timeout {
-        tokio::time::timeout(
-            timeout,
-            call_unary_intercepted(dispatcher, interceptors, &path, ctx, body, codec_format),
-        )
-        .await
-        .map_err(|_| ConnectError::deadline_exceeded("request timeout"))?
-    } else {
-        call_unary_intercepted(dispatcher, interceptors, &path, ctx, body, codec_format).await
-    }?;
+    // Call the handler with the appropriate codec format.
+    let resp: EncodedResponse = with_request_deadline(
+        deadline,
+        call_unary_intercepted(dispatcher, interceptors, &path, ctx, body, codec_format),
+    )
+    .await?;
 
     // Negotiate response compression
     let response_encoding = compression.negotiate_encoding(
@@ -1774,6 +1827,11 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Extract metadata before any body reads, including error-path drains.
+    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
+    metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
+    let deadline = absolute_deadline(metadata.timeout);
+
     // Helper to build a gRPC trailers-only error response using GrpcUnaryBody.
     let grpc_unary_error = |err: &ConnectError| -> Response<GrpcUnaryBody> {
         let grpc_trailers = build_grpc_trailers(Some(err), err.trailers());
@@ -1819,14 +1877,13 @@ where
         let err = ConnectError::internal(format!("invalid method for gRPC: {}", req.method()));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
         let (_parts, body) = req.into_parts();
-        let limited = http_body_util::Limited::new(body, limits.max_request_body_size);
-        let _ = limited.collect().await;
+        let _ = with_request_deadline(
+            deadline,
+            collect_body_limited(body, limits.max_request_body_size),
+        )
+        .await;
         return grpc_unary_error(&err);
     }
-
-    // Extract metadata
-    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
-    metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
     // Validate request compression
     if let Some(ref encoding) = metadata.streaming_encoding
@@ -1836,8 +1893,11 @@ where
         let err = ConnectError::unimplemented(format!("unsupported compression: {encoding}"));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
         let (_parts, body) = req.into_parts();
-        let limited = http_body_util::Limited::new(body, limits.max_request_body_size);
-        let _ = limited.collect().await;
+        let _ = with_request_deadline(
+            deadline,
+            collect_body_limited(body, limits.max_request_body_size),
+        )
+        .await;
         return grpc_unary_error(&err);
     }
 
@@ -1845,7 +1905,12 @@ where
     // read, so an oversized body is rejected before it is fully buffered.
     let (parts, body) = req.into_parts();
     let extensions = parts.extensions;
-    let post_body = match collect_body_limited(body, limits.max_request_body_size).await {
+    let post_body = match with_request_deadline(
+        deadline,
+        collect_body_limited(body, limits.max_request_body_size),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(err) => return grpc_unary_error(&err),
     };
@@ -1898,9 +1963,6 @@ where
     };
 
     // Create handler context
-    let deadline = metadata
-        .timeout
-        .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -1908,28 +1970,9 @@ where
         .with_protocol(Some(protocol))
         .with_path(format!("/{path}"));
 
-    // Call the handler with timeout if configured
-    let handler_result = if let Some(timeout) = metadata.timeout {
-        match tokio::time::timeout(
-            timeout,
-            call_unary_intercepted(
-                dispatcher,
-                interceptors,
-                path,
-                ctx,
-                request_body,
-                codec_format,
-            ),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                let err = ConnectError::deadline_exceeded("request timeout");
-                return grpc_unary_error(&err);
-            }
-        }
-    } else {
+    // Call the handler with the same deadline used while receiving the body.
+    let resp = match with_request_deadline(
+        deadline,
         call_unary_intercepted(
             dispatcher,
             interceptors,
@@ -1937,11 +1980,10 @@ where
             ctx,
             request_body,
             codec_format,
-        )
-        .await
-    };
-
-    let resp = match handler_result {
+        ),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => return grpc_unary_error(&e),
     };
@@ -2045,19 +2087,23 @@ where
     let path = req.uri().path();
     let path = path.strip_prefix('/').unwrap_or(path).to_owned();
 
+    // Extract metadata before any body reads, including error-path drains.
+    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
+    metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
+
     // gRPC and gRPC-Web require POST method
     if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) && req.method() != Method::POST {
         let err = ConnectError::internal(format!("invalid method for gRPC: {}", req.method()));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
         let (_parts, body) = req.into_parts();
-        let limited = http_body_util::Limited::new(body, limits.max_request_body_size);
-        let _ = limited.collect().await;
+        let deadline = absolute_deadline(metadata.timeout);
+        let _ = with_request_deadline(
+            deadline,
+            collect_body_limited(body, limits.max_request_body_size),
+        )
+        .await;
         return streaming_error_response(&err, protocol, codec_format);
     }
-
-    // Extract metadata from headers using the detected protocol
-    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
-    metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
 
     // Validate request compression is supported (if specified)
     if let Some(ref encoding) = metadata.streaming_encoding
@@ -2067,8 +2113,12 @@ where
         let err = ConnectError::unimplemented(format!("unsupported compression: {encoding}"));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
         let (_parts, body) = req.into_parts();
-        let limited = http_body_util::Limited::new(body, limits.max_request_body_size);
-        let _ = limited.collect().await;
+        let deadline = absolute_deadline(metadata.timeout);
+        let _ = with_request_deadline(
+            deadline,
+            collect_body_limited(body, limits.max_request_body_size),
+        )
+        .await;
         return streaming_error_response(&err, protocol, codec_format);
     }
 
@@ -2118,9 +2168,16 @@ where
         .await;
     }
 
+    let deadline = absolute_deadline(metadata.timeout);
+
     // For server streaming (or errors), read the full body (single envelope expected).
     // collect_body_limited bounds allocation during the read.
-    let post_body = match collect_body_limited(body, limits.max_request_body_size).await {
+    let post_body = match with_request_deadline(
+        deadline,
+        collect_body_limited(body, limits.max_request_body_size),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(err) => return streaming_error_response(&err, protocol, codec_format),
     };
@@ -2206,9 +2263,6 @@ where
     };
 
     // Create handler context with the request headers from metadata
-    let deadline = metadata
-        .timeout
-        .and_then(|t| std::time::Instant::now().checked_add(t));
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -2228,18 +2282,7 @@ where
                 request_body,
                 codec_format,
             );
-            let handler_result = if let Some(timeout) = metadata.timeout {
-                match tokio::time::timeout(timeout, fut).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let err = ConnectError::deadline_exceeded("request timeout");
-                        return streaming_error_response(&err, protocol, codec_format);
-                    }
-                }
-            } else {
-                fut.await
-            };
-            match handler_result {
+            match with_request_deadline(deadline, fut).await {
                 Ok(result) => result,
                 Err(e) => return streaming_error_response(&e, protocol, codec_format),
             }
@@ -2253,18 +2296,7 @@ where
                 request_body,
                 codec_format,
             );
-            let handler_result = if let Some(timeout) = metadata.timeout {
-                match tokio::time::timeout(timeout, fut).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let err = ConnectError::deadline_exceeded("request timeout");
-                        return streaming_error_response(&err, protocol, codec_format);
-                    }
-                }
-            } else {
-                fut.await
-            };
-            match handler_result {
+            match with_request_deadline(deadline, fut).await {
                 // Wrap single response in a one-item stream
                 Ok(r) => r.map_body(|bytes| -> BoxStream<Result<Bytes, ConnectError>> {
                     Box::pin(futures::stream::once(async move { Ok(bytes) }))
@@ -2627,6 +2659,36 @@ impl BodyReader {
             pending_trailing_data_warn,
         };
     }
+
+    /// Handle a transport-level request body error.
+    ///
+    /// While the reader is still decoding request messages, the failure is
+    /// surfaced to the handler stream as an internal [`ConnectError`] so a
+    /// truncated or failed body is not mistaken for a complete client stream.
+    /// Once the reader is only draining trailing bytes (after END_STREAM, a
+    /// decode error, or the handler dropping the request stream), the error is
+    /// diagnostic-only — the handler has already seen the terminal outcome.
+    ///
+    /// The code is `internal` deliberately, for parity with the unary
+    /// body-read path (`collect_body_limited`): the same transport failure
+    /// reports the same code regardless of RPC shape. connect-go reports
+    /// `unknown` here; if the attribution is ever revisited (a broken
+    /// inbound transport is arguably `unavailable`), change both paths
+    /// together.
+    async fn on_body_error(&mut self, err: impl std::fmt::Display + Send) {
+        tracing::debug!(error = %err, "request body error, stopping reader");
+
+        // Only the decoding path allocates the message; the drain path logs
+        // via `Display` above and returns without touching the handler.
+        if matches!(self.mode, ReadMode::Decoding) {
+            let _ = self
+                .tx
+                .send(Err(ConnectError::internal(format!(
+                    "failed to read request body: {err}"
+                ))))
+                .await;
+        }
+    }
 }
 
 /// Spawn a background task that reads envelope-framed messages from an HTTP
@@ -2677,9 +2739,7 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    // Transport-level body error — the handler just sees the
-                    // stream end; record the cause for diagnostics.
-                    tracing::debug!(error = %e, "request body error, stopping reader");
+                    reader.on_body_error(e).await;
                     break;
                 }
                 None => {
@@ -3147,6 +3207,65 @@ mod tests {
         let err = collect_body_limited(body, 5).await.unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
         assert!(err.message.as_deref().unwrap().contains("limit 5"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_unary_deadline_bounds_stalled_body_collection() {
+        let router = Router::new();
+        let body = http_body_util::StreamBody::new(futures::stream::pending::<
+            Result<Frame<Bytes>, std::io::Error>,
+        >());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/svc/Method")
+            .header(header::CONTENT_TYPE, "application/proto")
+            .body(body)
+            .unwrap();
+        let deadline_policy = DeadlinePolicy::new().with_default_timeout(Duration::from_millis(1));
+
+        let err = handle_unary_request(
+            &router,
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &deadline_policy,
+            &[],
+        )
+        .await
+        .expect_err("stalled body must exceed the request deadline");
+        assert_eq!(err.code, crate::error::ErrorCode::DeadlineExceeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_server_streaming_deadline_bounds_stalled_body_collection() {
+        let router = Router::new();
+        let body = http_body_util::StreamBody::new(futures::stream::pending::<
+            Result<Frame<Bytes>, std::io::Error>,
+        >());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/svc/Method")
+            .body(body)
+            .unwrap();
+        let deadline_policy = DeadlinePolicy::new().with_default_timeout(Duration::from_millis(1));
+
+        let resp = handle_streaming_request(
+            &router,
+            req,
+            Protocol::Grpc,
+            CodecFormat::Proto,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &deadline_policy,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            resp.headers().get(&GRPC_STATUS).unwrap(),
+            &crate::ErrorCode::DeadlineExceeded.grpc_code().to_string()
+        );
     }
 
     #[test]
@@ -4522,5 +4641,127 @@ mod tests {
             "reader pulled {pulled} bytes after the decode error \
              (expected at most {max_expected})"
         );
+    }
+
+    /// Test body that yields a fixed sequence of data frames and then fails
+    /// with a single transport-level body error.
+    struct ErrorAfterFramesBody {
+        frames: std::collections::VecDeque<Bytes>,
+        errored: bool,
+    }
+
+    impl Body for ErrorAfterFramesBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+
+            if let Some(data) = this.frames.pop_front() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+
+            if !this.errored {
+                this.errored = true;
+                return Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "simulated body read failure",
+                ))));
+            }
+
+            Poll::Ready(None)
+        }
+    }
+
+    /// A request body that yields a valid streaming message and then fails at
+    /// the transport level (while the reader is still decoding) must surface
+    /// the failure to the handler as an internal error — not a clean EOF that
+    /// is indistinguishable from a complete client stream.
+    #[tokio::test]
+    async fn test_body_reader_surfaces_body_error_while_decoding() {
+        let mut frames = std::collections::VecDeque::new();
+        frames.push_back(Envelope::data(Bytes::from_static(b"hello")).encode());
+
+        let body = ErrorAfterFramesBody {
+            frames,
+            errored: false,
+        };
+
+        let (mut request_stream, reader_task) = spawn_body_reader(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+
+        let first = request_stream
+            .next()
+            .await
+            .expect("one message before the body error")
+            .expect("message decodes before the body error");
+        assert_eq!(&first[..], b"hello");
+
+        let err = request_stream
+            .next()
+            .await
+            .expect("body error must be delivered")
+            .expect_err("body error must not be converted to clean EOF");
+
+        assert_eq!(err.code, crate::error::ErrorCode::Internal);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to read request body: simulated body read failure"),
+            "unexpected error message: {:?}",
+            err.message
+        );
+
+        assert!(
+            request_stream.next().await.is_none(),
+            "no further items after the body error"
+        );
+
+        reader_task
+            .expect("tests run inside a tokio runtime")
+            .await
+            .expect("reader task must not panic");
+    }
+
+    /// Once the reader has finished decoding (here: a clean END_STREAM has put
+    /// it in drain mode), a subsequent transport-level body error is
+    /// diagnostic-only — the handler already observed the terminal end of the
+    /// stream and must not then receive a spurious error.
+    #[tokio::test]
+    async fn test_body_reader_body_error_after_end_stream_is_suppressed() {
+        let mut frames = std::collections::VecDeque::new();
+        frames.push_back(Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+
+        let body = ErrorAfterFramesBody {
+            frames,
+            errored: false,
+        };
+
+        let (mut request_stream, reader_task) = spawn_body_reader(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+
+        // END_STREAM ended the stream cleanly; the body error that follows is
+        // suppressed, so the handler sees a clean end with no error item.
+        assert!(
+            request_stream.next().await.is_none(),
+            "a body error after END_STREAM must not surface to the handler"
+        );
+
+        reader_task
+            .expect("tests run inside a tokio runtime")
+            .await
+            .expect("reader task must not panic");
     }
 }

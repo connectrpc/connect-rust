@@ -87,7 +87,7 @@ and the three client suites.
 
 ## Checked-In Generated Code
 
-Four directories contain checked-in `buf generate` output and **must be
+Five directories contain checked-in `buf generate` output and **must be
 regenerated** whenever `connectrpc-codegen` output changes (or the buffa
 dependency is bumped):
 
@@ -95,6 +95,7 @@ dependency is bumped):
 - `examples/eliza/src/generated/`
 - `examples/multiservice/src/generated/`
 - `benches/rpc/src/generated/`
+- `connectrpc-health/src/generated/`
 
 Regenerate all of them with:
 

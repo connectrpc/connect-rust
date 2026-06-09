@@ -175,6 +175,23 @@ impl Config {
         self
     }
 
+    /// Prefix every generated `FooClient<T>` struct and its `impl` block
+    /// with `#[cfg(feature = "client")]` (default: `false`).
+    ///
+    /// Opt in when you want a server-only build of your crate to drop
+    /// the `connectrpc/client` transport stack from its dependency
+    /// graph. The consumer crate then declares a `client` Cargo feature
+    /// that forwards to `connectrpc/client`; see the `# Client-side cfg
+    /// gate` section in [`connectrpc_codegen::codegen::generate`]'s
+    /// docs for the minimal pattern. With the option off (the default),
+    /// generated client items are unconditional — external consumers
+    /// don't have to declare any Cargo feature.
+    #[must_use]
+    pub fn gate_client_feature(mut self, enabled: bool) -> Self {
+        self.options.gate_client_feature = enabled;
+        self
+    }
+
     /// Replace the underlying buffa [`CodeGenConfig`] wholesale.
     ///
     /// Any buffa knob not surfaced as a builder method here can be set this
@@ -664,12 +681,14 @@ mod tests {
             .strict_utf8_mapping(true)
             .generate_json(false)
             .emit_register_fn(false)
+            .gate_client_feature(true)
             .include_file("_inc.rs");
         assert_eq!(cfg.files.len(), 2);
         assert_eq!(cfg.includes.len(), 1);
         assert!(cfg.options.buffa.strict_utf8_mapping);
         assert!(!cfg.options.buffa.generate_json);
         assert!(!cfg.options.buffa.emit_register_fn);
+        assert!(cfg.options.gate_client_feature);
         assert_eq!(cfg.include_file.as_deref(), Some("_inc.rs"));
     }
 
@@ -679,8 +698,69 @@ mod tests {
         assert!(!cfg.options.buffa.strict_utf8_mapping);
         assert!(cfg.options.buffa.generate_json);
         assert!(cfg.options.buffa.emit_register_fn);
+        // `gate_client_feature` defaults off — build.rs consumers don't
+        // have to declare a `client` Cargo feature unless they opt in.
+        assert!(!cfg.options.gate_client_feature);
         assert!(cfg.emit_rerun_directives);
         assert!(matches!(cfg.descriptor_source, DescriptorSource::Protoc));
+    }
+
+    /// End-to-end through `Config`: with `gate_client_feature(true)`,
+    /// the generated `__connect.rs` contains `#[cfg(feature = "client")]`
+    /// on the `EchoServiceClient` struct + impl. Without the opt-in, the
+    /// cfg attr is absent. Uses the same `echo.fds.bin` fixture as
+    /// [`compile_precompiled_descriptor_set`].
+    #[test]
+    fn compile_gate_client_feature_emits_cfg_attr() {
+        let fixture = format!("{}/tests/fixtures/echo.fds.bin", env!("CARGO_MANIFEST_DIR"));
+
+        // Opt-in: cfg attrs present on the client items.
+        let out_with = tempfile::tempdir().unwrap();
+        Config::new()
+            .descriptor_set(&fixture)
+            .files(&["echo.proto"])
+            .out_dir(out_with.path())
+            .gate_client_feature(true)
+            .emit_rerun_directives(false)
+            .compile()
+            .expect("compile with gate_client_feature=true");
+        let gated = std::fs::read_to_string(out_with.path().join("echo.__connect.rs"))
+            .expect("read gated __connect.rs");
+        let cfg_count = gated.matches("#[cfg(feature = \"client\")]").count();
+        assert_eq!(
+            cfg_count, 2,
+            "expected exactly 2 cfg attrs (struct + impl) with \
+             gate_client_feature=true; got {cfg_count}:\n{gated}"
+        );
+        // Sanity: the server-side trait + ext trait must not be gated.
+        for marker in ["pub trait EchoService", "pub trait EchoServiceExt"] {
+            let idx = gated
+                .find(marker)
+                .unwrap_or_else(|| panic!("expected `{marker}` in output:\n{gated}"));
+            let prefix = &gated[..idx];
+            assert!(
+                !prefix.trim_end().ends_with("#[cfg(feature = \"client\")]"),
+                "`{marker}` must not be gated:\n{gated}"
+            );
+        }
+
+        // Opt-out (default): no cfg attrs anywhere in the same file.
+        let out_without = tempfile::tempdir().unwrap();
+        Config::new()
+            .descriptor_set(&fixture)
+            .files(&["echo.proto"])
+            .out_dir(out_without.path())
+            .emit_rerun_directives(false)
+            .compile()
+            .expect("compile with default options");
+        let ungated = std::fs::read_to_string(out_without.path().join("echo.__connect.rs"))
+            .expect("read default __connect.rs");
+        assert!(
+            !ungated.contains("#[cfg(feature ="),
+            "default emission must not emit any cfg attr — external \
+             consumers should not need to declare a `client` Cargo \
+             feature unless they opt in. Got:\n{ungated}"
+        );
     }
 
     #[test]
