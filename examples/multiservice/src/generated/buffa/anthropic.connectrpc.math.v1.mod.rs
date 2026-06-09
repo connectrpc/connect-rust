@@ -29,6 +29,10 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::AddRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::AddRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::AddResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::AddResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

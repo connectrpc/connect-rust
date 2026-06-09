@@ -125,8 +125,7 @@ Implement the service:
 ```rust
 // src/main.rs
 use std::sync::Arc;
-use buffa::view::OwnedView;
-use connectrpc::{RequestContext, Response, Router, ServiceResult};
+use connectrpc::{RequestContext, Response, Router, ServiceRequest, ServiceResult};
 
 pub mod proto {
     connectrpc::include_generated!();
@@ -139,7 +138,7 @@ impl GreetService for MyGreet {
     async fn greet(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<GreetRequestView<'static>>,
+        req: ServiceRequest<'_, GreetRequest>,
     ) -> ServiceResult<GreetResponse> {
         Response::ok(GreetResponse {
             greeting: format!("Hello, {}!", req.name),
@@ -260,8 +259,8 @@ trait name matches the proto service name (`GreetService` becomes
 
 ### Handler signatures
 
-Unary handlers take a read-only `RequestContext` plus an
-`OwnedView<RequestView<'static>>`, and return
+Unary handlers take a read-only `RequestContext` plus a borrowed
+`ServiceRequest<'_, RequestType>`, and return
 `ServiceResult<ResponseType>`:
 
 ```rust
@@ -269,9 +268,9 @@ impl GreetService for MyGreet {
     async fn greet(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<GreetRequestView<'static>>,
+        req: ServiceRequest<'_, GreetRequest>,
     ) -> ServiceResult<GreetResponse> {
-        // req derefs to the view: zero-copy field access.
+        // req derefs to the request view: zero-copy field access.
         // String fields are &str borrowed from the request buffer.
         Response::ok(GreetResponse {
             greeting: format!("Hello, {}!", req.name),
@@ -281,10 +280,12 @@ impl GreetService for MyGreet {
 }
 ```
 
-The `OwnedView` shape lets handlers read string fields without
-allocating - `req.name` is a `&str` directly into the request bytes.
-Call `.to_owned_message()` to get the prost-style owned struct when
-you need it.
+The `ServiceRequest` shape lets handlers read string fields without
+allocating - `req.name` is a `&str` directly into the request bytes,
+and the borrow may be held across `.await` points. The request is
+borrowed from the dispatcher-owned body, so the response (and anything
+moved into `tokio::spawn`) cannot borrow from it - call
+`.to_owned_message()` to get the owned struct when you need one.
 
 ### `RequestContext` and `Response`
 
@@ -339,7 +340,7 @@ builder:
 async fn greet(
     &self,
     _ctx: RequestContext,
-    req: OwnedView<GreetRequestView<'static>>,
+    req: ServiceRequest<'_, GreetRequest>,
 ) -> ServiceResult<GreetResponse> {
     Ok(Response::new(GreetResponse { /* ... */ })
         .with_header("x-greet-version", "v2")
@@ -389,25 +390,30 @@ or `#[allow(refining_impl_trait)]` on the impl block.
 
 For handlers that often return the request unchanged (proxies, filters,
 validators), the `Encodable<M>` bound lets you skip the owned-message
-allocation by returning the request view directly. Codegen emits
+allocation by returning an `OwnedView` rebuilt zero-copy from the
+retained request bytes (the request itself is borrowed and cannot
+outlive the call, so it is re-decoded - a Bytes refcount bump plus a
+decode walk, with no per-field copy). Codegen emits
 `OwnedFooView` aliases and `impl Encodable<Foo> for OwnedFooView` per
 RPC type. (When two RPC types in the same package would alias to the
 same `OwnedFooView` name — e.g. a local `MyMessage` plus an imported
-`api.v1.foo.bar.MyMessage` — the alias is suppressed for both and the
-trait signature uses the inlined `OwnedView<…View<'static>>` form
-instead.) `connectrpc::MaybeBorrowed` covers the conditional case:
+`api.v1.foo.bar.MyMessage` — the alias is suppressed for both; spell
+the inlined `OwnedView<…View<'static>>` form for those types.) `connectrpc::MaybeBorrowed` covers the conditional case:
 
 ```rust
-use connectrpc::{MaybeBorrowed, RequestContext, Response, ServiceResult};
+use connectrpc::{MaybeBorrowed, RequestContext, Response, ServiceRequest, ServiceResult};
+// `Record` and `OwnedRecordView` come from your generated module.
 
 async fn redact(
     &self,
     _ctx: RequestContext,
-    req: OwnedRecordView,
+    req: ServiceRequest<'_, Record>,
 ) -> ServiceResult<MaybeBorrowed<Record, OwnedRecordView>> {
     if req.email.is_empty() && req.ssn.is_empty() {
-        // pass-through: re-encode straight from the request bytes
-        return Response::ok(MaybeBorrowed::Borrowed(req));
+        // Pass-through. The response must be 'static, so rebuild an
+        // OwnedView from the retained body bytes - zero-copy (Bytes
+        // refcount + decode walk), then re-encode via ViewEncode.
+        return Response::ok(MaybeBorrowed::Borrowed(req.to_owned_view()));
     }
     let mut owned = req.to_owned_message();
     owned.email.clear();
@@ -499,7 +505,7 @@ metadata):
 async fn range(
     &self,
     _ctx: RequestContext,
-    req: OwnedView<RangeRequestView<'static>>,
+    req: ServiceRequest<'_, RangeRequest>,
 ) -> ServiceResult<ServiceStream<RangeResponse>> {
     let stream = futures::stream::iter(/* ... */);
     Response::stream_ok(stream)
@@ -508,18 +514,20 @@ async fn range(
 
 ### Client streaming
 
-The handler receives a stream of request views and returns a single
-response:
+The handler receives a stream of `StreamMessage<Req>` items and
+returns a single response. Each item owns its decoded buffer, is
+`Send + 'static` (so it can be buffered or moved into spawned tasks),
+and exposes zero-copy accessor methods per field:
 
 ```rust
 async fn sum(
     &self,
     _ctx: RequestContext,
-    mut requests: ServiceStream<OwnedView<SumRequestView<'static>>>,
+    mut requests: ServiceStream<StreamMessage<SumRequest>>,
 ) -> ServiceResult<SumResponse> {
     let mut total: i64 = 0;
     while let Some(req) = requests.next().await {
-        total += req?.value.unwrap_or(0) as i64;
+        total += req?.value().unwrap_or(0) as i64;
     }
     Response::ok(SumResponse { total: Some(total), ..Default::default() })
 }
@@ -541,7 +549,7 @@ emit messages independently:
 async fn running_sum(
     &self,
     _ctx: RequestContext,
-    requests: ServiceStream<OwnedView<RunningSumRequestView<'static>>>,
+    requests: ServiceStream<StreamMessage<RunningSumRequest>>,
 ) -> ServiceResult<ServiceStream<RunningSumResponse>> {
     // Map the request stream to a response stream however you like.
     let response_stream = futures::stream::unfold(/* ... */);
@@ -564,16 +572,19 @@ handle with `.send(req).await?` and `.message().await?` plus
 `.close_send()`:
 
 ```rust
-// Server streaming
+// Server streaming. Each item is an `OwnedView` of the response view
+// (not the deref-ready view that unary `.view()` returns), so field
+// access goes through `.reborrow()` - zero-copy, same as Pattern 2 in
+// [Reading the response](#reading-the-response).
 let mut stream = client.range(req).await?;
 while let Some(msg) = stream.message().await? {
-    // ...
+    println!("{}", msg.reborrow().value.unwrap_or_default());
 }
 
 // Client streaming - takes a Vec
 let resp = client.sum(vec![req1, req2, req3]).await?;
 
-// Bidi
+// Bidi - received items are `OwnedView`s too: `reply.reborrow().total`
 let mut bidi = client.running_sum().await?;
 bidi.send(req).await?;
 let reply = bidi.message().await?;
@@ -662,7 +673,7 @@ generated client.
 async fn greet(
     &self,
     ctx: RequestContext,
-    req: OwnedView<GreetRequestView<'static>>,
+    req: ServiceRequest<'_, GreetRequest>,
 ) -> ServiceResult<GreetResponse> {
     if let Some(spec) = ctx.spec() {
         tracing::info_span!(
@@ -1204,17 +1215,18 @@ Unary responses give you several access patterns:
 ```rust
 let resp = client.greet(req).await?;
 
-// Pattern 1: borrow the view via .view(). Zero-copy. Use this when
-// you also need headers/trailers - OwnedView derefs to the view, so
-// field access (.greeting -> &str) works directly.
+// Pattern 1: borrow the view via .view(). Zero-copy. Field access
+// (.greeting -> &str) works directly on the returned view, and the
+// response handle keeps headers/trailers available alongside it.
 println!("{}", resp.view().greeting);
 let _ = resp.headers();
 let _ = resp.trailers();
 
 // Pattern 2: consume via .into_view() to get the OwnedView. Still
-// zero-copy via Deref, but discards headers/trailers.
+// zero-copy - read fields through .reborrow() - but discards
+// headers/trailers.
 let msg = client.greet(req).await?.into_view();
-let greeting: &str = msg.greeting;
+let greeting: &str = msg.reborrow().greeting;
 
 // Pattern 3: .into_owned() for the prost-style owned struct.
 // Allocates and copies all string/bytes fields.
@@ -1305,7 +1317,7 @@ response via `Response::compress`:
 async fn greet(
     &self,
     _ctx: RequestContext,
-    req: OwnedView<GreetRequestView<'static>>,
+    req: ServiceRequest<'_, GreetRequest>,
 ) -> ServiceResult<GreetResponse> {
     let mut resp = Response::new(/* ... */);
     if response_is_huge() {

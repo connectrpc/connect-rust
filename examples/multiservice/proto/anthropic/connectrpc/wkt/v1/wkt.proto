@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package anthropic.connectrpc.wkt.v1;
 
+import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
@@ -16,6 +17,10 @@ service WellKnownTypesService {
 
   // ProcessMetadata processes arbitrary metadata as a Struct.
   rpc ProcessMetadata(ProcessMetadataRequest) returns (ProcessMetadataResponse);
+
+  // Heartbeat returns the server's current time. Exercises well-known
+  // types as the direct RPC input (Empty) and output (Timestamp).
+  rpc Heartbeat(google.protobuf.Empty) returns (google.protobuf.Timestamp);
 }
 
 // CreateEventRequest is the request for CreateEvent.

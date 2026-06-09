@@ -62,6 +62,7 @@ pub struct Config {
     out_dir: Option<PathBuf>,
     descriptor_source: DescriptorSource,
     include_file: Option<String>,
+    emit_descriptor_set: Option<String>,
     emit_rerun_directives: bool,
     options: Options,
 }
@@ -75,6 +76,7 @@ impl Config {
             out_dir: None,
             descriptor_source: DescriptorSource::default(),
             include_file: None,
+            emit_descriptor_set: None,
             emit_rerun_directives: true,
             options: Options::default(),
         }
@@ -237,6 +239,37 @@ impl Config {
         self
     }
 
+    /// Also write the input `FileDescriptorSet` (the full set handed to
+    /// codegen, not just the files selected for generation) to
+    /// `<out_dir>/<name>` as wire-format bytes. `name` must be a bare file
+    /// name — no path separators.
+    ///
+    /// The set carries the full transitive import closure for every descriptor
+    /// source (`protoc --include_imports`, `buf --as-file-descriptor-set`, or a
+    /// precompiled set), so it is ready to back `grpc.reflection.v1.ServerReflection`
+    /// for clients such as `grpcurl`. Pair it with `include_bytes!`:
+    ///
+    /// ```ignore
+    /// // build.rs
+    /// connectrpc_build::Config::new()
+    ///     .files(&["proto/svc.proto"])
+    ///     .includes(&["proto/"])
+    ///     .emit_descriptor_set("svc_descriptor.bin")
+    ///     .compile()?;
+    /// // src/lib.rs
+    /// pub const FILE_DESCRIPTOR_SET: &[u8] =
+    ///     include_bytes!(concat!(env!("OUT_DIR"), "/svc_descriptor.bin"));
+    /// ```
+    ///
+    /// The inverse of [`Config::descriptor_set`], which *reads* a precompiled
+    /// set; this *writes* the one connectrpc-build already computed, so build
+    /// scripts no longer need a second `protoc --descriptor_set_out` pass.
+    #[must_use]
+    pub fn emit_descriptor_set(mut self, name: impl Into<String>) -> Self {
+        self.emit_descriptor_set = Some(name.into());
+        self
+    }
+
     /// Emit an `include!`-based module tree file alongside the per-file
     /// `.rs` outputs.
     ///
@@ -263,6 +296,8 @@ impl Config {
     /// - a precompiled descriptor set cannot be read or decoded
     /// - codegen fails (unsupported proto feature)
     /// - the output directory cannot be created or written to
+    /// - [`Config::emit_descriptor_set`] was given a name containing path
+    ///   separators, or the descriptor set cannot be written
     pub fn compile(self) -> Result<()> {
         // When out_dir() is explicitly set, emit sibling-relative include!
         // paths — the include file lives next to the generated files and
@@ -321,6 +356,23 @@ impl Config {
         //    stitchers.
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("failed to create out_dir '{}'", out_dir.display()))?;
+
+        // Emit the parsed descriptor set for gRPC server reflection, if requested.
+        // `descriptor_bytes` already carries the full import closure for every
+        // descriptor source, so the written set is reflection-ready as-is.
+        if let Some(name) = &self.emit_descriptor_set {
+            // `<out_dir>/<name>` is the documented contract; a separator or
+            // absolute path would silently escape it via `Path::join`.
+            if Path::new(name).components().count() != 1 || Path::new(name).is_absolute() {
+                bail!(
+                    "emit_descriptor_set name must be a bare file name \
+                     (no path separators), got {name:?}"
+                );
+            }
+            let target = out_dir.join(name);
+            write_if_changed(&target, &descriptor_bytes)
+                .with_context(|| format!("failed to write descriptor set {}", target.display()))?;
+        }
 
         let mut entries: Vec<(String, String)> = Vec::new();
         for file in &generated {
@@ -749,6 +801,103 @@ mod tests {
             Config::new().descriptor_set("x.bin").descriptor_source,
             DescriptorSource::Precompiled(_)
         ));
+    }
+
+    #[test]
+    fn config_emit_descriptor_set_toggle() {
+        let cfg = Config::new().emit_descriptor_set("d.bin");
+        assert_eq!(cfg.emit_descriptor_set.as_deref(), Some("d.bin"));
+    }
+
+    /// `emit_descriptor_set` writes the descriptor set used for codegen to
+    /// `<out_dir>/<name>` as a wire-format `FileDescriptorSet` ready for gRPC
+    /// server reflection. A precompiled source passes the bytes through
+    /// unchanged, so the emitted file round-trips the input set.
+    #[test]
+    fn emit_descriptor_set_writes_reflection_bin() {
+        let fixture = format!("{}/tests/fixtures/echo.fds.bin", env!("CARGO_MANIFEST_DIR"));
+        let out = tempfile::tempdir().unwrap();
+
+        Config::new()
+            .descriptor_set(&fixture)
+            .files(&["echo.proto"])
+            .out_dir(out.path())
+            .emit_descriptor_set("echo_descriptor.bin")
+            .compile()
+            .unwrap();
+
+        let emitted = out.path().join("echo_descriptor.bin");
+        assert!(emitted.exists(), "expected {emitted:?} to be written");
+
+        let bytes = std::fs::read(&emitted).unwrap();
+        let fds = FileDescriptorSet::decode_from_slice(&bytes)
+            .expect("emitted descriptor set must decode");
+        let names: Vec<_> = fds.file.iter().filter_map(|f| f.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            ["echo.proto"],
+            "emitted set should contain the compiled file by name"
+        );
+
+        // Precompiled source passes bytes through unchanged → exact round-trip.
+        let fixture_bytes = std::fs::read(&fixture).unwrap();
+        assert_eq!(
+            bytes, fixture_bytes,
+            "emitted bytes must equal the source set"
+        );
+    }
+
+    /// The emitted set carries the full transitive import closure, not just
+    /// the files selected for generation: `imports.fds.bin` was built with
+    /// `protoc --include_imports` from `uses_dep.proto` (which imports
+    /// `dep.proto`), and both must appear in the emitted bytes — that is
+    /// what makes the file servable via `grpc.reflection.v1.ServerReflection`.
+    #[test]
+    fn emit_descriptor_set_preserves_import_closure() {
+        let fixture = format!(
+            "{}/tests/fixtures/imports.fds.bin",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let out = tempfile::tempdir().unwrap();
+
+        Config::new()
+            .descriptor_set(&fixture)
+            .files(&["uses_dep.proto"])
+            .out_dir(out.path())
+            .emit_descriptor_set("fixture_descriptor.bin")
+            .compile()
+            .unwrap();
+
+        let bytes = std::fs::read(out.path().join("fixture_descriptor.bin")).unwrap();
+        let fds = FileDescriptorSet::decode_from_slice(&bytes)
+            .expect("emitted descriptor set must decode");
+        let names: Vec<_> = fds.file.iter().filter_map(|f| f.name.as_deref()).collect();
+        assert!(
+            names.contains(&"dep.proto") && names.contains(&"uses_dep.proto"),
+            "emitted set must include the imported dependency, got {names:?}"
+        );
+    }
+
+    /// `emit_descriptor_set` promises `<out_dir>/<name>`; a name with path
+    /// separators (or an absolute path) would escape it via `Path::join`,
+    /// so it is rejected.
+    #[test]
+    fn emit_descriptor_set_rejects_path_separators() {
+        let fixture = format!("{}/tests/fixtures/echo.fds.bin", env!("CARGO_MANIFEST_DIR"));
+        for name in ["sub/d.bin", "../d.bin", "/tmp/d.bin"] {
+            let out = tempfile::tempdir().unwrap();
+            let err = Config::new()
+                .descriptor_set(&fixture)
+                .files(&["echo.proto"])
+                .out_dir(out.path())
+                .emit_descriptor_set(name)
+                .compile()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("bare file name"),
+                "expected bare-file-name error for {name:?}, got: {err}"
+            );
+        }
     }
 
     /// End-to-end: precompiled descriptor set → generated Rust in a tempdir.

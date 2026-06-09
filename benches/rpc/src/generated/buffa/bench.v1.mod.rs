@@ -51,46 +51,90 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::EchoRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::EchoRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::EchoResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::EchoResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::BenchRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::BenchRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::BenchResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::BenchResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::PayloadView;
 #[doc(inline)]
+pub use self::__buffa::view::PayloadOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::MetadataView;
+#[doc(inline)]
+pub use self::__buffa::view::MetadataOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::LogRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::LogRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::LogResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::LogResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::LogRecordView;
 #[doc(inline)]
+pub use self::__buffa::view::LogRecordOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::LogSourceView;
+#[doc(inline)]
+pub use self::__buffa::view::LogSourceOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::LogIngestResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::LogIngestResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::BloatEchoView;
+#[doc(inline)]
+pub use self::__buffa::view::BloatEchoOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::BloatHeaderView;
 #[doc(inline)]
+pub use self::__buffa::view::BloatHeaderOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ScalarHeavyView;
+#[doc(inline)]
+pub use self::__buffa::view::ScalarHeavyOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::FewLargeStringsView;
 #[doc(inline)]
+pub use self::__buffa::view::FewLargeStringsOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::NestL5View;
+#[doc(inline)]
+pub use self::__buffa::view::NestL5OwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::NestL4View;
 #[doc(inline)]
+pub use self::__buffa::view::NestL4OwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::NestL3View;
+#[doc(inline)]
+pub use self::__buffa::view::NestL3OwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::NestL2View;
 #[doc(inline)]
+pub use self::__buffa::view::NestL2OwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::NestL1View;
+#[doc(inline)]
+pub use self::__buffa::view::NestL1OwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::DeepNestedView;
 #[doc(inline)]
+pub use self::__buffa::view::DeepNestedOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::MapDominatedView;
+#[doc(inline)]
+pub use self::__buffa::view::MapDominatedOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

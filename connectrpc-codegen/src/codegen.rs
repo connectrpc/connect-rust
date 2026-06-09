@@ -56,6 +56,15 @@ pub struct Options {
     /// absolute paths into service stubs (set a `(".", "crate::proto")`
     /// catch-all so every type resolves); it is ignored by
     /// [`generate_files`] (the unified `super::`-relative path).
+    ///
+    /// Every `extern_path` target must be buffa-generated code from
+    /// buffa ≥ 0.7.0 with views enabled (and, if the crate feature-gates
+    /// its generated impls, with that feature turned on): the service
+    /// stubs rely on the `buffa::HasMessageView` impls and `FooOwnedView`
+    /// wrappers emitted alongside each message, the same way they rely on
+    /// the JSON/`Serialize` impls. `buffa-types` 0.7+ satisfies this for
+    /// the well-known types. A crate generated without them fails to
+    /// compile against the stubs (missing `HasMessageView` impl).
     pub buffa: CodeGenConfig,
 
     /// When `true`, prefix every emitted `FooClient<T>` struct and its
@@ -425,6 +434,10 @@ pub fn generate_services(
 ///   to a Rust module path. Repeatable; longest-prefix-match wins.
 ///   `extern_path=.=<path>` is the catch-all (equivalent to `buffa_module`).
 ///   At least one catch-all mapping is required so every type resolves.
+///   Every mapped path must point at buffa-generated code from
+///   buffa ≥ 0.7.0 with views enabled — the stubs use the
+///   `buffa::HasMessageView` impls and owned-view wrappers generated with
+///   each message (`buffa-types` 0.7+ qualifies for the well-known types).
 /// - `file_per_package` — emit one `<dotted.pkg>.rs` per proto package
 ///   instead of the per-proto split + stitcher. Set `protoc-gen-buffa`'s
 ///   own `file_per_package` option to the same value — the BSR/`tonic`
@@ -764,6 +777,10 @@ fn generate_connect_services(
     // files can be `include!`d into the same module without E0252 duplicate
     // import errors.
 
+    // The view-family impls (`buffa::HasMessageView`) are emitted by buffa's
+    // own codegen alongside each message's view and owned-view wrapper, so
+    // nothing service-specific is needed here for `ServiceRequest` /
+    // `StreamMessage` to be usable.
     tokens.extend(generate_owned_view_aliases(file, resolver, batch)?);
     tokens.extend(generate_encodable_view_impls(file, resolver, batch)?);
 
@@ -794,25 +811,62 @@ fn alias_collides(batch: &BatchState, current_package: &str, proto_fqn: &str) ->
         .contains(&(current_package.to_string(), alias))
 }
 
-/// Trait-method input-type tokens for an RPC: either the local
-/// `Owned<Msg>View` alias (the common case) or the inlined
-/// `::buffa::view::OwnedView<Path::To::<Msg>View<'static>>` form for
-/// types whose alias would collide with another type in the same target
-/// Rust module (issue #75). The inlined form mirrors what the generated
-/// client method signatures already emit for response types.
-fn owned_view_input_arg_type(
+/// Statement converting the Router-path `ServiceStream<OwnedView<…>>` into
+/// `StreamMessage<Req>` items before calling the handler. Applies to every
+/// input type, including ones mapped via `extern_path`: the backing
+/// `buffa::HasMessageView` impl is emitted by buffa's codegen in the crate
+/// that owns the type (`extern_path` targets are required to be generated
+/// with buffa ≥ 0.7.0 and views enabled).
+fn router_stream_items_tokens(
     resolver: &TypeResolver<'_>,
-    batch: &BatchState,
-    proto_fqn: &str,
-    current_package: &str,
-) -> Result<TokenStream> {
-    if alias_collides(batch, current_package, proto_fqn) {
-        let view = resolver.rust_view_type(proto_fqn, current_package)?;
-        Ok(quote!(::buffa::view::OwnedView<#view<'static>>))
-    } else {
-        let alias = owned_view_alias_ident(proto_fqn);
-        Ok(quote!(#alias))
+    method: &MethodDescriptorProto,
+    package: &str,
+) -> TokenStream {
+    let input_fqn = method.input_type.as_deref().unwrap_or("");
+    // Panic on resolver errors like the surrounding route-registration code
+    // does. (Threading `Result` through the registration builder is a
+    // follow-up.)
+    let input_owned = resolver
+        .rust_type(input_fqn, package)
+        .expect("rust_type failed for streaming input type");
+    quote! {
+        let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<#input_owned>(req);
     }
+}
+
+/// Doc lines describing the inbound stream item type on a client-streaming /
+/// bidi trait method.
+///
+/// The yield-back sentence is only true when the method's input and output
+/// types coincide (`StreamMessage<M>: Encodable<M>`), so it is emitted only
+/// for echo-shaped methods.
+fn stream_items_doc(method: &MethodDescriptorProto) -> TokenStream {
+    let mut doc = quote! {
+        #[doc = ""]
+        #[doc = " Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):"]
+        #[doc = " it owns its buffer, is `Send + 'static`, and exposes zero-copy"]
+        #[doc = " accessor methods (`item.name()`), `.view()`, and"]
+        #[doc = " `.to_owned_message()`."]
+    };
+    if method.input_type == method.output_type {
+        doc.extend(quote! {
+            #[doc = " Items can be yielded back unchanged"]
+            #[doc = " (`StreamMessage<M>` implements `Encodable<M>`)."]
+        });
+    }
+    doc
+}
+
+/// Inbound stream item type for a client-streaming / bidi RPC:
+/// `StreamMessage<Req>` keyed by the owned message.
+fn stream_item_arg(
+    resolver: &TypeResolver<'_>,
+    method: &MethodDescriptorProto,
+    package: &str,
+) -> Result<TokenStream> {
+    let input_fqn = method.input_type.as_deref().unwrap_or("");
+    let input_owned = resolver.rust_type(input_fqn, package)?;
+    Ok(quote! { ::connectrpc::StreamMessage<#input_owned> })
 }
 
 /// Walk every service's method input/output FQNs across `file_to_generate`
@@ -871,16 +925,15 @@ fn collect_alias_collisions(
 
 /// Emit `pub type Owned#{Msg}View = OwnedView<#{Msg}View<'static>>;` for
 /// every distinct RPC input/output type referenced by services in this
-/// file. The alias is what handlers see in trait method signatures and
-/// what users write in their `impl` blocks.
+/// file. The alias names the owned-view form of a message in handler code
+/// (e.g. an `OwnedOutView` response body or a decoded client response).
 ///
 /// Aliases whose name would collide with another distinct type's alias
 /// in the same target package (per [`BatchState::colliding_aliases`]) are
-/// suppressed — the trait method signature inlines the
-/// `OwnedView<…<'static>>` form for those types instead (see
-/// [`owned_view_input_arg_type`]). This is the issue [#75] fix; the
-/// non-colliding common case (including well-known types like
-/// `.google.protobuf.Empty`) keeps its alias.
+/// suppressed — users spell the inlined `OwnedView<…<'static>>` form for
+/// those types instead. This is the issue [#75] fix; the non-colliding
+/// common case (including well-known types like `.google.protobuf.Empty`)
+/// keeps its alias.
 ///
 /// Deduped on `(package, fqn)` across the batch so two files in the same
 /// package don't both emit the alias (E0428).
@@ -972,7 +1025,7 @@ fn generate_encodable_view_impls(
                     fn encode(&self, codec: ::connectrpc::CodecFormat)
                         -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError>
                     {
-                        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+                        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
                     }
                 }
             });
@@ -1052,18 +1105,28 @@ fn generate_service(
     let full_doc = format!(
         "{base_doc}\n\n\
          # Implementing handlers\n\n\
-         Handlers receive requests as `OwnedFooView` (an alias for\n\
-         `OwnedView<FooView<'static>>`), which gives zero-copy borrowed access\n\
-         to fields (e.g. `request.name` is a `&str` into the decoded buffer).\n\
-         The view can be held across `.await` points. When two RPC types in\n\
-         the same package would alias to the same `Owned<…>View` name (e.g.\n\
-         a local message plus an imported one with the same short name), the\n\
-         alias is suppressed for both and the request type is spelled as\n\
-         `OwnedView<…View<'static>>` directly in the trait signature.\n\n\
          Implement methods with plain `async fn`; the returned future satisfies\n\
-         the `Send` bound automatically. See the\n\
-         [buffa user guide](https://github.com/anthropics/buffa/blob/main/docs/guide.md#ownedview-in-async-trait-implementations)\n\
-         for zero-copy access patterns and when `to_owned_message()` is needed.\n\n\
+         the `Send` bound automatically.\n\n\
+         **Unary and server-streaming requests** arrive as\n\
+         [`ServiceRequest<'_, Req>`](::connectrpc::ServiceRequest): a zero-copy\n\
+         view of the request plus its body, valid for the duration of the call.\n\
+         Fields are read directly (`request.name` is a `&str` into the decoded\n\
+         buffer) and the borrow may be held across `.await` points. Anything\n\
+         that must outlive the call — `tokio::spawn`, channels, server state,\n\
+         or data captured by a returned response stream — takes owned data:\n\
+         call `request.to_owned_message()` (or copy the specific fields)\n\
+         first.\n\n\
+         **Client-streaming and bidi requests** arrive as\n\
+         `ServiceStream<`[`StreamMessage<Req>`](::connectrpc::StreamMessage)`>`.\n\
+         Each item owns its decoded buffer and is `Send + 'static`, so items\n\
+         can be buffered or moved into spawned tasks; read fields zero-copy\n\
+         through the generated accessor methods (`item.name()`) or `.view()`,\n\
+         convert with `.to_owned_message()`, or yield an item back unchanged —\n\
+         `StreamMessage<M>` implements `Encodable<M>`.\n\n\
+         Request types resolved through `extern_path` (e.g. well-known types\n\
+         from another crate) use the same wrappers; the crate that owns the\n\
+         type must be generated with buffa ≥ 0.7.0 and views enabled so the\n\
+         backing `HasMessageView` impl exists.\n\n\
          The `impl Encodable<Out>` return bound accepts the owned `Out`, the\n\
          generated `OutView<'_>` / `OwnedOutView`,\n\
          [`MaybeBorrowed`](::connectrpc::MaybeBorrowed), or\n\
@@ -1074,10 +1137,11 @@ fn generate_service(
          WKT/extern outputs.\n\n\
          Server-streaming and bidi-streaming methods return\n\
          `ServiceStream<impl Encodable<Out> + Send + use<Self>>`. The\n\
-         `use<Self>` precise-capturing clause excludes `&self`'s lifetime\n\
-         (unary methods use `use<'a, Self>` and may borrow), so stream items\n\
-         must be `'static`. To stream view-encoded data, encode each item\n\
-         inside the stream body and yield\n\
+         `use<Self>` precise-capturing clause excludes `&self`'s lifetime and\n\
+         the request's lifetime (unary methods use `use<'a, Self>` and may\n\
+         borrow from `&self`), so stream items must be `'static` and cannot\n\
+         borrow from the request. To stream view-encoded data, encode each\n\
+         item inside the stream body and yield\n\
          [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming\n\
          example` doc."
     );
@@ -1087,7 +1151,7 @@ fn generate_service(
     let trait_methods: Vec<TokenStream> = service
         .method
         .iter()
-        .map(|m| generate_trait_method(file, service, m, resolver, batch, package))
+        .map(|m| generate_trait_method(file, service, m, resolver, package))
         .collect::<Result<Vec<_>>>()?;
 
     // Generate route registrations for extension trait
@@ -1113,15 +1177,26 @@ fn generate_service(
                 let output_type = resolver
                     .rust_type(m.output_type.as_deref().unwrap_or(""), package)
                     .unwrap();
+                let input_fqn = m.input_type.as_deref().unwrap_or("");
+                let input_view = resolver.rust_view_type(input_fqn, package).unwrap();
+                let input_owned = resolver.rust_type(input_fqn, package).unwrap();
+                let call_handler = quote! {
+                    let sreq = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(req.reborrow(), req.bytes());
+                    svc.#method_snake(ctx, sreq).await
+                };
                 quote! {
                     .route_view_server_stream::<_, _, #output_type>(
                         #service_name_const,
                         #method_name,
                         ::connectrpc::view_streaming_handler_fn({
                             let svc = ::std::sync::Arc::clone(&self);
-                            move |ctx, req| {
+                            move |ctx, req: ::buffa::view::OwnedView<#input_view<'static>>| {
                                 let svc = ::std::sync::Arc::clone(&svc);
-                                async move { svc.#method_snake(ctx, req).await }
+                                async move {
+                                    // `req` (an OwnedView) is owned by this future; the
+                                    // handler borrows from it until it returns the stream.
+                                    #call_handler
+                                }
                             }
                         }),
                     )
@@ -1131,6 +1206,7 @@ fn generate_service(
                 let output_type = resolver
                     .rust_type(m.output_type.as_deref().unwrap_or(""), package)
                     .unwrap();
+                let into_items = router_stream_items_tokens(resolver, m, package);
                 quote! {
                     .route_view_client_stream(
                         #service_name_const,
@@ -1140,6 +1216,7 @@ fn generate_service(
                             move |ctx, req, format| {
                                 let svc = ::std::sync::Arc::clone(&svc);
                                 async move {
+                                    #into_items
                                     svc.#method_snake(ctx, req).await?.encode::<#output_type>(format)
                                 }
                             }
@@ -1152,6 +1229,7 @@ fn generate_service(
                 let output_type = resolver
                     .rust_type(m.output_type.as_deref().unwrap_or(""), package)
                     .unwrap();
+                let into_items = router_stream_items_tokens(resolver, m, package);
                 quote! {
                     .route_view_bidi_stream::<_, _, #output_type>(
                         #service_name_const,
@@ -1160,7 +1238,10 @@ fn generate_service(
                             let svc = ::std::sync::Arc::clone(&self);
                             move |ctx, req| {
                                 let svc = ::std::sync::Arc::clone(&svc);
-                                async move { svc.#method_snake(ctx, req).await }
+                                async move {
+                                    #into_items
+                                    svc.#method_snake(ctx, req).await
+                                }
                             }
                         }),
                     )
@@ -1181,6 +1262,16 @@ fn generate_service(
                 let output_type = resolver
                     .rust_type(m.output_type.as_deref().unwrap_or(""), package)
                     .unwrap();
+                // The closure parameter is annotated because the handler now
+                // takes a borrowed request, so `ReqView` is no longer
+                // inferable from the call alone.
+                let input_fqn = m.input_type.as_deref().unwrap_or("");
+                let input_view = resolver.rust_view_type(input_fqn, package).unwrap();
+                let input_owned = resolver.rust_type(input_fqn, package).unwrap();
+                let call_handler = quote! {
+                    let sreq = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(req.reborrow(), req.bytes());
+                    svc.#method_snake(ctx, sreq).await?.encode::<#output_type>(format)
+                };
 
                 quote! {
                     .#route_method(
@@ -1188,10 +1279,12 @@ fn generate_service(
                         #method_name,
                         {
                             let svc = ::std::sync::Arc::clone(&self);
-                            ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                            ::connectrpc::view_handler_fn(move |ctx, req: ::buffa::view::OwnedView<#input_view<'static>>, format| {
                                 let svc = ::std::sync::Arc::clone(&svc);
                                 async move {
-                                    svc.#method_snake(ctx, req).await?.encode::<#output_type>(format)
+                                    // `req` (an OwnedView) is owned by this future; the
+                                    // handler borrows from it for the call.
+                                    #call_handler
                                 }
                             })
                         },
@@ -1278,11 +1371,12 @@ let response = client.{example_method}(request).await?;
 # Working with the response
 
 Unary calls return [`UnaryResponse<OwnedView<FooView>>`](::connectrpc::client::UnaryResponse).
-The `OwnedView` derefs to the view, so field access is zero-copy:
+[`view()`](::connectrpc::client::UnaryResponse::view) borrows the response
+message, so field access is zero-copy:
 
 ```rust,ignore
-let resp = client.{example_method}(request).await?.into_view();
-let name: &str = resp.name;  // borrow into the response buffer
+let resp = client.{example_method}(request).await?;
+let name: &str = resp.view().name;  // borrow into the response buffer
 ```
 
 If you need the owned struct (e.g. to store or pass by value), use
@@ -1290,7 +1384,13 @@ If you need the owned struct (e.g. to store or pass by value), use
 
 ```rust,ignore
 let owned = client.{example_method}(request).await?.into_owned();
-```"#
+```
+
+[`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
+zero-copy decoded body (an `OwnedView`) without copying; field access on it
+goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
+received message from `.message().await` — bind `msg.reborrow()` for field
+access, or convert with `.to_owned_message()`."#
     );
     let client_doc_tokens = doc_attrs(&client_doc);
     // Opt-in `#[cfg(feature = "client")]` on every client-side item.
@@ -1519,13 +1619,21 @@ fn generate_service_server(
         let cs = m.client_streaming.unwrap_or(false);
         let ss = m.server_streaming.unwrap_or(false);
 
+        // Inbound stream decoding for client-streaming / bidi: typed
+        // `StreamMessage<Req>` items.
+        let stream_decode = {
+            let input_fqn = m.input_type.as_deref().unwrap_or("");
+            let input_owned = resolver.rust_type(input_fqn, package)?;
+            quote! { ::connectrpc::dispatcher::codegen::decode_message_request_stream::<#input_owned>(requests, format) }
+        };
+
         if cs && ss {
             // Bidi streaming
             call_bidi_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
                     Box::pin(async move {
-                        let req_stream = ::connectrpc::dispatcher::codegen::decode_view_request_stream::<#input_view>(requests, format);
+                        let req_stream = #stream_decode;
                         let resp = svc.#method_snake(ctx, req_stream).await?;
                         Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
@@ -1537,25 +1645,40 @@ fn generate_service_server(
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
                     Box::pin(async move {
-                        let req_stream = ::connectrpc::dispatcher::codegen::decode_view_request_stream::<#input_view>(requests, format);
+                        let req_stream = #stream_decode;
                         svc.#method_snake(ctx, req_stream).await?.encode::<#output_type>(format)
                     })
                 }
             });
         } else if ss {
             // Server streaming
+            let input_fqn = m.input_type.as_deref().unwrap_or("");
+            let input_owned = resolver.rust_type(input_fqn, package)?;
+            let call_handler = quote! {
+                let req = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(&req, &body);
+                let resp = svc.#method_snake(ctx, req).await?;
+            };
             call_ss_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
                     Box::pin(async move {
-                        let req = ::connectrpc::dispatcher::codegen::decode_request_view::<#input_view>(request, format)?;
-                        let resp = svc.#method_snake(ctx, req).await?;
+                        // The normalized body is owned by this future; the handler
+                        // borrows from it until it returns the response stream.
+                        let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request, format)?;
+                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body)?;
+                        #call_handler
                         Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
                 }
             });
         } else {
             // Unary
+            let input_fqn = m.input_type.as_deref().unwrap_or("");
+            let input_owned = resolver.rust_type(input_fqn, package)?;
+            let call_handler = quote! {
+                let req = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(&req, &body);
+                svc.#method_snake(ctx, req).await?.encode::<#output_type>(format)
+            };
             call_unary_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
@@ -1564,8 +1687,11 @@ fn generate_service_server(
                         // cache an interceptor may have populated cannot be reused.
                         // `encoded()` returns the (post-replacement) wire bytes —
                         // a cheap `Bytes` clone for the common no-replacement case.
-                        let req = ::connectrpc::dispatcher::codegen::decode_request_view::<#input_view>(request.encoded()?, format)?;
-                        svc.#method_snake(ctx, req).await?.encode::<#output_type>(format)
+                        // The normalized body is owned by this future; the handler
+                        // borrows from it for the duration of the call.
+                        let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request.encoded()?, format)?;
+                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body)?;
+                        #call_handler
                     })
                 }
             });
@@ -1705,17 +1831,10 @@ fn generate_trait_method(
     service: &ServiceDescriptorProto,
     method: &MethodDescriptorProto,
     resolver: &TypeResolver<'_>,
-    batch: &BatchState,
     package: &str,
 ) -> Result<TokenStream> {
     let method_name = method.name.as_deref().unwrap_or("");
     let method_snake = make_field_ident(&method_name.to_snake_case());
-    let input_arg = owned_view_input_arg_type(
-        resolver,
-        batch,
-        method.input_type.as_deref().unwrap_or(""),
-        package,
-    )?;
     let output_type = resolver.rust_type(method.output_type.as_deref().unwrap_or(""), package)?;
 
     // Get method documentation
@@ -1739,46 +1858,93 @@ fn generate_trait_method(
         // `use<Self>` opts out of capturing `&self`'s lifetime (RPITITs in
         // trait methods otherwise capture it by default), since stream
         // items have to be `'static`. Without it, the generated route
-        // registration's `Arc::clone` closures fail E0597.
+        // registration's `Arc::clone` closures fail E0597. The borrowed
+        // `ServiceRequest` lifetime is likewise excluded, so the returned
+        // stream cannot borrow from the request — anything the stream needs
+        // must be copied or converted to owned before returning it.
+        let input_fqn = method.input_type.as_deref().unwrap_or("");
+        let input_owned = resolver.rust_type(input_fqn, package)?;
+        let request_param = quote! { ::connectrpc::ServiceRequest<'_, #input_owned> };
+        let request_doc = quote! {
+            #[doc = ""]
+            #[doc = " `request` is borrowed from the request body and is valid for the"]
+            #[doc = " duration of the call (until the response stream is returned);"]
+            #[doc = " message fields are read directly on it (zero-copy). Data the"]
+            #[doc = " returned stream needs must be copied out or converted via"]
+            #[doc = " `.to_owned_message()`."]
+        };
         Ok(quote! {
             #method_doc_tokens
+            #request_doc
             fn #method_snake(
                 &self,
                 ctx: ::connectrpc::RequestContext,
-                request: #input_arg,
+                request: #request_param,
             ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + Send + use<Self>>>> + Send;
         })
     } else if client_streaming && !server_streaming {
-        // Client streaming method
+        // Client streaming method. Inbound items are `StreamMessage<Req>` —
+        // each received message owns its decoded buffer (zero-copy reads via
+        // `.view()`, conversion via `.to_owned_message()`, and — for
+        // echo-shaped methods — items can be forwarded as-is since
+        // `StreamMessage<M>: Encodable<M>`).
+        let stream_item_arg = stream_item_arg(resolver, method, package)?;
+        let items_doc = stream_items_doc(method);
         Ok(quote! {
             #method_doc_tokens
             #borrow_doc
+            #items_doc
             fn #method_snake<'a>(
                 &'a self,
                 ctx: ::connectrpc::RequestContext,
-                requests: ::connectrpc::ServiceStream<#input_arg>,
+                requests: ::connectrpc::ServiceStream<#stream_item_arg>,
             ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + Send + use<'a, Self>>> + Send;
         })
     } else if client_streaming && server_streaming {
         // Bidi streaming method. Same `impl Encodable<...>` item type and
-        // `use<Self>` capture clause as server streaming above.
+        // `use<Self>` capture clause as server streaming above; inbound items
+        // are `StreamMessage<Req>` as for client streaming.
+        let stream_item_arg = stream_item_arg(resolver, method, package)?;
+        let items_doc = stream_items_doc(method);
         Ok(quote! {
             #method_doc_tokens
+            #items_doc
             fn #method_snake(
                 &self,
                 ctx: ::connectrpc::RequestContext,
-                requests: ::connectrpc::ServiceStream<#input_arg>,
+                requests: ::connectrpc::ServiceStream<#stream_item_arg>,
             ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + Send + use<Self>>>> + Send;
         })
     } else {
-        // Unary method
+        // Unary method. The request is *borrowed*: the generated dispatcher
+        // owns the request body for the duration of the call and hands the
+        // handler a `ServiceRequest<'_, Req>` (zero-copy view + raw body)
+        // borrowed from it, so field access (`request.field`) is plain
+        // borrow-checked access with no synthetic `'static` involved. The
+        // handler future captures that borrow (RPITIT captures all in-scope
+        // lifetimes), which is fine because the dispatcher awaits it while
+        // still owning the body. The response's `use<'a, Self>` deliberately
+        // excludes the request lifetime: the response must not borrow from
+        // the request.
+        let input_fqn = method.input_type.as_deref().unwrap_or("");
+        let input_owned = resolver.rust_type(input_fqn, package)?;
+        let request_param = quote! { ::connectrpc::ServiceRequest<'_, #input_owned> };
+        let request_doc = quote! {
+            #[doc = ""]
+            #[doc = " `request` is borrowed from the request body and is valid for the"]
+            #[doc = " duration of the call; message fields are read directly on it"]
+            #[doc = " (zero-copy). The response cannot borrow from `request` — use"]
+            #[doc = " `.to_owned_message()` (or copy the specific fields) for anything"]
+            #[doc = " returned, stored, or moved into `tokio::spawn`."]
+        };
         Ok(quote! {
             #method_doc_tokens
             #borrow_doc
+            #request_doc
             fn #method_snake<'a>(
                 &'a self,
                 ctx: ::connectrpc::RequestContext,
-                request: #input_arg,
+                request: #request_param,
             ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + Send + use<'a, Self>>> + Send;
         })
     }
@@ -2203,10 +2369,20 @@ mod tests {
             code.contains("pub type OwnedPingRespView = :: buffa :: view :: OwnedView"),
             "missing OwnedPingRespView alias: {code}"
         );
-        // Trait method uses the alias for the request param.
+        // Unary trait methods take a borrowed ServiceRequest; the alias is
+        // still emitted (the natural spelling for pass-through response
+        // bodies, e.g. `MaybeBorrowed<Ping, OwnedPingView>` holding a
+        // `req.to_owned_view()`).
         assert!(
-            code.contains("request : OwnedPingReqView ,"),
-            "trait method should take request: OwnedPingReqView: {code}"
+            code.contains("request : :: connectrpc :: ServiceRequest < '_"),
+            "unary trait method should take request: ServiceRequest<'_, PingReq>: {code}"
+        );
+        // The view-family impls backing ServiceRequest come from buffa's own
+        // codegen (alongside each message's view types), so connect-codegen
+        // emits none of its own.
+        assert!(
+            !code.contains("impl :: connectrpc :: HasMessageView for"),
+            "connect-codegen must not emit view-family impls (buffa does): {code}"
         );
     }
 
@@ -2250,9 +2426,11 @@ mod tests {
             !code.contains("request : OwnedMyMessageView"),
             "colliding input must not reference the suppressed alias: {code}"
         );
+        // The unary request is a borrowed ServiceRequest over the owned type,
+        // so the alias collision only affects the (still-suppressed) aliases.
         assert!(
-            code.contains("request : :: buffa :: view :: OwnedView <"),
-            "colliding input should be inlined as OwnedView<…<'static>>: {code}"
+            code.contains("request : :: connectrpc :: ServiceRequest < '_"),
+            "colliding unary input should still use ServiceRequest: {code}"
         );
     }
 
@@ -2284,9 +2462,16 @@ mod tests {
             code.contains("pub type OwnedEmptyView = :: buffa :: view :: OwnedView"),
             "WKT cross-package input should keep its alias: {code}"
         );
+        // `.google.protobuf.Empty` resolves through the default extern_path to
+        // `::buffa_types::…`. extern_path targets are required to be
+        // buffa ≥ 0.7.0 generated code with views enabled, so the unary input
+        // uses the same `ServiceRequest<'_, Req>` form as local types — the
+        // backing `buffa::HasMessageView` impl ships with buffa-types.
         assert!(
-            code.contains("request : OwnedEmptyView ,"),
-            "trait method should still use OwnedEmptyView for non-colliding cross-package input: {code}"
+            code.contains(
+                "request : :: connectrpc :: ServiceRequest < '_ , :: buffa_types :: google :: protobuf :: Empty >"
+            ),
+            "extern unary input should use ServiceRequest over the extern owned type: {code}"
         );
     }
 
@@ -2357,22 +2542,23 @@ mod tests {
             "no method shape should reference the suppressed alias: {code}"
         );
 
-        // Each method shape uses the inlined OwnedView<…<'static>> form.
-        // Unary + server-streaming take a single request param; client-
-        // streaming + bidi take a ServiceStream<…>.
+        // Unary and server-streaming both take the borrowed ServiceRequest
+        // keyed by the owned message; the alias collision is irrelevant to it.
         assert!(
-            code.matches("request : :: buffa :: view :: OwnedView <")
+            code.matches("request : :: connectrpc :: ServiceRequest < '_")
                 .count()
                 >= 2,
-            "unary and server-streaming should both inline the request type: {code}"
+            "unary and server-streaming should take the borrowed ServiceRequest form: {code}"
         );
+        // Client-streaming and bidi inbound items are StreamMessage<Req> keyed
+        // by the owned message — the alias collision is irrelevant to them.
         assert!(
             code.matches(
-                "requests : :: connectrpc :: ServiceStream < :: buffa :: view :: OwnedView <"
+                "requests : :: connectrpc :: ServiceStream < :: connectrpc :: StreamMessage <"
             )
             .count()
                 >= 2,
-            "client-streaming and bidi should both inline the streamed request type: {code}"
+            "client-streaming and bidi should both take StreamMessage items: {code}"
         );
     }
 

@@ -200,6 +200,116 @@ impl ::buffa::ViewReborrow for LogRequestView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `LogRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`LogRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`LogRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct LogRequestOwnedView(::buffa::OwnedView<LogRequestView<'static>>);
+impl LogRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogRequestOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::LogRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`LogRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &LogRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::LogRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `records`
+    #[must_use]
+    pub fn records(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::LogRecordView<'_>> {
+        &self.0.reborrow().records
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<LogRequestView<'static>>>
+for LogRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<LogRequestView<'static>>) -> Self {
+        LogRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<LogRequestOwnedView>
+for ::buffa::OwnedView<LogRequestView<'static>> {
+    fn from(wrapper: LogRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<LogRequestView<'static>>>
+for LogRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<LogRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::LogRequest {
+    type View<'a> = LogRequestView<'a>;
+    type ViewHandle = LogRequestOwnedView;
+}
+impl ::serde::Serialize for LogRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct LogRecordView<'a> {
     /// Field 1: `timestamp_nanos`
@@ -767,6 +877,158 @@ impl ::buffa::ViewReborrow for LogRecordView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `LogRecord` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`LogRecordView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`LogRecordView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct LogRecordOwnedView(::buffa::OwnedView<LogRecordView<'static>>);
+impl LogRecordOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogRecordOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogRecordOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::LogRecord,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogRecordOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`LogRecordView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &LogRecordView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::LogRecord {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `timestamp_nanos`
+    #[must_use]
+    pub fn timestamp_nanos(&self) -> ::core::option::Option<i64> {
+        self.0.reborrow().timestamp_nanos
+    }
+    /// Field 2: `service_name`
+    #[must_use]
+    pub fn service_name(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().service_name
+    }
+    /// Field 3: `instance_id`
+    #[must_use]
+    pub fn instance_id(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().instance_id
+    }
+    /// Field 4: `severity`
+    #[must_use]
+    pub fn severity(
+        &self,
+    ) -> ::core::option::Option<::buffa::EnumValue<super::super::log_record::Severity>> {
+        self.0.reborrow().severity
+    }
+    /// Field 5: `message`
+    #[must_use]
+    pub fn message(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().message
+    }
+    /// Field 6: `labels` (map)
+    #[must_use]
+    pub fn labels(&self) -> &::buffa::MapView<'_, &'_ [u8], &'_ [u8]> {
+        &self.0.reborrow().labels
+    }
+    /// Field 7: `trace_id`
+    #[must_use]
+    pub fn trace_id(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().trace_id
+    }
+    /// Field 8: `span_id`
+    #[must_use]
+    pub fn span_id(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().span_id
+    }
+    /// Field 9: `source`
+    #[must_use]
+    pub fn source(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::LogSourceView<'_>> {
+        &self.0.reborrow().source
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<LogRecordView<'static>>>
+for LogRecordOwnedView {
+    fn from(inner: ::buffa::OwnedView<LogRecordView<'static>>) -> Self {
+        LogRecordOwnedView(inner)
+    }
+}
+impl ::core::convert::From<LogRecordOwnedView>
+for ::buffa::OwnedView<LogRecordView<'static>> {
+    fn from(wrapper: LogRecordOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<LogRecordView<'static>>>
+for LogRecordOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<LogRecordView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::LogRecord {
+    type View<'a> = LogRecordView<'a>;
+    type ViewHandle = LogRecordOwnedView;
+}
+impl ::serde::Serialize for LogRecordOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct LogSourceView<'a> {
     /// Field 1: `file`
@@ -1019,6 +1281,124 @@ impl ::buffa::ViewReborrow for LogSourceView<'static> {
     type Reborrowed<'b> = LogSourceView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `LogSource` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`LogSourceView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`LogSourceView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct LogSourceOwnedView(::buffa::OwnedView<LogSourceView<'static>>);
+impl LogSourceOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogSourceOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogSourceOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::LogSource,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogSourceOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`LogSourceView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &LogSourceView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::LogSource {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `file`
+    #[must_use]
+    pub fn file(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().file
+    }
+    /// Field 2: `line`
+    #[must_use]
+    pub fn line(&self) -> ::core::option::Option<i32> {
+        self.0.reborrow().line
+    }
+    /// Field 3: `function`
+    #[must_use]
+    pub fn function(&self) -> ::core::option::Option<&'_ [u8]> {
+        self.0.reborrow().function
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<LogSourceView<'static>>>
+for LogSourceOwnedView {
+    fn from(inner: ::buffa::OwnedView<LogSourceView<'static>>) -> Self {
+        LogSourceOwnedView(inner)
+    }
+}
+impl ::core::convert::From<LogSourceOwnedView>
+for ::buffa::OwnedView<LogSourceView<'static>> {
+    fn from(wrapper: LogSourceOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<LogSourceView<'static>>>
+for LogSourceOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<LogSourceView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::LogSource {
+    type View<'a> = LogSourceView<'a>;
+    type ViewHandle = LogSourceOwnedView;
+}
+impl ::serde::Serialize for LogSourceOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -1304,5 +1684,132 @@ impl ::buffa::ViewReborrow for LogIngestResponseView<'static> {
     type Reborrowed<'b> = LogIngestResponseView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `LogIngestResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`LogIngestResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`LogIngestResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct LogIngestResponseOwnedView(
+    ::buffa::OwnedView<LogIngestResponseView<'static>>,
+);
+impl LogIngestResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogIngestResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogIngestResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::LogIngestResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            LogIngestResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`LogIngestResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &LogIngestResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::LogIngestResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `count`
+    #[must_use]
+    pub fn count(&self) -> ::core::option::Option<i32> {
+        self.0.reborrow().count
+    }
+    /// Field 2: `total_message_bytes`
+    #[must_use]
+    pub fn total_message_bytes(&self) -> ::core::option::Option<i64> {
+        self.0.reborrow().total_message_bytes
+    }
+    /// Field 3: `total_label_bytes`
+    #[must_use]
+    pub fn total_label_bytes(&self) -> ::core::option::Option<i64> {
+        self.0.reborrow().total_label_bytes
+    }
+    /// Field 4: `max_severity`
+    #[must_use]
+    pub fn max_severity(&self) -> ::core::option::Option<i32> {
+        self.0.reborrow().max_severity
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<LogIngestResponseView<'static>>>
+for LogIngestResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<LogIngestResponseView<'static>>) -> Self {
+        LogIngestResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<LogIngestResponseOwnedView>
+for ::buffa::OwnedView<LogIngestResponseView<'static>> {
+    fn from(wrapper: LogIngestResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<LogIngestResponseView<'static>>>
+for LogIngestResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<LogIngestResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::LogIngestResponse {
+    type View<'a> = LogIngestResponseView<'a>;
+    type ViewHandle = LogIngestResponseOwnedView;
+}
+impl ::serde::Serialize for LogIngestResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }

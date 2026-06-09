@@ -26,8 +26,7 @@ use std::time::Duration;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use buffa::view::OwnedView;
-use connectrpc::{ConnectError, ErrorCode, RequestContext, Router, ServiceResult};
+use connectrpc::{ConnectError, ErrorCode, RequestContext, Router, ServiceRequest, ServiceResult};
 use http_body_util::BodyExt;
 use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
@@ -137,7 +136,7 @@ impl SecretService for SecretServiceImpl {
     async fn get_secret(
         &self,
         ctx: RequestContext,
-        request: OwnedView<GetSecretRequestView<'static>>,
+        request: ServiceRequest<'_, GetSecretRequest>,
     ) -> ServiceResult<GetSecretResponse> {
         // The auth layer stamped UserId into the http::Request extensions,
         // which the connect dispatcher then forwarded into ctx.extensions().

@@ -288,6 +288,20 @@ pub mod health_check_response {
         /// Used only by the Watch method.
         SERVICE_UNKNOWN = 3i32,
     }
+    impl ServingStatus {
+        ///Idiomatic alias for [`Self::UNKNOWN`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Unknown: Self = Self::UNKNOWN;
+        ///Idiomatic alias for [`Self::SERVING`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Serving: Self = Self::SERVING;
+        ///Idiomatic alias for [`Self::NOT_SERVING`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const NotServing: Self = Self::NOT_SERVING;
+        ///Idiomatic alias for [`Self::SERVICE_UNKNOWN`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const ServiceUnknown: Self = Self::SERVICE_UNKNOWN;
+    }
     impl ::core::default::Default for ServingStatus {
         fn default() -> Self {
             Self::UNKNOWN

@@ -28,4 +28,6 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::RecordView;
 #[doc(inline)]
+pub use self::__buffa::view::RecordOwnedView;
+#[doc(inline)]
 pub use self::__buffa::register_types;

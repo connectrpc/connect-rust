@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use connectrpc::{ConnectError, ConnectRpcService, RequestContext, Response, ServiceResult};
+use connectrpc::{
+    ConnectError, ConnectRpcService, RequestContext, Response, ServiceRequest, ServiceResult,
+};
 
 use rpc_bench::connect::fortune::v1::*;
 use rpc_bench::fortune;
 use rpc_bench::proto::fortune::v1::*;
-
-use buffa::view::OwnedView;
 
 const VALKEY_POOL_SIZE: usize = 8;
 
@@ -18,7 +18,7 @@ impl FortuneService for FortuneServiceImpl {
     async fn get_fortunes(
         &self,
         _ctx: RequestContext,
-        _req: OwnedView<GetFortunesRequestView<'static>>,
+        _req: ServiceRequest<'_, GetFortunesRequest>,
     ) -> ServiceResult<GetFortunesResponse> {
         let mut conn = self.pool.get();
         let fortunes = fortune::query_fortunes(&mut conn)

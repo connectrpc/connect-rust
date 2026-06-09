@@ -34,16 +34,30 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::CreateEventRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::CreateEventRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::CreateEventResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateEventResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::EventView;
 #[doc(inline)]
+pub use self::__buffa::view::EventOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::CalculateDurationRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::CalculateDurationRequestOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CalculateDurationResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::CalculateDurationResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ProcessMetadataRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::ProcessMetadataRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ProcessMetadataResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ProcessMetadataResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

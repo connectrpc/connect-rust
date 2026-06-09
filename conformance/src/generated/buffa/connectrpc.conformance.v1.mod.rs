@@ -87,70 +87,138 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::ConfigView;
 #[doc(inline)]
+pub use self::__buffa::view::ConfigOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::FeaturesView;
+#[doc(inline)]
+pub use self::__buffa::view::FeaturesOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ConfigCaseView;
 #[doc(inline)]
+pub use self::__buffa::view::ConfigCaseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::TLSCredsView;
+#[doc(inline)]
+pub use self::__buffa::view::TLSCredsOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::UnaryResponseDefinitionView;
 #[doc(inline)]
+pub use self::__buffa::view::UnaryResponseDefinitionOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::StreamResponseDefinitionView;
+#[doc(inline)]
+pub use self::__buffa::view::StreamResponseDefinitionOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::UnaryRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::UnaryRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::UnaryResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::UnaryResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::IdempotentUnaryRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::IdempotentUnaryRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::IdempotentUnaryResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::IdempotentUnaryResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ServerStreamRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::ServerStreamRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ServerStreamResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ServerStreamResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ClientStreamRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::ClientStreamRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ClientStreamResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ClientStreamResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::BidiStreamRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::BidiStreamRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::BidiStreamResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::BidiStreamResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::UnimplementedRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::UnimplementedRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::UnimplementedResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::UnimplementedResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ConformancePayloadView;
 #[doc(inline)]
+pub use self::__buffa::view::ConformancePayloadOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ErrorView;
+#[doc(inline)]
+pub use self::__buffa::view::ErrorOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::HeaderView;
 #[doc(inline)]
+pub use self::__buffa::view::HeaderOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::RawHTTPRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::RawHTTPRequestOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::MessageContentsView;
 #[doc(inline)]
+pub use self::__buffa::view::MessageContentsOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::StreamContentsView;
+#[doc(inline)]
+pub use self::__buffa::view::StreamContentsOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::RawHTTPResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::RawHTTPResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ClientCompatRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ClientCompatRequestOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ClientCompatResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::ClientCompatResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ClientResponseResultView;
+#[doc(inline)]
+pub use self::__buffa::view::ClientResponseResultOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ClientErrorResultView;
 #[doc(inline)]
+pub use self::__buffa::view::ClientErrorResultOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::WireDetailsView;
+#[doc(inline)]
+pub use self::__buffa::view::WireDetailsOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ServerCompatRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::ServerCompatRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ServerCompatResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ServerCompatResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::TestSuiteView;
 #[doc(inline)]
+pub use self::__buffa::view::TestSuiteOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::TestCaseView;
+#[doc(inline)]
+pub use self::__buffa::view::TestCaseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

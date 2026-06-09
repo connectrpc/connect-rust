@@ -713,6 +713,17 @@ pub mod test_suite {
         /// reference client, to verify how the server reacts to such requests.
         TEST_MODE_SERVER = 2i32,
     }
+    impl TestMode {
+        ///Idiomatic alias for [`Self::TEST_MODE_UNSPECIFIED`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Unspecified: Self = Self::TEST_MODE_UNSPECIFIED;
+        ///Idiomatic alias for [`Self::TEST_MODE_CLIENT`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Client: Self = Self::TEST_MODE_CLIENT;
+        ///Idiomatic alias for [`Self::TEST_MODE_SERVER`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Server: Self = Self::TEST_MODE_SERVER;
+    }
     impl ::core::default::Default for TestMode {
         fn default() -> Self {
             Self::TEST_MODE_UNSPECIFIED
@@ -857,6 +868,17 @@ pub mod test_suite {
         /// Used when the suite relies on the server ignore any Connect
         /// header or query param.
         CONNECT_VERSION_MODE_IGNORE = 2i32,
+    }
+    impl ConnectVersionMode {
+        ///Idiomatic alias for [`Self::CONNECT_VERSION_MODE_UNSPECIFIED`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Unspecified: Self = Self::CONNECT_VERSION_MODE_UNSPECIFIED;
+        ///Idiomatic alias for [`Self::CONNECT_VERSION_MODE_REQUIRE`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Require: Self = Self::CONNECT_VERSION_MODE_REQUIRE;
+        ///Idiomatic alias for [`Self::CONNECT_VERSION_MODE_IGNORE`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Ignore: Self = Self::CONNECT_VERSION_MODE_IGNORE;
     }
     impl ::core::default::Default for ConnectVersionMode {
         fn default() -> Self {
@@ -1498,4 +1520,6 @@ pub mod test_case {
     };
     #[doc(inline)]
     pub use super::__buffa::view::test_case::ExpandedSizeView;
+    #[doc(inline)]
+    pub use super::__buffa::view::test_case::ExpandedSizeOwnedView;
 }

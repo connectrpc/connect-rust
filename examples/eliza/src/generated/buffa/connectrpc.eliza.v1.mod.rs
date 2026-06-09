@@ -33,14 +33,26 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::SayRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::SayRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::SayResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::SayResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ConverseRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::ConverseRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ConverseResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ConverseResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::IntroduceRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::IntroduceRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::IntroduceResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::IntroduceResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

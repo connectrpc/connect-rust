@@ -30,8 +30,14 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::GetFortunesRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::GetFortunesRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::GetFortunesResponseView;
 #[doc(inline)]
+pub use self::__buffa::view::GetFortunesResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::FortuneView;
+#[doc(inline)]
+pub use self::__buffa::view::FortuneOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

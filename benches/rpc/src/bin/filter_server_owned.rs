@@ -1,7 +1,7 @@
 //! Baseline filter server: always converts the request to the owned
 //! `Record`, scrubs sensitive fields if any are set, and returns owned.
 
-use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceResult};
+use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceRequest, ServiceResult};
 
 use rpc_bench::filter::*;
 
@@ -11,10 +11,10 @@ impl FilterService for Impl {
     async fn redact(
         &self,
         _ctx: RequestContext,
-        request: OwnedRecordView,
+        request: ServiceRequest<'_, Record>,
     ) -> ServiceResult<Record> {
         let mut owned = request.to_owned_message();
-        if has_sensitive(&request) {
+        if has_sensitive(request.view()) {
             scrub(&mut owned);
         }
         Response::ok(owned)

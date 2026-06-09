@@ -9,6 +9,20 @@ pub enum HTTPVersion {
     HTTP_VERSION_2 = 2i32,
     HTTP_VERSION_3 = 3i32,
 }
+impl HTTPVersion {
+    ///Idiomatic alias for [`Self::HTTP_VERSION_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const HttpVersionUnspecified: Self = Self::HTTP_VERSION_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::HTTP_VERSION_1`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const HttpVersion1: Self = Self::HTTP_VERSION_1;
+    ///Idiomatic alias for [`Self::HTTP_VERSION_2`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const HttpVersion2: Self = Self::HTTP_VERSION_2;
+    ///Idiomatic alias for [`Self::HTTP_VERSION_3`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const HttpVersion3: Self = Self::HTTP_VERSION_3;
+}
 impl ::core::default::Default for HTTPVersion {
     fn default() -> Self {
         Self::HTTP_VERSION_UNSPECIFIED
@@ -152,6 +166,20 @@ pub enum Protocol {
     /// PROTOCOL_REST_TRANSCODING = 5;
     PROTOCOL_GRPC_WEB = 3i32,
 }
+impl Protocol {
+    ///Idiomatic alias for [`Self::PROTOCOL_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::PROTOCOL_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::PROTOCOL_CONNECT`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Connect: Self = Self::PROTOCOL_CONNECT;
+    ///Idiomatic alias for [`Self::PROTOCOL_GRPC`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Grpc: Self = Self::PROTOCOL_GRPC;
+    ///Idiomatic alias for [`Self::PROTOCOL_GRPC_WEB`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const GrpcWeb: Self = Self::PROTOCOL_GRPC_WEB;
+}
 impl ::core::default::Default for Protocol {
     fn default() -> Self {
         Self::PROTOCOL_UNSPECIFIED
@@ -293,6 +321,20 @@ pub enum Codec {
     /// not used; will be ignored
     CODEC_TEXT = 3i32,
 }
+impl Codec {
+    ///Idiomatic alias for [`Self::CODEC_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::CODEC_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::CODEC_PROTO`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Proto: Self = Self::CODEC_PROTO;
+    ///Idiomatic alias for [`Self::CODEC_JSON`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Json: Self = Self::CODEC_JSON;
+    ///Idiomatic alias for [`Self::CODEC_TEXT`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Text: Self = Self::CODEC_TEXT;
+}
 impl ::core::default::Default for Codec {
     fn default() -> Self {
         Self::CODEC_UNSPECIFIED
@@ -428,6 +470,29 @@ pub enum Compression {
     COMPRESSION_ZSTD = 4i32,
     COMPRESSION_DEFLATE = 5i32,
     COMPRESSION_SNAPPY = 6i32,
+}
+impl Compression {
+    ///Idiomatic alias for [`Self::COMPRESSION_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::COMPRESSION_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::COMPRESSION_IDENTITY`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Identity: Self = Self::COMPRESSION_IDENTITY;
+    ///Idiomatic alias for [`Self::COMPRESSION_GZIP`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Gzip: Self = Self::COMPRESSION_GZIP;
+    ///Idiomatic alias for [`Self::COMPRESSION_BR`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Br: Self = Self::COMPRESSION_BR;
+    ///Idiomatic alias for [`Self::COMPRESSION_ZSTD`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Zstd: Self = Self::COMPRESSION_ZSTD;
+    ///Idiomatic alias for [`Self::COMPRESSION_DEFLATE`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Deflate: Self = Self::COMPRESSION_DEFLATE;
+    ///Idiomatic alias for [`Self::COMPRESSION_SNAPPY`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Snappy: Self = Self::COMPRESSION_SNAPPY;
 }
 impl ::core::default::Default for Compression {
     fn default() -> Self {
@@ -588,6 +653,26 @@ pub enum StreamType {
     STREAM_TYPE_SERVER_STREAM = 3i32,
     STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM = 4i32,
     STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM = 5i32,
+}
+impl StreamType {
+    ///Idiomatic alias for [`Self::STREAM_TYPE_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::STREAM_TYPE_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::STREAM_TYPE_UNARY`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unary: Self = Self::STREAM_TYPE_UNARY;
+    ///Idiomatic alias for [`Self::STREAM_TYPE_CLIENT_STREAM`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const ClientStream: Self = Self::STREAM_TYPE_CLIENT_STREAM;
+    ///Idiomatic alias for [`Self::STREAM_TYPE_SERVER_STREAM`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const ServerStream: Self = Self::STREAM_TYPE_SERVER_STREAM;
+    ///Idiomatic alias for [`Self::STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const HalfDuplexBidiStream: Self = Self::STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM;
+    ///Idiomatic alias for [`Self::STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const FullDuplexBidiStream: Self = Self::STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM;
 }
 impl ::core::default::Default for StreamType {
     fn default() -> Self {
@@ -765,6 +850,59 @@ pub enum Code {
     CODE_UNAVAILABLE = 14i32,
     CODE_DATA_LOSS = 15i32,
     CODE_UNAUTHENTICATED = 16i32,
+}
+impl Code {
+    ///Idiomatic alias for [`Self::CODE_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::CODE_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::CODE_CANCELED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Canceled: Self = Self::CODE_CANCELED;
+    ///Idiomatic alias for [`Self::CODE_UNKNOWN`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unknown: Self = Self::CODE_UNKNOWN;
+    ///Idiomatic alias for [`Self::CODE_INVALID_ARGUMENT`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const InvalidArgument: Self = Self::CODE_INVALID_ARGUMENT;
+    ///Idiomatic alias for [`Self::CODE_DEADLINE_EXCEEDED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const DeadlineExceeded: Self = Self::CODE_DEADLINE_EXCEEDED;
+    ///Idiomatic alias for [`Self::CODE_NOT_FOUND`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const NotFound: Self = Self::CODE_NOT_FOUND;
+    ///Idiomatic alias for [`Self::CODE_ALREADY_EXISTS`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const AlreadyExists: Self = Self::CODE_ALREADY_EXISTS;
+    ///Idiomatic alias for [`Self::CODE_PERMISSION_DENIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const PermissionDenied: Self = Self::CODE_PERMISSION_DENIED;
+    ///Idiomatic alias for [`Self::CODE_RESOURCE_EXHAUSTED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const ResourceExhausted: Self = Self::CODE_RESOURCE_EXHAUSTED;
+    ///Idiomatic alias for [`Self::CODE_FAILED_PRECONDITION`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const FailedPrecondition: Self = Self::CODE_FAILED_PRECONDITION;
+    ///Idiomatic alias for [`Self::CODE_ABORTED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Aborted: Self = Self::CODE_ABORTED;
+    ///Idiomatic alias for [`Self::CODE_OUT_OF_RANGE`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const OutOfRange: Self = Self::CODE_OUT_OF_RANGE;
+    ///Idiomatic alias for [`Self::CODE_UNIMPLEMENTED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unimplemented: Self = Self::CODE_UNIMPLEMENTED;
+    ///Idiomatic alias for [`Self::CODE_INTERNAL`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Internal: Self = Self::CODE_INTERNAL;
+    ///Idiomatic alias for [`Self::CODE_UNAVAILABLE`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unavailable: Self = Self::CODE_UNAVAILABLE;
+    ///Idiomatic alias for [`Self::CODE_DATA_LOSS`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const DataLoss: Self = Self::CODE_DATA_LOSS;
+    ///Idiomatic alias for [`Self::CODE_UNAUTHENTICATED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unauthenticated: Self = Self::CODE_UNAUTHENTICATED;
 }
 impl ::core::default::Default for Code {
     fn default() -> Self {

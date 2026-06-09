@@ -9,6 +9,20 @@ pub enum Status {
     STATUS_INACTIVE = 2i32,
     STATUS_PENDING = 3i32,
 }
+impl Status {
+    ///Idiomatic alias for [`Self::STATUS_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::STATUS_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::STATUS_ACTIVE`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Active: Self = Self::STATUS_ACTIVE;
+    ///Idiomatic alias for [`Self::STATUS_INACTIVE`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Inactive: Self = Self::STATUS_INACTIVE;
+    ///Idiomatic alias for [`Self::STATUS_PENDING`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Pending: Self = Self::STATUS_PENDING;
+}
 impl ::core::default::Default for Status {
     fn default() -> Self {
         Self::STATUS_UNSPECIFIED
@@ -2478,6 +2492,23 @@ pub mod log_record {
         SEVERITY_INFO = 2i32,
         SEVERITY_WARN = 3i32,
         SEVERITY_ERROR = 4i32,
+    }
+    impl Severity {
+        ///Idiomatic alias for [`Self::SEVERITY_UNSPECIFIED`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Unspecified: Self = Self::SEVERITY_UNSPECIFIED;
+        ///Idiomatic alias for [`Self::SEVERITY_DEBUG`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Debug: Self = Self::SEVERITY_DEBUG;
+        ///Idiomatic alias for [`Self::SEVERITY_INFO`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Info: Self = Self::SEVERITY_INFO;
+        ///Idiomatic alias for [`Self::SEVERITY_WARN`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Warn: Self = Self::SEVERITY_WARN;
+        ///Idiomatic alias for [`Self::SEVERITY_ERROR`]; `Debug` prints the variant name.
+        #[allow(non_upper_case_globals)]
+        pub const Error: Self = Self::SEVERITY_ERROR;
     }
     impl ::core::default::Default for Severity {
         fn default() -> Self {

@@ -11,14 +11,13 @@ mod tests {
 
     use connectrpc::client::{ClientConfig, ClientTransport, HttpClient};
     use connectrpc::{
-        ConnectError, ConnectRpcService, RequestContext, Response, Router, ServiceResult,
-        ServiceStream,
+        ConnectError, ConnectRpcService, RequestContext, Response, Router, ServiceRequest,
+        ServiceResult, ServiceStream, StreamMessage,
     };
     use futures::StreamExt;
     use tokio::net::TcpListener;
 
     use super::*;
-    use buffa::view::OwnedView;
 
     const MSG_DELAY: Duration = Duration::from_millis(100);
 
@@ -29,12 +28,37 @@ mod tests {
         async fn echo(
             &self,
             _ctx: RequestContext,
-            request: OwnedView<EchoRequestView<'static>>,
+            request: ServiceRequest<'_, EchoRequest>,
         ) -> ServiceResult<EchoResponse> {
-            let request = request.to_owned_message();
+            // Borrowed request view: plain field access, with the borrow tied
+            // to the dispatcher-owned request body — no owned round-trip.
+            //
+            // This handler also exercises the async shapes that matter for the
+            // borrowed-request design (every existing unary test runs through
+            // it, on both the Router and the monomorphic dispatcher):
+            //
+            // 1. The borrow is held across an await point: `request` is read
+            //    *after* the yield, so the handler future captures the borrow
+            //    across the suspension and must still satisfy the trait's
+            //    `Send` bound.
+            tokio::task::yield_now().await;
+
+            // 2. Inner async blocks may borrow the request freely as long as
+            //    they are awaited inside the handler (they are not 'static).
+            let data = async { request.data.to_owned() }.await;
+
+            // 3. Anything that needs 'static — tokio::spawn, channels, state —
+            //    takes owned data: convert (or copy fields) first, then move
+            //    the owned value into the task. Capturing `request` itself in
+            //    a spawned task does not compile.
+            let owned = request.to_owned_message();
+            let sequence = tokio::spawn(async move { owned.sequence })
+                .await
+                .expect("spawned background task");
+
             Response::ok(EchoResponse {
-                sequence: request.sequence,
-                data: request.data,
+                sequence,
+                data,
                 ..Default::default()
             })
         }
@@ -42,9 +66,10 @@ mod tests {
         async fn server_stream(
             &self,
             _ctx: RequestContext,
-            request: OwnedView<EchoRequestView<'static>>,
+            request: ServiceRequest<'_, EchoRequest>,
         ) -> ServiceResult<ServiceStream<EchoResponse>> {
-            let request = request.to_owned_message();
+            // Borrowed request: copy out the one field the returned stream
+            // needs (the stream must be 'static and cannot borrow `request`).
             let count = request.sequence;
             let stream = futures::stream::unfold(0, move |i| async move {
                 if i >= count {
@@ -68,14 +93,16 @@ mod tests {
         async fn client_stream(
             &self,
             _ctx: RequestContext,
-            mut requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+            mut requests: ServiceStream<StreamMessage<EchoRequest>>,
         ) -> ServiceResult<EchoResponse> {
             let mut count = 0i32;
             let mut parts = Vec::new();
             while let Some(req) = requests.next().await {
-                let req = req?.to_owned_message();
+                // Per-item zero-copy reads via the generated accessor methods
+                // (Deref to `EchoRequestOwnedView`); copy out only what is kept.
+                let req = req?;
                 count += 1;
-                parts.push(req.data);
+                parts.push(req.data().to_owned());
             }
             Response::ok(EchoResponse {
                 sequence: count,
@@ -87,10 +114,11 @@ mod tests {
         async fn bidi_stream(
             &self,
             _ctx: RequestContext,
-            requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+            mut requests: ServiceStream<StreamMessage<EchoRequest>>,
         ) -> ServiceResult<ServiceStream<EchoResponse>> {
-            // Map stream to owned types before spawning to satisfy Send bounds
-            let mut requests = Box::pin(requests.map(|r| r.map(|v| v.to_owned_message())));
+            // `StreamMessage` items are Send + 'static, so the stream can be
+            // moved into a spawned task and read zero-copy there — no
+            // map-to-owned pass is needed any more.
             // Echo each request back immediately via an mpsc channel.
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<EchoResponse, ConnectError>>(1);
             tokio::spawn(async move {
@@ -98,8 +126,8 @@ mod tests {
                     match req {
                         Ok(req) => {
                             let resp = EchoResponse {
-                                sequence: req.sequence,
-                                data: req.data,
+                                sequence: req.sequence(),
+                                data: req.data().to_owned(),
                                 ..Default::default()
                             };
                             if tx.send(Ok(resp)).await.is_err() {
@@ -167,9 +195,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let msg = resp.into_view();
-        assert_eq!(msg.sequence, 42);
-        assert_eq!(msg.data, "hello");
+        assert_eq!(resp.view().sequence, 42);
+        assert_eq!(resp.view().data, "hello");
     }
 
     /// Documents the three ways to access a unary response, in order of
@@ -186,22 +213,21 @@ mod tests {
             ..Default::default()
         };
 
-        // Pattern 1: borrow the view via `.view()`. Zero-copy. Use this for
-        // simple assertions when you also need headers/trailers — `OwnedView`
-        // derefs to the view, so field access (`.sequence`, `.data` → &str)
-        // works directly.
+        // Pattern 1: borrow the message via `.view()`. Zero-copy field access
+        // (`.sequence`, `.data` → &str), and headers/trailers stay available.
+        // This is the default for reading a response.
         let resp = client.echo(req()).await.unwrap();
         assert_eq!(resp.view().sequence, 7);
         assert_eq!(resp.view().data, "test");
         // Headers/trailers are still available.
         let _ = resp.headers();
 
-        // Pattern 2: consume via `.into_view()` to get the `OwnedView`.
-        // Still zero-copy (Deref-based field access), but discards headers/
-        // trailers. Use this when you only care about the body.
+        // Pattern 2: consume via `.into_view()` to keep the decoded body
+        // (an `OwnedView`) without copying — e.g. to stash it or send it to
+        // another task. Field access goes through `.reborrow()`.
         let msg = client.echo(req()).await.unwrap().into_view();
-        assert_eq!(msg.sequence, 7);
-        assert_eq!(msg.data, "test"); // &str via Deref — no allocation
+        assert_eq!(msg.reborrow().sequence, 7);
+        assert_eq!(msg.reborrow().data, "test"); // &str, no allocation
 
         // Pattern 3: `.into_owned()` to get the owned struct. Allocates and
         // copies all string/bytes fields. Only needed when you want the
@@ -232,7 +258,7 @@ mod tests {
 
         while let Some(msg) = stream.message().await.unwrap() {
             let elapsed = start.elapsed();
-            received.push((msg.sequence, elapsed));
+            received.push((msg.reborrow().sequence, elapsed));
         }
 
         assert_eq!(received.len(), num_messages as usize);
@@ -297,8 +323,8 @@ mod tests {
         let resp = client.client_stream(messages).await.unwrap();
 
         let msg = resp.into_view();
-        assert_eq!(msg.sequence, 5);
-        assert_eq!(msg.data, "msg-0,msg-1,msg-2,msg-3,msg-4");
+        assert_eq!(msg.reborrow().sequence, 5);
+        assert_eq!(msg.reborrow().data, "msg-0,msg-1,msg-2,msg-3,msg-4");
     }
 
     #[tokio::test]
@@ -312,8 +338,8 @@ mod tests {
             .unwrap();
 
         let msg = resp.into_view();
-        assert_eq!(msg.sequence, 0);
-        assert_eq!(msg.data, "");
+        assert_eq!(msg.reborrow().sequence, 0);
+        assert_eq!(msg.reborrow().data, "");
     }
 
     /// Regression: `call_client_stream` must stream the request body
@@ -495,7 +521,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resp.into_view().data, "mono-unary");
+        assert_eq!(resp.view().data, "mono-unary");
 
         // Server streaming
         let mut stream = client
@@ -521,7 +547,7 @@ mod tests {
             })
             .collect();
         let resp = client.client_stream(messages).await.unwrap();
-        assert_eq!(resp.into_view().sequence, 4);
+        assert_eq!(resp.view().sequence, 4);
 
         // NotFound — wrong path should produce Unimplemented, not panic.
         // Use the raw HTTP client to hit a nonexistent method.
@@ -550,12 +576,13 @@ mod tests {
         async fn echo(
             &self,
             _ctx: RequestContext,
-            request: OwnedView<EchoRequestView<'static>>,
+            request: ServiceRequest<'_, EchoRequest>,
         ) -> ServiceResult<EchoResponse> {
-            let request = request.to_owned_message();
+            // Borrowed request view: plain field access, with the borrow tied
+            // to the dispatcher-owned request body — no owned round-trip.
             Response::ok(EchoResponse {
                 sequence: request.sequence,
-                data: request.data,
+                data: request.data.to_owned(),
                 ..Default::default()
             })
         }
@@ -563,7 +590,7 @@ mod tests {
         async fn server_stream(
             &self,
             _ctx: RequestContext,
-            request: OwnedView<EchoRequestView<'static>>,
+            request: ServiceRequest<'_, EchoRequest>,
         ) -> ServiceResult<ServiceStream<connectrpc::PreEncoded<EchoResponse>>> {
             let count = request.sequence;
             let stream = futures::stream::unfold(0, move |i| async move {
@@ -588,7 +615,7 @@ mod tests {
         async fn client_stream(
             &self,
             _ctx: RequestContext,
-            mut requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+            mut requests: ServiceStream<StreamMessage<EchoRequest>>,
         ) -> ServiceResult<EchoResponse> {
             let mut count = 0i32;
             while requests.next().await.is_some() {
@@ -604,7 +631,7 @@ mod tests {
         async fn bidi_stream(
             &self,
             _ctx: RequestContext,
-            mut requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+            mut requests: ServiceStream<StreamMessage<EchoRequest>>,
         ) -> ServiceResult<ServiceStream<connectrpc::PreEncoded<EchoResponse>>> {
             // Echo each request back as a `PreEncoded` item — same
             // build-view-encode-yield-bytes pattern as `server_stream`,
@@ -616,9 +643,9 @@ mod tests {
                 while let Some(req) = requests.next().await {
                     match req {
                         Ok(req) => {
-                            let data = format!("bidi-{}", req.data);
+                            let data = format!("bidi-{}", req.view().data);
                             let view = EchoResponseView {
-                                sequence: req.sequence,
+                                sequence: req.view().sequence,
                                 data: &data,
                                 ..Default::default()
                             };
@@ -669,7 +696,7 @@ mod tests {
 
         let mut got = Vec::new();
         while let Some(msg) = stream.message().await.unwrap() {
-            got.push((msg.sequence, msg.data.to_string()));
+            got.push((msg.reborrow().sequence, msg.reborrow().data.to_string()));
         }
         assert_eq!(
             got,
@@ -791,8 +818,8 @@ mod tests {
             .await
             .unwrap();
         let msg = resp.into_view();
-        assert_eq!(msg.sequence, 7);
-        assert_eq!(msg.data, "h2-direct");
+        assert_eq!(msg.reborrow().sequence, 7);
+        assert_eq!(msg.reborrow().data, "h2-direct");
 
         // Lazy connect variant — first request triggers the handshake.
         let lazy = Http2Connection::lazy_plaintext(uri.clone()).shared(64);
@@ -805,7 +832,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resp.into_view().data, "h2-lazy");
+        assert_eq!(resp.view().data, "h2-lazy");
 
         // Concurrent requests on the shared handle — exercises the Buffer.
         let mut handles = Vec::new();
@@ -826,7 +853,7 @@ mod tests {
         }
         for (i, h) in handles.into_iter().enumerate() {
             let msg = h.await.unwrap().unwrap();
-            assert_eq!(msg.sequence, i as i32);
+            assert_eq!(msg.reborrow().sequence, i as i32);
         }
     }
 
@@ -874,7 +901,10 @@ mod tests {
 
             let mut received = 0;
             while let Some(resp) = stream.message().await.unwrap() {
-                assert_eq!(resp.data, format!("half-duplex-{}", resp.sequence));
+                assert_eq!(
+                    resp.reborrow().data,
+                    format!("half-duplex-{}", resp.reborrow().sequence)
+                );
                 received += 1;
             }
             assert_eq!(received, 40);
@@ -972,8 +1002,8 @@ mod tests {
             .await
             .unwrap();
         let msg = resp.into_view();
-        assert_eq!(msg.sequence, 1);
-        assert_eq!(msg.data, "tls-hello");
+        assert_eq!(msg.reborrow().sequence, 1);
+        assert_eq!(msg.reborrow().data, "tls-hello");
     }
 
     /// End-to-end TLS round-trip using Http2Connection::connect_tls.
@@ -1008,8 +1038,8 @@ mod tests {
             .await
             .unwrap();
         let msg = resp.into_view();
-        assert_eq!(msg.sequence, 2);
-        assert_eq!(msg.data, "tls-h2-hello");
+        assert_eq!(msg.reborrow().sequence, 2);
+        assert_eq!(msg.reborrow().data, "tls-h2-hello");
     }
 
     /// Http2Connection::connect_tls must fail when the server doesn't
@@ -1148,7 +1178,7 @@ mod tests {
         async fn echo(
             &self,
             ctx: RequestContext,
-            request: OwnedView<EchoRequestView<'static>>,
+            request: ServiceRequest<'_, EchoRequest>,
         ) -> ServiceResult<EchoResponse> {
             let proto = ctx
                 .protocol()
@@ -1171,7 +1201,7 @@ mod tests {
         async fn server_stream(
             &self,
             _ctx: RequestContext,
-            _request: OwnedView<EchoRequestView<'static>>,
+            _request: ServiceRequest<'_, EchoRequest>,
         ) -> ServiceResult<ServiceStream<EchoResponse>> {
             unimplemented!()
         }
@@ -1179,7 +1209,7 @@ mod tests {
         async fn client_stream(
             &self,
             _ctx: RequestContext,
-            _requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+            _requests: ServiceStream<StreamMessage<EchoRequest>>,
         ) -> ServiceResult<EchoResponse> {
             unimplemented!()
         }
@@ -1187,7 +1217,7 @@ mod tests {
         async fn bidi_stream(
             &self,
             _ctx: RequestContext,
-            _requests: ServiceStream<OwnedView<EchoRequestView<'static>>>,
+            _requests: ServiceStream<StreamMessage<EchoRequest>>,
         ) -> ServiceResult<ServiceStream<EchoResponse>> {
             unimplemented!()
         }
@@ -1259,7 +1289,7 @@ mod tests {
         );
         assert_eq!(resp.headers().get("x-req-data").unwrap(), "ping");
         // The handler echoes `sequence`; the interceptor adds 1000.
-        assert_eq!(resp.into_view().sequence, 1007);
+        assert_eq!(resp.view().sequence, 1007);
     }
 
     /// End-to-end: a registered streaming interceptor wraps server-streaming,
@@ -1341,11 +1371,7 @@ mod tests {
             resp.headers().get("x-stream-intercepted").unwrap(),
             "/test.echo.v1.EchoService/ClientStream"
         );
-        assert_eq!(
-            resp.into_view().sequence,
-            2,
-            "all items must reach the handler"
-        );
+        assert_eq!(resp.view().sequence, 2, "all items must reach the handler");
 
         // Bidi streaming: N requests ↔ N responses (gRPC, full duplex).
         {
@@ -1462,6 +1488,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_view()
+                .reborrow()
                 .data
                 .to_owned()
         }

@@ -39,7 +39,7 @@ for ::buffa::view::OwnedView<
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
 impl ::connectrpc::Encodable<crate::proto::connectrpc::eliza::v1::ConverseResponse>
@@ -59,7 +59,7 @@ for ::buffa::view::OwnedView<
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
 impl ::connectrpc::Encodable<crate::proto::connectrpc::eliza::v1::IntroduceResponse>
@@ -79,7 +79,7 @@ for ::buffa::view::OwnedView<
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
 /// Full service name for this service.
@@ -120,19 +120,31 @@ pub const ELIZA_SERVICE_INTRODUCE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec:
 ///
 /// # Implementing handlers
 ///
-/// Handlers receive requests as `OwnedFooView` (an alias for
-/// `OwnedView<FooView<'static>>`), which gives zero-copy borrowed access
-/// to fields (e.g. `request.name` is a `&str` into the decoded buffer).
-/// The view can be held across `.await` points. When two RPC types in
-/// the same package would alias to the same `Owned<…>View` name (e.g.
-/// a local message plus an imported one with the same short name), the
-/// alias is suppressed for both and the request type is spelled as
-/// `OwnedView<…View<'static>>` directly in the trait signature.
-///
 /// Implement methods with plain `async fn`; the returned future satisfies
-/// the `Send` bound automatically. See the
-/// [buffa user guide](https://github.com/anthropics/buffa/blob/main/docs/guide.md#ownedview-in-async-trait-implementations)
-/// for zero-copy access patterns and when `to_owned_message()` is needed.
+/// the `Send` bound automatically.
+///
+/// **Unary and server-streaming requests** arrive as
+/// [`ServiceRequest<'_, Req>`](::connectrpc::ServiceRequest): a zero-copy
+/// view of the request plus its body, valid for the duration of the call.
+/// Fields are read directly (`request.name` is a `&str` into the decoded
+/// buffer) and the borrow may be held across `.await` points. Anything
+/// that must outlive the call — `tokio::spawn`, channels, server state,
+/// or data captured by a returned response stream — takes owned data:
+/// call `request.to_owned_message()` (or copy the specific fields)
+/// first.
+///
+/// **Client-streaming and bidi requests** arrive as
+/// `ServiceStream<`[`StreamMessage<Req>`](::connectrpc::StreamMessage)`>`.
+/// Each item owns its decoded buffer and is `Send + 'static`, so items
+/// can be buffered or moved into spawned tasks; read fields zero-copy
+/// through the generated accessor methods (`item.name()`) or `.view()`,
+/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// `StreamMessage<M>` implements `Encodable<M>`.
+///
+/// Request types resolved through `extern_path` (e.g. well-known types
+/// from another crate) use the same wrappers; the crate that owns the
+/// type must be generated with buffa ≥ 0.7.0 and views enabled so the
+/// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
 /// generated `OutView<'_>` / `OwnedOutView`,
@@ -145,10 +157,11 @@ pub const ELIZA_SERVICE_INTRODUCE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec:
 ///
 /// Server-streaming and bidi-streaming methods return
 /// `ServiceStream<impl Encodable<Out> + Send + use<Self>>`. The
-/// `use<Self>` precise-capturing clause excludes `&self`'s lifetime
-/// (unary methods use `use<'a, Self>` and may borrow), so stream items
-/// must be `'static`. To stream view-encoded data, encode each item
-/// inside the stream body and yield
+/// `use<Self>` precise-capturing clause excludes `&self`'s lifetime and
+/// the request's lifetime (unary methods use `use<'a, Self>` and may
+/// borrow from `&self`), so stream items must be `'static` and cannot
+/// borrow from the request. To stream view-encoded data, encode each
+/// item inside the stream body and yield
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
@@ -156,10 +169,19 @@ pub trait ElizaService: Send + Sync + 'static {
     /// Say is a unary RPC. Eliza responds to the prompt with a single sentence.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn say<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedSayRequestView,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::connectrpc::eliza::v1::SayRequest,
+        >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
@@ -170,10 +192,19 @@ pub trait ElizaService: Send + Sync + 'static {
     /// Converse is a bidirectional RPC. The caller may exchange multiple
     /// back-and-forth messages with Eliza over a long-lived connection. Eliza
     /// responds to each ConverseRequest with a ConverseResponse.
+    ///
+    /// Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):
+    /// it owns its buffer, is `Send + 'static`, and exposes zero-copy
+    /// accessor methods (`item.name()`), `.view()`, and
+    /// `.to_owned_message()`.
     fn converse(
         &self,
         ctx: ::connectrpc::RequestContext,
-        requests: ::connectrpc::ServiceStream<OwnedConverseRequestView>,
+        requests: ::connectrpc::ServiceStream<
+            ::connectrpc::StreamMessage<
+                crate::proto::connectrpc::eliza::v1::ConverseRequest,
+            >,
+        >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             ::connectrpc::ServiceStream<
@@ -185,10 +216,19 @@ pub trait ElizaService: Send + Sync + 'static {
     > + Send;
     /// Introduce is a server streaming RPC. Given the caller's name, Eliza
     /// returns a stream of sentences to introduce itself.
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call (until the response stream is returned);
+    /// message fields are read directly on it (zero-copy). Data the
+    /// returned stream needs must be copied out or converted via
+    /// `.to_owned_message()`.
     fn introduce(
         &self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedIntroduceRequestView,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::connectrpc::eliza::v1::IntroduceRequest,
+        >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             ::connectrpc::ServiceStream<
@@ -232,10 +272,21 @@ impl<S: ElizaService> ElizaServiceExt for S {
                 "Say",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::connectrpc::eliza::v1::__buffa::view::SayRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.say(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::connectrpc::eliza::v1::SayRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.say(ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::connectrpc::eliza::v1::SayResponse,
@@ -256,7 +307,12 @@ impl<S: ElizaService> ElizaServiceExt for S {
                     let svc = ::std::sync::Arc::clone(&self);
                     move |ctx, req| {
                         let svc = ::std::sync::Arc::clone(&svc);
-                        async move { svc.converse(ctx, req).await }
+                        async move {
+                            let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
+                                crate::proto::connectrpc::eliza::v1::ConverseRequest,
+                            >(req);
+                            svc.converse(ctx, req).await
+                        }
                     }
                 }),
             )
@@ -270,9 +326,21 @@ impl<S: ElizaService> ElizaServiceExt for S {
                 "Introduce",
                 ::connectrpc::view_streaming_handler_fn({
                     let svc = ::std::sync::Arc::clone(&self);
-                    move |ctx, req| {
+                    move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::connectrpc::eliza::v1::__buffa::view::IntroduceRequestView<
+                                'static,
+                            >,
+                        >|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
-                        async move { svc.introduce(ctx, req).await }
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::connectrpc::eliza::v1::IntroduceRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.introduce(ctx, sreq).await
+                        }
                     }
                 }),
             )
@@ -358,9 +426,17 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
             "Say" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        crate::proto::connectrpc::eliza::v1::__buffa::view::SayRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::connectrpc::eliza::v1::SayRequest,
                     >(request.encoded()?, format)?;
+                    let req: crate::proto::connectrpc::eliza::v1::__buffa::view::SayRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::connectrpc::eliza::v1::SayRequest,
+                    >::from_parts(&req, &body);
                     svc.say(ctx, req)
                         .await?
                         .encode::<
@@ -386,9 +462,17 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
             "Introduce" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        crate::proto::connectrpc::eliza::v1::__buffa::view::IntroduceRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::connectrpc::eliza::v1::IntroduceRequest,
                     >(request, format)?;
+                    let req: crate::proto::connectrpc::eliza::v1::__buffa::view::IntroduceRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::connectrpc::eliza::v1::IntroduceRequest,
+                    >::from_parts(&req, &body);
                     let resp = svc.introduce(ctx, req).await?;
                     Ok(
                         resp
@@ -433,8 +517,8 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
             "Converse" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_view_request_stream::<
-                        crate::proto::connectrpc::eliza::v1::__buffa::view::ConverseRequestView,
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                        crate::proto::connectrpc::eliza::v1::ConverseRequest,
                     >(requests, format);
                     let resp = svc.converse(ctx, req_stream).await?;
                     Ok(
@@ -487,11 +571,12 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
 /// # Working with the response
 ///
 /// Unary calls return [`UnaryResponse<OwnedView<FooView>>`](::connectrpc::client::UnaryResponse).
-/// The `OwnedView` derefs to the view, so field access is zero-copy:
+/// [`view()`](::connectrpc::client::UnaryResponse::view) borrows the response
+/// message, so field access is zero-copy:
 ///
 /// ```rust,ignore
-/// let resp = client.say(request).await?.into_view();
-/// let name: &str = resp.name;  // borrow into the response buffer
+/// let resp = client.say(request).await?;
+/// let name: &str = resp.view().name;  // borrow into the response buffer
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
@@ -500,6 +585,12 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
 /// ```rust,ignore
 /// let owned = client.say(request).await?.into_owned();
 /// ```
+///
+/// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
+/// zero-copy decoded body (an `OwnedView`) without copying; field access on it
+/// goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
+/// received message from `.message().await` — bind `msg.reborrow()` for field
+/// access, or convert with `.to_owned_message()`.
 #[derive(Clone)]
 pub struct ElizaServiceClient<T> {
     transport: T,

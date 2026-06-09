@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
-use buffa::view::OwnedView;
-use connectrpc::{ConnectError, RequestContext, Response, Router, ServiceResult, ServiceStream};
+use connectrpc::{
+    ConnectError, RequestContext, Response, Router, ServiceRequest, ServiceResult, ServiceStream,
+};
 use futures::StreamExt;
 
 use crate::connect::grpc::health::v1::{Health, HealthExt};
 use crate::proto::grpc::health::v1::{
-    HealthCheckRequestView, HealthCheckResponse, health_check_response::ServingStatus,
+    HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
 };
 use crate::{Checker, StaticChecker};
 
@@ -142,7 +143,7 @@ impl<C: Checker> Health for HealthService<C> {
     async fn check(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<HealthCheckRequestView<'static>>,
+        request: ServiceRequest<'_, HealthCheckRequest>,
     ) -> ServiceResult<HealthCheckResponse> {
         let status = self.checker.check(request.service).await?;
         Response::ok(HealthCheckResponse {
@@ -154,7 +155,7 @@ impl<C: Checker> Health for HealthService<C> {
     async fn watch(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<HealthCheckRequestView<'static>>,
+        request: ServiceRequest<'_, HealthCheckRequest>,
     ) -> ServiceResult<ServiceStream<HealthCheckResponse>> {
         let stream = self.checker.watch(request.service).await?;
         Response::stream_ok(stream.map(|status| {
@@ -296,7 +297,7 @@ mod tests {
             .await
             .unwrap()
             .expect("expected initial Watch message");
-        assert_eq!(first.status, ServingStatus::SERVING);
+        assert_eq!(first.reborrow().status, ServingStatus::SERVING);
 
         // Server-side receiver count must be elevated by exactly 1.
         assert_eq!(
@@ -356,7 +357,7 @@ mod tests {
             .await
             .unwrap()
             .expect("expected initial Watch message");
-        assert_eq!(initial.status, ServingStatus::SERVING);
+        assert_eq!(initial.reborrow().status, ServingStatus::SERVING);
 
         // Update fires a follow-up message.
         checker.set_status("acme.A", Status::NotServing).unwrap();
@@ -365,7 +366,7 @@ mod tests {
             .expect("watch did not deliver update within timeout")
             .unwrap()
             .expect("expected follow-up Watch message");
-        assert_eq!(after.status, ServingStatus::NOT_SERVING);
+        assert_eq!(after.reborrow().status, ServingStatus::NOT_SERVING);
     }
 
     #[tokio::test]

@@ -735,6 +735,219 @@ impl ::buffa::ViewReborrow for TestSuiteView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `TestSuite` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`TestSuiteView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`TestSuiteView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct TestSuiteOwnedView(::buffa::OwnedView<TestSuiteView<'static>>);
+impl TestSuiteOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TestSuiteOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TestSuiteOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::TestSuite,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TestSuiteOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`TestSuiteView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &TestSuiteView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::TestSuite {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Test suite name. When writing test suites, this is a required field.
+    ///
+    /// Field 1: `name`
+    #[must_use]
+    pub fn name(&self) -> &'_ str {
+        self.0.reborrow().name
+    }
+    /// The mode (client or server) that this test suite applies to. This is used
+    /// in conjunction with the `--mode` flag passed to the conformance runner
+    /// binary. If the mode on the suite is set to client, the tests will only be
+    /// run if `--mode client` is set on the command to the test runner.
+    /// Likewise if mode is server. If this is unset, the test case will be run in both modes.
+    ///
+    /// Field 2: `mode`
+    #[must_use]
+    pub fn mode(&self) -> ::buffa::EnumValue<super::super::test_suite::TestMode> {
+        self.0.reborrow().mode
+    }
+    /// The actual test cases in the suite.
+    ///
+    /// Field 3: `test_cases`
+    #[must_use]
+    pub fn test_cases(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::TestCaseView<'_>> {
+        &self.0.reborrow().test_cases
+    }
+    /// If non-empty, the protocols to which this suite applies. If empty,
+    /// this suite applies to all protocols.
+    ///
+    /// Field 4: `relevant_protocols`
+    #[must_use]
+    pub fn relevant_protocols(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Protocol>> {
+        &self.0.reborrow().relevant_protocols
+    }
+    /// If non-empty, the HTTP versions to which this suite applies. If empty,
+    /// this suite applies to all HTTP versions.
+    ///
+    /// Field 5: `relevant_http_versions`
+    #[must_use]
+    pub fn relevant_http_versions(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::HTTPVersion>> {
+        &self.0.reborrow().relevant_http_versions
+    }
+    /// If non-empty, the codecs to which this suite applies. If empty, this
+    /// suite applies to all codecs.
+    ///
+    /// Field 6: `relevant_codecs`
+    #[must_use]
+    pub fn relevant_codecs(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Codec>> {
+        &self.0.reborrow().relevant_codecs
+    }
+    /// If non-empty, the compression encodings to which this suite applies.
+    /// If empty, this suite applies to all encodings.
+    ///
+    /// Field 7: `relevant_compressions`
+    #[must_use]
+    pub fn relevant_compressions(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Compression>> {
+        &self.0.reborrow().relevant_compressions
+    }
+    /// Indicates the Connect version validation behavior that this suite
+    /// relies on.
+    ///
+    /// Field 8: `connect_version_mode`
+    #[must_use]
+    pub fn connect_version_mode(
+        &self,
+    ) -> ::buffa::EnumValue<super::super::test_suite::ConnectVersionMode> {
+        self.0.reborrow().connect_version_mode
+    }
+    /// If true, the cases in this suite rely on TLS and will only be run against
+    /// TLS server configurations.
+    ///
+    /// Field 9: `relies_on_tls`
+    #[must_use]
+    pub fn relies_on_tls(&self) -> bool {
+        self.0.reborrow().relies_on_tls
+    }
+    /// If true, the cases in this suite rely on the client using TLS
+    /// certificates to authenticate with the server. (Should only be
+    /// true if relies_on_tls is also true.)
+    ///
+    /// Field 10: `relies_on_tls_client_certs`
+    #[must_use]
+    pub fn relies_on_tls_client_certs(&self) -> bool {
+        self.0.reborrow().relies_on_tls_client_certs
+    }
+    /// If true, the cases in this suite rely on the Connect GET protocol.
+    ///
+    /// Field 11: `relies_on_connect_get`
+    #[must_use]
+    pub fn relies_on_connect_get(&self) -> bool {
+        self.0.reborrow().relies_on_connect_get
+    }
+    /// If true, the cases in this suite rely on support for limiting the
+    /// size of received messages. When true, mode should be set to indicate
+    /// whether it is the client or the server that must support the limit.
+    ///
+    /// Field 12: `relies_on_message_receive_limit`
+    #[must_use]
+    pub fn relies_on_message_receive_limit(&self) -> bool {
+        self.0.reborrow().relies_on_message_receive_limit
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<TestSuiteView<'static>>>
+for TestSuiteOwnedView {
+    fn from(inner: ::buffa::OwnedView<TestSuiteView<'static>>) -> Self {
+        TestSuiteOwnedView(inner)
+    }
+}
+impl ::core::convert::From<TestSuiteOwnedView>
+for ::buffa::OwnedView<TestSuiteView<'static>> {
+    fn from(wrapper: TestSuiteOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<TestSuiteView<'static>>>
+for TestSuiteOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<TestSuiteView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::TestSuite {
+    type View<'a> = TestSuiteView<'a>;
+    type ViewHandle = TestSuiteOwnedView;
+}
+impl ::serde::Serialize for TestSuiteOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct TestCaseView<'a> {
     /// Defines the RPC that the client should invoke. The first eight fields
@@ -1172,6 +1385,189 @@ impl ::buffa::ViewReborrow for TestCaseView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `TestCase` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`TestCaseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`TestCaseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct TestCaseOwnedView(::buffa::OwnedView<TestCaseView<'static>>);
+impl TestCaseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(TestCaseOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TestCaseOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::TestCase,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TestCaseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`TestCaseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &TestCaseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::TestCase {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Defines the RPC that the client should invoke. The first eight fields
+    /// are not fully specified. Instead the first field, test_name, must be
+    /// present but is a prefix -- other characteristics that identify one
+    /// permutation of the test case will be appended to this name. The next
+    /// seven fields (http_version, protocol, codec, compression, host, port,
+    /// and server_tls_cert) must not be present. They are all populated by
+    /// the test harness based on the test environment (e.g. actual server and
+    ///  port to use) and characteristics of a single permutation.
+    ///
+    /// Field 1: `request`
+    #[must_use]
+    pub fn request(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::ClientCompatRequestView<'_>,
+    > {
+        &self.0.reborrow().request
+    }
+    /// To support extremely large messages, as well as very precisely-sized
+    /// messages, without having to encode them fully or perfectly in YAML
+    /// test cases, this value can be specified. When non-empty, this value
+    /// should have no more entries than there are messages in the request
+    /// stream. The first value is applied to the first request message, and
+    /// so on. For each entry, if the size is present, it is used to expand
+    /// the data field in the request (which is actually part of the response
+    /// definition). The specified size is added to the current limit on
+    /// message size that the server will accept. That sum is the size of the
+    /// the serialized message that will be sent, and the data field will be
+    /// padded as needed to reach that size.
+    ///
+    /// Field 2: `expand_requests`
+    #[must_use]
+    pub fn expand_requests(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::test_case::ExpandedSizeView<'_>,
+    > {
+        &self.0.reborrow().expand_requests
+    }
+    /// Defines the expected response to the above RPC. The expected response for
+    /// a test is auto-generated based on the request details. The conformance runner
+    /// will determine what the response should be according to the values specified
+    /// in the test suite and individual test cases.
+    ///
+    /// This value can also be specified explicitly in the test case YAML. However,
+    /// this is typically only needed for exception test cases. If the expected
+    /// response is mostly re-stating the response definition that appears in the
+    /// requests, test cases should rely on the auto-generation if possible.
+    /// Otherwise, specifying an expected response can make the test YAML overly
+    /// verbose and harder to read, write, and maintain.
+    ///
+    /// If the test induces behavior that prevents the server from sending or client
+    /// from receiving the full response definition, it will be necessary to define
+    /// the expected response explicitly. Timeouts, cancellations, and exceeding
+    /// message size limits are good examples of this.
+    ///
+    /// Specifying an expected response explicitly in test definitions will override
+    /// the auto-generation of the test runner.
+    ///
+    /// Field 3: `expected_response`
+    #[must_use]
+    pub fn expected_response(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::ClientResponseResultView<'_>,
+    > {
+        &self.0.reborrow().expected_response
+    }
+    /// When expected_response indicates that an error is expected, in some cases, the
+    /// actual error code returned may be flexible. In that case, this field provides
+    /// other acceptable error codes, in addition to the one indicated in the
+    /// expected_response. As long as the actual error's code matches any of these, the
+    /// error is considered conformant, and the test case can pass.
+    ///
+    /// Field 4: `other_allowed_error_codes`
+    #[must_use]
+    pub fn other_allowed_error_codes(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Code>> {
+        &self.0.reborrow().other_allowed_error_codes
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<TestCaseView<'static>>>
+for TestCaseOwnedView {
+    fn from(inner: ::buffa::OwnedView<TestCaseView<'static>>) -> Self {
+        TestCaseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<TestCaseOwnedView>
+for ::buffa::OwnedView<TestCaseView<'static>> {
+    fn from(wrapper: TestCaseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<TestCaseView<'static>>>
+for TestCaseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<TestCaseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::TestCase {
+    type View<'a> = TestCaseView<'a>;
+    type ViewHandle = TestCaseOwnedView;
+}
+impl ::serde::Serialize for TestCaseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 pub mod test_case {
     #[allow(unused_imports)]
     use super::*;
@@ -1364,6 +1760,121 @@ pub mod test_case {
         type Reborrowed<'b> = ExpandedSizeView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
             this
+        }
+    }
+    /** Self-contained, `'static` owned view of a `ExpandedSize` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ExpandedSizeView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ExpandedSizeView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+    #[derive(Clone, Debug)]
+    pub struct ExpandedSizeOwnedView(::buffa::OwnedView<ExpandedSizeView<'static>>);
+    impl ExpandedSizeOwnedView {
+        /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+        ///
+        /// The view borrows directly from the buffer's data; the buffer is
+        /// retained inside the returned handle.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+        /// protobuf data.
+        pub fn decode(
+            bytes: ::buffa::bytes::Bytes,
+        ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+            ::core::result::Result::Ok(
+                ExpandedSizeOwnedView(::buffa::OwnedView::decode(bytes)?),
+            )
+        }
+        /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+        /// max message size).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+        /// exceeds the configured limits.
+        pub fn decode_with_options(
+            bytes: ::buffa::bytes::Bytes,
+            opts: &::buffa::DecodeOptions,
+        ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+            ::core::result::Result::Ok(
+                ExpandedSizeOwnedView(
+                    ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+                ),
+            )
+        }
+        /// Build from an owned message via an encode → decode round-trip.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+        /// somehow invalid (should not happen for well-formed messages).
+        pub fn from_owned(
+            msg: &super::super::super::test_case::ExpandedSize,
+        ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+            ::core::result::Result::Ok(
+                ExpandedSizeOwnedView(::buffa::OwnedView::from_owned(msg)?),
+            )
+        }
+        /// Borrow the full [`ExpandedSizeView`] with its lifetime tied to `&self`.
+        #[must_use]
+        pub fn view(&self) -> &ExpandedSizeView<'_> {
+            self.0.reborrow()
+        }
+        /// Convert to the owned message type.
+        #[must_use]
+        pub fn to_owned_message(&self) -> super::super::super::test_case::ExpandedSize {
+            self.0.to_owned_message()
+        }
+        /// The underlying bytes buffer.
+        #[must_use]
+        pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+            self.0.bytes()
+        }
+        /// Consume the handle, returning the underlying bytes buffer.
+        #[must_use]
+        pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+            self.0.into_bytes()
+        }
+        /// The size, in bytes, relative to the limit. For example, to expand to a
+        /// size that is exactly equal to the limit, this should be set to zero.
+        /// Any value greater than zero indicates that the request size will be that
+        /// many bytes over the limit.
+        ///
+        /// Field 1: `size_relative_to_limit`
+        #[must_use]
+        pub fn size_relative_to_limit(&self) -> ::core::option::Option<i32> {
+            self.0.reborrow().size_relative_to_limit
+        }
+    }
+    impl ::core::convert::From<::buffa::OwnedView<ExpandedSizeView<'static>>>
+    for ExpandedSizeOwnedView {
+        fn from(inner: ::buffa::OwnedView<ExpandedSizeView<'static>>) -> Self {
+            ExpandedSizeOwnedView(inner)
+        }
+    }
+    impl ::core::convert::From<ExpandedSizeOwnedView>
+    for ::buffa::OwnedView<ExpandedSizeView<'static>> {
+        fn from(wrapper: ExpandedSizeOwnedView) -> Self {
+            wrapper.0
+        }
+    }
+    impl ::core::convert::AsRef<::buffa::OwnedView<ExpandedSizeView<'static>>>
+    for ExpandedSizeOwnedView {
+        fn as_ref(&self) -> &::buffa::OwnedView<ExpandedSizeView<'static>> {
+            &self.0
+        }
+    }
+    impl ::buffa::HasMessageView for super::super::super::test_case::ExpandedSize {
+        type View<'a> = ExpandedSizeView<'a>;
+        type ViewHandle = ExpandedSizeOwnedView;
+    }
+    impl ::serde::Serialize for ExpandedSizeOwnedView {
+        fn serialize<__S: ::serde::Serializer>(
+            &self,
+            __s: __S,
+        ) -> ::core::result::Result<__S::Ok, __S::Error> {
+            ::serde::Serialize::serialize(&self.0, __s)
         }
     }
 }

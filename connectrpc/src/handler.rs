@@ -653,13 +653,11 @@ where
 
 /// Decode a request as an `OwnedView` from bytes using the specified codec format.
 ///
-/// For proto-encoded requests, this is a true zero-copy decode — the view borrows
-/// directly from the input bytes. For JSON-encoded requests, the data is first
-/// deserialized to an owned message, then re-encoded to proto bytes and decoded as
-/// a view. This JSON round-trip adds overhead relative to owned-type decoding, but
-/// is negligible compared to JSON parsing itself.
-#[doc(hidden)] // exposed only for dispatcher::codegen (generated code)
-pub fn decode_request_view<ReqView>(
+/// Normalizes the body to proto wire bytes via [`request_proto_bytes`],
+/// then decodes the view over that buffer — a true zero-copy decode for
+/// proto-encoded requests. The JSON round-trip adds overhead relative to
+/// owned-type decoding, but is negligible compared to JSON parsing itself.
+pub(crate) fn decode_request_view<ReqView>(
     request: Bytes,
     format: CodecFormat,
 ) -> Result<OwnedView<ReqView>, ConnectError>
@@ -667,18 +665,59 @@ where
     ReqView: MessageView<'static> + Send,
     ReqView::Owned: Message + DeserializeOwned,
 {
+    let body = request_proto_bytes::<ReqView::Owned>(request, format)?;
+    OwnedView::<ReqView>::decode(body)
+        .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto request: {e}")))
+}
+
+/// Normalize a request body to protobuf wire bytes.
+///
+/// For proto-encoded requests this is a pass-through of the input `Bytes`.
+/// For JSON-encoded requests the body is deserialized to the owned message
+/// and re-encoded to proto bytes. The returned buffer is what a request
+/// view borrows from — in the generated unary dispatch glue the dispatcher
+/// keeps it alive for the duration of the handler call, so a scoped view's
+/// borrows are tied to the call frame; on the streaming and Router paths it
+/// backs an [`OwnedView`].
+///
+/// # Errors
+///
+/// Returns `ConnectError::invalid_argument` if the JSON body cannot be
+/// deserialized into the request message.
+#[doc(hidden)] // exposed only for dispatcher::codegen (generated code)
+pub fn request_proto_bytes<Req>(request: Bytes, format: CodecFormat) -> Result<Bytes, ConnectError>
+where
+    Req: Message + DeserializeOwned,
+{
     match format {
-        CodecFormat::Proto => OwnedView::<ReqView>::decode(request).map_err(|e| {
-            ConnectError::invalid_argument(format!("failed to decode proto request: {e}"))
-        }),
+        CodecFormat::Proto => Ok(request),
         CodecFormat::Json => {
-            let owned: ReqView::Owned = serde_json::from_slice(&request).map_err(|e| {
+            let owned: Req = serde_json::from_slice(&request).map_err(|e| {
                 ConnectError::invalid_argument(format!("failed to decode JSON request: {e}"))
             })?;
-            OwnedView::<ReqView>::from_owned(&owned)
-                .map_err(|e| ConnectError::internal(format!("failed to re-encode for view: {e}")))
+            Ok(Bytes::from(owned.encode_to_vec()))
         }
     }
+}
+
+/// Decode a scoped (borrowed) request view from normalized proto bytes.
+///
+/// Companion to [`request_proto_bytes`]: the generated dispatch glue
+/// keeps the returned view's backing buffer alive across the handler call,
+/// so the view's borrows are tied to the call frame rather than promoted to
+/// a synthetic `'static`.
+///
+/// # Errors
+///
+/// Returns `ConnectError::invalid_argument` if the bytes are not a valid
+/// encoding of the request message.
+#[doc(hidden)] // exposed only for dispatcher::codegen (generated code)
+pub fn decode_borrowed_request_view<'a, ReqView>(body: &'a [u8]) -> Result<ReqView, ConnectError>
+where
+    ReqView: MessageView<'a>,
+{
+    ReqView::decode_view(body)
+        .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto request: {e}")))
 }
 
 /// Trait for unary RPC handlers using zero-copy request views.
@@ -1192,14 +1231,14 @@ mod tests {
         let msg = StringValue::from("view-test");
         let encoded = Bytes::from(msg.encode_to_vec());
         let view = decode_request_view::<StringValueView>(encoded, CodecFormat::Proto).unwrap();
-        assert_eq!(view.value, "view-test");
+        assert_eq!(view.reborrow().value, "view-test");
     }
 
     #[test]
     fn test_decode_request_view_json() {
         let encoded = Bytes::from_static(b"\"json-view\"");
         let view = decode_request_view::<StringValueView>(encoded, CodecFormat::Json).unwrap();
-        assert_eq!(view.value, "json-view");
+        assert_eq!(view.reborrow().value, "json-view");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! View-response filter server: if no sensitive field is set, return
-//! the request `OwnedView` directly (re-encodes from the borrowed view
-//! via `ViewEncode`, no per-field allocation). Otherwise convert to
-//! owned, scrub, and return owned.
+//! the request as an `OwnedView` rebuilt zero-copy from the retained
+//! request bytes (re-encodes via `ViewEncode`, no per-field allocation).
+//! Otherwise convert to owned, scrub, and return owned.
 
-use connectrpc::{ConnectRpcService, MaybeBorrowed, RequestContext, Response, ServiceResult};
+use connectrpc::{
+    ConnectRpcService, MaybeBorrowed, RequestContext, Response, ServiceRequest, ServiceResult,
+};
 
 use rpc_bench::filter::*;
 
@@ -13,10 +15,12 @@ impl FilterService for Impl {
     async fn redact(
         &self,
         _ctx: RequestContext,
-        request: OwnedRecordView,
+        request: ServiceRequest<'_, Record>,
     ) -> ServiceResult<MaybeBorrowed<Record, OwnedRecordView>> {
-        if !has_sensitive(&request) {
-            return Response::ok(MaybeBorrowed::Borrowed(request));
+        if !has_sensitive(request.view()) {
+            // Pass-through: rebuild a 'static view from the retained body
+            // (zero-copy) and keep the ViewEncode response path under test.
+            return Response::ok(MaybeBorrowed::Borrowed(request.to_owned_view()));
         }
         let mut owned = request.to_owned_message();
         scrub(&mut owned);

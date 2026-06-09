@@ -31,10 +31,18 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::LogRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::LogRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::LogRecordView;
+#[doc(inline)]
+pub use self::__buffa::view::LogRecordOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::LogSourceView;
 #[doc(inline)]
+pub use self::__buffa::view::LogSourceOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::LogIngestResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::LogIngestResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

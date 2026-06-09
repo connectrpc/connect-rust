@@ -29,15 +29,16 @@ futures = "0.3"
 pin-project = "1"
 async-trait = "0.1"
 
-# Protobuf. The 0.6 floor matches the regen baseline for the checked-in
-# generated code: 0.6.0 adds `with_*` setters for explicit-presence fields,
-# `MessageName`/`Serialize` impls on view types, and stops emitting empty
-# `__oneof`/`__ext`/`__view_oneof` ancillary files. (connectrpc-build also
-# sources the generated `mod.rs` `#[allow(...)]` list from
-# `buffa_codegen::ALLOW_LINTS`, present since 0.5.1.)
-buffa = { version = "0.6", features = ["json"] }
-buffa-types = { version = "0.6", features = ["json"] }
-buffa-codegen = { version = "0.6" }
+# Protobuf. The 0.7 floor matches the regen baseline for the checked-in
+# generated code and the request/stream-item API: 0.7.0 adds the
+# `HasMessageView` trait and the generated `FooOwnedView` accessor wrappers
+# that `ServiceRequest`/`StreamMessage` are built on, and removes the
+# `OwnedView` `Deref` impl that earlier handler signatures relied on.
+# (connectrpc-build also sources the generated `mod.rs` `#[allow(...)]` list
+# from `buffa_codegen::ALLOW_LINTS`, present since 0.5.1.)
+buffa = { version = "0.7", features = ["json"] }
+buffa-types = { version = "0.7", features = ["json"] }
+buffa-codegen = { version = "0.7" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

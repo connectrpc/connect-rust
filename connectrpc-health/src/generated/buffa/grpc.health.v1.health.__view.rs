@@ -177,6 +177,118 @@ impl ::buffa::ViewReborrow for HealthCheckRequestView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `HealthCheckRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`HealthCheckRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`HealthCheckRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct HealthCheckRequestOwnedView(
+    ::buffa::OwnedView<HealthCheckRequestView<'static>>,
+);
+impl HealthCheckRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            HealthCheckRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            HealthCheckRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::HealthCheckRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            HealthCheckRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`HealthCheckRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &HealthCheckRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::HealthCheckRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `service`
+    #[must_use]
+    pub fn service(&self) -> &'_ str {
+        self.0.reborrow().service
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<HealthCheckRequestView<'static>>>
+for HealthCheckRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<HealthCheckRequestView<'static>>) -> Self {
+        HealthCheckRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<HealthCheckRequestOwnedView>
+for ::buffa::OwnedView<HealthCheckRequestView<'static>> {
+    fn from(wrapper: HealthCheckRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<HealthCheckRequestView<'static>>>
+for HealthCheckRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<HealthCheckRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::HealthCheckRequest {
+    type View<'a> = HealthCheckRequestView<'a>;
+    type ViewHandle = HealthCheckRequestOwnedView;
+}
+impl ::serde::Serialize for HealthCheckRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct HealthCheckResponseView<'a> {
     /// Field 1: `status`
@@ -356,5 +468,119 @@ impl ::buffa::ViewReborrow for HealthCheckResponseView<'static> {
     type Reborrowed<'b> = HealthCheckResponseView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `HealthCheckResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`HealthCheckResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`HealthCheckResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct HealthCheckResponseOwnedView(
+    ::buffa::OwnedView<HealthCheckResponseView<'static>>,
+);
+impl HealthCheckResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            HealthCheckResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            HealthCheckResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::HealthCheckResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            HealthCheckResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`HealthCheckResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &HealthCheckResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::HealthCheckResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `status`
+    #[must_use]
+    pub fn status(
+        &self,
+    ) -> ::buffa::EnumValue<super::super::health_check_response::ServingStatus> {
+        self.0.reborrow().status
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<HealthCheckResponseView<'static>>>
+for HealthCheckResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<HealthCheckResponseView<'static>>) -> Self {
+        HealthCheckResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<HealthCheckResponseOwnedView>
+for ::buffa::OwnedView<HealthCheckResponseView<'static>> {
+    fn from(wrapper: HealthCheckResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<HealthCheckResponseView<'static>>>
+for HealthCheckResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<HealthCheckResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::HealthCheckResponse {
+    type View<'a> = HealthCheckResponseView<'a>;
+    type ViewHandle = HealthCheckResponseOwnedView;
+}
+impl ::serde::Serialize for HealthCheckResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }

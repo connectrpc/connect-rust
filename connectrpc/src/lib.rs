@@ -193,10 +193,12 @@ pub mod handler;
 pub mod interceptor;
 pub mod payload;
 pub mod protocol;
+pub mod request;
 pub mod response;
 pub mod router;
 pub mod service;
 pub mod spec;
+pub mod stream_message;
 
 // Optional: HTTP client
 pub mod client;
@@ -251,6 +253,8 @@ pub use handler::view_bidi_streaming_handler_fn;
 pub use handler::view_client_streaming_handler_fn;
 pub use handler::view_handler_fn;
 pub use handler::view_streaming_handler_fn;
+pub use request::HasMessageView;
+pub use request::ServiceRequest;
 pub use response::Encodable;
 pub use response::EncodedResponse;
 pub use response::MaybeBorrowed;
@@ -259,6 +263,7 @@ pub use response::RequestContext;
 pub use response::Response;
 pub use response::ServiceResult;
 pub use response::ServiceStream;
+pub use stream_message::StreamMessage;
 
 /// Re-exports for generated code. Not part of the public API; subject
 /// to change without a semver bump.

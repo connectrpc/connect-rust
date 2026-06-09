@@ -3402,7 +3402,11 @@ pub mod conformance_payload {
     #[doc(inline)]
     pub use super::__buffa::view::conformance_payload::RequestInfoView;
     #[doc(inline)]
+    pub use super::__buffa::view::conformance_payload::RequestInfoOwnedView;
+    #[doc(inline)]
     pub use super::__buffa::view::conformance_payload::ConnectGetInfoView;
+    #[doc(inline)]
+    pub use super::__buffa::view::conformance_payload::ConnectGetInfoOwnedView;
 }
 /// An error definition used for specifying a desired error response
 #[derive(Clone, PartialEq, Default)]
@@ -4633,6 +4637,8 @@ pub mod raw_http_request {
     #[doc(inline)]
     pub use super::__buffa::view::raw_http_request::EncodedQueryParamView;
     #[doc(inline)]
+    pub use super::__buffa::view::raw_http_request::EncodedQueryParamOwnedView;
+    #[doc(inline)]
     pub use super::__buffa::view::oneof::raw_http_request::Body as BodyView;
 }
 /// MessageContents represents a message in a request body.
@@ -5403,6 +5409,8 @@ pub mod stream_contents {
     };
     #[doc(inline)]
     pub use super::__buffa::view::stream_contents::StreamItemView;
+    #[doc(inline)]
+    pub use super::__buffa::view::stream_contents::StreamItemOwnedView;
 }
 /// RawHTTPResponse models a raw HTTP response. This can be used to craft
 /// custom responses with odd properties (including certain kinds of

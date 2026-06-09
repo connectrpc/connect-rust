@@ -1261,6 +1261,8 @@ pub mod client_compat_request {
     }
     #[doc(inline)]
     pub use super::__buffa::view::client_compat_request::CancelView;
+    #[doc(inline)]
+    pub use super::__buffa::view::client_compat_request::CancelOwnedView;
 }
 /// The outcome of one ClientCompatRequest.
 #[derive(Clone, PartialEq, Default)]

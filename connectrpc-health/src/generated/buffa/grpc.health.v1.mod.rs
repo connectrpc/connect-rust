@@ -29,6 +29,10 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::HealthCheckRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::HealthCheckRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::HealthCheckResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::HealthCheckResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

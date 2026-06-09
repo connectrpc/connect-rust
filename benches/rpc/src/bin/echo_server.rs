@@ -4,8 +4,7 @@
 //! dispatch + proto decode/encode of a single string. This isolates
 //! the per-request cost of the connectrpc-rs request pipeline.
 
-use buffa::view::OwnedView;
-use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceResult};
+use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceRequest, ServiceResult};
 use rpc_bench::connect::bench::v1::*;
 use rpc_bench::proto::bench::v1::*;
 
@@ -15,7 +14,7 @@ impl EchoService for EchoImpl {
     async fn echo(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<EchoRequestView<'static>>,
+        req: ServiceRequest<'_, EchoRequest>,
     ) -> ServiceResult<EchoResponse> {
         // One allocation to copy the borrowed &str into the owned response.
         // This is the minimal work a real echo server would do.

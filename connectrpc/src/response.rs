@@ -508,6 +508,8 @@ pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> +
 ///   emitted by codegen per RPC output type;
 /// - [`MaybeBorrowed<M, V>`] for handlers that conditionally return
 ///   either;
+/// - [`StreamMessage<M>`](crate::StreamMessage) for echoing inbound
+///   stream items back out (re-encodes from the retained wire bytes);
 /// - [`PreEncoded`] for handlers that encode a non-`'static` view
 ///   internally and pass the bytes across the handler boundary.
 ///

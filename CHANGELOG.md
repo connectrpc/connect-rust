@@ -10,6 +10,63 @@ increment the patch version.
 
 ## [Unreleased]
 
+This release reworks the server-side request surface around buffa 0.7.0,
+which removed `OwnedView`'s `Deref` impl (the impl let safe code hold view
+fields past the backing buffer's lifetime). Handlers move from owned
+`OwnedView<FooView<'static>>` parameters to borrowed requests and owned
+stream items with per-field accessors. **Consumers with checked-in
+`protoc-gen-connect-rust` output must regenerate with this release's
+toolchain and buffa ≥ 0.7.0.**
+
+### Breaking
+
+- **Unary and server-streaming handlers take `ServiceRequest<'_, Req>`**
+  ([#143]). The request is borrowed from the dispatcher-owned body for the
+  duration of the call: it Derefs to the request view for zero-copy field
+  access, and offers `to_owned_message()` (zero-copy from the retained body
+  bytes), `to_owned_view()` (a `'static` view for pass-through responses),
+  `bytes()`, and `view()`. The borrow may be held across `.await`
+  points; the response — and anything moved into `tokio::spawn` — cannot
+  borrow from it (enforced by the compiler). Existing handler impls must
+  update their signatures; bodies that already started with
+  `.to_owned_message()` work unchanged.
+- **Client-streaming and bidi inbound items are `StreamMessage<Req>`**
+  ([#143]). Each item owns its decoded buffer, is `Send + 'static`, Derefs
+  to the buffa-generated `FooOwnedView` wrapper for per-field accessor
+  methods (`item.name()`), and re-encodes from the retained wire bytes when
+  yielded back (`StreamMessage<M>: Encodable<M>`).
+- **`UnaryResponse::view()` returns the reborrowed view** rather than a
+  reference to the `OwnedView`, so `resp.view().field` works directly on
+  the client ([#143]).
+- **`extern_path` targets must be buffa ≥ 0.7.0 generated code with views
+  enabled** ([#143]). Request types resolved through `extern_path`
+  (e.g. well-known types from `buffa-types`) use the same
+  `ServiceRequest`/`StreamMessage` wrappers as local types, backed by
+  `buffa::HasMessageView` impls that buffa emits with each message.
+  `buffa-types` 0.7+ qualifies; a crate generated with older buffa or with
+  views disabled fails to compile with a missing `HasMessageView` impl
+  (on buffa 0.7.1+ the compile error itself explains the fix; 0.7.0 only
+  names the missing impl). The output side is
+  unchanged: view-body `Encodable` impls are still not emitted for extern
+  output types — return the owned message for those.
+- **The workspace requires `buffa`/`buffa-types`/`buffa-codegen` 0.7**
+  ([#143]), which is also the regen baseline for checked-in generated code.
+
+### Added
+
+- **`ServiceRequest<'a, Req>` and `StreamMessage<M>`** ([#143]) — the
+  request wrappers described above, exported from the crate root.
+- The multiservice example gains a `Heartbeat(google.protobuf.Empty) →
+  google.protobuf.Timestamp` RPC exercising well-known types as direct RPC
+  input and output ([#143]).
+- **`connectrpc_build::Config::emit_descriptor_set(name)`** ([#141]) —
+  also write the input `FileDescriptorSet` (full transitive import
+  closure, regardless of descriptor source) to `<out_dir>/<name>` as
+  wire-format bytes, ready to `include_bytes!` and serve via
+  `grpc.reflection.v1.ServerReflection` (e.g. for `grpcurl`). The inverse
+  of `Config::descriptor_set`, which reads a precompiled set; build
+  scripts no longer need a second `protoc --descriptor_set_out` pass.
+
 ### Fixed
 
 - **The gRPC and gRPC-Web unary response parsers enforce the
@@ -63,6 +120,8 @@ increment the patch version.
 
 [#136]: https://github.com/anthropics/connect-rust/issues/136
 [#140]: https://github.com/anthropics/connect-rust/issues/140
+[#141]: https://github.com/anthropics/connect-rust/pull/141
+[#143]: https://github.com/anthropics/connect-rust/pull/143
 [#147]: https://github.com/anthropics/connect-rust/pull/147
 [#150]: https://github.com/anthropics/connect-rust/pull/150
 

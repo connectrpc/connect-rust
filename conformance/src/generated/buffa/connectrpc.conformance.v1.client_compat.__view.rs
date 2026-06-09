@@ -983,6 +983,311 @@ impl ::buffa::ViewReborrow for ClientCompatRequestView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `ClientCompatRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ClientCompatRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ClientCompatRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ClientCompatRequestOwnedView(
+    ::buffa::OwnedView<ClientCompatRequestView<'static>>,
+);
+impl ClientCompatRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientCompatRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientCompatRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ClientCompatRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientCompatRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ClientCompatRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ClientCompatRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ClientCompatRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The name of the test that this request is performing.
+    /// When writing test cases, this is a required field.
+    ///
+    /// Field 1: `test_name`
+    #[must_use]
+    pub fn test_name(&self) -> &'_ str {
+        self.0.reborrow().test_name
+    }
+    /// Test suite YAML definitions should NOT set values for these next
+    /// nine fields (fields 2 - 10). They are automatically populated by the test
+    /// runner. If a test is specific to one of these values, it should instead be
+    /// indicated in the test suite itself (where it defines the required
+    /// features and relevant values for these fields).
+    ///
+    /// The HTTP version to use for the test (i.e. HTTP/1.1, HTTP/2, HTTP/3).
+    ///
+    /// Field 2: `http_version`
+    #[must_use]
+    pub fn http_version(&self) -> ::buffa::EnumValue<super::super::HTTPVersion> {
+        self.0.reborrow().http_version
+    }
+    /// The protocol to use for the test (i.e. Connect, gRPC, gRPC-web).
+    ///
+    /// Field 3: `protocol`
+    #[must_use]
+    pub fn protocol(&self) -> ::buffa::EnumValue<super::super::Protocol> {
+        self.0.reborrow().protocol
+    }
+    /// The codec to use for the test (i.e. JSON, proto/binary).
+    ///
+    /// Field 4: `codec`
+    #[must_use]
+    pub fn codec(&self) -> ::buffa::EnumValue<super::super::Codec> {
+        self.0.reborrow().codec
+    }
+    /// The compression to use for the test (i.e. brotli, gzip, identity).
+    ///
+    /// Field 5: `compression`
+    #[must_use]
+    pub fn compression(&self) -> ::buffa::EnumValue<super::super::Compression> {
+        self.0.reborrow().compression
+    }
+    /// The server host that this request will be sent to.
+    ///
+    /// Field 6: `host`
+    #[must_use]
+    pub fn host(&self) -> &'_ str {
+        self.0.reborrow().host
+    }
+    /// The server port that this request will be sent to.
+    ///
+    /// Field 7: `port`
+    #[must_use]
+    pub fn port(&self) -> u32 {
+        self.0.reborrow().port
+    }
+    /// If non-empty, the server is using TLS. The bytes are the
+    /// server's PEM-encoded certificate, which the client should
+    /// verify and trust.
+    ///
+    /// Field 8: `server_tls_cert`
+    #[must_use]
+    pub fn server_tls_cert(&self) -> &'_ [u8] {
+        self.0.reborrow().server_tls_cert
+    }
+    /// If present, the client certificate credentials to use to
+    /// authenticate with the server. This will only be present
+    /// when server_tls_cert is non-empty.
+    ///
+    /// Field 9: `client_tls_creds`
+    #[must_use]
+    pub fn client_tls_creds(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::TLSCredsView<'_>> {
+        &self.0.reborrow().client_tls_creds
+    }
+    /// If non-zero, indicates the maximum size in bytes for a message.
+    /// If the server sends anything larger, the client should reject it.
+    ///
+    /// Field 10: `message_receive_limit`
+    #[must_use]
+    pub fn message_receive_limit(&self) -> u32 {
+        self.0.reborrow().message_receive_limit
+    }
+    /// The fully-qualified name of the service this test will interact with.
+    /// If specified, method must also be specified.
+    /// If not specified, defaults to "connectrpc.conformance.v1.ConformanceService".
+    ///
+    /// Field 11: `service`
+    #[must_use]
+    pub fn service(&self) -> ::core::option::Option<&'_ str> {
+        self.0.reborrow().service
+    }
+    /// The method on `service` that will be called.
+    /// If specified, service must also be specified.
+    /// If not specified, the test runner will auto-populate this field based on the stream_type.
+    ///
+    /// Field 12: `method`
+    #[must_use]
+    pub fn method(&self) -> ::core::option::Option<&'_ str> {
+        self.0.reborrow().method
+    }
+    /// The stream type of `method` (i.e. unary, client stream, server stream, full-duplex bidi
+    /// stream, or half-duplex bidi stream).
+    /// When writing test cases, this is a required field.
+    ///
+    /// Field 13: `stream_type`
+    #[must_use]
+    pub fn stream_type(&self) -> ::buffa::EnumValue<super::super::StreamType> {
+        self.0.reborrow().stream_type
+    }
+    /// If protocol indicates Connect and stream type indicates
+    /// Unary, this instructs the client to use a GET HTTP method
+    /// when making the request.
+    ///
+    /// Field 14: `use_get_http_method`
+    #[must_use]
+    pub fn use_get_http_method(&self) -> bool {
+        self.0.reborrow().use_get_http_method
+    }
+    /// Any request headers that should be sent as part of the request.
+    /// These include only custom header metadata. Headers that are
+    /// part of the relevant protocol (such as "content-type", etc) should
+    /// not be stated here.
+    ///
+    /// Field 15: `request_headers`
+    #[must_use]
+    pub fn request_headers(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::HeaderView<'_>> {
+        &self.0.reborrow().request_headers
+    }
+    /// The actual request messages that will sent to the server.
+    /// The type URL for all entries should be equal to the request type of the
+    /// method.
+    /// There must be exactly one for unary and server stream methods but
+    /// can be zero or more for client and bidi stream methods.
+    /// For client and bidi stream methods, all entries will have the
+    /// same type URL.
+    ///
+    /// Field 16: `request_messages`
+    #[must_use]
+    pub fn request_messages(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        ::buffa_types::google::protobuf::__buffa::view::AnyView<'_>,
+    > {
+        &self.0.reborrow().request_messages
+    }
+    /// The timeout, in milliseconds, for the request. This is equivalent to a
+    /// deadline for the request. If unset, there will be no timeout.
+    ///
+    /// Field 17: `timeout_ms`
+    #[must_use]
+    pub fn timeout_ms(&self) -> ::core::option::Option<u32> {
+        self.0.reborrow().timeout_ms
+    }
+    /// Wait this many milliseconds before sending a request message.
+    /// For client or bidi stream methods, this delay should be
+    /// applied before each request sent.
+    ///
+    /// Field 18: `request_delay_ms`
+    #[must_use]
+    pub fn request_delay_ms(&self) -> u32 {
+        self.0.reborrow().request_delay_ms
+    }
+    /// If present, the client should cancel the RPC instead of
+    /// allowing to complete normally.
+    ///
+    /// Field 19: `cancel`
+    #[must_use]
+    pub fn cancel(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::client_compat_request::CancelView<'_>,
+    > {
+        &self.0.reborrow().cancel
+    }
+    /// The following field is only used by the reference client. If
+    /// you are implementing a client under test, you may ignore it
+    /// or respond with an error if the client receives a request where
+    /// it is set.
+    ///
+    /// When this field is present, it defines the actual HTTP request
+    /// that will be sent. The above group of fields must still be
+    /// provided and valid so that the reference client knows how it
+    /// should try to interpret the server's response.
+    ///
+    /// Field 20: `raw_request`
+    #[must_use]
+    pub fn raw_request(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::RawHTTPRequestView<'_>,
+    > {
+        &self.0.reborrow().raw_request
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ClientCompatRequestView<'static>>>
+for ClientCompatRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<ClientCompatRequestView<'static>>) -> Self {
+        ClientCompatRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ClientCompatRequestOwnedView>
+for ::buffa::OwnedView<ClientCompatRequestView<'static>> {
+    fn from(wrapper: ClientCompatRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ClientCompatRequestView<'static>>>
+for ClientCompatRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ClientCompatRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ClientCompatRequest {
+    type View<'a> = ClientCompatRequestView<'a>;
+    type ViewHandle = ClientCompatRequestOwnedView;
+}
+impl ::serde::Serialize for ClientCompatRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 pub mod client_compat_request {
     #[allow(unused_imports)]
     use super::*;
@@ -1333,6 +1638,122 @@ pub mod client_compat_request {
             this
         }
     }
+    /** Self-contained, `'static` owned view of a `Cancel` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`CancelView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CancelView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+    #[derive(Clone, Debug)]
+    pub struct CancelOwnedView(::buffa::OwnedView<CancelView<'static>>);
+    impl CancelOwnedView {
+        /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+        ///
+        /// The view borrows directly from the buffer's data; the buffer is
+        /// retained inside the returned handle.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+        /// protobuf data.
+        pub fn decode(
+            bytes: ::buffa::bytes::Bytes,
+        ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+            ::core::result::Result::Ok(
+                CancelOwnedView(::buffa::OwnedView::decode(bytes)?),
+            )
+        }
+        /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+        /// max message size).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+        /// exceeds the configured limits.
+        pub fn decode_with_options(
+            bytes: ::buffa::bytes::Bytes,
+            opts: &::buffa::DecodeOptions,
+        ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+            ::core::result::Result::Ok(
+                CancelOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+            )
+        }
+        /// Build from an owned message via an encode → decode round-trip.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+        /// somehow invalid (should not happen for well-formed messages).
+        pub fn from_owned(
+            msg: &super::super::super::client_compat_request::Cancel,
+        ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+            ::core::result::Result::Ok(
+                CancelOwnedView(::buffa::OwnedView::from_owned(msg)?),
+            )
+        }
+        /// Borrow the full [`CancelView`] with its lifetime tied to `&self`.
+        #[must_use]
+        pub fn view(&self) -> &CancelView<'_> {
+            self.0.reborrow()
+        }
+        /// Convert to the owned message type.
+        #[must_use]
+        pub fn to_owned_message(
+            &self,
+        ) -> super::super::super::client_compat_request::Cancel {
+            self.0.to_owned_message()
+        }
+        /// The underlying bytes buffer.
+        #[must_use]
+        pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+            self.0.bytes()
+        }
+        /// Consume the handle, returning the underlying bytes buffer.
+        #[must_use]
+        pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+            self.0.into_bytes()
+        }
+        /// Oneof `cancel_timing`.
+        #[must_use]
+        pub fn cancel_timing(
+            &self,
+        ) -> ::core::option::Option<
+            &super::super::super::__buffa::view::oneof::client_compat_request::cancel::CancelTiming<
+                '_,
+            >,
+        > {
+            self.0.reborrow().cancel_timing.as_ref()
+        }
+    }
+    impl ::core::convert::From<::buffa::OwnedView<CancelView<'static>>>
+    for CancelOwnedView {
+        fn from(inner: ::buffa::OwnedView<CancelView<'static>>) -> Self {
+            CancelOwnedView(inner)
+        }
+    }
+    impl ::core::convert::From<CancelOwnedView>
+    for ::buffa::OwnedView<CancelView<'static>> {
+        fn from(wrapper: CancelOwnedView) -> Self {
+            wrapper.0
+        }
+    }
+    impl ::core::convert::AsRef<::buffa::OwnedView<CancelView<'static>>>
+    for CancelOwnedView {
+        fn as_ref(&self) -> &::buffa::OwnedView<CancelView<'static>> {
+            &self.0
+        }
+    }
+    impl ::buffa::HasMessageView for super::super::super::client_compat_request::Cancel {
+        type View<'a> = CancelView<'a>;
+        type ViewHandle = CancelOwnedView;
+    }
+    impl ::serde::Serialize for CancelOwnedView {
+        fn serialize<__S: ::serde::Serializer>(
+            &self,
+            __s: __S,
+        ) -> ::core::result::Result<__S::Ok, __S::Error> {
+            ::serde::Serialize::serialize(&self.0, __s)
+        }
+    }
 }
 /// The outcome of one ClientCompatRequest.
 #[derive(Clone, Debug, Default)]
@@ -1665,6 +2086,129 @@ impl ::buffa::ViewReborrow for ClientCompatResponseView<'static> {
     type Reborrowed<'b> = ClientCompatResponseView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `ClientCompatResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ClientCompatResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ClientCompatResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ClientCompatResponseOwnedView(
+    ::buffa::OwnedView<ClientCompatResponseView<'static>>,
+);
+impl ClientCompatResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientCompatResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientCompatResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ClientCompatResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientCompatResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ClientCompatResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ClientCompatResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ClientCompatResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The test name that this response applies to.
+    ///
+    /// Field 1: `test_name`
+    #[must_use]
+    pub fn test_name(&self) -> &'_ str {
+        self.0.reborrow().test_name
+    }
+    /// Oneof `result`.
+    #[must_use]
+    pub fn result(
+        &self,
+    ) -> ::core::option::Option<
+        &super::super::__buffa::view::oneof::client_compat_response::Result<'_>,
+    > {
+        self.0.reborrow().result.as_ref()
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ClientCompatResponseView<'static>>>
+for ClientCompatResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<ClientCompatResponseView<'static>>) -> Self {
+        ClientCompatResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ClientCompatResponseOwnedView>
+for ::buffa::OwnedView<ClientCompatResponseView<'static>> {
+    fn from(wrapper: ClientCompatResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ClientCompatResponseView<'static>>>
+for ClientCompatResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ClientCompatResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ClientCompatResponse {
+    type View<'a> = ClientCompatResponseView<'a>;
+    type ViewHandle = ClientCompatResponseOwnedView;
+}
+impl ::serde::Serialize for ClientCompatResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }
 /// The result of a ClientCompatRequest, which may or may not be successful.
@@ -2149,6 +2693,187 @@ impl ::buffa::ViewReborrow for ClientResponseResultView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `ClientResponseResult` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ClientResponseResultView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ClientResponseResultView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ClientResponseResultOwnedView(
+    ::buffa::OwnedView<ClientResponseResultView<'static>>,
+);
+impl ClientResponseResultOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientResponseResultOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientResponseResultOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ClientResponseResult,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientResponseResultOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ClientResponseResultView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ClientResponseResultView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ClientResponseResult {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// All response headers read from the response.
+    ///
+    /// Field 1: `response_headers`
+    #[must_use]
+    pub fn response_headers(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::HeaderView<'_>> {
+        &self.0.reborrow().response_headers
+    }
+    /// Servers should echo back payloads that they received as part of the request.
+    /// This field should contain all the payloads the server echoed back. Note that
+    /// There will be zero-to-one for unary and client stream methods and
+    /// zero-to-many for server and bidi stream methods.
+    ///
+    /// Field 2: `payloads`
+    #[must_use]
+    pub fn payloads(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::ConformancePayloadView<'_>,
+    > {
+        &self.0.reborrow().payloads
+    }
+    /// The error received from the actual RPC invocation. Note this is not representative
+    /// of a runtime error and should always be the proto equivalent of a Connect
+    /// or gRPC error.
+    ///
+    /// Field 3: `error`
+    #[must_use]
+    pub fn error(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::ErrorView<'_>> {
+        &self.0.reborrow().error
+    }
+    /// All response headers read from the response.
+    ///
+    /// Field 4: `response_trailers`
+    #[must_use]
+    pub fn response_trailers(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::HeaderView<'_>> {
+        &self.0.reborrow().response_trailers
+    }
+    /// The number of messages that were present in the request but that could not be
+    /// sent because an error occurred before finishing the upload.
+    ///
+    /// Field 5: `num_unsent_requests`
+    #[must_use]
+    pub fn num_unsent_requests(&self) -> i32 {
+        self.0.reborrow().num_unsent_requests
+    }
+    /// The following field is only set by the reference client. It communicates
+    /// the underlying HTTP status code of the server's response.
+    /// If you are implementing a client-under-test, you should ignore this field
+    /// and leave it unset.
+    ///
+    /// Field 6: `http_status_code`
+    #[must_use]
+    pub fn http_status_code(&self) -> ::core::option::Option<i32> {
+        self.0.reborrow().http_status_code
+    }
+    /// This field is used only by the reference client, and it can be used
+    /// to provide additional feedback about problems observed in the server
+    /// response or in client processing of the response. If non-empty, the test
+    /// case is considered failed even if the result above matches all expectations.
+    /// If you are implementing a client-under-test, you should ignore this field
+    /// and leave it unset.
+    ///
+    /// Field 7: `feedback`
+    #[must_use]
+    pub fn feedback(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().feedback
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ClientResponseResultView<'static>>>
+for ClientResponseResultOwnedView {
+    fn from(inner: ::buffa::OwnedView<ClientResponseResultView<'static>>) -> Self {
+        ClientResponseResultOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ClientResponseResultOwnedView>
+for ::buffa::OwnedView<ClientResponseResultView<'static>> {
+    fn from(wrapper: ClientResponseResultOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ClientResponseResultView<'static>>>
+for ClientResponseResultOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ClientResponseResultView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ClientResponseResult {
+    type View<'a> = ClientResponseResultView<'a>;
+    type ViewHandle = ClientResponseResultOwnedView;
+}
+impl ::serde::Serialize for ClientResponseResultOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 /// The client is not able to fulfill the ClientCompatRequest. This may be due
 /// to a runtime error or an unexpected internal error such as the requested protocol
 /// not being supported. This is completely independent of the actual RPC invocation.
@@ -2330,6 +3055,122 @@ impl ::buffa::ViewReborrow for ClientErrorResultView<'static> {
     type Reborrowed<'b> = ClientErrorResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `ClientErrorResult` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ClientErrorResultView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ClientErrorResultView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ClientErrorResultOwnedView(
+    ::buffa::OwnedView<ClientErrorResultView<'static>>,
+);
+impl ClientErrorResultOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientErrorResultOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientErrorResultOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ClientErrorResult,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ClientErrorResultOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ClientErrorResultView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ClientErrorResultView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ClientErrorResult {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// A message describing the error that occurred. This string will be shown to
+    /// users running conformance tests so it should include any relevant details
+    /// that may help troubleshoot or remedy the error.
+    ///
+    /// Field 1: `message`
+    #[must_use]
+    pub fn message(&self) -> &'_ str {
+        self.0.reborrow().message
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ClientErrorResultView<'static>>>
+for ClientErrorResultOwnedView {
+    fn from(inner: ::buffa::OwnedView<ClientErrorResultView<'static>>) -> Self {
+        ClientErrorResultOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ClientErrorResultOwnedView>
+for ::buffa::OwnedView<ClientErrorResultView<'static>> {
+    fn from(wrapper: ClientErrorResultOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ClientErrorResultView<'static>>>
+for ClientErrorResultOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ClientErrorResultView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ClientErrorResult {
+    type View<'a> = ClientErrorResultView<'a>;
+    type ViewHandle = ClientErrorResultOwnedView;
+}
+impl ::serde::Serialize for ClientErrorResultOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }
 /// Details about various values as observed on the wire. This message is used
@@ -2672,5 +3513,151 @@ impl ::buffa::ViewReborrow for WireDetailsView<'static> {
     type Reborrowed<'b> = WireDetailsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `WireDetails` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`WireDetailsView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`WireDetailsView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct WireDetailsOwnedView(::buffa::OwnedView<WireDetailsView<'static>>);
+impl WireDetailsOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            WireDetailsOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            WireDetailsOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::WireDetails,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            WireDetailsOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`WireDetailsView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &WireDetailsView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::WireDetails {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The HTTP status code of the response.
+    ///
+    /// Field 1: `actual_status_code`
+    #[must_use]
+    pub fn actual_status_code(&self) -> i32 {
+        self.0.reborrow().actual_status_code
+    }
+    /// When processing an error from a Connect server, this should contain
+    /// the actual JSON received on the wire.
+    ///
+    /// Field 2: `connect_error_raw`
+    #[must_use]
+    pub fn connect_error_raw(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        ::buffa_types::google::protobuf::__buffa::view::StructView<'_>,
+    > {
+        &self.0.reborrow().connect_error_raw
+    }
+    /// Any HTTP trailers observed after the response body. These do NOT
+    /// include trailers that conveyed via the body, as done in the gRPC-Web
+    /// and Connect streaming protocols.
+    ///
+    /// Field 3: `actual_http_trailers`
+    #[must_use]
+    pub fn actual_http_trailers(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::HeaderView<'_>> {
+        &self.0.reborrow().actual_http_trailers
+    }
+    /// Any trailers that were transmitted in the final message of the
+    /// response body for a gRPC-Web response. This could differ from the
+    /// ClientResponseResult.response_trailers field since the RPC client
+    /// library might canonicalize keys and it might choose to remove
+    /// "grpc-status" et al from the set of metadata. This field will
+    /// capture all of the entries and their exact on-the-wire spelling
+    /// and formatting.
+    ///
+    /// Field 4: `actual_grpcweb_trailers`
+    #[must_use]
+    pub fn actual_grpcweb_trailers(&self) -> ::core::option::Option<&'_ str> {
+        self.0.reborrow().actual_grpcweb_trailers
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<WireDetailsView<'static>>>
+for WireDetailsOwnedView {
+    fn from(inner: ::buffa::OwnedView<WireDetailsView<'static>>) -> Self {
+        WireDetailsOwnedView(inner)
+    }
+}
+impl ::core::convert::From<WireDetailsOwnedView>
+for ::buffa::OwnedView<WireDetailsView<'static>> {
+    fn from(wrapper: WireDetailsOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<WireDetailsView<'static>>>
+for WireDetailsOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<WireDetailsView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::WireDetails {
+    type View<'a> = WireDetailsView<'a>;
+    type ViewHandle = WireDetailsOwnedView;
+}
+impl ::serde::Serialize for WireDetailsOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }

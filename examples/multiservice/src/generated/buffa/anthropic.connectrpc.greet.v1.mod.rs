@@ -29,6 +29,10 @@ pub mod __buffa {
 #[doc(inline)]
 pub use self::__buffa::view::GreetRequestView;
 #[doc(inline)]
+pub use self::__buffa::view::GreetRequestOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::GreetResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::GreetResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

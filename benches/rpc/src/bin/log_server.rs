@@ -7,8 +7,7 @@
 //! map entries (labels). No I/O, no allocation beyond the response
 //! struct: proto decode/encode cost dominates.
 
-use buffa::view::OwnedView;
-use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceResult};
+use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceRequest, ServiceResult};
 use rpc_bench::connect::bench::v1::*;
 use rpc_bench::proto::bench::v1::*;
 
@@ -18,7 +17,7 @@ impl LogIngestService for LogIngestImpl {
     async fn ingest(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<LogRequestView<'static>>,
+        req: ServiceRequest<'_, LogRequest>,
     ) -> ServiceResult<LogIngestResponse> {
         let mut count = 0i32;
         let mut total_message_bytes = 0i64;

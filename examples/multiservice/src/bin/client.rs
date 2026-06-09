@@ -43,18 +43,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name: "World".to_string(),
             ..Default::default()
         })
-        .await?
-        .into_view();
-    tracing::info!("Greet response: {}", response.message);
+        .await?;
+    tracing::info!("Greet response: {}", response.view().message);
 
     let response = greet_client
         .greet(GreetRequest {
             name: "ConnectRPC".to_string(),
             ..Default::default()
         })
-        .await?
-        .into_view();
-    tracing::info!("Greet response: {}", response.message);
+        .await?;
+    tracing::info!("Greet response: {}", response.view().message);
 
     // --- MathService ---
     tracing::info!("Testing Add RPC...");
@@ -64,9 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             b: 2,
             ..Default::default()
         })
-        .await?
-        .into_view();
-    tracing::info!("Add: 40 + 2 = {}", response.result);
+        .await?;
+    tracing::info!("Add: 40 + 2 = {}", response.view().result);
 
     let response = math_client
         .add(AddRequest {
@@ -74,9 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             b: 25,
             ..Default::default()
         })
-        .await?
-        .into_view();
-    tracing::info!("Add: -10 + 25 = {}", response.result);
+        .await?;
+    tracing::info!("Add: -10 + 25 = {}", response.view().result);
 
     // --- Error handling ---
     tracing::info!("Testing error handling (empty name)...");
@@ -110,9 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into(),
             ..Default::default()
         })
-        .await?
-        .into_view();
-    let event = response.event.as_option().unwrap();
+        .await?;
+    let event = response.view().event.as_option().unwrap();
     tracing::info!(
         "Created event: id={}, name={}, occurred_at={:?}",
         event.id,
@@ -137,9 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into(),
             ..Default::default()
         })
-        .await?
-        .into_view();
-    let duration = response.duration.as_option().unwrap();
+        .await?;
+    let duration = response.view().duration.as_option().unwrap();
     tracing::info!("Duration: {}s {}ns", duration.seconds, duration.nanos);
 
     tracing::info!("Testing ProcessMetadata RPC...");
@@ -168,17 +162,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into(),
             ..Default::default()
         })
-        .await?
-        .into_view();
+        .await?;
     tracing::info!(
         "ProcessMetadata: input had {} fields, output has {} fields",
-        response.field_count,
+        response.view().field_count,
         response
+            .view()
             .metadata
             .as_option()
             .map(|m| m.fields.len())
             .unwrap_or(0)
     );
+
+    tracing::info!("Testing Heartbeat RPC...");
+    let response = wkt_client
+        .heartbeat(buffa_types::google::protobuf::Empty::default())
+        .await?;
+    let now = response.view();
+    tracing::info!("Heartbeat: server time {}s {}ns", now.seconds, now.nanos);
 
     tracing::info!("All tests completed successfully!");
     Ok(())

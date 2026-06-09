@@ -8,8 +8,7 @@
 //! showed `str::from_utf8` at 11.23% of server CPU. This variant measures
 //! the actual recovery.
 
-use buffa::view::OwnedView;
-use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceResult};
+use connectrpc::{ConnectRpcService, RequestContext, Response, ServiceRequest, ServiceResult};
 use rpc_bench::connect::bench::noutf8::v1::*;
 use rpc_bench::proto::bench::noutf8::v1::*;
 
@@ -19,7 +18,7 @@ impl LogIngestService for LogIngestImpl {
     async fn ingest(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<LogRequestView<'static>>,
+        req: ServiceRequest<'_, LogRequest>,
     ) -> ServiceResult<LogIngestResponse> {
         let mut count = 0i32;
         let mut total_message_bytes = 0i64;

@@ -34,6 +34,14 @@ pub type OwnedProcessMetadataResponseView = ::buffa::view::OwnedView<
         'static,
     >,
 >;
+///Shorthand for `OwnedView<EmptyView<'static>>`.
+pub type OwnedEmptyView = ::buffa::view::OwnedView<
+    ::buffa_types::google::protobuf::__buffa::view::EmptyView<'static>,
+>;
+///Shorthand for `OwnedView<TimestampView<'static>>`.
+pub type OwnedTimestampView = ::buffa::view::OwnedView<
+    ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
+>;
 impl ::connectrpc::Encodable<
     crate::proto::anthropic::connectrpc::wkt::v1::CreateEventResponse,
 >
@@ -59,7 +67,7 @@ for ::buffa::view::OwnedView<
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
 impl ::connectrpc::Encodable<
@@ -87,7 +95,7 @@ for ::buffa::view::OwnedView<
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
 impl ::connectrpc::Encodable<
@@ -115,7 +123,7 @@ for ::buffa::view::OwnedView<
         &self,
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(&**self, codec)
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
 /// Full service name for this service.
@@ -147,23 +155,44 @@ pub const WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC: ::connectrpc::Spec = :
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `Heartbeat` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/Heartbeat",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// WellKnownTypesService provides operations using Timestamp, Duration, and Struct.
 ///
 /// # Implementing handlers
 ///
-/// Handlers receive requests as `OwnedFooView` (an alias for
-/// `OwnedView<FooView<'static>>`), which gives zero-copy borrowed access
-/// to fields (e.g. `request.name` is a `&str` into the decoded buffer).
-/// The view can be held across `.await` points. When two RPC types in
-/// the same package would alias to the same `Owned<…>View` name (e.g.
-/// a local message plus an imported one with the same short name), the
-/// alias is suppressed for both and the request type is spelled as
-/// `OwnedView<…View<'static>>` directly in the trait signature.
-///
 /// Implement methods with plain `async fn`; the returned future satisfies
-/// the `Send` bound automatically. See the
-/// [buffa user guide](https://github.com/anthropics/buffa/blob/main/docs/guide.md#ownedview-in-async-trait-implementations)
-/// for zero-copy access patterns and when `to_owned_message()` is needed.
+/// the `Send` bound automatically.
+///
+/// **Unary and server-streaming requests** arrive as
+/// [`ServiceRequest<'_, Req>`](::connectrpc::ServiceRequest): a zero-copy
+/// view of the request plus its body, valid for the duration of the call.
+/// Fields are read directly (`request.name` is a `&str` into the decoded
+/// buffer) and the borrow may be held across `.await` points. Anything
+/// that must outlive the call — `tokio::spawn`, channels, server state,
+/// or data captured by a returned response stream — takes owned data:
+/// call `request.to_owned_message()` (or copy the specific fields)
+/// first.
+///
+/// **Client-streaming and bidi requests** arrive as
+/// `ServiceStream<`[`StreamMessage<Req>`](::connectrpc::StreamMessage)`>`.
+/// Each item owns its decoded buffer and is `Send + 'static`, so items
+/// can be buffered or moved into spawned tasks; read fields zero-copy
+/// through the generated accessor methods (`item.name()`) or `.view()`,
+/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// `StreamMessage<M>` implements `Encodable<M>`.
+///
+/// Request types resolved through `extern_path` (e.g. well-known types
+/// from another crate) use the same wrappers; the crate that owns the
+/// type must be generated with buffa ≥ 0.7.0 and views enabled so the
+/// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
 /// generated `OutView<'_>` / `OwnedOutView`,
@@ -176,10 +205,11 @@ pub const WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC: ::connectrpc::Spec = :
 ///
 /// Server-streaming and bidi-streaming methods return
 /// `ServiceStream<impl Encodable<Out> + Send + use<Self>>`. The
-/// `use<Self>` precise-capturing clause excludes `&self`'s lifetime
-/// (unary methods use `use<'a, Self>` and may borrow), so stream items
-/// must be `'static`. To stream view-encoded data, encode each item
-/// inside the stream body and yield
+/// `use<Self>` precise-capturing clause excludes `&self`'s lifetime and
+/// the request's lifetime (unary methods use `use<'a, Self>` and may
+/// borrow from `&self`), so stream items must be `'static` and cannot
+/// borrow from the request. To stream view-encoded data, encode each
+/// item inside the stream body and yield
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
@@ -187,10 +217,19 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// CreateEvent creates an event with a timestamp.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn create_event<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedCreateEventRequestView,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
+        >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
@@ -201,10 +240,19 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// CalculateDuration calculates the duration between two timestamps.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn calculate_duration<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedCalculateDurationRequestView,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
+        >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
@@ -215,14 +263,44 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// ProcessMetadata processes arbitrary metadata as a Struct.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
     fn process_metadata<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: OwnedProcessMetadataRequestView,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
+        >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Heartbeat returns the server's current time. Exercises well-known
+    /// types as the direct RPC input (Empty) and output (Timestamp).
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn heartbeat<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<'_, ::buffa_types::google::protobuf::Empty>,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                ::buffa_types::google::protobuf::Timestamp,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -260,10 +338,21 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                 "CreateEvent",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CreateEventRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.create_event(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.create_event(ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::wkt::v1::CreateEventResponse,
@@ -278,10 +367,21 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                 "CalculateDuration",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CalculateDurationRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.calculate_duration(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.calculate_duration(ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationResponse,
@@ -296,10 +396,21 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                 "ProcessMetadata",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |ctx, req, format| {
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::ProcessMetadataRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            svc.process_metadata(ctx, req)
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.process_metadata(ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
@@ -309,6 +420,35 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                 },
             )
             .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC)
+            .route_view(
+                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
+                "Heartbeat",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            ::buffa_types::google::protobuf::__buffa::view::EmptyView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                ::buffa_types::google::protobuf::Empty,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.heartbeat(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    ::buffa_types::google::protobuf::Timestamp,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC)
     }
 }
 /// Monomorphic dispatcher for `WellKnownTypesService`.
@@ -374,6 +514,12 @@ for WellKnownTypesServiceServer<T> {
                         .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC),
                 )
             }
+            "Heartbeat" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC),
+                )
+            }
             _ => None,
         }
     }
@@ -393,9 +539,17 @@ for WellKnownTypesServiceServer<T> {
             "CreateEvent" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CreateEventRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
                     >(request.encoded()?, format)?;
+                    let req: crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CreateEventRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
+                    >::from_parts(&req, &body);
                     svc.create_event(ctx, req)
                         .await?
                         .encode::<
@@ -406,9 +560,17 @@ for WellKnownTypesServiceServer<T> {
             "CalculateDuration" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CalculateDurationRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
                     >(request.encoded()?, format)?;
+                    let req: crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CalculateDurationRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
+                    >::from_parts(&req, &body);
                     svc.calculate_duration(ctx, req)
                         .await?
                         .encode::<
@@ -419,14 +581,41 @@ for WellKnownTypesServiceServer<T> {
             "ProcessMetadata" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
-                    let req = ::connectrpc::dispatcher::codegen::decode_request_view::<
-                        crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::ProcessMetadataRequestView,
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
                     >(request.encoded()?, format)?;
+                    let req: crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::ProcessMetadataRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
+                    >::from_parts(&req, &body);
                     svc.process_metadata(ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
                         >(format)
+                })
+            }
+            "Heartbeat" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        ::buffa_types::google::protobuf::Empty,
+                    >(request.encoded()?, format)?;
+                    let req: ::buffa_types::google::protobuf::__buffa::view::EmptyView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        ::buffa_types::google::protobuf::Empty,
+                    >::from_parts(&req, &body);
+                    svc.heartbeat(ctx, req)
+                        .await?
+                        .encode::<::buffa_types::google::protobuf::Timestamp>(format)
                 })
             }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_unary(path),
@@ -517,11 +706,12 @@ for WellKnownTypesServiceServer<T> {
 /// # Working with the response
 ///
 /// Unary calls return [`UnaryResponse<OwnedView<FooView>>`](::connectrpc::client::UnaryResponse).
-/// The `OwnedView` derefs to the view, so field access is zero-copy:
+/// [`view()`](::connectrpc::client::UnaryResponse::view) borrows the response
+/// message, so field access is zero-copy:
 ///
 /// ```rust,ignore
-/// let resp = client.create_event(request).await?.into_view();
-/// let name: &str = resp.name;  // borrow into the response buffer
+/// let resp = client.create_event(request).await?;
+/// let name: &str = resp.view().name;  // borrow into the response buffer
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
@@ -530,6 +720,12 @@ for WellKnownTypesServiceServer<T> {
 /// ```rust,ignore
 /// let owned = client.create_event(request).await?.into_owned();
 /// ```
+///
+/// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
+/// zero-copy decoded body (an `OwnedView`) without copying; field access on it
+/// goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
+/// received message from `.message().await` — bind `msg.reborrow()` for field
+/// access, or convert with `.to_owned_message()`.
 #[derive(Clone)]
 pub struct WellKnownTypesServiceClient<T> {
     transport: T,
@@ -682,6 +878,47 @@ where
                 &self.config,
                 WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
                 "ProcessMetadata",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the Heartbeat RPC. Sends a request to /anthropic.connectrpc.wkt.v1.WellKnownTypesService/Heartbeat.
+    pub async fn heartbeat(
+        &self,
+        request: ::buffa_types::google::protobuf::Empty,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.heartbeat_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the Heartbeat RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn heartbeat_with_options(
+        &self,
+        request: ::buffa_types::google::protobuf::Empty,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
+                "Heartbeat",
                 request,
                 options,
             )

@@ -436,6 +436,191 @@ impl ::buffa::ViewReborrow for ServerCompatRequestView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `ServerCompatRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ServerCompatRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ServerCompatRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ServerCompatRequestOwnedView(
+    ::buffa::OwnedView<ServerCompatRequestView<'static>>,
+);
+impl ServerCompatRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ServerCompatRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ServerCompatRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ServerCompatRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ServerCompatRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ServerCompatRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ServerCompatRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ServerCompatRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Signals to the server that it must support at least this protocol. Note
+    /// that it is fine to support others.
+    /// For example if `PROTOCOL_CONNECT` is specified, the server _must_ support
+    /// at least Connect, but _may_ also support gRPC or gRPC-web.
+    ///
+    /// Field 1: `protocol`
+    #[must_use]
+    pub fn protocol(&self) -> ::buffa::EnumValue<super::super::Protocol> {
+        self.0.reborrow().protocol
+    }
+    /// Signals to the server the minimum HTTP version to support. As with
+    /// `protocol`, it is fine to support other versions. For example, if
+    /// `HTTP_VERSION_2` is specified, the server _must_ support HTTP/2, but _may_ also
+    /// support HTTP/1.1 or HTTP/3.
+    ///
+    /// Field 2: `http_version`
+    #[must_use]
+    pub fn http_version(&self) -> ::buffa::EnumValue<super::super::HTTPVersion> {
+        self.0.reborrow().http_version
+    }
+    /// If true, generate a certificate that clients will be configured to trust
+    /// when connecting and return it in the `pem_cert` field of the `ServerCompatResponse`.
+    /// The certificate can be any TLS certificate where the subject matches the
+    /// value sent back in the `host` field of the `ServerCompatResponse`.
+    /// Self-signed certificates (and `localhost` as the subject) are allowed.
+    /// If false, the server should not use TLS and instead use
+    /// a plain-text/unencrypted socket.
+    ///
+    /// Field 4: `use_tls`
+    #[must_use]
+    pub fn use_tls(&self) -> bool {
+        self.0.reborrow().use_tls
+    }
+    /// If non-empty, the clients will use certificates to authenticate
+    /// themselves. This value is a PEM-encoded cert that should be
+    /// trusted by the server. When non-empty, the server should require
+    /// that clients provide certificates and they should validate that
+    /// the certificate presented is valid.
+    ///
+    /// This will always be empty if use_tls is false.
+    ///
+    /// Field 5: `client_tls_cert`
+    #[must_use]
+    pub fn client_tls_cert(&self) -> &'_ [u8] {
+        self.0.reborrow().client_tls_cert
+    }
+    /// If non-zero, indicates the maximum size in bytes for a message.
+    /// If the client sends anything larger, the server should reject it.
+    ///
+    /// Field 6: `message_receive_limit`
+    #[must_use]
+    pub fn message_receive_limit(&self) -> u32 {
+        self.0.reborrow().message_receive_limit
+    }
+    /// If use_tls is true, this provides details for a self-signed TLS
+    /// cert that the server may use.
+    ///
+    /// The provided certificate is only good for loopback communication:
+    /// it uses "localhost" and "127.0.0.1" as the IP and DNS names in
+    /// the certificate's subject. If the server needs a different subject
+    /// or the client is in an environment where configuring trust of a
+    /// self-signed certificate is difficult or infeasible.
+    ///
+    /// If the server implementation chooses to use these credentials,
+    /// it must echo back the certificate in the ServerCompatResponse and
+    /// should also leave the host field empty or explicitly set to
+    /// "127.0.0.1".
+    ///
+    /// If it chooses to use a different certificate and key, it must send
+    /// back the corresponding certificate in the ServerCompatResponse.
+    ///
+    /// Field 7: `server_creds`
+    #[must_use]
+    pub fn server_creds(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::TLSCredsView<'_>> {
+        &self.0.reborrow().server_creds
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ServerCompatRequestView<'static>>>
+for ServerCompatRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<ServerCompatRequestView<'static>>) -> Self {
+        ServerCompatRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ServerCompatRequestOwnedView>
+for ::buffa::OwnedView<ServerCompatRequestView<'static>> {
+    fn from(wrapper: ServerCompatRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ServerCompatRequestView<'static>>>
+for ServerCompatRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ServerCompatRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ServerCompatRequest {
+    type View<'a> = ServerCompatRequestView<'a>;
+    type ViewHandle = ServerCompatRequestOwnedView;
+}
+impl ::serde::Serialize for ServerCompatRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 /// The outcome of one ServerCompatRequest.
 #[derive(Clone, Debug, Default)]
 pub struct ServerCompatResponseView<'a> {
@@ -690,5 +875,137 @@ impl ::buffa::ViewReborrow for ServerCompatResponseView<'static> {
     type Reborrowed<'b> = ServerCompatResponseView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `ServerCompatResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ServerCompatResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ServerCompatResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ServerCompatResponseOwnedView(
+    ::buffa::OwnedView<ServerCompatResponseView<'static>>,
+);
+impl ServerCompatResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ServerCompatResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ServerCompatResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ServerCompatResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ServerCompatResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ServerCompatResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ServerCompatResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ServerCompatResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The host where the server is running. This should usually be `127.0.0.1`,
+    /// unless your program actually starts a remote server to which the client
+    /// should connect.
+    ///
+    /// Field 1: `host`
+    #[must_use]
+    pub fn host(&self) -> &'_ str {
+        self.0.reborrow().host
+    }
+    /// The port where the server is listening.
+    ///
+    /// Field 2: `port`
+    #[must_use]
+    pub fn port(&self) -> u32 {
+        self.0.reborrow().port
+    }
+    /// The TLS certificate, in PEM format, if `use_tls` was set
+    /// to `true`. Clients will verify this certificate when connecting via TLS.
+    /// If `use_tls` was set to `false`, this should always be empty.
+    ///
+    /// Field 3: `pem_cert`
+    #[must_use]
+    pub fn pem_cert(&self) -> &'_ [u8] {
+        self.0.reborrow().pem_cert
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ServerCompatResponseView<'static>>>
+for ServerCompatResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<ServerCompatResponseView<'static>>) -> Self {
+        ServerCompatResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ServerCompatResponseOwnedView>
+for ::buffa::OwnedView<ServerCompatResponseView<'static>> {
+    fn from(wrapper: ServerCompatResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ServerCompatResponseView<'static>>>
+for ServerCompatResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ServerCompatResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ServerCompatResponse {
+    type View<'a> = ServerCompatResponseView<'a>;
+    type ViewHandle = ServerCompatResponseOwnedView;
+}
+impl ::serde::Serialize for ServerCompatResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }

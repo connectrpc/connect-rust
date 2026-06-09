@@ -321,6 +321,135 @@ impl ::buffa::ViewReborrow for ConfigView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `Config` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ConfigView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ConfigView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ConfigOwnedView(::buffa::OwnedView<ConfigView<'static>>);
+impl ConfigOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(ConfigOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ConfigOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::Config,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(ConfigOwnedView(::buffa::OwnedView::from_owned(msg)?))
+    }
+    /// Borrow the full [`ConfigView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ConfigView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::Config {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The features supported by the client or server under test.
+    /// This is used to filter the set of test cases that are run.
+    /// If absent, an empty message is used. See Features for more
+    /// on how empty/absent fields are interpreted.
+    ///
+    /// Field 1: `features`
+    #[must_use]
+    pub fn features(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::FeaturesView<'_>> {
+        &self.0.reborrow().features
+    }
+    /// This can indicate additional permutations that are supported
+    /// that might otherwise be excluded based on the above features.
+    ///
+    /// Field 2: `include_cases`
+    #[must_use]
+    pub fn include_cases(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::ConfigCaseView<'_>> {
+        &self.0.reborrow().include_cases
+    }
+    /// This can indicates permutations that are not supported even
+    /// though their support might be implied by the above features.
+    ///
+    /// Field 3: `exclude_cases`
+    #[must_use]
+    pub fn exclude_cases(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::ConfigCaseView<'_>> {
+        &self.0.reborrow().exclude_cases
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ConfigView<'static>>> for ConfigOwnedView {
+    fn from(inner: ::buffa::OwnedView<ConfigView<'static>>) -> Self {
+        ConfigOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ConfigOwnedView> for ::buffa::OwnedView<ConfigView<'static>> {
+    fn from(wrapper: ConfigOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ConfigView<'static>>>
+for ConfigOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ConfigView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::Config {
+    type View<'a> = ConfigView<'a>;
+    type ViewHandle = ConfigOwnedView;
+}
+impl ::serde::Serialize for ConfigOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 /// Features define the feature set that a client or server supports. They are
 /// used to determine the server configurations and test cases that
 /// will be run. They are defined in YAML files and are specified as part of the
@@ -1044,6 +1173,217 @@ impl ::buffa::ViewReborrow for FeaturesView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `Features` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`FeaturesView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`FeaturesView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct FeaturesOwnedView(::buffa::OwnedView<FeaturesView<'static>>);
+impl FeaturesOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(FeaturesOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            FeaturesOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::Features,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            FeaturesOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`FeaturesView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &FeaturesView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::Features {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Supported HTTP versions.
+    /// If empty, HTTP 1.1 and HTTP/2 are assumed.
+    ///
+    /// Field 1: `versions`
+    #[must_use]
+    pub fn versions(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::HTTPVersion>> {
+        &self.0.reborrow().versions
+    }
+    /// Supported protocols.
+    /// If empty, all three are assumed: Connect, gRPC, and gRPC-Web.
+    ///
+    /// Field 2: `protocols`
+    #[must_use]
+    pub fn protocols(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Protocol>> {
+        &self.0.reborrow().protocols
+    }
+    /// Supported codecs.
+    /// If empty, "proto" and "json" are assumed.
+    ///
+    /// Field 3: `codecs`
+    #[must_use]
+    pub fn codecs(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Codec>> {
+        &self.0.reborrow().codecs
+    }
+    /// Supported compression algorithms.
+    /// If empty, "identity" and "gzip" are assumed.
+    ///
+    /// Field 4: `compressions`
+    #[must_use]
+    pub fn compressions(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Compression>> {
+        &self.0.reborrow().compressions
+    }
+    /// Supported stream types.
+    /// If empty, all stream types are assumed. This is usually for
+    /// clients, since some client environments may not be able to
+    /// support certain kinds of streaming operations, especially
+    /// bidirectional streams.
+    ///
+    /// Field 5: `stream_types`
+    #[must_use]
+    pub fn stream_types(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::StreamType>> {
+        &self.0.reborrow().stream_types
+    }
+    /// Whether H2C (unencrypted, non-TLS HTTP/2 over cleartext) is supported.
+    /// If absent, true is assumed.
+    ///
+    /// Field 6: `supports_h2c`
+    #[must_use]
+    pub fn supports_h2c(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_h2c
+    }
+    /// Whether TLS is supported.
+    /// If absent, true is assumed.
+    ///
+    /// Field 7: `supports_tls`
+    #[must_use]
+    pub fn supports_tls(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_tls
+    }
+    /// Whether the client supports TLS certificates.
+    /// If absent, false is assumed. This should not be set if
+    /// supports_tls is false.
+    ///
+    /// Field 8: `supports_tls_client_certs`
+    #[must_use]
+    pub fn supports_tls_client_certs(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_tls_client_certs
+    }
+    /// Whether trailers are supported.
+    /// If absent, true is assumed. If false, implies that gRPC protocol is not allowed.
+    ///
+    /// Field 9: `supports_trailers`
+    #[must_use]
+    pub fn supports_trailers(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_trailers
+    }
+    /// Whether half duplex bidi streams are supported over HTTP/1.1.
+    /// If absent, false is assumed.
+    ///
+    /// Field 10: `supports_half_duplex_bidi_over_http1`
+    #[must_use]
+    pub fn supports_half_duplex_bidi_over_http1(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_half_duplex_bidi_over_http1
+    }
+    /// Whether Connect via GET is supported.
+    /// If absent, true is assumed.
+    ///
+    /// Field 11: `supports_connect_get`
+    #[must_use]
+    pub fn supports_connect_get(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_connect_get
+    }
+    /// Whether a message receive limit is supported.
+    /// If absent, true is assumed.
+    ///
+    /// Field 12: `supports_message_receive_limit`
+    #[must_use]
+    pub fn supports_message_receive_limit(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().supports_message_receive_limit
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<FeaturesView<'static>>>
+for FeaturesOwnedView {
+    fn from(inner: ::buffa::OwnedView<FeaturesView<'static>>) -> Self {
+        FeaturesOwnedView(inner)
+    }
+}
+impl ::core::convert::From<FeaturesOwnedView>
+for ::buffa::OwnedView<FeaturesView<'static>> {
+    fn from(wrapper: FeaturesOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<FeaturesView<'static>>>
+for FeaturesOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<FeaturesView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::Features {
+    type View<'a> = FeaturesView<'a>;
+    type ViewHandle = FeaturesOwnedView;
+}
+impl ::serde::Serialize for FeaturesOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 /// ConfigCase represents a single resolved configuration case. When tests are
 /// run, the Config and the supported features therein are used to compute all
 /// of the cases relevant to the implementation under test. These configuration
@@ -1458,6 +1798,169 @@ impl ::buffa::ViewReborrow for ConfigCaseView<'static> {
         this
     }
 }
+/** Self-contained, `'static` owned view of a `ConfigCase` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ConfigCaseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ConfigCaseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ConfigCaseOwnedView(::buffa::OwnedView<ConfigCaseView<'static>>);
+impl ConfigCaseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ConfigCaseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ConfigCaseOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ConfigCase,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ConfigCaseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ConfigCaseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ConfigCaseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ConfigCase {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// If unspecified, indicates cases for all versions.
+    ///
+    /// Field 1: `version`
+    #[must_use]
+    pub fn version(&self) -> ::buffa::EnumValue<super::super::HTTPVersion> {
+        self.0.reborrow().version
+    }
+    /// If unspecified, indicates cases for all protocols.
+    ///
+    /// Field 2: `protocol`
+    #[must_use]
+    pub fn protocol(&self) -> ::buffa::EnumValue<super::super::Protocol> {
+        self.0.reborrow().protocol
+    }
+    /// If unspecified, indicates cases for all codecs.
+    ///
+    /// Field 3: `codec`
+    #[must_use]
+    pub fn codec(&self) -> ::buffa::EnumValue<super::super::Codec> {
+        self.0.reborrow().codec
+    }
+    /// If unspecified, indicates cases for all compression algorithms.
+    ///
+    /// Field 4: `compression`
+    #[must_use]
+    pub fn compression(&self) -> ::buffa::EnumValue<super::super::Compression> {
+        self.0.reborrow().compression
+    }
+    /// If unspecified, indicates cases for all stream types.
+    ///
+    /// Field 5: `stream_type`
+    #[must_use]
+    pub fn stream_type(&self) -> ::buffa::EnumValue<super::super::StreamType> {
+        self.0.reborrow().stream_type
+    }
+    /// If absent, indicates cases for plaintext (no TLS) but also for
+    /// TLS if features indicate that TLS is supported.
+    ///
+    /// Field 6: `use_tls`
+    #[must_use]
+    pub fn use_tls(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().use_tls
+    }
+    /// If absent, indicates cases without client certs but also cases
+    /// that use client certs if features indicate they are supported.
+    ///
+    /// Field 7: `use_tls_client_certs`
+    #[must_use]
+    pub fn use_tls_client_certs(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().use_tls_client_certs
+    }
+    /// If absent, indicates cases that do not test message receive
+    /// limits but also cases that do test message receive limits if
+    /// features indicate they are supported.
+    ///
+    /// Field 8: `use_message_receive_limit`
+    #[must_use]
+    pub fn use_message_receive_limit(&self) -> ::core::option::Option<bool> {
+        self.0.reborrow().use_message_receive_limit
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ConfigCaseView<'static>>>
+for ConfigCaseOwnedView {
+    fn from(inner: ::buffa::OwnedView<ConfigCaseView<'static>>) -> Self {
+        ConfigCaseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ConfigCaseOwnedView>
+for ::buffa::OwnedView<ConfigCaseView<'static>> {
+    fn from(wrapper: ConfigCaseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ConfigCaseView<'static>>>
+for ConfigCaseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ConfigCaseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ConfigCase {
+    type View<'a> = ConfigCaseView<'a>;
+    type ViewHandle = ConfigCaseOwnedView;
+}
+impl ::serde::Serialize for ConfigCaseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
 /// TLSCreds represents credentials for TLS. It includes both a
 /// certificate and corresponding private key. Both are encoded
 /// in PEM format.
@@ -1680,5 +2183,116 @@ impl ::buffa::ViewReborrow for TLSCredsView<'static> {
     type Reborrowed<'b> = TLSCredsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
         this
+    }
+}
+/** Self-contained, `'static` owned view of a `TLSCreds` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`TLSCredsView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`TLSCredsView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct TLSCredsOwnedView(::buffa::OwnedView<TLSCredsView<'static>>);
+impl TLSCredsOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(TLSCredsOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TLSCredsOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::TLSCreds,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            TLSCredsOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`TLSCredsView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &TLSCredsView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::TLSCreds {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `cert`
+    #[must_use]
+    pub fn cert(&self) -> &'_ [u8] {
+        self.0.reborrow().cert
+    }
+    /// Field 2: `key`
+    #[must_use]
+    pub fn key(&self) -> &'_ [u8] {
+        self.0.reborrow().key
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<TLSCredsView<'static>>>
+for TLSCredsOwnedView {
+    fn from(inner: ::buffa::OwnedView<TLSCredsView<'static>>) -> Self {
+        TLSCredsOwnedView(inner)
+    }
+}
+impl ::core::convert::From<TLSCredsOwnedView>
+for ::buffa::OwnedView<TLSCredsView<'static>> {
+    fn from(wrapper: TLSCredsOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<TLSCredsView<'static>>>
+for TLSCredsOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<TLSCredsView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::TLSCreds {
+    type View<'a> = TLSCredsView<'a>;
+    type ViewHandle = TLSCredsOwnedView;
+}
+impl ::serde::Serialize for TLSCredsOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
     }
 }

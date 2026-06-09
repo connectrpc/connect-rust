@@ -413,9 +413,9 @@ mod tests {
     fn view_zero_copy_proto() {
         let p = proto_payload("zero copy");
         let v = p.view::<StringValueView>().unwrap();
-        assert_eq!(v.value, "zero copy");
+        assert_eq!(v.reborrow().value, "zero copy");
         // Borrows the payload's bytes — same backing storage.
-        let value_ptr = v.value.as_ptr() as usize;
+        let value_ptr = v.reborrow().value.as_ptr() as usize;
         let bytes_range =
             p.bytes().as_ptr() as usize..p.bytes().as_ptr() as usize + p.bytes().len();
         assert!(
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(m.value, "after");
         // view() re-encodes the replacement and views it.
         let v = p.view::<StringValueView>().unwrap();
-        assert_eq!(v.value, "after");
+        assert_eq!(v.reborrow().value, "after");
         // encoded() re-encodes for the original format.
         let encoded = p.encoded().unwrap();
         let rt: StringValue = decode_proto(&encoded).unwrap();
@@ -549,7 +549,7 @@ mod tests {
             ..Default::default()
         });
         let v = p.view::<StringValueView>().unwrap();
-        assert_eq!(v.value, "after");
+        assert_eq!(v.reborrow().value, "after");
     }
 
     #[test]
