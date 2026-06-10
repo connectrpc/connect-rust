@@ -1943,12 +1943,14 @@ where
     /// `Err(...)` for everything else: protocol/decode/deadline errors *and*
     /// a server error carried in the stream's termination metadata (gRPC
     /// trailers, gRPC-Web trailer frame, or Connect END_STREAM envelope).
-    /// `Ok(None)` means the RPC succeeded — matching `tonic`.
+    /// `Ok(None)` means the RPC succeeded. Terminal errors arrive from
+    /// `message()` itself, as in `tonic`.
     ///
     /// Every `Err` is terminal and sticky: the stream will never yield
     /// another message, subsequent calls return the same `Err` (the same
-    /// policy as a failed stream construction), and recovery means making a
-    /// new call — not re-polling this one. The terminal error also remains
+    /// policy as a failed stream construction; stronger than `tonic`, which
+    /// yields the error once and then reads as a clean end), and recovery
+    /// means making a new call — not re-polling this one. The terminal error also remains
     /// inspectable via [`error()`](Self::error), and
     /// [`trailers()`](Self::trailers) is populated when termination metadata
     /// was received — for both the `Ok(None)` and `Err` ends.
@@ -1962,12 +1964,13 @@ where
     ///
     /// A response body that ends without its protocol's termination
     /// metadata is not a clean end and returns `Err` rather than
-    /// `Ok(None)`: code `unavailable` for a Connect stream missing its
-    /// END_STREAM envelope, `internal` for a gRPC/gRPC-Web stream that
-    /// never delivered a `grpc-status` — whether the trailers were absent
-    /// entirely or present without the status (matching grpc-go). A
-    /// Trailers-Only response carrying `grpc-status: 0` in the headers is
-    /// a clean end.
+    /// `Ok(None)`: `unavailable` for a Connect stream missing its
+    /// END_STREAM envelope; for gRPC/gRPC-Web, `internal` when no
+    /// trailers arrived at all, `unknown` when trailers arrived without a
+    /// `grpc-status`, and `unknown` for a malformed `grpc-status` value —
+    /// matching grpc-go's treatment of each case. A Trailers-Only response
+    /// carrying `grpc-status: 0` in the headers (empty body) is a clean
+    /// end.
     pub async fn message(&mut self) -> Result<Option<OwnedView<RespView>>, ConnectError> {
         // The outcome is immutable once reported: never re-enter the
         // deadline wrapper or the body after the stream has ended. Every
@@ -1987,6 +1990,10 @@ where
         match with_deadline(deadline, self.message_inner()).await {
             Ok(Some(msg)) => Ok(Some(msg)),
             Ok(None) => {
+                debug_assert!(
+                    self.done,
+                    "message_inner returned Ok(None) without marking done"
+                );
                 // An end-of-stream whose termination metadata carries a
                 // server error is a failed RPC, not a clean close — surface
                 // it as `Err`. Callers that only match `Ok(None)` must never
@@ -2163,7 +2170,19 @@ where
                 .is_some_and(|d| std::time::Instant::now() >= d)
             {
                 ConnectError::deadline_exceeded("request timeout")
+            } else if self.trailers.is_some() {
+                // Trailers arrived but carry no usable status: the server
+                // spoke, just not enough — Unknown, matching grpc-go,
+                // connect-go, and the conformance suite's primary
+                // expectation for this sub-case.
+                ConnectError::new(
+                    ErrorCode::Unknown,
+                    "protocol error: grpc-status missing from trailers",
+                )
             } else {
+                // No termination metadata at all: indistinguishable from a
+                // mid-stream cut — Internal, matching grpc-go ("server
+                // closed the stream without sending trailers").
                 ConnectError::internal("stream ended without grpc-status")
             },
         )
@@ -2815,7 +2834,7 @@ where
     pub fn error(&self) -> Option<&ConnectError> {
         match &self.recv {
             RecvState::Ready(s) => s.error(),
-            _ => None,
+            _ => self.construct_err.as_ref(),
         }
     }
 }
@@ -3517,10 +3536,16 @@ fn add_streaming_request_headers(
 
 /// Parse a gRPC error from HTTP/2 trailers or gRPC-Web trailer frame headers.
 fn parse_grpc_error_from_trailers(trailers: &http::HeaderMap) -> Option<ConnectError> {
-    let status = trailers
-        .get("grpc-status")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u32>().ok())?;
+    let raw = trailers.get("grpc-status")?;
+    // A present-but-unparseable status is a protocol error, not an absent
+    // status — it must not read as success. grpc-go maps malformed
+    // grpc-status to Unknown.
+    let Some(status) = raw.to_str().ok().and_then(|s| s.parse::<u32>().ok()) else {
+        return Some(ConnectError::new(
+            ErrorCode::Unknown,
+            format!("protocol error: malformed grpc-status: {raw:?}"),
+        ));
+    };
 
     if status == 0 {
         return None; // OK
@@ -4229,7 +4254,9 @@ mod tests {
             .message()
             .await
             .expect_err("trailers without grpc-status must surface as Err");
-        assert_eq!(err.code, ErrorCode::Internal);
+        // Unknown, not Internal: trailers arrived, just without a status —
+        // grpc-go / connect-go / conformance-primary semantics.
+        assert_eq!(err.code, ErrorCode::Unknown);
         // The malformed trailers are still inspectable.
         assert!(stream.trailers().is_some());
 
@@ -4237,7 +4264,56 @@ mod tests {
             .message()
             .await
             .expect_err("missing-status error must be sticky");
-        assert_eq!(again.code, ErrorCode::Internal);
+        assert_eq!(again.code, ErrorCode::Unknown);
+    }
+
+    /// A present-but-garbage `grpc-status` is a protocol error (`unknown`,
+    /// grpc-go parity) — it must not satisfy the status-presence check and
+    /// read as a clean end.
+    #[tokio::test]
+    async fn grpc_malformed_status_errors() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "banana".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::trailers(trailers))];
+        let body = StreamBody::new(futures::stream::iter(frames));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers: http::HeaderMap::new(),
+            body,
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Grpc,
+            max_message_size: Some(1024),
+            deadline: None,
+            trailers: None,
+            error: None,
+            done: false,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("malformed grpc-status must surface as Err");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert!(
+            err.to_string().contains("malformed grpc-status"),
+            "unexpected error: {err}"
+        );
+
+        let again = stream
+            .message()
+            .await
+            .expect_err("malformed-status error must be sticky");
+        assert_eq!(again.code, ErrorCode::Unknown);
     }
 
     #[cfg(feature = "client")]
