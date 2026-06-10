@@ -2026,14 +2026,14 @@ where
         if let Some(end) = &self.end {
             return end.replay();
         }
-        match self.message_inner().await {
+        match self.next_message_or_end().await {
             Ok(msg) => Ok(Some(msg)),
             // The single writer of the terminal record. `message_inner`
             // cannot end the stream without producing one — "ended without
             // recording why" is unrepresentable.
             Err(end) => {
                 debug_assert!(self.end.is_none(), "terminal record written twice");
-                self.end.insert(end).replay()
+                self.end.get_or_insert(end).replay()
             }
         }
     }
@@ -2044,7 +2044,7 @@ where
     /// decode/transport/deadline errors lift into a `StreamEnd` via
     /// `From`. There is deliberately no way to exit this loop without
     /// producing the terminal record.
-    async fn message_inner(&mut self) -> Result<OwnedView<RespView>, StreamEnd> {
+    async fn next_message_or_end(&mut self) -> Result<OwnedView<RespView>, StreamEnd> {
         loop {
             // For gRPC-Web, check for a complete trailer frame (flag 0x80)
             // before attempting envelope decode (which would treat 0x80 as
@@ -2124,9 +2124,14 @@ where
                             )
                             .into());
                         }
-                        // gRPC-Web: a complete trailer frame may sit in the
-                        // buffer remnant; an absent or incomplete one
-                        // classifies as `None`.
+                        // gRPC-Web: preserved verbatim from the
+                        // pre-refactor shape, and provably dead — the
+                        // loop-top completeness check consumes any complete
+                        // trailer frame before poll_body runs, and EOF
+                        // appends nothing, so the remnant here is absent or
+                        // incomplete and the parse returns `None`. Removal
+                        // is a follow-up; either way classification sees
+                        // "no usable termination metadata".
                         let parsed = if matches!(self.protocol, Protocol::GrpcWeb)
                             && !self.buf.is_empty()
                             && self.buf[0] & 0x80 != 0
@@ -2242,7 +2247,7 @@ where
             // between frame polls is non-yielding, and `timeout_at` polls
             // the inner future before the timer (a Ready frame at the
             // deadline wins, in both shapes). It is what lets every
-            // terminal cause exit `message_inner` as a `StreamEnd`. (A
+            // terminal cause exit `next_message_or_end` as a `StreamEnd`. (A
             // relative per-poll timeout would break it;
             // `deadline_bounds_multi_frame_message` pins that.)
             let deadline = self.deadline;
@@ -4078,9 +4083,12 @@ mod tests {
     }
 
     /// A gRPC stream ending with `grpc-status: 0` is the one true clean end —
-    /// `Ok(None)`, no error.
+    /// `Ok(None)`, no error. Runs with an unexpired deadline set, so an
+    /// implementation that errors eagerly on any deadline would fail here.
     #[tokio::test]
     async fn grpc_ok_trailers_end_as_ok_none() {
+        use std::time::Duration;
+
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
         use http_body::Frame;
         use http_body_util::StreamBody;
@@ -4100,7 +4108,7 @@ mod tests {
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
             max_message_size: Some(1024),
-            deadline: None,
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(5)),
             end: None,
             saw_body_data: false,
             _phantom: PhantomData,
@@ -4323,6 +4331,11 @@ mod tests {
             .await
             .expect_err("absolute deadline must fire mid-trickle");
         assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "deadline must not fire early (elapsed {:?})",
+            start.elapsed()
+        );
         assert!(
             start.elapsed() <= Duration::from_millis(150),
             "deadline must be absolute across polls, not per-poll relative (elapsed {:?})",
