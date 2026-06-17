@@ -100,6 +100,18 @@ impl ::buffa_descriptor::reflect::Reflectable for CreateEventRequest {
         )
     }
 }
+impl ::buffa_descriptor::reflect::ReflectElement for CreateEventRequest {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
+        )
+    }
+}
 impl ::buffa::MessageName for CreateEventRequest {
     const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
     const NAME: &'static str = "CreateEventRequest";
@@ -343,6 +355,18 @@ impl ::buffa_descriptor::reflect::Reflectable for CreateEventResponse {
         )
     }
 }
+impl ::buffa_descriptor::reflect::ReflectElement for CreateEventResponse {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
+        )
+    }
+}
 impl ::buffa::MessageName for CreateEventResponse {
     const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
     const NAME: &'static str = "CreateEventResponse";
@@ -571,6 +595,18 @@ impl ::buffa_descriptor::reflect::Reflectable for Event {
                     idx,
                 ),
             ),
+        )
+    }
+}
+impl ::buffa_descriptor::reflect::ReflectElement for Event {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
         )
     }
 }
@@ -882,6 +918,18 @@ impl ::buffa_descriptor::reflect::Reflectable for CalculateDurationRequest {
         )
     }
 }
+impl ::buffa_descriptor::reflect::ReflectElement for CalculateDurationRequest {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
+        )
+    }
+}
 impl ::buffa::MessageName for CalculateDurationRequest {
     const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
     const NAME: &'static str = "CalculateDurationRequest";
@@ -1105,6 +1153,18 @@ impl ::buffa_descriptor::reflect::Reflectable for CalculateDurationResponse {
         )
     }
 }
+impl ::buffa_descriptor::reflect::ReflectElement for CalculateDurationResponse {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
+        )
+    }
+}
 impl ::buffa::MessageName for CalculateDurationResponse {
     const PACKAGE: &'static str = "anthropic.connectrpc.wkt.v1";
     const NAME: &'static str = "CalculateDurationResponse";
@@ -1293,6 +1353,18 @@ impl ::buffa_descriptor::reflect::Reflectable for ProcessMetadataRequest {
                     idx,
                 ),
             ),
+        )
+    }
+}
+impl ::buffa_descriptor::reflect::ReflectElement for ProcessMetadataRequest {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
         )
     }
 }
@@ -1495,6 +1567,18 @@ impl ::buffa_descriptor::reflect::Reflectable for ProcessMetadataResponse {
                     idx,
                 ),
             ),
+        )
+    }
+}
+impl ::buffa_descriptor::reflect::ReflectElement for ProcessMetadataResponse {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
         )
     }
 }

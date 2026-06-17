@@ -8,6 +8,19 @@ with the [Rust 0.x convention](https://doc.rust-lang.org/cargo/reference/semver.
 breaking changes increment the minor version (0.2 → 0.3), additive changes
 increment the patch version.
 
+## [Unreleased]
+
+### Fixed
+
+- **Connect client-streaming responses require the END_STREAM envelope**
+  ([#163]). A response that ended after its single data message but before
+  the END_STREAM envelope was accepted as a success with empty trailers, so
+  a truncated response was indistinguishable from a complete one. It now
+  returns `Err(unavailable)`, matching the `ServerStream` Connect EOF path
+  ([#140]); complete responses are unchanged.
+
+[#163]: https://github.com/anthropics/connect-rust/pull/163
+
 ## [0.7.0] - 2026-06-10
 
 A breaking release that reworks both ends of the message surface:

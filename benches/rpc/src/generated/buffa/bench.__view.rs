@@ -1480,6 +1480,7 @@ impl<'a> PayloadView<'a> {
                 13u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.scores.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.scores.push(::buffa::types::decode_int32(&mut pcur)?);
