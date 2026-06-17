@@ -79,6 +79,18 @@ impl ::buffa_descriptor::reflect::Reflectable for GreetRequest {
         )
     }
 }
+impl ::buffa_descriptor::reflect::ReflectElement for GreetRequest {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
+        )
+    }
+}
 impl ::buffa::MessageName for GreetRequest {
     const PACKAGE: &'static str = "anthropic.connectrpc.greet.v1";
     const NAME: &'static str = "GreetRequest";
@@ -256,6 +268,18 @@ impl ::buffa_descriptor::reflect::Reflectable for GreetResponse {
                     idx,
                 ),
             ),
+        )
+    }
+}
+impl ::buffa_descriptor::reflect::ReflectElement for GreetResponse {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
         )
     }
 }

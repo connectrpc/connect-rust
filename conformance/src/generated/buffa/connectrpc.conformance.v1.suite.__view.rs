@@ -228,6 +228,7 @@ impl<'a> TestSuiteView<'a> {
                 4u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.relevant_protocols.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.relevant_protocols
@@ -255,6 +256,7 @@ impl<'a> TestSuiteView<'a> {
                 5u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.relevant_http_versions.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.relevant_http_versions
@@ -282,6 +284,7 @@ impl<'a> TestSuiteView<'a> {
                 6u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.relevant_codecs.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.relevant_codecs
@@ -309,6 +312,7 @@ impl<'a> TestSuiteView<'a> {
                 7u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.relevant_compressions.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.relevant_compressions
@@ -1126,6 +1130,7 @@ impl<'a> TestCaseView<'a> {
                 4u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.other_allowed_error_codes.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.other_allowed_error_codes
