@@ -88,6 +88,18 @@ impl ::buffa_descriptor::reflect::Reflectable for AddRequest {
         )
     }
 }
+impl ::buffa_descriptor::reflect::ReflectElement for AddRequest {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
+        )
+    }
+}
 impl ::buffa::MessageName for AddRequest {
     const PACKAGE: &'static str = "anthropic.connectrpc.math.v1";
     const NAME: &'static str = "AddRequest";
@@ -281,6 +293,18 @@ impl ::buffa_descriptor::reflect::Reflectable for AddResponse {
                     idx,
                 ),
             ),
+        )
+    }
+}
+impl ::buffa_descriptor::reflect::ReflectElement for AddResponse {
+    /// Bridge-mode element reflection: each call snapshots this
+    /// element through [`Reflectable::reflect`]
+    /// (one encode/decode round-trip plus an allocation).
+    ///
+    /// [`Reflectable::reflect`]: ::buffa_descriptor::reflect::Reflectable::reflect
+    fn as_value_ref(&self) -> ::buffa_descriptor::reflect::ValueRef<'_> {
+        ::buffa_descriptor::reflect::ValueRef::Message(
+            ::buffa_descriptor::reflect::Reflectable::reflect(self),
         )
     }
 }

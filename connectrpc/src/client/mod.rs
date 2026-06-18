@@ -3205,18 +3205,18 @@ where
 
 /// Scan a collected Connect client-streaming response body.
 ///
-/// The body must contain exactly one data envelope. The END_STREAM envelope,
-/// if present, terminates the scan and supplies the trailers; a body that
-/// ends without one is still accepted (matching the previous behavior).
-/// Returns the (still encoded) message payload and any trailers carried in
-/// the END_STREAM metadata.
+/// The body must contain exactly one data envelope followed by an END_STREAM
+/// envelope, the protocol-level terminus: it supplies the trailers (or a
+/// terminal Connect error) and marks the response complete. A body that
+/// yields the data message and then ends before END_STREAM is truncated, not
+/// successful, and is rejected with `unavailable`, matching the `ServerStream`
+/// Connect EOF behavior. Returns the (still encoded) message payload and any
+/// trailers carried in the END_STREAM metadata.
 ///
-/// Scanning stops at the END_STREAM envelope — it is the protocol-level end
-/// of the response, so anything after it is ignored rather than decoded. A
-/// second data envelope is rejected before its payload is decompressed, so a
-/// response cannot make the client do per-envelope decompression work (or
-/// hold per-envelope decompressed buffers) beyond the single message the RPC
-/// shape allows.
+/// Scanning stops at END_STREAM, so anything after it is ignored rather than
+/// decoded. A second data envelope is rejected before its payload is
+/// decompressed, so the client never spends decompression work or memory on
+/// more than the single message the RPC allows.
 fn parse_connect_client_stream_envelopes(
     body: Bytes,
     compression: &crate::compression::CompressionRegistry,
@@ -3227,6 +3227,7 @@ fn parse_connect_client_stream_envelopes(
     let mut buf = BytesMut::from(body.as_ref());
     let mut message: Option<Bytes> = None;
     let mut trailers = http::HeaderMap::new();
+    let mut saw_end_stream = false;
 
     while !buf.is_empty() {
         let envelope = match Envelope::decode_with_limit(&mut buf, max_msg_size)? {
@@ -3235,6 +3236,7 @@ fn parse_connect_client_stream_envelopes(
         };
 
         if envelope.is_end_stream() {
+            saw_end_stream = true;
             let end_stream_data = if envelope.is_compressed() {
                 let enc = encoding.ok_or_else(|| {
                     ConnectError::internal("received compressed END_STREAM without encoding header")
@@ -3310,6 +3312,15 @@ fn parse_connect_client_stream_envelopes(
     let message = message.ok_or_else(|| {
         ConnectError::unimplemented("client streaming response contains no data messages")
     })?;
+
+    // The data message is present, but the body ended before END_STREAM. That
+    // is a truncated response, not a completed one — match ServerStream's
+    // Connect EOF handling rather than reporting success with no trailers.
+    if !saw_end_stream {
+        return Err(ConnectError::unavailable(
+            "Connect streaming response ended without END_STREAM envelope",
+        ));
+    }
 
     Ok((message, trailers))
 }
@@ -5585,5 +5596,83 @@ mod tests {
             err.to_string().contains("no data messages"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A data envelope followed by EOF, with no END_STREAM envelope, is a
+    /// truncated response rather than a completed one: it is rejected with
+    /// `unavailable` instead of succeeding with empty trailers, matching the
+    /// `ServerStream` Connect EOF behavior.
+    #[test]
+    fn client_stream_response_requires_end_stream_after_message() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let body = Envelope::data(Bytes::from_static(b"only")).encode();
+
+        let err = parse_connect_client_stream_envelopes(
+            body,
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("Connect streaming response ended without END_STREAM envelope"),
+        );
+    }
+
+    /// A data envelope followed by a truncated END_STREAM envelope (its
+    /// declared payload never arrives) is also a truncated response: the
+    /// partial envelope decodes to "needs more data", so END_STREAM is never
+    /// observed and the response is rejected with `unavailable`.
+    #[test]
+    fn client_stream_response_requires_complete_end_stream_after_message() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        let end_stream = Envelope::end_stream(Bytes::from_static(b"{}")).encode();
+        // Append everything but the final byte of the END_STREAM envelope.
+        body.extend_from_slice(&end_stream[..end_stream.len() - 1]);
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("Connect streaming response ended without END_STREAM envelope"),
+        );
+    }
+
+    /// A data envelope followed by an empty END_STREAM envelope (`{}`) is a
+    /// complete response: the message is returned with empty trailers.
+    #[test]
+    fn client_stream_response_end_stream_completes_the_response() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+
+        let (message, trailers) = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            None,
+            1024,
+            &http::HeaderMap::new(),
+        )
+        .unwrap();
+        assert_eq!(&message[..], b"only");
+        assert!(trailers.is_empty());
     }
 }

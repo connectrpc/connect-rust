@@ -657,6 +657,7 @@ impl<'a> FeaturesView<'a> {
                 1u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.versions.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.versions
@@ -684,6 +685,7 @@ impl<'a> FeaturesView<'a> {
                 2u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.protocols.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.protocols
@@ -711,6 +713,7 @@ impl<'a> FeaturesView<'a> {
                 3u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.codecs.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.codecs
@@ -738,6 +741,7 @@ impl<'a> FeaturesView<'a> {
                 4u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.compressions.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.compressions
@@ -765,6 +769,7 @@ impl<'a> FeaturesView<'a> {
                 5u32 => {
                     if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
                         let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                        view.stream_types.reserve(payload.len());
                         let mut pcur: &[u8] = payload;
                         while !pcur.is_empty() {
                             view.stream_types
