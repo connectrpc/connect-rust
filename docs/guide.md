@@ -61,6 +61,7 @@ The runtime is feature-gated so you only pay for what you use:
 
 | Feature | Default | What it adds |
 |---|---|---|
+| `json` | yes | JSON codec for protobuf messages (the proto3-JSON wire format). Disabling it drops the `serde` requirement on message types — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip` | yes | Gzip compression via `flate2` |
 | `zstd` | yes | Zstandard compression via `zstd` |
 | `streaming` | yes | Streaming compression via `async-compression` |
@@ -86,6 +87,46 @@ connectrpc = { version = "0.7", features = ["server"] }
 # Minimal (wasm-friendly: no networking, no native compression)
 connectrpc = { version = "0.7", default-features = false }
 ```
+
+### Proto-only (no-JSON) builds
+
+The Connect protocol supports two message codecs: binary proto and proto3
+JSON. The JSON codec needs every message type to be `serde::Serialize` /
+`Deserialize`, which is why the code generator derives those impls by default.
+A deployment that only ever speaks binary proto can turn JSON off and shed
+those derives — smaller generated code, no `serde_derive` in the message-type
+build.
+
+It takes two coordinated settings:
+
+1. **Generate without serde derives.** Pass the `no_json` plugin option (or
+   `connectrpc-build`'s [`.generate_json(false)`](#connectrpc-build-build-time-simplest)),
+   so message structs are emitted without `#[derive(serde::Serialize,
+   serde::Deserialize)]`.
+2. **Disable the runtime `json` feature**, which relaxes the message-type
+   bounds from `Message + Serialize`/`DeserializeOwned` to just `Message`:
+
+   ```toml
+   # Proto-only server: no JSON codec, no serde on message types
+   connectrpc = { version = "0.7", default-features = false, features = ["server"] }
+   ```
+
+With `json` off, the `Message + serde` requirement is replaced by the
+`JsonSerialize` / `JsonDeserialize` marker traits, which become empty bounds —
+so a serde-free generated type still satisfies every handler, router, and
+client signature. If a JSON request
+nonetheless reaches a proto-only server, the codec returns a Connect
+`Unimplemented` error (the error body itself is still JSON, as the Connect spec
+requires regardless of the request codec).
+
+`connectrpc` itself still depends on `serde` and `serde_json` even in a
+proto-only build — the always-JSON error wire format needs them — so they stay
+in `cargo tree`. What proto-only mode removes is the serde *derive* on your
+generated message types and the per-message JSON (de)serialization paths.
+
+> View-body responses are already proto-only and return `Unimplemented` for the
+> JSON codec — see [Returning a view body](#returning-a-view-body) — so a
+> proto-only build changes nothing for them.
 
 ## Quick start
 

@@ -130,10 +130,18 @@ impl Config {
         self
     }
 
-    /// Emit `serde` derives and proto3 JSON helpers (default: true).
+    /// Emit `serde` derives and proto3 JSON helpers on generated message
+    /// types (default: true).
     ///
-    /// Disable only for binary-only clients; the Connect protocol's JSON
-    /// codec requires this. See [`CodeGenConfig::generate_json`].
+    /// Disable for **proto-only** builds that never speak the Connect JSON
+    /// codec: message types are emitted without
+    /// `#[derive(serde::Serialize, serde::Deserialize)]`, cutting code size
+    /// and serde compile time. Pair it with `connectrpc`'s
+    /// `default-features = false` (the `json` cargo feature off) so the
+    /// runtime drops its matching serde bounds — proto-only generated code
+    /// only compiles against a proto-only runtime, and a JSON request to such
+    /// a server returns `Unimplemented`. With `json` left on, the runtime
+    /// still requires these derives. See [`CodeGenConfig::generate_json`].
     #[must_use]
     pub fn generate_json(mut self, enabled: bool) -> Self {
         self.options.buffa.generate_json = enabled;

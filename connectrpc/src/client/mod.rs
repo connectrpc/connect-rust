@@ -120,6 +120,7 @@ use buffa::view::ViewReborrow;
 
 use crate::codec::CodecFormat;
 use crate::codec::content_type;
+use crate::codec::encode_json;
 use crate::codec::header as connect_header;
 use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
@@ -1150,11 +1151,12 @@ fn decode_response_view<RespView>(
 ) -> Result<OwnedView<RespView>, ConnectError>
 where
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     match format {
         CodecFormat::Proto => OwnedView::<RespView>::decode(data)
             .map_err(|e| ConnectError::internal(format!("failed to decode response: {e}"))),
+        #[cfg(feature = "json")]
         CodecFormat::Json => {
             let owned: RespView::Owned = serde_json::from_slice(&data).map_err(|e| {
                 ConnectError::internal(format!("failed to decode JSON response: {e}"))
@@ -1162,6 +1164,10 @@ where
             OwnedView::<RespView>::from_owned(&owned)
                 .map_err(|e| ConnectError::internal(format!("failed to re-encode for view: {e}")))
         }
+        #[cfg(not(feature = "json"))]
+        CodecFormat::Json => Err(ConnectError::unimplemented(
+            crate::codec::JSON_FEATURE_DISABLED,
+        )),
     }
 }
 
@@ -1180,9 +1186,9 @@ pub async fn call_unary<T, Req, RespView>(
 where
     T: ClientTransport,
     <T::ResponseBody as Body>::Error: std::fmt::Display,
-    Req: buffa::Message + serde::Serialize,
+    Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let options = effective_options(config, options);
 
@@ -1197,12 +1203,7 @@ where
     // Encode the request body
     let body = match config.codec_format {
         CodecFormat::Proto => request.encode_to_bytes(),
-        CodecFormat::Json => {
-            let buf = serde_json::to_vec(&request).map_err(|e| {
-                ConnectError::internal(format!("failed to encode JSON request: {e}"))
-            })?;
-            Bytes::from(buf)
-        }
+        CodecFormat::Json => encode_json(&request)?,
     };
 
     // Apply compression and framing based on protocol.
@@ -1320,9 +1321,9 @@ pub async fn call_unary_get<T, Req, RespView>(
 where
     T: ClientTransport,
     <T::ResponseBody as Body>::Error: std::fmt::Display,
-    Req: buffa::Message + serde::Serialize,
+    Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     // Connect GET is a Connect-protocol-only feature.
     if !matches!(config.protocol, Protocol::Connect) {
@@ -1340,12 +1341,7 @@ where
     // Encode the request body
     let body = match config.codec_format {
         CodecFormat::Proto => request.encode_to_bytes(),
-        CodecFormat::Json => {
-            let buf = serde_json::to_vec(&request).map_err(|e| {
-                ConnectError::internal(format!("failed to encode JSON request: {e}"))
-            })?;
-            Bytes::from(buf)
-        }
+        CodecFormat::Json => encode_json(&request)?,
     };
 
     // Apply compression if configured (compression makes base64 mandatory).
@@ -1474,7 +1470,7 @@ where
     B: Body<Data = Bytes> + Send,
     B::Error: std::fmt::Display,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let status = response.status();
     if !status.is_success() {
@@ -1646,7 +1642,7 @@ where
     B: Body<Data = Bytes> + Send,
     B::Error: std::fmt::Display,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let status = response.status();
     let resp_headers = response.headers().clone();
@@ -1975,7 +1971,7 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     /// Returns the response headers.
     #[must_use]
@@ -2377,9 +2373,9 @@ pub async fn call_server_stream<T, Req, RespView>(
 where
     T: ClientTransport,
     <T::ResponseBody as Body>::Error: std::fmt::Display,
-    Req: buffa::Message + serde::Serialize,
+    Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let options = effective_options(config, options);
 
@@ -2394,12 +2390,7 @@ where
     // Encode the request body
     let body = match config.codec_format {
         CodecFormat::Proto => request.encode_to_bytes(),
-        CodecFormat::Json => {
-            let buf = serde_json::to_vec(&request).map_err(|e| {
-                ConnectError::internal(format!("failed to encode JSON request: {e}"))
-            })?;
-            Bytes::from(buf)
-        }
+        CodecFormat::Json => encode_json(&request)?,
     };
 
     // Compress and envelope-frame the request body (streaming protocol
@@ -2479,7 +2470,7 @@ where
     B: Body<Data = Bytes> + Send,
     B::Error: std::fmt::Display,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let response_headers = response.headers().clone();
     let status = response.status();
@@ -2698,9 +2689,9 @@ impl<B, Req, RespView> BidiStream<B, Req, RespView>
 where
     B: Body<Data = Bytes> + Send + Unpin,
     B::Error: std::fmt::Display,
-    Req: buffa::Message + serde::Serialize,
+    Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     /// Send a request message.
     ///
@@ -2727,12 +2718,7 @@ where
         // compression). Same logic as call_server_stream's request encoding.
         let msg_bytes = match self.codec_format {
             CodecFormat::Proto => msg.encode_to_bytes(),
-            CodecFormat::Json => {
-                let buf = serde_json::to_vec(&msg).map_err(|e| {
-                    ConnectError::internal(format!("failed to encode JSON request: {e}"))
-                })?;
-                Bytes::from(buf)
-            }
+            CodecFormat::Json => encode_json(&msg)?,
         };
 
         let mut envelope_buf = BytesMut::new();
@@ -2893,9 +2879,9 @@ pub async fn call_bidi_stream<T, Req, RespView>(
 where
     T: ClientTransport,
     <T::ResponseBody as Body>::Error: std::fmt::Display,
-    Req: buffa::Message + serde::Serialize,
+    Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let options = effective_options(config, options);
 
@@ -2995,9 +2981,9 @@ pub async fn call_client_stream<T, Req, RespView>(
 where
     T: ClientTransport,
     <T::ResponseBody as Body>::Error: std::fmt::Display,
-    Req: buffa::Message + serde::Serialize,
+    Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let options = effective_options(config, options);
 
@@ -3066,12 +3052,7 @@ where
         for request in requests {
             let msg_bytes = match config.codec_format {
                 CodecFormat::Proto => request.encode_to_bytes(),
-                CodecFormat::Json => {
-                    let buf = serde_json::to_vec(&request).map_err(|e| {
-                        ConnectError::internal(format!("failed to encode JSON request: {e}"))
-                    })?;
-                    Bytes::from(buf)
-                }
+                CodecFormat::Json => encode_json(&request)?,
             };
 
             let mut envelope_buf = BytesMut::new();
@@ -3117,7 +3098,7 @@ where
     B: Body<Data = Bytes> + Send,
     B::Error: std::fmt::Display,
     RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + serde::de::DeserializeOwned,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let status = response.status();
 
@@ -4816,6 +4797,28 @@ mod tests {
 
         let config = config.with_codec_format(CodecFormat::Json);
         assert_eq!(unary_request_content_type(&config), "application/json");
+    }
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn decode_response_view_json_is_unimplemented_without_feature() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        // Proto-only client: the response-decode JSON arm is compiled out and
+        // surfaces `Unimplemented` instead of attempting serde. The
+        // request-encode paths are the symmetric `return Err(Unimplemented)`
+        // guards that fire before any transport I/O.
+        let err = decode_response_view::<StringValueView>(
+            Bytes::from_static(b"\"x\""),
+            CodecFormat::Json,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+
+        // Proto decoding still works.
+        let bytes = StringValue::from("ok").encode_to_bytes();
+        assert!(decode_response_view::<StringValueView>(bytes, CodecFormat::Proto).is_ok());
     }
 
     #[test]

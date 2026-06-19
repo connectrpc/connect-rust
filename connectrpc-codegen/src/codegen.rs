@@ -450,8 +450,10 @@ pub fn generate_services(
 ///   [`CodeGenConfig::file_per_package`] for the `strategy: directory`
 ///   constraint.
 /// - `strict_utf8_mapping` — see [`CodeGenConfig::strict_utf8_mapping`].
-/// - `no_json` — disable `serde` derives on generated message types.
-///   Ignored in this plugin (no message types emitted); accepted for
+/// - `no_json` — disable `serde` derives on generated message types, for
+///   proto-only builds. Pair it with `connectrpc`'s `default-features = false`
+///   (the `json` cargo feature off) so the runtime drops its matching serde
+///   bounds. Ignored in this plugin (no message types emitted); accepted for
 ///   compatibility with the unified path.
 /// - `no_register_fn` — suppress the per-file
 ///   `register_types(&mut TypeRegistry)` aggregator. See

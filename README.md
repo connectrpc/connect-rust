@@ -318,6 +318,7 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 
 | Feature      | Default | Description                                      |
 | ------------ | ------- | ------------------------------------------------ |
+| `json`       | Yes     | JSON codec for protobuf messages. Disable (with codegen `no_json`) for proto-only builds — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip`       | Yes     | Gzip compression via flate2                      |
 | `zstd`       | Yes     | Zstandard compression via zstd                   |
 | `streaming`  | Yes     | Streaming compression via async-compression      |
@@ -344,6 +345,25 @@ connectrpc = { version = "0.7", default-features = false, features = ["gzip"] }
 connectrpc = { version = "0.7", default-features = false }
 ```
 
+### Proto-only (no-JSON) builds
+
+A deployment that only speaks binary proto can drop the JSON codec and the
+`serde` derives it requires on message types. Generate code with the `no_json`
+plugin option (or `connectrpc-build`'s `.generate_json(false)`) so message
+structs are emitted without serde derives, and disable the runtime `json`
+feature:
+
+```toml
+[dependencies]
+connectrpc = { version = "0.7", default-features = false, features = ["server"] }
+```
+
+With `json` off, message-type bounds relax from `Message + Serialize` to just
+`Message`, so serde-free generated code compiles. A JSON request to such a
+server gets a Connect `Unimplemented` error (the error body stays JSON, as the
+protocol requires). See the [user guide](docs/guide.md#proto-only-no-json-builds)
+for details.
+
 ### With Axum integration
 
 ```toml
@@ -364,6 +384,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 http-body = "1"
 ```
+
+For **proto-only** code (generated with `no_json`, and `connectrpc` built with
+`default-features = false`), drop the `json` feature on `buffa`/`buffa-types`
+and omit `serde`/`serde_json` — the generated message types no longer derive
+them. See [Proto-only builds](#proto-only-no-json-builds).
 
 ### Optional: gate the client behind a Cargo feature
 

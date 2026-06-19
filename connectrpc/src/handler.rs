@@ -30,10 +30,10 @@ use buffa::view::MessageView;
 use buffa::view::OwnedView;
 use bytes::Bytes;
 use futures::Stream;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 use crate::codec::CodecFormat;
+use crate::codec::decode_json;
+use crate::codec::{JsonDeserialize, JsonSerialize};
 use crate::error::ConnectError;
 use crate::response::{
     Encodable, EncodedResponse, RequestContext, Response, ServiceResult, ServiceStream,
@@ -42,15 +42,13 @@ use crate::response::{
 /// Decode a request message from bytes using the specified codec format.
 pub(crate) fn decode_request<Req>(request: &Bytes, format: CodecFormat) -> Result<Req, ConnectError>
 where
-    Req: Message + DeserializeOwned,
+    Req: Message + JsonDeserialize,
 {
     match format {
         CodecFormat::Proto => Req::decode_from_slice(&request[..]).map_err(|e| {
             ConnectError::invalid_argument(format!("failed to decode proto request: {e}"))
         }),
-        CodecFormat::Json => serde_json::from_slice(request).map_err(|e| {
-            ConnectError::invalid_argument(format!("failed to decode JSON request: {e}"))
-        }),
+        CodecFormat::Json => decode_json(&request[..]),
     }
 }
 
@@ -213,8 +211,8 @@ where
 pub(crate) struct UnaryHandlerWrapper<H, Req, Res>
 where
     H: Handler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
-    Res: Message + Serialize + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
+    Res: Message + JsonSerialize + Send + 'static,
 {
     handler: Arc<H>,
     _phantom: std::marker::PhantomData<fn(Req) -> Res>,
@@ -223,8 +221,8 @@ where
 impl<H, Req, Res> UnaryHandlerWrapper<H, Req, Res>
 where
     H: Handler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
-    Res: Message + Serialize + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
+    Res: Message + JsonSerialize + Send + 'static,
 {
     /// Create a new wrapper around the given handler.
     pub fn new(handler: H) -> Self {
@@ -238,8 +236,8 @@ where
 impl<H, Req, Res> ErasedHandler for UnaryHandlerWrapper<H, Req, Res>
 where
     H: Handler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
-    Res: Message + Serialize + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
+    Res: Message + JsonSerialize + Send + 'static,
 {
     fn call_erased(
         &self,
@@ -364,7 +362,7 @@ where
 pub(crate) struct ServerStreamingHandlerWrapper<H, Req, Res>
 where
     H: StreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
     Res: Message + Send + 'static,
 {
     handler: Arc<H>,
@@ -374,7 +372,7 @@ where
 impl<H, Req, Res> ServerStreamingHandlerWrapper<H, Req, Res>
 where
     H: StreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
     Res: Message + Send + 'static,
 {
     /// Create a new wrapper around the given streaming handler.
@@ -389,7 +387,7 @@ where
 impl<H, Req, Res> ErasedStreamingHandler for ServerStreamingHandlerWrapper<H, Req, Res>
 where
     H: StreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
     Res: Message + Send + 'static,
 {
     fn call_erased(
@@ -476,8 +474,8 @@ where
 pub(crate) struct ClientStreamingHandlerWrapper<H, Req, Res>
 where
     H: ClientStreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
-    Res: Message + Serialize + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
+    Res: Message + JsonSerialize + Send + 'static,
 {
     handler: Arc<H>,
     _phantom: std::marker::PhantomData<fn(Req) -> Res>,
@@ -486,8 +484,8 @@ where
 impl<H, Req, Res> ClientStreamingHandlerWrapper<H, Req, Res>
 where
     H: ClientStreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
-    Res: Message + Serialize + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
+    Res: Message + JsonSerialize + Send + 'static,
 {
     /// Create a new wrapper around the given client streaming handler.
     pub fn new(handler: H) -> Self {
@@ -501,8 +499,8 @@ where
 impl<H, Req, Res> ErasedClientStreamingHandler for ClientStreamingHandlerWrapper<H, Req, Res>
 where
     H: ClientStreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
-    Res: Message + Serialize + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
+    Res: Message + JsonSerialize + Send + 'static,
 {
     fn call_erased(
         &self,
@@ -601,7 +599,7 @@ where
 pub(crate) struct BidiStreamingHandlerWrapper<H, Req, Res>
 where
     H: BidiStreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
     Res: Message + Send + 'static,
 {
     handler: Arc<H>,
@@ -611,7 +609,7 @@ where
 impl<H, Req, Res> BidiStreamingHandlerWrapper<H, Req, Res>
 where
     H: BidiStreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
     Res: Message + Send + 'static,
 {
     /// Create a new wrapper around the given bidi streaming handler.
@@ -626,7 +624,7 @@ where
 impl<H, Req, Res> ErasedBidiStreamingHandler for BidiStreamingHandlerWrapper<H, Req, Res>
 where
     H: BidiStreamingHandler<Req, Res>,
-    Req: Message + DeserializeOwned + Send + 'static,
+    Req: Message + JsonDeserialize + Send + 'static,
     Res: Message + Send + 'static,
 {
     fn call_erased(
@@ -663,7 +661,7 @@ pub(crate) fn decode_request_view<ReqView>(
 ) -> Result<OwnedView<ReqView>, ConnectError>
 where
     ReqView: MessageView<'static> + Send,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     let body = request_proto_bytes::<ReqView::Owned>(request, format)?;
     OwnedView::<ReqView>::decode(body)
@@ -687,14 +685,12 @@ where
 #[doc(hidden)] // exposed only for dispatcher::codegen (generated code)
 pub fn request_proto_bytes<Req>(request: Bytes, format: CodecFormat) -> Result<Bytes, ConnectError>
 where
-    Req: Message + DeserializeOwned,
+    Req: Message + JsonDeserialize,
 {
     match format {
         CodecFormat::Proto => Ok(request),
         CodecFormat::Json => {
-            let owned: Req = serde_json::from_slice(&request).map_err(|e| {
-                ConnectError::invalid_argument(format!("failed to decode JSON request: {e}"))
-            })?;
+            let owned: Req = decode_json(&request[..])?;
             Ok(Bytes::from(owned.encode_to_vec()))
         }
     }
@@ -798,7 +794,7 @@ pub(crate) struct UnaryViewHandlerWrapper<H, ReqView>
 where
     H: ViewHandler<ReqView>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     handler: Arc<H>,
     _phantom: std::marker::PhantomData<fn(ReqView)>,
@@ -808,7 +804,7 @@ impl<H, ReqView> UnaryViewHandlerWrapper<H, ReqView>
 where
     H: ViewHandler<ReqView>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     pub fn new(handler: H) -> Self {
         Self {
@@ -822,7 +818,7 @@ impl<H, ReqView> ErasedHandler for UnaryViewHandlerWrapper<H, ReqView>
 where
     H: ViewHandler<ReqView>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     fn call_erased(
         &self,
@@ -915,7 +911,7 @@ pub(crate) struct ServerStreamingViewHandlerWrapper<H, ReqView, Res>
 where
     H: ViewStreamingHandler<ReqView, Res>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
     Res: Message + Send + 'static,
 {
     handler: Arc<H>,
@@ -926,7 +922,7 @@ impl<H, ReqView, Res> ServerStreamingViewHandlerWrapper<H, ReqView, Res>
 where
     H: ViewStreamingHandler<ReqView, Res>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
     Res: Message + Send + 'static,
 {
     pub fn new(handler: H) -> Self {
@@ -941,7 +937,7 @@ impl<H, ReqView, Res> ErasedStreamingHandler for ServerStreamingViewHandlerWrapp
 where
     H: ViewStreamingHandler<ReqView, Res>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
     Res: Message + Send + 'static,
 {
     fn call_erased(
@@ -1026,7 +1022,7 @@ pub(crate) struct ClientStreamingViewHandlerWrapper<H, ReqView>
 where
     H: ViewClientStreamingHandler<ReqView>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     handler: Arc<H>,
     _phantom: std::marker::PhantomData<fn(ReqView)>,
@@ -1036,7 +1032,7 @@ impl<H, ReqView> ClientStreamingViewHandlerWrapper<H, ReqView>
 where
     H: ViewClientStreamingHandler<ReqView>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     pub fn new(handler: H) -> Self {
         Self {
@@ -1050,7 +1046,7 @@ impl<H, ReqView> ErasedClientStreamingHandler for ClientStreamingViewHandlerWrap
 where
     H: ViewClientStreamingHandler<ReqView>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
 {
     fn call_erased(
         &self,
@@ -1142,7 +1138,7 @@ pub(crate) struct BidiStreamingViewHandlerWrapper<H, ReqView, Res>
 where
     H: ViewBidiStreamingHandler<ReqView, Res>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
     Res: Message + Send + 'static,
 {
     handler: Arc<H>,
@@ -1153,7 +1149,7 @@ impl<H, ReqView, Res> BidiStreamingViewHandlerWrapper<H, ReqView, Res>
 where
     H: ViewBidiStreamingHandler<ReqView, Res>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
     Res: Message + Send + 'static,
 {
     pub fn new(handler: H) -> Self {
@@ -1169,7 +1165,7 @@ impl<H, ReqView, Res> ErasedBidiStreamingHandler
 where
     H: ViewBidiStreamingHandler<ReqView, Res>,
     ReqView: MessageView<'static> + Send + Sync + 'static,
-    ReqView::Owned: Message + DeserializeOwned,
+    ReqView::Owned: Message + JsonDeserialize,
     Res: Message + Send + 'static,
 {
     fn call_erased(
@@ -1205,6 +1201,7 @@ mod tests {
         assert_eq!(decoded.value, "hello");
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_decode_request_json() {
         let encoded = Bytes::from_static(b"\"world\"");
@@ -1219,6 +1216,7 @@ mod tests {
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_decode_request_json_invalid() {
         let garbage = Bytes::from_static(b"not json");
@@ -1234,11 +1232,33 @@ mod tests {
         assert_eq!(view.reborrow().value, "view-test");
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_decode_request_view_json() {
         let encoded = Bytes::from_static(b"\"json-view\"");
         let view = decode_request_view::<StringValueView>(encoded, CodecFormat::Json).unwrap();
         assert_eq!(view.reborrow().value, "json-view");
+    }
+
+    // Proto-only build: the JSON request-decode arms (`decode_request` and
+    // `request_proto_bytes`, the latter reached via `decode_request_view`)
+    // are compiled out and report `Unimplemented`; proto decoding is
+    // unaffected (covered by the `*_proto` tests above).
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn decode_request_json_is_unimplemented_without_feature() {
+        let body = Bytes::from_static(b"\"world\"");
+        let err = decode_request::<StringValue>(&body, CodecFormat::Json).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Unimplemented);
+    }
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn decode_request_view_json_is_unimplemented_without_feature() {
+        let body = Bytes::from_static(b"\"world\"");
+        let err = decode_request_view::<StringValueView>(body, CodecFormat::Json).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Unimplemented);
     }
 
     #[test]
@@ -1289,6 +1309,7 @@ mod tests {
         assert!(out.next().await.is_none());
     }
 
+    #[cfg(feature = "json")]
     #[tokio::test]
     async fn encode_body_stream_pre_encoded_json_decodes_per_item() {
         use crate::PreEncoded;

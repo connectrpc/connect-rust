@@ -338,9 +338,9 @@ pub mod codegen {
     use bytes::Bytes;
     use futures::Stream;
     use futures::StreamExt;
-    use serde::de::DeserializeOwned;
 
     use crate::codec::CodecFormat;
+    use crate::codec::JsonDeserialize;
     use crate::error::ConnectError;
     use crate::handler::BoxStream;
 
@@ -421,7 +421,7 @@ pub mod codegen {
         format: CodecFormat,
     ) -> crate::ServiceStream<crate::StreamMessage<M>>
     where
-        M: crate::HasMessageView + DeserializeOwned + 'static,
+        M: crate::HasMessageView + JsonDeserialize + 'static,
         M::View<'static>: 'static,
     {
         Box::pin(requests.map(move |r| {

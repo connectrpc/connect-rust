@@ -10,6 +10,23 @@ increment the patch version.
 
 ## [Unreleased]
 
+### Added
+
+- **Optional `json` cargo feature for proto-only builds** ([#172]). The
+  Connect JSON codec requires `serde::Serialize`/`Deserialize` on every
+  message type, so the code generator derives them by default — pure cost for
+  crates that only speak binary proto. The new default-on `json` feature, when
+  disabled (`connectrpc = { default-features = false }`), relaxes the runtime's
+  message-type bounds to just `buffa::Message` via the new
+  `JsonSerialize`/`JsonDeserialize` marker traits, so message types
+  generated with the codegen `no_json` option (no serde derives) compile
+  against the runtime. A JSON request to a proto-only server returns
+  `Unimplemented`. The Connect error/end-stream wire format is always JSON per
+  spec, so `serde`/`serde_json` remain required dependencies. See the
+  [proto-only build guide](docs/guide.md#proto-only-no-json-builds).
+
+[#172]: https://github.com/anthropics/connect-rust/pull/172
+
 ### Fixed
 
 - **Connect client-streaming responses require the END_STREAM envelope**

@@ -319,7 +319,11 @@ pub use interceptor::unary_interceptor;
 // ============================================================================
 
 pub use codec::CodecFormat;
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub use codec::JsonCodec;
+pub use codec::JsonDeserialize;
+pub use codec::JsonSerialize;
 pub use codec::ProtoCodec;
 
 // ============================================================================

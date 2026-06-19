@@ -26,10 +26,11 @@ use std::sync::OnceLock;
 use buffa::Message;
 use buffa::view::{MessageView, OwnedView};
 use bytes::Bytes;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 
-use crate::codec::{CodecFormat, decode_json, decode_proto, encode_json, encode_proto};
+use crate::codec::{
+    CodecFormat, JsonDeserialize, JsonSerialize, decode_json, decode_proto, encode_json,
+    encode_proto,
+};
 use crate::error::ConnectError;
 
 /// Object-safe, type-erased RPC message.
@@ -40,7 +41,7 @@ use crate::error::ConnectError;
 /// interceptor swaps it.
 ///
 /// You will almost never implement this trait directly. A blanket
-/// implementation covers every type that is `Message + Serialize`, which
+/// implementation covers every type that is `Message + JsonSerialize`, which
 /// includes every owned message the code generator emits. A manual impl
 /// must uphold a round-trip invariant: bytes returned by
 /// [`encode`](AnyMessage::encode)`(format)` must decode back to an
@@ -77,7 +78,7 @@ pub trait AnyMessage: Send + Sync + 'static {
 impl<T> AnyMessage for T
 where
     // Message already requires Send + Sync as supertraits.
-    T: Message + Serialize + 'static,
+    T: Message + JsonSerialize + 'static,
 {
     fn as_any(&self) -> &dyn Any {
         self
@@ -175,7 +176,7 @@ impl Payload {
     ///   holds whichever type decoded first.
     pub fn message<M>(&self) -> Result<&M, ConnectError>
     where
-        M: Message + Serialize + DeserializeOwned + 'static,
+        M: Message + JsonSerialize + JsonDeserialize + 'static,
     {
         if let Some(replaced) = &self.replaced {
             return replaced.as_any().downcast_ref::<M>().ok_or_else(|| {
@@ -246,10 +247,10 @@ impl Payload {
     pub fn take_message<M>(self) -> Result<M, ConnectError>
     where
         // Unlike `message()`, this never *populates* the cache, so it
-        // does not need `M: Serialize` (the bound `message()` carries to
+        // does not need `M: JsonSerialize` (the bound `message()` carries to
         // box `M` as `dyn AnyMessage`). It only reads the cache or
         // decodes fresh.
-        M: Message + DeserializeOwned + 'static,
+        M: Message + JsonDeserialize + 'static,
     {
         if let Some(replaced) = self.replaced {
             let type_name = replaced.type_name();
@@ -397,6 +398,7 @@ mod tests {
         assert!(std::ptr::eq(m1, m2), "second call should hit the cache");
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn message_decodes_json() {
         let bytes = encode_json(&StringValue {
@@ -424,6 +426,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn view_errors_on_json() {
         let bytes = encode_json(&StringValue {
@@ -464,6 +467,7 @@ mod tests {
         assert_eq!(orig.value, "before");
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn set_message_round_trips_json_format() {
         let bytes = encode_json(&StringValue {
@@ -517,6 +521,31 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidArgument, "{err:?}");
     }
 
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn message_json_format_is_unimplemented_without_feature() {
+        // A JSON-format payload can't be decoded in a proto-only build; the
+        // codec reports `Unimplemented` rather than attempting serde.
+        let p = Payload::new(Bytes::from_static(b"{}"), CodecFormat::Json);
+        assert_eq!(
+            p.message::<StringValue>().unwrap_err().code,
+            crate::ErrorCode::Unimplemented
+        );
+        // Proto-format payloads still decode normally.
+        assert!(proto_payload("ok").message::<StringValue>().is_ok());
+    }
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn take_message_json_format_is_unimplemented_without_feature() {
+        let p = Payload::new(Bytes::from_static(b"{}"), CodecFormat::Json);
+        assert_eq!(
+            p.take_message::<StringValue>().unwrap_err().code,
+            crate::ErrorCode::Unimplemented
+        );
+        assert!(proto_payload("ok").take_message::<StringValue>().is_ok());
+    }
+
     #[test]
     fn message_replacement_wrong_type_errors() {
         use buffa_types::google::protobuf::Int32Value;
@@ -534,6 +563,7 @@ mod tests {
         assert!(msg.contains("StringValue"), "{err:?}");
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn view_replaced_json_format_payload() {
         // A replacement is always re-encoded to proto for view(), so a
