@@ -62,10 +62,22 @@ increment the patch version.
   returns `Err(unavailable)`, matching the `ServerStream` Connect EOF path
   ([#140]); complete responses are unchanged.
 
+### Changed
+
+- **Unsupported gRPC/gRPC-Web message codecs return `unimplemented`**
+  ([#180]). A request with a valid `application/grpc` / `application/grpc-web`
+  prefix but a codec the server does not speak (for example
+  `application/grpc+thrift`, or `application/grpc+json` in a proto-only build)
+  now returns grpc-status `unimplemented` (12) instead of `internal` (13).
+  This matches the compression axis, which already returns `unimplemented` for
+  an unsupported `grpc-encoding`. Clients that branch on grpc-status will
+  observe 13 → 12 for this case on upgrade.
+
 [#151]: https://github.com/anthropics/connect-rust/issues/151
 [#163]: https://github.com/anthropics/connect-rust/pull/163
 [#164]: https://github.com/anthropics/connect-rust/pull/164
 [#172]: https://github.com/anthropics/connect-rust/pull/172
+[#180]: https://github.com/anthropics/connect-rust/issues/180
 
 ## [0.7.0] - 2026-06-10
 
