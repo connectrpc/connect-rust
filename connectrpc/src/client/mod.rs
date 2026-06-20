@@ -263,6 +263,9 @@ mod http2;
 pub use http2::Http2Connection;
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+pub use http2::Http2ConnectionBuilder;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub use http2::SharedHttp2Connection;
 
 /// General-purpose HTTP client supporting both HTTP/1.1 and HTTP/2.
@@ -315,16 +318,17 @@ impl std::fmt::Debug for HttpClient {
 
 /// Inner hyper client, parameterized over connector type via an enum.
 ///
-/// This keeps the plaintext case exactly as before (zero cost) while
-/// allowing the TLS variant to use a different connector type without
-/// leaking generics into the public `HttpClient` signature.
+/// Both connectors are wrapped in [`TimeoutConnector`] so an optional
+/// `handshake_timeout` can bound the whole connector establishment. When no
+/// timeout is set the wrapper forwards each connect unchanged (a single boxed
+/// future per *connection*, not per request — negligible).
 #[cfg(feature = "client")]
 #[derive(Clone)]
 enum HttpClientInner {
     /// Plaintext HTTP (http:// only). Rejects https:// at send-time.
     Plain(
         hyper_util::client::legacy::Client<
-            hyper_util::client::legacy::connect::HttpConnector,
+            TimeoutConnector<hyper_util::client::legacy::connect::HttpConnector>,
             ClientBody,
         >,
     ),
@@ -333,10 +337,64 @@ enum HttpClientInner {
     #[cfg(feature = "client-tls")]
     Tls(
         hyper_util::client::legacy::Client<
-            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+            TimeoutConnector<
+                hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+            >,
             ClientBody,
         >,
     ),
+}
+
+/// A `tower::Service<Uri>` connector wrapper that bounds connection
+/// establishment with an optional timeout.
+///
+/// Wraps the built-in `HttpConnector` (plaintext) or hyper-rustls's
+/// `HttpsConnector` (TLS). When `timeout` is `Some`, a connect that doesn't
+/// resolve in time is cancelled (dropping the in-flight TCP/TLS work) and
+/// surfaced as a `deadline_exceeded` error. When `None`, the inner connector's
+/// future is awaited unchanged.
+#[cfg(feature = "client")]
+#[derive(Clone)]
+struct TimeoutConnector<C> {
+    inner: C,
+    timeout: Option<Duration>,
+}
+
+#[cfg(feature = "client")]
+impl<C> tower::Service<Uri> for TimeoutConnector<C>
+where
+    C: tower::Service<Uri>,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = BoxFuture<'static, Result<C::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let fut = self.inner.call(uri);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            match timeout {
+                Some(dur) => match tokio::time::timeout(dur, fut).await {
+                    Ok(res) => res.map_err(Into::into),
+                    Err(_) => Err(ConnectError::deadline_exceeded(format!(
+                        "connection establishment did not complete within {dur:?}"
+                    ))
+                    .into()),
+                },
+                None => fut.await.map_err(Into::into),
+            }
+        })
+    }
 }
 
 #[cfg(feature = "client")]
@@ -348,6 +406,7 @@ impl HttpClient {
     /// `HttpClient::plaintext()` is equivalent to
     /// `HttpClient::builder().plaintext()`, and likewise for the other
     /// constructors.
+    #[must_use]
     pub fn builder() -> HttpClientBuilder {
         HttpClientBuilder::default()
     }
@@ -430,6 +489,7 @@ impl HttpClient {
 #[derive(Debug, Default, Clone)]
 pub struct HttpClientBuilder {
     connect_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
 }
 
 #[cfg(feature = "client")]
@@ -452,8 +512,39 @@ impl HttpClientBuilder {
     /// stall on kernel retransmits.
     ///
     /// [hyper-ct]: hyper_util::client::legacy::connect::HttpConnector::set_connect_timeout
+    #[must_use]
     pub fn connect_timeout(mut self, dur: Duration) -> Self {
         self.connect_timeout = Some(dur);
+        self
+    }
+
+    /// Bound the whole connector establishment: the TCP connect plus, for
+    /// [`with_tls`](Self::with_tls), the TLS handshake.
+    ///
+    /// Unlike [`connect_timeout`](Self::connect_timeout) (which bounds only the
+    /// per-address TCP `connect(2)` call), this is a single wall-clock bound on
+    /// everything the connector does to produce a usable stream — so on the TLS
+    /// transport the two bounds overlap on the TCP phase.
+    ///
+    /// # What it does and does not cover
+    ///
+    /// Because `HttpClient` pools connections through hyper's legacy client, the
+    /// HTTP/2 preface runs *inside* the pool and is not separately observable
+    /// here — this bound covers **TCP and TLS, not the h2 preface**. This
+    /// differs from [`Http2Connection`], whose handshake bound covers the TLS
+    /// handshake *and* the h2 preface while bounding TCP separately via its own
+    /// `connect_timeout`. Use a per-request timeout (e.g.
+    /// [`CallOptions::with_timeout`]) for a true end-to-end bound. For a
+    /// transport that bounds the h2 preface too, use [`Http2Connection`].
+    ///
+    /// Exceeding this bound surfaces as a [`ConnectError`] with
+    /// [`ErrorCode::Unavailable`] (the connect is retryable); the message names
+    /// the establishment phase.
+    ///
+    /// Unset (the default) means the connector establishment is unbounded.
+    #[must_use]
+    pub fn handshake_timeout(mut self, dur: Duration) -> Self {
+        self.handshake_timeout = Some(dur);
         self
     }
 
@@ -464,12 +555,22 @@ impl HttpClientBuilder {
         connector
     }
 
+    /// Wrap a connector so `handshake_timeout` (if set) bounds its establishment.
+    fn wrap<C>(&self, connector: C) -> TimeoutConnector<C> {
+        TimeoutConnector {
+            inner: connector,
+            timeout: self.handshake_timeout,
+        }
+    }
+
     /// Finish building as a plaintext client. See [`HttpClient::plaintext`].
+    #[must_use]
     pub fn plaintext(self) -> HttpClient {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
 
-        let client = Client::builder(TokioExecutor::new()).build(self.http_connector());
+        let connector = self.wrap(self.http_connector());
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         HttpClient {
             inner: HttpClientInner::Plain(client),
         }
@@ -477,13 +578,15 @@ impl HttpClientBuilder {
 
     /// Finish building as an h2c-only plaintext client. See
     /// [`HttpClient::plaintext_http2_only`].
+    #[must_use]
     pub fn plaintext_http2_only(self) -> HttpClient {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
 
+        let connector = self.wrap(self.http_connector());
         let client = Client::builder(TokioExecutor::new())
             .http2_only(true)
-            .build(self.http_connector());
+            .build(connector);
         HttpClient {
             inner: HttpClientInner::Plain(client),
         }
@@ -492,6 +595,7 @@ impl HttpClientBuilder {
     /// Finish building as a TLS client. See [`HttpClient::with_tls`].
     #[cfg(feature = "client-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
+    #[must_use]
     pub fn with_tls(self, tls_config: std::sync::Arc<rustls::ClientConfig>) -> HttpClient {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
@@ -518,7 +622,8 @@ impl HttpClientBuilder {
             .enable_all_versions()
             .wrap_connector(http);
 
-        let client = Client::builder(TokioExecutor::new()).build(https);
+        let connector = self.wrap(https);
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         HttpClient {
             inner: HttpClientInner::Tls(client),
         }
@@ -3830,6 +3935,77 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "connect_timeout(100ms) should abort within ~2s, took {elapsed:?}: {err}"
         );
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_handshake_timeout_bounds_plaintext_connector() {
+        use std::time::Instant;
+
+        // The handshake_timeout wrapper bounds the whole connector. For
+        // plaintext that's just the TCP connect, so an unroutable TEST-NET-1
+        // address must fail fast rather than stall on kernel SYN retransmits.
+        let target = "http://192.0.2.1:9/";
+        let http = HttpClient::builder()
+            .handshake_timeout(Duration::from_millis(100))
+            .plaintext();
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(target)
+            .body(full_body(Bytes::new()))
+            .unwrap();
+
+        let start = Instant::now();
+        let err = http.send(req).await.expect_err("connect must fail");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handshake_timeout(100ms) should abort within ~2s, took {elapsed:?}: {err}"
+        );
+    }
+
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn http_client_handshake_timeout_bounds_stalled_tls() {
+        use std::time::Instant;
+
+        // A listener that accepts the TCP connection but never performs the TLS
+        // handshake. The TCP connect succeeds, so only handshake_timeout (which
+        // covers TCP + TLS for the connector) can release the stalled connect.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let tls_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let http = HttpClient::builder()
+            .handshake_timeout(Duration::from_millis(150))
+            .with_tls(tls_config);
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("https://{addr}/"))
+            .body(full_body(Bytes::new()))
+            .unwrap();
+
+        let start = Instant::now();
+        let err = http.send(req).await.expect_err("stalled TLS must fail");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handshake_timeout(150ms) should fire within ~2s, took {elapsed:?}: {err}"
+        );
+
+        server.abort();
     }
 
     #[test]
