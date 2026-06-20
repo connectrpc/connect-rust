@@ -43,6 +43,18 @@
 //! period. This is independent of whole-server graceful shutdown, which still
 //! drains in-flight requests indefinitely even while a connection is in its
 //! age-grace window.
+//!
+//! # Maximum Connection Idle
+//!
+//! Use [`Server::with_max_connection_idle`] (or the [`BoundServer`] equivalent)
+//! to reclaim connections that have gone quiet. A connection is idle when it
+//! has no in-flight requests; once it stays idle for the configured duration it
+//! is retired through the same GOAWAY-then-grace path as maximum age, draining
+//! over the same grace period set by `with_max_connection_age_grace`. The idle
+//! timer resets on activity, so a connection with steady traffic is never
+//! retired. The window is evaluated lazily, so retirement happens between one
+//! and two times the configured duration after the last activity. When both
+//! limits are configured, whichever fires first wins.
 
 use std::any::Any;
 use std::collections::hash_map::RandomState;
@@ -51,6 +63,9 @@ use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -158,6 +173,7 @@ pub struct Server {
     tls_handshake_timeout: std::time::Duration,
     max_connection_age: Option<Duration>,
     max_connection_age_grace: Duration,
+    max_connection_idle: Option<Duration>,
 }
 
 impl Server {
@@ -172,6 +188,7 @@ impl Server {
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
+            max_connection_idle: None,
         }
     }
 
@@ -186,6 +203,7 @@ impl Server {
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
+            max_connection_idle: None,
         }
     }
 
@@ -341,20 +359,56 @@ impl Server {
         self
     }
 
-    /// Set the grace period used after a max-age connection begins shutdown.
+    /// Set the grace period used after a retired connection begins shutdown.
     ///
     /// The one-step counterpart of
     /// [`BoundServer::with_max_connection_age_grace`]. Defaults to five
-    /// seconds; has no effect unless [`with_max_connection_age`](Self::with_max_connection_age)
-    /// is also set.
+    /// seconds. This single grace period is shared by both
+    /// [`with_max_connection_age`](Self::with_max_connection_age) and
+    /// [`with_max_connection_idle`](Self::with_max_connection_idle); it has no
+    /// effect unless at least one of them is set.
     #[must_use]
     pub fn with_max_connection_age_grace(mut self, grace: Duration) -> Self {
         self.max_connection_age_grace = grace;
         self
     }
 
+    /// Retire a connection that has had no in-flight requests for `duration`.
+    ///
+    /// The one-step counterpart of
+    /// [`BoundServer::with_max_connection_idle`]; see it for full behaviour
+    /// (GOAWAY then grace-period drain). Disabled by default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `duration` is zero.
+    #[must_use]
+    pub fn with_max_connection_idle(mut self, duration: Duration) -> Self {
+        assert!(
+            !duration.is_zero(),
+            "with_max_connection_idle requires a non-zero duration",
+        );
+        self.max_connection_idle = Some(duration);
+        self
+    }
+
     fn connection_age_config(&self) -> Option<ConnectionAgeConfig> {
-        build_connection_age_config(self.max_connection_age, self.max_connection_age_grace)
+        build_connection_age_config(
+            self.max_connection_age,
+            self.max_connection_idle,
+            self.max_connection_age_grace,
+        )
+    }
+
+    fn connection_idle_config(&self) -> Option<IdleConfig> {
+        build_connection_idle_config(self.max_connection_idle, self.max_connection_age_grace)
+    }
+
+    fn retirement_config(&self) -> RetirementConfig {
+        RetirementConfig {
+            age: self.connection_age_config(),
+            idle: self.connection_idle_config(),
+        }
     }
 
     /// Get a reference to the underlying router.
@@ -371,7 +425,7 @@ impl Server {
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(addr).await?;
-        let connection_age = self.connection_age_config();
+        let retirement = self.retirement_config();
         #[cfg(feature = "server-tls")]
         let tls_acceptor = self.tls_config.map(tokio_rustls::TlsAcceptor::from);
         #[cfg(not(feature = "server-tls"))]
@@ -392,7 +446,7 @@ impl Server {
             #[cfg(feature = "server-tls")]
             self.tls_handshake_timeout,
             None,
-            connection_age,
+            retirement,
         )
         .await
     }
@@ -424,6 +478,7 @@ impl Server {
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
+            max_connection_idle: None,
         }
     }
 
@@ -442,6 +497,7 @@ impl Server {
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
+            max_connection_idle: None,
         })
     }
 }
@@ -456,6 +512,7 @@ pub struct BoundServer {
     tls_handshake_timeout: std::time::Duration,
     max_connection_age: Option<Duration>,
     max_connection_age_grace: Duration,
+    max_connection_idle: Option<Duration>,
 }
 
 impl BoundServer {
@@ -523,15 +580,61 @@ impl BoundServer {
         self
     }
 
-    /// Set the grace period used after a max-age connection begins shutdown.
+    /// Set the grace period used after a retired connection begins shutdown.
     ///
-    /// Defaults to five seconds. This only affects connections retired by
-    /// [`with_max_connection_age`](Self::with_max_connection_age) — setting it
-    /// without also setting a max age has no effect. Whole-server graceful
-    /// shutdown still waits indefinitely for in-flight requests.
+    /// Defaults to five seconds. This single grace period is shared by both
+    /// [`with_max_connection_age`](Self::with_max_connection_age) and
+    /// [`with_max_connection_idle`](Self::with_max_connection_idle) — setting it
+    /// without either knob has no effect, and the two cannot be tuned
+    /// independently. Whole-server graceful shutdown still waits indefinitely
+    /// for in-flight requests.
     #[must_use]
     pub fn with_max_connection_age_grace(mut self, grace: Duration) -> Self {
         self.max_connection_age_grace = grace;
+        self
+    }
+
+    /// Retire a connection that has had no in-flight requests for `duration`.
+    ///
+    /// Disabled by default. This complements
+    /// [`with_max_connection_age`](Self::with_max_connection_age): age caps a
+    /// connection's total lifetime regardless of use, while idle reclaims
+    /// connections that have gone quiet (clients behind NAT, bursty workloads,
+    /// pooled clients holding connections they no longer need).
+    ///
+    /// A connection is idle when it has zero in-flight requests. The idle
+    /// timer resets on activity: any request that starts, or completes, during
+    /// an idle window keeps the connection alive. Once a connection stays idle
+    /// for the full `duration`, the server begins graceful shutdown for it —
+    /// HTTP/2 connections receive a GOAWAY, HTTP/1.1 connections have
+    /// keep-alive disabled — then waits up to
+    /// [`with_max_connection_age_grace`](Self::with_max_connection_age_grace)
+    /// (a grace period shared with maximum age) for any straggling request
+    /// before force-closing it.
+    ///
+    /// The idle window is evaluated lazily — it is re-checked when the timer
+    /// expires rather than re-armed at the instant of each request — so a
+    /// connection is retired between one and two times `duration` after its
+    /// last activity. Size `duration` against that upper bound. Unlike maximum
+    /// age, idle reaping applies no jitter.
+    ///
+    /// When both an idle timeout and a
+    /// [`max age`](Self::with_max_connection_age) are configured, whichever
+    /// fires first retires the connection. Whole-server graceful shutdown still
+    /// waits indefinitely for in-flight requests, and is never capped by the
+    /// idle grace period.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `duration` is zero — a zero idle timeout is rejected rather
+    /// than silently retiring every connection the instant it falls idle.
+    #[must_use]
+    pub fn with_max_connection_idle(mut self, duration: Duration) -> Self {
+        assert!(
+            !duration.is_zero(),
+            "with_max_connection_idle requires a non-zero duration",
+        );
+        self.max_connection_idle = Some(duration);
         self
     }
 
@@ -601,7 +704,7 @@ impl BoundServer {
         self,
         service: ConnectRpcService<D>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let connection_age = self.connection_age_config();
+        let retirement = self.retirement_config();
 
         #[cfg(feature = "server-tls")]
         let tls_acceptor = self.tls_config.map(tokio_rustls::TlsAcceptor::from);
@@ -616,7 +719,7 @@ impl BoundServer {
             #[cfg(feature = "server-tls")]
             self.tls_handshake_timeout,
             None,
-            connection_age,
+            retirement,
         )
         .await
     }
@@ -634,7 +737,7 @@ impl BoundServer {
         D: Dispatcher,
         F: Future<Output = ()> + Send + 'static,
     {
-        let connection_age = self.connection_age_config();
+        let retirement = self.retirement_config();
 
         #[cfg(feature = "server-tls")]
         let tls_acceptor = self.tls_config.map(tokio_rustls::TlsAcceptor::from);
@@ -649,32 +752,56 @@ impl BoundServer {
             #[cfg(feature = "server-tls")]
             self.tls_handshake_timeout,
             Some(Box::pin(signal)),
-            connection_age,
+            retirement,
         )
         .await
     }
 
     fn connection_age_config(&self) -> Option<ConnectionAgeConfig> {
-        build_connection_age_config(self.max_connection_age, self.max_connection_age_grace)
+        build_connection_age_config(
+            self.max_connection_age,
+            self.max_connection_idle,
+            self.max_connection_age_grace,
+        )
+    }
+
+    fn connection_idle_config(&self) -> Option<IdleConfig> {
+        build_connection_idle_config(self.max_connection_idle, self.max_connection_age_grace)
+    }
+
+    fn retirement_config(&self) -> RetirementConfig {
+        RetirementConfig {
+            age: self.connection_age_config(),
+            idle: self.connection_idle_config(),
+        }
     }
 }
 
 /// Build the per-connection age config, warning if a grace was configured
-/// without a max age (in which case the grace has no effect).
+/// without anything that uses it (in which case the grace has no effect). The
+/// grace period is shared with idle reaping, so it is only inert when neither a
+/// max age nor a max idle is set.
 fn build_connection_age_config(
     max_age: Option<Duration>,
+    max_idle: Option<Duration>,
     grace: Duration,
 ) -> Option<ConnectionAgeConfig> {
     let Some(max_age) = max_age else {
-        if grace != DEFAULT_MAX_CONNECTION_AGE_GRACE {
+        if max_idle.is_none() && grace != DEFAULT_MAX_CONNECTION_AGE_GRACE {
             tracing::debug!(
-                "max_connection_age_grace is set but max_connection_age is not; \
-                 the grace period has no effect",
+                "max_connection_age_grace is set but neither max_connection_age \
+                 nor max_connection_idle is; the grace period has no effect",
             );
         }
         return None;
     };
     Some(ConnectionAgeConfig { max_age, grace })
+}
+
+/// Build the per-connection idle config. Idle reaping reuses the
+/// max-connection-age grace period for its post-GOAWAY drain.
+fn build_connection_idle_config(max_idle: Option<Duration>, grace: Duration) -> Option<IdleConfig> {
+    max_idle.map(|idle| IdleConfig { idle, grace })
 }
 
 /// Type alias for the panic-catching wrapper around ConnectRpcService, used
@@ -699,6 +826,93 @@ impl ConnectionAgeConfig {
     }
 }
 
+/// Per-connection idle-reaping configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IdleConfig {
+    /// How long a connection may have zero in-flight requests before it is
+    /// retired.
+    idle: Duration,
+    /// Drain window after GOAWAY before the connection is force-closed. Shared
+    /// with [`ConnectionAgeConfig::grace`].
+    grace: Duration,
+}
+
+/// Per-connection retirement policy: the optional max-age and max-idle limits
+/// that the connection lifecycle enforces. Bundled so the accept loop and the
+/// per-connection task pass a single value rather than two parallel options.
+#[derive(Clone, Copy, Debug, Default)]
+struct RetirementConfig {
+    age: Option<ConnectionAgeConfig>,
+    idle: Option<IdleConfig>,
+}
+
+/// Shared in-flight request accounting for one connection.
+///
+/// The per-request `service_fn` wrapper bumps these counters at the dispatch
+/// boundary (hyper does not surface per-connection stream counts directly), and
+/// the connection lifecycle reads them to decide whether the connection has
+/// been idle. `epoch` increments on every request start *and* completion, so a
+/// short request that begins and ends entirely within an idle window is still
+/// observed as activity and resets the idle timer.
+///
+/// The two counters use `SeqCst` for clarity; correctness only needs each
+/// counter to be individually monotonic, so `Relaxed` would also be sound. The
+/// ordering is not load-bearing — in particular [`snapshot`](Self::snapshot)
+/// does not read the pair atomically (see its note).
+#[derive(Debug, Default)]
+struct ConnectionActivity {
+    in_flight: AtomicUsize,
+    epoch: AtomicU64,
+}
+
+impl ConnectionActivity {
+    fn request_started(&self) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn request_finished(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current `(in_flight, epoch)` pair.
+    ///
+    /// The two fields are read as independent loads, so a request arriving in
+    /// the instant between them (or between the writer's two increments in
+    /// [`request_started`](Self::request_started)) can be observed as
+    /// `(0, armed_epoch)` and trigger a reap while a request is actually
+    /// landing. This is benign: `graceful_shutdown` sends GOAWAY with the
+    /// standard last-stream-id handling and the grace window drains anything
+    /// genuinely in flight, so the racing request either completes or the
+    /// client retries on a fresh connection.
+    fn snapshot(&self) -> (usize, u64) {
+        (
+            self.in_flight.load(Ordering::SeqCst),
+            self.epoch.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// RAII guard that records a request as in-flight for the lifetime of its
+/// response future. Decrementing on drop (rather than on a success path) keeps
+/// the in-flight count correct even when a request future is cancelled or its
+/// handler panics.
+struct ActiveRequestGuard(Arc<ConnectionActivity>);
+
+impl ActiveRequestGuard {
+    fn new(activity: Arc<ConnectionActivity>) -> Self {
+        activity.request_started();
+        Self(activity)
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.request_finished();
+    }
+}
+
 /// Serve HTTP requests on an already-accepted stream.
 ///
 /// Generic over the IO type so it works for both plain TCP and TLS streams.
@@ -713,25 +927,47 @@ async fn serve_accepted_stream<D, S>(
     service: Arc<WrappedService<D>>,
     http1_keep_alive: bool,
     global_shutdown: watch::Receiver<bool>,
-    connection_age: Option<ConnectionAgeConfig>,
+    retirement: RetirementConfig,
 ) where
     D: Dispatcher,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tracing::trace!(remote_addr = %peer.addr, "Accepted new connection");
 
+    // In-flight accounting is only needed when idle reaping is enabled; when it
+    // is off there is no per-request bookkeeping overhead.
+    let activity = retirement
+        .idle
+        .map(|_| Arc::new(ConnectionActivity::default()));
+
     let peer_for_requests = peer.clone();
+    let activity_for_requests = activity.clone();
     let svc = hyper::service::service_fn(move |mut req| {
         peer_for_requests.insert_into(req.extensions_mut());
         let mut service = (*service).clone();
-        async move { service.call(req).await }
+        // Mark the request in-flight before its future is polled; the guard
+        // decrements on completion or drop.
+        let guard = activity_for_requests
+            .as_ref()
+            .map(|activity| ActiveRequestGuard::new(Arc::clone(activity)));
+        async move {
+            let _guard = guard;
+            service.call(req).await
+        }
     });
 
     let mut builder = AutoBuilder::new(TokioExecutor::new());
     builder.http1().keep_alive(http1_keep_alive);
 
     let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
-    serve_connection_with_lifecycle(conn, peer.addr, global_shutdown, connection_age).await;
+    serve_connection_with_lifecycle(
+        conn,
+        peer.addr,
+        global_shutdown,
+        retirement.age,
+        retirement.idle.zip(activity),
+    )
+    .await;
 }
 
 fn serve_connection_with_lifecycle<C>(
@@ -739,6 +975,7 @@ fn serve_connection_with_lifecycle<C>(
     remote_addr: SocketAddr,
     global_shutdown: watch::Receiver<bool>,
     connection_age: Option<ConnectionAgeConfig>,
+    connection_idle: Option<(IdleConfig, Arc<ConnectionActivity>)>,
 ) -> ConnectionLifecycle<C>
 where
     C: GracefulConnection,
@@ -749,6 +986,15 @@ where
         remote_addr,
         global_shutdown: global_shutdown_future(global_shutdown),
         age: connection_age.map(|config| (Box::pin(tokio::time::sleep(config.max_age)), config)),
+        idle: connection_idle.map(|(config, activity)| {
+            let armed_epoch = activity.snapshot().1;
+            IdleTracker {
+                config,
+                activity,
+                timer: Box::pin(tokio::time::sleep(config.idle)),
+                armed_epoch,
+            }
+        }),
         state: ConnectionLifecycleState::Serving,
     }
 }
@@ -772,13 +1018,29 @@ struct ConnectionLifecycle<C: GracefulConnection> {
     remote_addr: SocketAddr,
     global_shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
     age: Option<(Pin<Box<tokio::time::Sleep>>, ConnectionAgeConfig)>,
+    idle: Option<IdleTracker>,
     state: ConnectionLifecycleState,
+}
+
+/// Per-connection idle-timer state held by [`ConnectionLifecycle`].
+struct IdleTracker {
+    config: IdleConfig,
+    activity: Arc<ConnectionActivity>,
+    /// Fires when the current idle window elapses.
+    timer: Pin<Box<tokio::time::Sleep>>,
+    /// Activity epoch observed when the current window was armed. If it is
+    /// unchanged and there are no in-flight requests when the timer fires, the
+    /// connection has been idle for the whole window.
+    armed_epoch: u64,
 }
 
 enum ConnectionLifecycleState {
     Serving,
     GlobalDraining,
-    AgeDraining {
+    /// Draining after a per-connection retirement trigger (max age or max
+    /// idle): graceful shutdown has been issued and the connection is given a
+    /// grace window to finish in-flight work before being force-closed.
+    Draining {
         grace: Pin<Box<tokio::time::Sleep>>,
         duration: Duration,
     },
@@ -818,10 +1080,38 @@ where
                             "Connection reached maximum age; starting graceful shutdown",
                         );
                         this.conn.as_mut().graceful_shutdown();
-                        this.state = ConnectionLifecycleState::AgeDraining {
+                        this.state = ConnectionLifecycleState::Draining {
                             grace: Box::pin(tokio::time::sleep(config.grace)),
                             duration: config.grace,
                         };
+                        continue;
+                    }
+
+                    if let Some(idle) = &mut this.idle
+                        && idle.timer.as_mut().poll(cx).is_ready()
+                    {
+                        let (in_flight, epoch) = idle.activity.snapshot();
+                        if in_flight == 0 && epoch == idle.armed_epoch {
+                            tracing::trace!(
+                                remote_addr = %this.remote_addr,
+                                idle = ?idle.config.idle,
+                                grace = ?idle.config.grace,
+                                "Connection idle; starting graceful shutdown",
+                            );
+                            this.conn.as_mut().graceful_shutdown();
+                            this.state = ConnectionLifecycleState::Draining {
+                                grace: Box::pin(tokio::time::sleep(idle.config.grace)),
+                                duration: idle.config.grace,
+                            };
+                            continue;
+                        }
+                        // A request is in flight, or activity occurred during
+                        // the window: reset the idle timer and re-arm. Reuse the
+                        // existing `Sleep` allocation rather than boxing a new
+                        // one each window.
+                        idle.armed_epoch = epoch;
+                        let next = tokio::time::Instant::now() + idle.config.idle;
+                        idle.timer.as_mut().reset(next);
                         continue;
                     }
 
@@ -834,7 +1124,7 @@ where
                     }
                     return Poll::Pending;
                 }
-                ConnectionLifecycleState::AgeDraining { grace, duration } => {
+                ConnectionLifecycleState::Draining { grace, duration } => {
                     if let Poll::Ready(result) = this.conn.as_mut().poll(cx) {
                         log_connection_result(this.remote_addr, result);
                         return Poll::Ready(());
@@ -849,7 +1139,7 @@ where
                         tracing::trace!(
                             remote_addr = %this.remote_addr,
                             grace = ?duration,
-                            "Connection maximum-age grace expired; closing connection",
+                            "Connection retirement grace expired; closing connection",
                         );
                         return Poll::Ready(());
                     }
@@ -925,7 +1215,7 @@ async fn serve_with_listener<D: Dispatcher>(
     http1_keep_alive: bool,
     #[cfg(feature = "server-tls")] tls_handshake_timeout: std::time::Duration,
     shutdown: ShutdownSignal,
-    connection_age: Option<ConnectionAgeConfig>,
+    retirement: RetirementConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wrap the service with panic handling to convert panics to 500 responses
     let service: WrappedService<D> = ServiceBuilder::new()
@@ -984,9 +1274,14 @@ async fn serve_with_listener<D: Dispatcher>(
         let service = Arc::clone(&service);
         let global_shutdown = global_shutdown_rx.clone();
         connection_sequence = connection_sequence.wrapping_add(1);
-        let connection_age = connection_age.map(|config| {
-            config.with_jitter(jitter_state.hash_one((remote_addr, connection_sequence)))
-        });
+        // Max age gets per-connection jitter; idle reaping is reactive and needs
+        // none.
+        let retirement = RetirementConfig {
+            age: retirement.age.map(|config| {
+                config.with_jitter(jitter_state.hash_one((remote_addr, connection_sequence)))
+            }),
+            idle: retirement.idle,
+        };
 
         #[cfg(feature = "server-tls")]
         let tls_acceptor = tls_acceptor.clone();
@@ -1019,7 +1314,7 @@ async fn serve_with_listener<D: Dispatcher>(
                             service,
                             http1_keep_alive,
                             global_shutdown,
-                            connection_age,
+                            retirement,
                         )
                         .await;
                     }
@@ -1052,7 +1347,7 @@ async fn serve_with_listener<D: Dispatcher>(
                 service,
                 http1_keep_alive,
                 global_shutdown,
-                connection_age,
+                retirement,
             )
             .await;
         });
@@ -2004,6 +2299,262 @@ mod tests {
         yield_to_tasks().await;
         h2_task.await.expect("h2 connection task panicked").ok();
 
+        let result = tokio::time::timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
+    }
+
+    // ========================================================================
+    // Maximum Connection Idle
+    // ========================================================================
+
+    #[test]
+    fn connection_activity_tracks_in_flight_and_epoch() {
+        let activity = ConnectionActivity::default();
+        assert_eq!(activity.snapshot(), (0, 0));
+
+        let guard = ActiveRequestGuard::new(Arc::new(ConnectionActivity::default()));
+        // The guard owns its own activity; exercise the shared-Arc path too.
+        drop(guard);
+
+        let shared = Arc::new(ConnectionActivity::default());
+        let g1 = ActiveRequestGuard::new(Arc::clone(&shared));
+        let g2 = ActiveRequestGuard::new(Arc::clone(&shared));
+        // Two starts: in_flight == 2, epoch bumped twice.
+        assert_eq!(shared.snapshot(), (2, 2));
+        drop(g1);
+        // One completion: in_flight back to 1, epoch bumped again.
+        assert_eq!(shared.snapshot(), (1, 3));
+        drop(g2);
+        assert_eq!(shared.snapshot(), (0, 4));
+    }
+
+    #[tokio::test]
+    async fn max_connection_idle_builder_defaults_and_overrides() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = Server::from_listener(listener);
+        assert_eq!(bound.max_connection_idle, None);
+        assert_eq!(bound.connection_idle_config(), None);
+
+        let bound = bound.with_max_connection_idle(Duration::from_secs(30));
+        assert_eq!(bound.max_connection_idle, Some(Duration::from_secs(30)));
+        assert_eq!(
+            bound.connection_idle_config(),
+            Some(IdleConfig {
+                idle: Duration::from_secs(30),
+                grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
+            })
+        );
+    }
+
+    #[test]
+    fn server_max_connection_idle_builder_threads_through() {
+        let server = Server::new(Router::new());
+        assert_eq!(server.max_connection_idle, None);
+        assert_eq!(server.connection_idle_config(), None);
+
+        // Idle reaping reuses the max-age grace period for its drain window.
+        let server = Server::new(Router::new())
+            .with_max_connection_idle(Duration::from_secs(30))
+            .with_max_connection_age_grace(Duration::from_secs(2));
+        assert_eq!(
+            server.connection_idle_config(),
+            Some(IdleConfig {
+                idle: Duration::from_secs(30),
+                grace: Duration::from_secs(2),
+            })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero duration")]
+    fn with_max_connection_idle_rejects_zero() {
+        let _ = Server::new(Router::new()).with_max_connection_idle(Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_connection_idle_reaps_quiet_connection() {
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_max_connection_idle(Duration::from_secs(10));
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(Router::new(), async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        let h2_task = tokio::spawn(h2_conn);
+
+        // One request, then the connection goes quiet. The empty router replies
+        // 415 (no Content-Type), but any response establishes activity.
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://{addr}/svc/Unknown"))
+            .body(())
+            .unwrap();
+        let (resp, _) = send_request.send_request(req, true).unwrap();
+        resp.await.unwrap();
+
+        // The request fell inside the first idle window, so that window resets
+        // rather than reaping: the connection must survive it.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        assert!(
+            !h2_task.is_finished(),
+            "connection reaped despite activity within the idle window"
+        );
+
+        // A second, fully quiet window elapses: now the connection is reaped.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        assert!(
+            h2_task.is_finished(),
+            "idle connection was not reaped after a quiet window"
+        );
+        let conn_result = h2_task.await.expect("h2 connection task panicked");
+        if let Err(err) = conn_result {
+            assert!(
+                err.is_go_away(),
+                "h2 connection ended with non-GOAWAY error: {err:?}"
+            );
+        }
+
+        drop(send_request);
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_connection_idle_inflight_request_prevents_reaping() {
+        let (router, entered_rx, release_tx) = slow_router();
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_max_connection_idle(Duration::from_secs(10));
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        let h2_task = tokio::spawn(h2_conn);
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://{addr}/svc/Slow"))
+            .header(header::CONTENT_TYPE, "application/proto")
+            .body(())
+            .unwrap();
+        let (resp, _) = send_request.send_request(req, true).unwrap();
+        let resp_task = tokio::spawn(resp);
+        entered_rx.await.unwrap();
+
+        // A request is in flight the whole time, so the connection is never
+        // idle even though the idle timeout elapses several times over.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        assert!(
+            !h2_task.is_finished(),
+            "connection with an in-flight request was retired by the idle timer"
+        );
+        assert!(
+            !resp_task.is_finished(),
+            "in-flight request unexpectedly ended"
+        );
+
+        // Let the handler finish; the connection then goes quiet and is reaped.
+        release_tx.send(()).unwrap();
+        yield_to_tasks().await;
+        let resp = resp_task
+            .await
+            .expect("response task panicked")
+            .expect("h2 request failed");
+        assert!(resp.status().is_success(), "got status {}", resp.status());
+        drain_h2_body(resp).await;
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        assert!(
+            h2_task.is_finished(),
+            "connection was not reaped after the in-flight request completed"
+        );
+        h2_task.await.expect("h2 connection task panicked").ok();
+
+        drop(send_request);
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_connection_idle_fires_before_a_longer_max_age() {
+        // Idle (10s) is shorter than age (60s): a quiet connection is retired by
+        // the idle timer well before it would reach max age.
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_max_connection_age(Duration::from_secs(60))
+            .with_max_connection_idle(Duration::from_secs(10));
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(Router::new(), async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        let h2_task = tokio::spawn(h2_conn);
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://{addr}/svc/Unknown"))
+            .body(())
+            .unwrap();
+        let (resp, _) = send_request.send_request(req, true).unwrap();
+        resp.await.unwrap();
+
+        // Two quiet idle windows (22s total) is far short of the 60s max age
+        // (even with +10% jitter), so any retirement here is the idle timer.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+        assert!(
+            h2_task.is_finished(),
+            "idle timer did not retire the connection before max age"
+        );
+        h2_task.await.expect("h2 connection task panicked").ok();
+
+        drop(send_request);
+        shutdown_tx.send(()).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), serve)
             .await
             .expect("server did not shut down")
