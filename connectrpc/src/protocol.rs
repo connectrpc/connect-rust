@@ -136,8 +136,14 @@ impl Protocol {
 
         // Check Connect streaming
         if let Some(rest) = content_type.strip_prefix("application/connect+") {
+            // The `json` arm is gated: with the `json` feature off this is a
+            // proto-only build, so a JSON content type is an unsupported media
+            // type and must be rejected here at negotiation (the caller maps a
+            // `None` to HTTP 415 / a gRPC "unsupported content type" error)
+            // rather than accepted and failed late at decode.
             let codec_format = match rest {
                 "proto" => CodecFormat::Proto,
+                #[cfg(feature = "json")]
                 "json" => CodecFormat::Json,
                 _ => return None,
             };
@@ -149,7 +155,9 @@ impl Protocol {
             });
         }
 
-        // Check Connect unary
+        // Check Connect unary. `application/json` is gated for the same reason
+        // as the streaming `+json` arm above: a proto-only build rejects it as
+        // an unsupported media type.
         match content_type {
             "application/proto" => Some(RequestProtocol {
                 protocol: Protocol::Connect,
@@ -157,6 +165,7 @@ impl Protocol {
                 is_streaming: false,
                 is_text_mode: false,
             }),
+            #[cfg(feature = "json")]
             "application/json" => Some(RequestProtocol {
                 protocol: Protocol::Connect,
                 codec_format: CodecFormat::Json,
@@ -176,6 +185,10 @@ impl Protocol {
         match suffix {
             "" => Some(CodecFormat::Proto),
             "+proto" => Some(CodecFormat::Proto),
+            // Gated: a proto-only build (no `json` feature) rejects
+            // `application/grpc+json` / `application/grpc-web+json` as an
+            // unsupported codec at negotiation.
+            #[cfg(feature = "json")]
             "+json" => Some(CodecFormat::Json),
             _ => None,
         }
@@ -277,6 +290,7 @@ mod tests {
         assert!(!result.is_streaming);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_detect_connect_unary_json() {
         let result = Protocol::detect_from_content_type("application/json").unwrap();
@@ -293,6 +307,7 @@ mod tests {
         assert!(result.is_streaming);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_detect_connect_streaming_json() {
         let result = Protocol::detect_from_content_type("application/connect+json").unwrap();
@@ -316,6 +331,7 @@ mod tests {
         assert_eq!(result.codec_format, CodecFormat::Proto);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_detect_grpc_json() {
         let result = Protocol::detect_from_content_type("application/grpc+json").unwrap();
@@ -338,6 +354,7 @@ mod tests {
         assert_eq!(result.codec_format, CodecFormat::Proto);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_detect_grpc_web_json() {
         let result = Protocol::detect_from_content_type("application/grpc-web+json").unwrap();
@@ -373,11 +390,47 @@ mod tests {
         assert!(Protocol::detect_from_content_type("application/grpc-web-text+json").is_none());
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_detect_with_charset_parameter() {
         let result = Protocol::detect_from_content_type("application/json; charset=utf-8").unwrap();
         assert_eq!(result.protocol, Protocol::Connect);
         assert_eq!(result.codec_format, CodecFormat::Json);
+    }
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn test_detect_with_charset_parameter_proto_only() {
+        // Charset stripping still applies in a proto-only build.
+        let result =
+            Protocol::detect_from_content_type("application/proto; charset=utf-8").unwrap();
+        assert_eq!(result.protocol, Protocol::Connect);
+        assert_eq!(result.codec_format, CodecFormat::Proto);
+    }
+
+    // Proto-only build (no `json` feature): every JSON content type is an
+    // unsupported media type and must be declined at negotiation, so the
+    // dispatch layer maps it to HTTP 415 / a gRPC "unsupported content type"
+    // error rather than accepting it and failing late at decode.
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn test_detect_json_content_types_rejected_without_feature() {
+        for ct in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/connect+json",
+            "application/grpc+json",
+            "application/grpc-web+json",
+        ] {
+            assert!(
+                Protocol::detect_from_content_type(ct).is_none(),
+                "{ct} must not be detected in a proto-only build"
+            );
+        }
+        // Proto content types are still detected.
+        assert!(Protocol::detect_from_content_type("application/proto").is_some());
+        assert!(Protocol::detect_from_content_type("application/connect+proto").is_some());
+        assert!(Protocol::detect_from_content_type("application/grpc+proto").is_some());
     }
 
     #[test]

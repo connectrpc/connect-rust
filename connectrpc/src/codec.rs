@@ -5,7 +5,9 @@
 
 use buffa::Message;
 use bytes::Bytes;
+#[cfg(feature = "json")]
 use serde::Serialize;
+#[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
 
 use crate::error::ConnectError;
@@ -34,6 +36,61 @@ pub mod header {
     pub const ACCEPT_ENCODING: &str = "connect-accept-encoding";
 }
 
+/// Marker bound for message types the JSON codec can **serialize**.
+///
+/// When the `json` feature is enabled this is exactly [`serde::Serialize`]:
+/// if a bound such as `T: Message + JsonSerialize` fails to hold, derive
+/// `serde::Serialize` on `T` (generated code does this unless you pass the
+/// codegen `no_json` option). When the feature is disabled it is an empty
+/// bound satisfied by every type, so proto-only message types generated
+/// without serde derives still qualify and the JSON codec is simply
+/// unavailable at runtime.
+///
+/// Auto-implemented for every qualifying type — do not implement it manually.
+#[cfg(feature = "json")]
+pub trait JsonSerialize: Serialize {}
+#[cfg(feature = "json")]
+impl<T: Serialize> JsonSerialize for T {}
+
+/// Marker bound for message types the JSON codec can **serialize**.
+///
+/// With the `json` feature disabled this is an empty bound, so message types
+/// without serde derives satisfy it. See the `json`-enabled definition for
+/// the full contract.
+///
+/// Auto-implemented for every type — do not implement it manually.
+#[cfg(not(feature = "json"))]
+pub trait JsonSerialize {}
+#[cfg(not(feature = "json"))]
+impl<T> JsonSerialize for T {}
+
+/// Marker bound for message types the JSON codec can **deserialize**.
+///
+/// When the `json` feature is enabled this is exactly
+/// [`serde::de::DeserializeOwned`]: if a bound such as
+/// `T: Message + JsonDeserialize` fails to hold, derive `serde::Deserialize`
+/// on `T` (generated code does this unless you pass the codegen `no_json`
+/// option). When the feature is disabled it is an empty bound satisfied by
+/// every type, so proto-only message types generated without serde derives
+/// still qualify.
+///
+/// Auto-implemented for every qualifying type — do not implement it manually.
+#[cfg(feature = "json")]
+pub trait JsonDeserialize: DeserializeOwned {}
+#[cfg(feature = "json")]
+impl<T: DeserializeOwned> JsonDeserialize for T {}
+
+/// Marker bound for message types the JSON codec can **deserialize**.
+///
+/// With the `json` feature disabled this is an empty bound. See the
+/// `json`-enabled definition for the full contract.
+///
+/// Auto-implemented for every type — do not implement it manually.
+#[cfg(not(feature = "json"))]
+pub trait JsonDeserialize {}
+#[cfg(not(feature = "json"))]
+impl<T> JsonDeserialize for T {}
+
 /// Encode a protobuf message to binary format.
 pub fn encode_proto<M: Message>(message: &M) -> Result<Bytes, ConnectError> {
     Ok(message.encode_to_bytes())
@@ -45,17 +102,50 @@ pub fn decode_proto<M: Message>(data: &[u8]) -> Result<M, ConnectError> {
         .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto: {e}")))
 }
 
+/// Message shared by the JSON codec entry points when the `json` feature is
+/// disabled.
+#[cfg(not(feature = "json"))]
+pub(crate) const JSON_FEATURE_DISABLED: &str =
+    "JSON codec not compiled in (connectrpc built without the `json` feature)";
+
 /// Encode a message to JSON format.
+///
+/// This (with [`decode_json`]) is the primary place the `json` feature is
+/// gated: with it disabled, the JSON codec is unavailable and this returns
+/// [`ErrorCode::Unimplemented`](crate::ErrorCode::Unimplemented) without
+/// requiring `M: serde::Serialize`, so proto-only callers compile. Callers can
+/// therefore invoke it unconditionally on their `CodecFormat::Json` arm. The
+/// one deliberate exception is the client's `decode_response_view`, which keeps
+/// its own `#[cfg]` gate so a failed response decode stays an `internal` error
+/// rather than `decode_json`'s `invalid_argument`.
+#[cfg(feature = "json")]
 pub fn encode_json<M: Serialize>(message: &M) -> Result<Bytes, ConnectError> {
     serde_json::to_vec(message)
         .map(Bytes::from)
         .map_err(|e| ConnectError::internal(format!("failed to encode JSON: {e}")))
 }
 
+/// Encode a message to JSON format — proto-only build: always `Unimplemented`.
+#[cfg(not(feature = "json"))]
+pub fn encode_json<M>(_message: &M) -> Result<Bytes, ConnectError> {
+    Err(ConnectError::unimplemented(JSON_FEATURE_DISABLED))
+}
+
 /// Decode JSON bytes into a message.
+///
+/// See [`encode_json`]: with the `json` feature disabled this returns
+/// [`ErrorCode::Unimplemented`](crate::ErrorCode::Unimplemented) without
+/// requiring `M: serde::de::DeserializeOwned`.
+#[cfg(feature = "json")]
 pub fn decode_json<M: DeserializeOwned>(data: &[u8]) -> Result<M, ConnectError> {
     serde_json::from_slice(data)
         .map_err(|e| ConnectError::invalid_argument(format!("failed to decode JSON: {e}")))
+}
+
+/// Decode JSON bytes into a message — proto-only build: always `Unimplemented`.
+#[cfg(not(feature = "json"))]
+pub fn decode_json<M>(_data: &[u8]) -> Result<M, ConnectError> {
+    Err(ConnectError::unimplemented(JSON_FEATURE_DISABLED))
 }
 
 /// Codec for binary protobuf encoding.
@@ -80,9 +170,12 @@ impl ProtoCodec {
 }
 
 /// Codec for JSON encoding of protobuf messages.
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JsonCodec;
 
+#[cfg(feature = "json")]
 impl JsonCodec {
     /// Get the content type for this codec.
     pub fn content_type() -> &'static str {
@@ -107,6 +200,17 @@ pub enum CodecFormat {
     /// Binary protobuf format.
     Proto,
     /// JSON format.
+    ///
+    /// Fully supported only when the `json` feature is enabled. The variant
+    /// always exists (the wire-protocol enums are codec-total), but with the
+    /// feature disabled a proto-only build rejects JSON at the edges: the
+    /// server declines JSON content types at negotiation
+    /// ([`from_content_type`](Self::from_content_type) /
+    /// [`from_codec`](Self::from_codec) return `None`), which yields HTTP 415
+    /// for Connect or a gRPC error status for gRPC/gRPC-Web; and message
+    /// encode/decode returns
+    /// [`ErrorCode::Unimplemented`](crate::ErrorCode::Unimplemented) as a
+    /// backstop. Connect *error* bodies are always JSON regardless.
     Json,
 }
 
@@ -121,26 +225,37 @@ impl std::fmt::Display for CodecFormat {
 
 impl CodecFormat {
     /// Parse codec format from content type string.
+    ///
+    /// With the `json` feature disabled (a proto-only build) a JSON content
+    /// type returns `None` instead of [`CodecFormat::Json`], so the server
+    /// rejects it as an unsupported media type at content negotiation rather
+    /// than accepting it and failing later at decode. The message-level
+    /// encode/decode gating remains as a backstop.
     pub fn from_content_type(content_type: &str) -> Option<Self> {
         if content_type.starts_with(content_type::PROTO)
             || content_type.starts_with(content_type::CONNECT_PROTO)
         {
-            Some(Self::Proto)
-        } else if content_type.starts_with(content_type::JSON)
+            return Some(Self::Proto);
+        }
+        #[cfg(feature = "json")]
+        if content_type.starts_with(content_type::JSON)
             || content_type.starts_with(content_type::CONNECT_JSON)
         {
-            Some(Self::Json)
-        } else {
-            None
+            return Some(Self::Json);
         }
+        None
     }
 
     /// Parse codec format from encoding name (used in GET request query params).
     ///
-    /// Accepts "proto" or "json" (the values used in the `encoding` query parameter).
+    /// Accepts `"proto"`, and `"json"` only when the `json` feature is enabled
+    /// (the values used in the `encoding` query parameter). In a proto-only
+    /// build `"json"` returns `None`, so a Connect GET requesting the JSON
+    /// codec is rejected as an unsupported media type.
     pub fn from_codec(codec: &str) -> Option<Self> {
         match codec {
             "proto" => Some(Self::Proto),
+            #[cfg(feature = "json")]
             "json" => Some(Self::Json),
             _ => None,
         }
@@ -165,9 +280,84 @@ impl CodecFormat {
     }
 
     /// Check if the given content type indicates a streaming request.
+    ///
+    /// With the `json` feature disabled, the `application/connect+json`
+    /// streaming content type is not recognized (a proto-only build treats it
+    /// as an unsupported media type), matching [`Self::from_content_type`].
     #[inline]
     pub fn is_streaming_content_type(content_type: &str) -> bool {
-        content_type.starts_with(content_type::CONNECT_PROTO)
-            || content_type.starts_with(content_type::CONNECT_JSON)
+        if content_type.starts_with(content_type::CONNECT_PROTO) {
+            return true;
+        }
+        #[cfg(feature = "json")]
+        if content_type.starts_with(content_type::CONNECT_JSON) {
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// With the `json` feature disabled, the message-type markers must be
+    /// empty bounds: a type with no serde derives — as emitted by the codegen
+    /// `no_json` option — still satisfies them. This is exactly what lets
+    /// proto-only generated code compile against this crate. (When `json` is
+    /// enabled the markers are `serde::Serialize` / `DeserializeOwned`, so the
+    /// assertion below would not even build — hence the `cfg`.)
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn markers_are_empty_bounds_without_json() {
+        use super::{JsonDeserialize, JsonSerialize};
+
+        // Derives neither `Serialize` nor `Deserialize`.
+        struct NoSerde;
+
+        fn assert_serialize<T: JsonSerialize>() {}
+        fn assert_deserialize<T: JsonDeserialize>() {}
+
+        assert_serialize::<NoSerde>();
+        assert_deserialize::<NoSerde>();
+    }
+
+    /// Proto-only build: the codec parsers decline every JSON content type and
+    /// the `json` GET encoding, so the server rejects them at negotiation.
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn parsers_reject_json_without_feature() {
+        use super::CodecFormat;
+
+        assert_eq!(CodecFormat::from_codec("json"), None);
+        assert_eq!(CodecFormat::from_codec("proto"), Some(CodecFormat::Proto));
+
+        for ct in ["application/json", "application/connect+json"] {
+            assert_eq!(CodecFormat::from_content_type(ct), None, "{ct}");
+        }
+        assert_eq!(
+            CodecFormat::from_content_type("application/proto"),
+            Some(CodecFormat::Proto)
+        );
+
+        assert!(!CodecFormat::is_streaming_content_type(
+            "application/connect+json"
+        ));
+        assert!(CodecFormat::is_streaming_content_type(
+            "application/connect+proto"
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn parsers_accept_json_with_feature() {
+        use super::CodecFormat;
+
+        assert_eq!(CodecFormat::from_codec("json"), Some(CodecFormat::Json));
+        assert_eq!(
+            CodecFormat::from_content_type("application/json"),
+            Some(CodecFormat::Json)
+        );
+        assert!(CodecFormat::is_streaming_content_type(
+            "application/connect+json"
+        ));
     }
 }

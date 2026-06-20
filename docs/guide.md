@@ -61,6 +61,7 @@ The runtime is feature-gated so you only pay for what you use:
 
 | Feature | Default | What it adds |
 |---|---|---|
+| `json` | yes | JSON codec for protobuf messages (the proto3-JSON wire format). Disabling it drops the `serde` requirement on message types — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip` | yes | Gzip compression via `flate2` |
 | `zstd` | yes | Zstandard compression via `zstd` |
 | `streaming` | yes | Streaming compression via `async-compression` |
@@ -86,6 +87,67 @@ connectrpc = { version = "0.7", features = ["server"] }
 # Minimal (wasm-friendly: no networking, no native compression)
 connectrpc = { version = "0.7", default-features = false }
 ```
+
+### Proto-only (no-JSON) builds
+
+The Connect protocol supports two message codecs: binary proto and proto3
+JSON. The JSON codec needs every message type to be `serde::Serialize` /
+`Deserialize`, which is why the code generator derives those impls by default.
+A deployment that only ever speaks binary proto can turn JSON off and shed
+those derives — smaller generated code, no `serde_derive` in the message-type
+build.
+
+It takes two coordinated settings:
+
+1. **Generate without serde derives.** Pass the `no_json` plugin option (or
+   `connectrpc-build`'s [`.generate_json(false)`](#connectrpc-build-build-time-simplest)),
+   so message structs are emitted without `#[derive(serde::Serialize,
+   serde::Deserialize)]`.
+2. **Disable the runtime `json` feature**, which relaxes the message-type
+   bounds from `Message + Serialize`/`DeserializeOwned` to just `Message`:
+
+   ```toml
+   # Proto-only server: no JSON codec, no serde on message types.
+   # `default-features = false` is the only way to drop `json`, so it also drops
+   # the default compression features (`gzip`/`zstd`/`streaming`) — re-list the
+   # ones you still want.
+   connectrpc = { version = "0.7", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
+   ```
+
+With `json` off, the `Message + serde` requirement is replaced by the
+`JsonSerialize` / `JsonDeserialize` marker traits, which become empty bounds —
+so a serde-free generated type still satisfies every handler, router, and
+client signature.
+
+A proto-only server **rejects JSON at content negotiation**, before it touches
+the request body: `application/json` and `application/connect+json` (and the
+Connect GET `encoding=json` parameter) are unsupported media types, so the
+server responds with a bodyless **HTTP 415 Unsupported Media Type** (the client
+maps the status to an error code); `application/grpc+json` and
+`application/grpc-web+json` get a gRPC error status. Message-level encode/decode
+also returns `Unimplemented` as a defense-in-depth backstop. Handler-level
+errors (and the streaming end-of-stream frame) remain JSON, as the Connect spec
+requires regardless of the request codec. On the client side, the
+`ClientConfig::json` shorthand is removed from the API in a proto-only build, so
+JSON cannot be selected by mistake.
+
+`connectrpc` itself still depends on `serde` and `serde_json` even in a
+proto-only build — the always-JSON error wire format needs them — so they stay
+in `cargo tree`. What proto-only mode removes is the serde *derive* on your
+generated message types and the per-message JSON (de)serialization paths.
+
+Because `json` is an additive, default-on Cargo feature, it is only truly off
+when *every* crate in your dependency graph that depends on `connectrpc`
+disables it. If any other crate pulls in `connectrpc` with `json` enabled,
+feature unification turns it back on for the whole build, the markers revert to
+`Serialize`/`DeserializeOwned`, and your serde-free generated types stop
+compiling (`Serialize is not satisfied` — note the error names the trait, not
+the feature). Proto-only mode therefore fits a leaf binary or a fully
+proto-only graph, not one library inside a mixed workspace.
+
+> View-body responses are already proto-only and return `Unimplemented` for the
+> JSON codec — see [Returning a view body](#returning-a-view-body) — so a
+> proto-only build changes nothing for them.
 
 ## Quick start
 

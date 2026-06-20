@@ -316,6 +316,7 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 
 | Feature      | Default | Description                                      |
 | ------------ | ------- | ------------------------------------------------ |
+| `json`       | Yes     | JSON codec for protobuf messages. Disable (with codegen `no_json`) for proto-only builds — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip`       | Yes     | Gzip compression via flate2                      |
 | `zstd`       | Yes     | Zstandard compression via zstd                   |
 | `streaming`  | Yes     | Streaming compression via async-compression      |
@@ -342,6 +343,36 @@ connectrpc = { version = "0.7", default-features = false, features = ["gzip"] }
 connectrpc = { version = "0.7", default-features = false }
 ```
 
+### Proto-only (no-JSON) builds
+
+A deployment that only speaks binary proto can drop the JSON codec and the
+`serde` derives it requires on message types. Generate code with the `no_json`
+plugin option (or `connectrpc-build`'s `.generate_json(false)`) so message
+structs are emitted without serde derives, and disable the runtime `json`
+feature:
+
+```toml
+[dependencies]
+# Note: `default-features = false` is the only way to drop `json`, so it also
+# drops the default compression features — re-list any you still want.
+connectrpc = { version = "0.7", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
+```
+
+With `json` off, message-type bounds relax from `Message + Serialize` to just
+`Message`, so serde-free generated code compiles. A JSON request to such a
+server is declined at content negotiation with HTTP 415 Unsupported Media Type
+(for gRPC / gRPC-Web, a gRPC error status); the JSON codec selectors on the
+client (`ClientConfig::json`) are removed from the API too. See the [user guide](docs/guide.md#proto-only-no-json-builds) for
+details.
+
+> **Cargo feature unification:** `json` is an additive, default-on feature, so
+> it is only truly off when *every* crate in your dependency graph that pulls in
+> `connectrpc` disables it. If any other crate depends on `connectrpc` with
+> `json` on, unification turns it back on for the whole build and your
+> serde-free generated types will fail to compile (`Serialize is not
+> satisfied`). Proto-only mode therefore fits leaf binaries and fully
+> proto-only graphs, not a single library in a mixed workspace.
+
 ### With Axum integration
 
 ```toml
@@ -362,6 +393,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 http-body = "1"
 ```
+
+For **proto-only** code (generated with `no_json`, and `connectrpc` built with
+`default-features = false`), drop the `json` feature on `buffa`/`buffa-types`
+and omit `serde`/`serde_json` — the generated message types no longer derive
+them. See [Proto-only builds](#proto-only-no-json-builds).
 
 ### Optional: gate the client behind a Cargo feature
 

@@ -18,9 +18,10 @@ use bytes::Bytes;
 use futures::Stream;
 use http::HeaderMap;
 use http::header::{HeaderName, HeaderValue};
-use serde::Serialize;
 
 use crate::codec::CodecFormat;
+use crate::codec::JsonSerialize;
+use crate::codec::encode_json;
 use crate::error::ConnectError;
 
 // ---------------------------------------------------------------------------
@@ -504,7 +505,7 @@ pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> +
 ///
 /// This is the bound on the response body in generated trait methods.
 /// Provided implementations:
-/// - the owned `M` itself (blanket `M: Message + Serialize` below);
+/// - the owned `M` itself (blanket `M: Message + JsonSerialize` below);
 /// - `MView<'_>` and [`OwnedView<MView<'static>>`](buffa::view::OwnedView),
 ///   emitted by codegen per RPC output type;
 /// - [`MaybeBorrowed<M, V>`] for handlers that conditionally return
@@ -530,13 +531,11 @@ pub trait Encodable<M> {
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError>;
 }
 
-impl<M: Message + Serialize> Encodable<M> for M {
+impl<M: Message + JsonSerialize> Encodable<M> for M {
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError> {
         match codec {
             CodecFormat::Proto => Ok(self.encode_to_bytes()),
-            CodecFormat::Json => serde_json::to_vec(self).map(Bytes::from).map_err(|e| {
-                ConnectError::internal(format!("failed to encode JSON response: {e}"))
-            }),
+            CodecFormat::Json => encode_json(self),
         }
     }
 }
@@ -548,7 +547,7 @@ impl<M: Message + Serialize> Encodable<M> for M {
 /// Used by codegen-emitted `impl Encodable<Foo> for FooView<'_>` /
 /// `impl Encodable<Foo> for OwnedView<FooView<'static>>` blocks. A
 /// runtime blanket on [`OwnedView`](buffa::view::OwnedView) would
-/// conflict with the `M: Message + Serialize` blanket above (coherence
+/// conflict with the `M: Message + JsonSerialize` blanket above (coherence
 /// can't rule out upstream adding `Message`/`Serialize` for
 /// `OwnedView`), so the impls are emitted per output type instead.
 #[doc(hidden)]
@@ -612,7 +611,7 @@ pub enum MaybeBorrowed<M, V> {
 
 impl<M, V> Encodable<M> for MaybeBorrowed<M, V>
 where
-    // satisfied via the blanket impl for M: Message + Serialize
+    // satisfied via the blanket impl for M: Message + JsonSerialize
     M: Encodable<M>,
     V: Encodable<M>,
 {
@@ -855,19 +854,19 @@ impl<M: Message> From<&M> for PreEncoded<M> {
 }
 
 // Coherence: this impl is non-overlapping with the
-// `impl<M: Message + Serialize> Encodable<M> for M` blanket above for
+// `impl<M: Message + JsonSerialize> Encodable<M> for M` blanket above for
 // structural reasons. For the two to overlap, some `T` would have to satisfy
-// both `T: Encodable<T>` (blanket, with `T: Message + Serialize`) and
+// both `T: Encodable<T>` (blanket, with `T: Message + JsonSerialize`) and
 // `T = PreEncoded<U>` with `T: Encodable<U>` (this impl) for the *same* trait
 // parameter — i.e. `T = U`, i.e. `PreEncoded<U> = U`, which is infinite. So
 // the impls cannot overlap even if a future change made `PreEncoded` a
 // `Message` (which would only add `PreEncoded<M>: Encodable<PreEncoded<M>>` —
 // a different trait instantiation). No invariant to maintain here.
 //
-// The `M: Message + Serialize` bound matches the blanket so a `PreEncoded<M>`
+// The `M: Message + JsonSerialize` bound matches the blanket so a `PreEncoded<M>`
 // is `Encodable<M>` exactly when an owned `M` would be — and is what makes the
 // JSON fallback path possible (decode as `M`, re-serialize).
-impl<M: Message + Serialize> Encodable<M> for PreEncoded<M> {
+impl<M: Message + JsonSerialize> Encodable<M> for PreEncoded<M> {
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError> {
         match codec {
             CodecFormat::Proto => Ok(self.bytes.clone()),
@@ -883,9 +882,7 @@ impl<M: Message + Serialize> Encodable<M> for PreEncoded<M> {
                         std::any::type_name::<M>(),
                     ))
                 })?;
-                serde_json::to_vec(&msg).map(Bytes::from).map_err(|e| {
-                    ConnectError::internal(format!("failed to encode JSON response: {e}"))
-                })
+                encode_json(&msg)
             }
         }
     }
@@ -987,6 +984,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn encodable_owned_json() {
         let m = StringValue::from("hello");
@@ -1213,6 +1211,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn pre_encoded_json_decodes_then_serializes() {
         // The JSON path round-trips: proto bytes → owned `M` → JSON. Slow,
@@ -1225,6 +1224,7 @@ mod tests {
         assert_eq!(out, Bytes::from(serde_json::to_vec(&m).unwrap()));
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn pre_encoded_json_decode_failure_is_internal_error() {
         // `from_bytes_unchecked` is unvalidated on the proto path. The JSON
@@ -1275,6 +1275,7 @@ mod tests {
         assert_eq!(out2, out);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn pre_encoded_codec_fidelity_diverges_on_unknown_fields() {
         // Documents the codec-dependent fidelity caveat: the proto path
@@ -1303,6 +1304,29 @@ mod tests {
             json,
             Bytes::from(serde_json::to_vec(&StringValue::from("hi")).unwrap())
         );
+    }
+
+    // --- proto-only (json feature disabled) fallback behaviour ---
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn encodable_owned_json_is_unimplemented_without_feature() {
+        let m = StringValue::from("hello");
+        // Proto still encodes normally...
+        assert!(Encodable::<StringValue>::encode(&m, CodecFormat::Proto).is_ok());
+        // ...but the JSON codec is compiled out and reports it cleanly.
+        let err = Encodable::<StringValue>::encode(&m, CodecFormat::Json).unwrap_err();
+        assert_eq!(err.code, crate::ErrorCode::Unimplemented);
+    }
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn pre_encoded_json_is_unimplemented_without_feature() {
+        let m = StringValue::from("hi");
+        let body = PreEncoded::<StringValue>::from_bytes_unchecked(m.encode_to_bytes());
+        assert!(Encodable::<StringValue>::encode(&body, CodecFormat::Proto).is_ok());
+        let err = Encodable::<StringValue>::encode(&body, CodecFormat::Json).unwrap_err();
+        assert_eq!(err.code, crate::ErrorCode::Unimplemented);
     }
 
     #[test]

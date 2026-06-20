@@ -151,6 +151,7 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
+//! | `json` | ✓ | JSON codec for protobuf messages; disable for proto-only builds |
 //! | `gzip` | ✓ | Gzip compression |
 //! | `zstd` | ✓ | Zstandard compression |
 //! | `streaming` | ✓ | Streaming compression support |
@@ -322,7 +323,11 @@ pub use interceptor::unary_interceptor;
 // ============================================================================
 
 pub use codec::CodecFormat;
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub use codec::JsonCodec;
+pub use codec::JsonDeserialize;
+pub use codec::JsonSerialize;
 pub use codec::ProtoCodec;
 
 // ============================================================================

@@ -12,6 +12,24 @@ increment the patch version.
 
 ### Added
 
+- **Optional `json` cargo feature for proto-only builds** ([#172]). The
+  Connect JSON codec requires `serde::Serialize`/`Deserialize` on every
+  message type, so the code generator derives them by default — pure cost for
+  crates that only speak binary proto. The new default-on `json` feature, when
+  disabled (`connectrpc = { default-features = false }`), relaxes the runtime's
+  message-type bounds to just `buffa::Message` via the new
+  `JsonSerialize`/`JsonDeserialize` marker traits, so message types
+  generated with the codegen `no_json` option (no serde derives) compile
+  against the runtime. A proto-only server declines JSON at content
+  negotiation — `application/json` / `application/connect+json` (and the
+  Connect GET `encoding=json` parameter) return HTTP 415, and
+  `application/grpc+json` / `application/grpc-web+json` return a gRPC error
+  status — with message-level encode/decode returning `Unimplemented` as a
+  backstop; the client's `ClientConfig::json` selector is removed from the API
+  in that build. The Connect error/end-stream wire format
+  is always JSON per spec, so `serde`/`serde_json` remain required
+  dependencies. See the
+  [proto-only build guide](docs/guide.md#proto-only-no-json-builds).
 - **Top-down service registration on `Router`** ([#164]). `Router::add_service`
   registers a generated service from the router outward
   (`Router::new().add_service(Arc::new(svc))`), the discoverable counterpart to
@@ -47,6 +65,7 @@ increment the patch version.
 [#151]: https://github.com/anthropics/connect-rust/issues/151
 [#163]: https://github.com/anthropics/connect-rust/pull/163
 [#164]: https://github.com/anthropics/connect-rust/pull/164
+[#172]: https://github.com/anthropics/connect-rust/pull/172
 
 ## [0.7.0] - 2026-06-10
 

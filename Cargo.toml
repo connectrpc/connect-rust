@@ -36,6 +36,9 @@ async-trait = "0.1"
 # `OwnedView` `Deref` impl that earlier handler signatures relied on.
 # (connectrpc-build also sources the generated `mod.rs` `#[allow(...)]` list
 # from `buffa_codegen::ALLOW_LINTS`, present since 0.5.1.)
+# NOTE: the `connectrpc` crate pins `buffa` directly (not `workspace = true`)
+# so its `json` cargo feature can gate `buffa/json` for proto-only builds —
+# keep that floor aligned with this one when bumping.
 buffa = { version = "0.7", features = ["json"] }
 buffa-types = { version = "0.7", features = ["json"] }
 buffa-codegen = { version = "0.7" }

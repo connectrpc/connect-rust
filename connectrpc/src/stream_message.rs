@@ -8,9 +8,10 @@
 
 use buffa::view::{OwnedView, ViewReborrow};
 use bytes::Bytes;
-use serde::Serialize;
 
 use crate::codec::CodecFormat;
+use crate::codec::JsonSerialize;
+use crate::codec::encode_json;
 use crate::error::ConnectError;
 use crate::request::HasMessageView;
 use crate::response::Encodable;
@@ -129,16 +130,12 @@ where
 /// the byte/HTTP layer instead.
 impl<M> Encodable<M> for StreamMessage<M>
 where
-    M: HasMessageView + Serialize,
+    M: HasMessageView + JsonSerialize,
 {
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError> {
         match codec {
             CodecFormat::Proto => Ok(self.inner.as_ref().bytes().clone()),
-            CodecFormat::Json => serde_json::to_vec(&self.to_owned_message())
-                .map(Bytes::from)
-                .map_err(|e| {
-                    ConnectError::internal(format!("failed to encode JSON response: {e}"))
-                }),
+            CodecFormat::Json => encode_json(&self.to_owned_message()),
         }
     }
 }
@@ -175,6 +172,7 @@ mod tests {
         assert_eq!(format!("{msg:?}"), format!("{cloned:?}"));
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn encodable_forwards_proto_bytes_without_reencoding() {
         let msg = message("forward me");
@@ -189,5 +187,16 @@ mod tests {
         let json = msg.encode(CodecFormat::Json).expect("json encode");
         let owned_json = serde_json::to_vec(&msg.to_owned_message()).unwrap();
         assert_eq!(json.as_ref(), owned_json.as_slice());
+    }
+
+    #[cfg(not(feature = "json"))]
+    #[test]
+    fn encode_json_is_unimplemented_without_feature() {
+        let msg = message("forward me");
+        // Proto forwarding still works in a proto-only build...
+        assert!(msg.encode(CodecFormat::Proto).is_ok());
+        // ...the JSON arm is compiled out and reports `Unimplemented`.
+        let err = msg.encode(CodecFormat::Json).unwrap_err();
+        assert_eq!(err.code, crate::ErrorCode::Unimplemented);
     }
 }
