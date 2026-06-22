@@ -1473,8 +1473,10 @@ where
 
     // Content type didn't resolve to a known protocol+codec. A gRPC/gRPC-Web
     // prefix with an unsupported codec (e.g. application/grpc+thrift, or
-    // application/grpc+json in a proto-only build) returns a gRPC-style error so
-    // the client gets gRPC framing it can parse. Any other unrecognized content
+    // application/grpc+json in a proto-only build) returns a gRPC `unimplemented`
+    // error so the client gets gRPC framing it can parse (the compression axis
+    // returns `unimplemented` for an unsupported encoding the same way). Any
+    // other unrecognized content
     // type returns HTTP 415 Unsupported Media Type with an `Accept-Post` header
     // advertising the content types this server does accept.
     if request_protocol.is_none() {
@@ -1507,11 +1509,11 @@ where
         .await;
 
         if ct.starts_with("application/grpc-web") {
-            let err = ConnectError::internal("unsupported content type");
+            let err = ConnectError::unimplemented("unsupported content type");
             let response = grpc_error_response(&err, Protocol::GrpcWeb, CodecFormat::Proto);
             return Ok(response.map(ConnectRpcBody::Streaming));
         } else if ct.starts_with("application/grpc") {
-            let err = ConnectError::internal("unsupported content type");
+            let err = ConnectError::unimplemented("unsupported content type");
             let response = grpc_error_response(&err, Protocol::Grpc, CodecFormat::Proto);
             return Ok(response.map(ConnectRpcBody::Streaming));
         } else {
@@ -4412,6 +4414,74 @@ mod tests {
             Err(err) => err.http_status(),
         };
         assert_ne!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // A valid `application/grpc` / `application/grpc-web` prefix paired with an
+    // unsupported message codec (e.g. `+thrift`) is rejected with the gRPC
+    // status `unimplemented` (code 12), matching the compression axis. The
+    // gRPC spec leaves this code unspecified and the conformance suite accepts
+    // either `internal` or `unimplemented`; we use `unimplemented` because the
+    // server genuinely does not implement the requested codec.
+    #[tokio::test]
+    async fn unsupported_grpc_codec_returns_unimplemented() {
+        let dispatcher = Arc::new(Router::new());
+
+        // gRPC: the trailers-only error echoes grpc-status in the response
+        // headers.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/svc/Method")
+            .header(header::CONTENT_TYPE, "application/grpc+thrift")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(
+            Arc::clone(&dispatcher),
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+            &[],
+        )
+        .await
+        .expect("a gRPC codec rejection is returned as an Ok response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("grpc-status").unwrap(),
+            "12",
+            "unsupported gRPC codec must map to unimplemented (12)"
+        );
+
+        // gRPC-Web: grpc-status is carried in the trailer frame in the body.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/svc/Method")
+            .header(header::CONTENT_TYPE, "application/grpc-web+thrift")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(
+            Arc::clone(&dispatcher),
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+            &[],
+        )
+        .await
+        .expect("a gRPC-Web codec rejection is returned as an Ok response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collecting the gRPC-Web error body must not fail")
+            .to_bytes();
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("grpc-status: 12\r\n"),
+            "unsupported gRPC-Web codec must map to unimplemented (12); body was {body_text:?}"
+        );
     }
 
     // Mirrors connect-go: an unsupported HTTP verb on a known procedure returns

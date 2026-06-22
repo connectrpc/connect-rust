@@ -2091,7 +2091,13 @@ where
                 let trailer_len =
                     u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
                         as usize;
-                if self.buf.len() >= 5 + trailer_len {
+                // `saturating_add`: `trailer_len` is a server-controlled u32, so
+                // on a 32-bit target (e.g. the supported `wasm32` gRPC-Web
+                // client) `5 + trailer_len` can overflow `usize` and panic in a
+                // debug build. Matches the sibling framing sites, which already
+                // saturate. A saturated sum is never `<= buf.len()`, so an
+                // over-large prefix simply waits for bytes that never arrive.
+                if self.buf.len() >= trailer_len.saturating_add(5) {
                     // Complete trailer frame — parse and classify. An
                     // unparseable frame classifies as `None` (no usable
                     // termination metadata).
@@ -2362,16 +2368,7 @@ where
 
         let trailers = end_stream.metadata.map(|metadata| {
             let mut trailers = http::HeaderMap::new();
-            for (name, values) in metadata {
-                for value in values {
-                    if let (Ok(name), Ok(value)) = (
-                        http::header::HeaderName::from_bytes(name.as_bytes()),
-                        http::header::HeaderValue::from_str(&value),
-                    ) {
-                        trailers.append(name, value);
-                    }
-                }
-            }
+            append_metadata_capped(&mut trailers, metadata);
             trailers
         });
 
@@ -3290,16 +3287,7 @@ fn parse_connect_client_stream_envelopes(
                 serde_json::from_slice(&end_stream_data).unwrap_or_default();
 
             if let Some(metadata) = end_stream.metadata {
-                for (name, values) in metadata {
-                    for value in values {
-                        if let (Ok(name), Ok(value)) = (
-                            http::header::HeaderName::from_bytes(name.as_bytes()),
-                            http::header::HeaderValue::from_str(&value),
-                        ) {
-                            trailers.append(name, value);
-                        }
-                    }
-                }
+                append_metadata_capped(&mut trailers, metadata);
             }
 
             if let Some(err) = end_stream.error {
@@ -3748,10 +3736,42 @@ fn parse_grpc_web_trailer_frame_with_compression(
                 http::HeaderValue::from_str(value.trim()),
             )
         {
-            headers.append(name, val);
+            // Use the fallible `try_append`: `HeaderMap` panics in
+            // `append` once the number of stored entries would exceed its
+            // hard ceiling (`MAX_SIZE = 1 << 15`). A hostile server can pack
+            // tens of thousands of short trailer lines into a payload that
+            // stays under `MAX_TRAILER_SIZE` (bytes, not entries), so the
+            // byte cap alone does not prevent the panic. Stop accumulating at
+            // the ceiling rather than crashing the RPC task.
+            if headers.try_append(name, val).is_err() {
+                break;
+            }
         }
     }
     Some(headers)
+}
+
+/// Append Connect end-stream `metadata` into `trailers`, capping at the
+/// `HeaderMap` entry ceiling.
+///
+/// `metadata` is deserialized from a server-supplied JSON end-stream frame, so
+/// its size is attacker-controlled. `HeaderMap::append` panics once the number
+/// of stored entries would exceed its hard ceiling (`MAX_SIZE = 1 << 15`); a
+/// hostile server could send tens of thousands of distinct keys in a few
+/// hundred KB of JSON and crash the RPC task. Use the fallible `try_append`
+/// and stop at the ceiling instead.
+fn append_metadata_capped(trailers: &mut http::HeaderMap, metadata: HashMap<String, Vec<String>>) {
+    'outer: for (name, values) in metadata {
+        for value in values {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                http::header::HeaderValue::from_str(&value),
+            ) && trailers.try_append(name, value).is_err()
+            {
+                break 'outer;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4758,6 +4778,66 @@ mod tests {
         frame.extend_from_slice(payload);
         // Without compression registry, should return None
         assert!(parse_grpc_web_trailer_frame_with_compression(&frame, None).is_none());
+    }
+
+    #[test]
+    fn test_parse_grpc_web_trailer_floods_do_not_panic() {
+        // A hostile server can pack far more distinct trailer names than
+        // `HeaderMap` can hold (`MAX_SIZE = 1 << 15 = 32_768`) into a payload
+        // that stays under the 1 MiB byte cap. Each `hN:` line is short, so
+        // 40_000 distinct names is only ~300 KiB. The parser must not panic.
+        let mut payload = String::new();
+        for i in 0..40_000u32 {
+            payload.push_str(&format!("h{i}:\n"));
+        }
+        let payload = payload.into_bytes();
+        assert!(
+            payload.len() < 1024 * 1024,
+            "payload must stay under byte cap"
+        );
+
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0x80);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        // Before the fix this panicked with "size overflows MAX_SIZE".
+        let headers = parse_grpc_web_trailer_frame_with_compression(&frame, None)
+            .expect("flood frame is well-formed and should parse");
+        // The map fills up to the type's hard ceiling and stops: it accepts
+        // entries (the loop didn't drop everything) but never exceeds the cap.
+        assert!(headers.keys_len() > 0, "early trailers should be retained");
+        assert!(headers.keys_len() <= 1 << 15);
+    }
+
+    #[test]
+    fn test_append_metadata_capped_copies_entries() {
+        let mut metadata = HashMap::new();
+        metadata.insert("grpc-status".to_string(), vec!["0".to_string()]);
+        metadata.insert(
+            "x-custom".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+        let mut trailers = http::HeaderMap::new();
+        append_metadata_capped(&mut trailers, metadata);
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert_eq!(trailers.get_all("x-custom").iter().count(), 2);
+    }
+
+    #[test]
+    fn test_append_metadata_capped_does_not_panic_on_flood() {
+        // A Connect end-stream `metadata` map is deserialized from server JSON,
+        // so its key count is attacker-controlled. Feeding more distinct keys
+        // than the `HeaderMap` ceiling (`MAX_SIZE = 1 << 15`) must cap rather
+        // than panic with "size overflows MAX_SIZE".
+        let mut metadata = HashMap::new();
+        for i in 0..40_000u32 {
+            metadata.insert(format!("h{i}"), vec![String::new()]);
+        }
+        let mut trailers = http::HeaderMap::new();
+        append_metadata_capped(&mut trailers, metadata);
+        assert!(trailers.keys_len() > 0, "early entries should be retained");
+        assert!(trailers.keys_len() <= 1 << 15);
     }
 
     #[test]
