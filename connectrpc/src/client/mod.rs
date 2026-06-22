@@ -2019,7 +2019,7 @@ where
     ///
     /// A response body that ends without its protocol's termination
     /// metadata is not a clean end and returns `Err` rather than
-    /// `Ok(None)`: `unavailable` for a Connect stream missing its
+    /// `Ok(None)`: `internal` for a Connect stream missing its
     /// END_STREAM envelope; for gRPC/gRPC-Web, `internal` when no
     /// trailers arrived at all, `unknown` when trailers arrived without a
     /// `grpc-status`, and `unknown` for a malformed `grpc-status` value —
@@ -2125,7 +2125,12 @@ where
                     }
                     BodyPoll::Eof => {
                         if matches!(self.protocol, Protocol::Connect) {
-                            return Err(ConnectError::unavailable(
+                            // The HTTP body completed cleanly but the Connect
+                            // envelope sequence is missing its terminus: a
+                            // wire-level error, classified as `internal` the
+                            // same way connect-go and other gRPC stacks treat a
+                            // failed decompression or an unparseable response.
+                            return Err(ConnectError::internal(
                                 "Connect streaming response ended without END_STREAM envelope",
                             )
                             .into());
@@ -3211,8 +3216,10 @@ where
 /// envelope, the protocol-level terminus: it supplies the trailers (or a
 /// terminal Connect error) and marks the response complete. A body that
 /// yields the data message and then ends before END_STREAM is truncated, not
-/// successful, and is rejected with `unavailable`, matching the `ServerStream`
-/// Connect EOF behavior. Returns the (still encoded) message payload and any
+/// successful, and is rejected with `internal` (matching the `ServerStream`
+/// Connect EOF behavior and connect-go's classification of a missing
+/// terminus as a wire-level error). Returns the (still encoded) message
+/// payload and any
 /// trailers carried in the END_STREAM metadata.
 ///
 /// Scanning stops at END_STREAM, so anything after it is ignored rather than
@@ -3328,7 +3335,7 @@ fn parse_connect_client_stream_envelopes(
     // is a truncated response, not a completed one — match ServerStream's
     // Connect EOF handling rather than reporting success with no trailers.
     if !saw_end_stream {
-        return Err(ConnectError::unavailable(
+        return Err(ConnectError::internal(
             "Connect streaming response ended without END_STREAM envelope",
         ));
     }
@@ -3909,7 +3916,7 @@ mod tests {
             Ok(Some(_)) => panic!("truncated stream unexpectedly yielded another message"),
             Ok(None) => panic!("truncated stream ended cleanly without END_STREAM"),
         };
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert!(
             err.to_string().contains("END_STREAM"),
             "unexpected error: {err}"
@@ -3921,7 +3928,7 @@ mod tests {
             .message()
             .await
             .expect_err("truncation error must be sticky");
-        assert_eq!(again.code, ErrorCode::Unavailable);
+        assert_eq!(again.code, ErrorCode::Internal);
     }
 
     /// A Connect streaming response whose body is empty (zero envelopes,
@@ -3952,7 +3959,7 @@ mod tests {
             Ok(Some(_)) => panic!("empty body unexpectedly yielded a message"),
             Ok(None) => panic!("empty body without END_STREAM ended cleanly"),
         };
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert!(
             err.to_string().contains("END_STREAM"),
             "unexpected error: {err}"
@@ -3962,7 +3969,7 @@ mod tests {
             .message()
             .await
             .expect_err("truncation error must be sticky");
-        assert_eq!(again.code, ErrorCode::Unavailable);
+        assert_eq!(again.code, ErrorCode::Internal);
     }
 
     /// `Ok(None)` means the RPC succeeded — a Connect END_STREAM envelope
@@ -5554,7 +5561,7 @@ mod tests {
 
     /// A data envelope followed by EOF, with no END_STREAM envelope, is a
     /// truncated response rather than a completed one: it is rejected with
-    /// `unavailable` instead of succeeding with empty trailers, matching the
+    /// `internal` instead of succeeding with empty trailers, matching the
     /// `ServerStream` Connect EOF behavior.
     #[test]
     fn client_stream_response_requires_end_stream_after_message() {
@@ -5570,7 +5577,7 @@ mod tests {
             &http::HeaderMap::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert_eq!(
             err.message.as_deref(),
             Some("Connect streaming response ended without END_STREAM envelope"),
@@ -5580,7 +5587,7 @@ mod tests {
     /// A data envelope followed by a truncated END_STREAM envelope (its
     /// declared payload never arrives) is also a truncated response: the
     /// partial envelope decodes to "needs more data", so END_STREAM is never
-    /// observed and the response is rejected with `unavailable`.
+    /// observed and the response is rejected with `internal`.
     #[test]
     fn client_stream_response_requires_complete_end_stream_after_message() {
         let registry = crate::compression::CompressionRegistry::new();
@@ -5600,7 +5607,7 @@ mod tests {
             &http::HeaderMap::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert_eq!(
             err.message.as_deref(),
             Some("Connect streaming response ended without END_STREAM envelope"),

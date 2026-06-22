@@ -66,20 +66,42 @@ increment the patch version.
   fixed window turns adaptive sizing off, mirroring grpc-go). The new default
   is exposed as the `DEFAULT_HTTP2_ADAPTIVE_WINDOW` constant.
 
+### Changed
+
+- **Connect streaming EOF without END_STREAM now returns `internal`**
+  ([#168]). The `ServerStream` Connect EOF path that 0.7.0's [#140]
+  introduced as `unavailable` now returns `internal` — the code
+  connect-go reports for this path, and the primary expected code in the
+  upstream conformance suite addition ([connectrpc/conformance#1104]).
+  The HTTP body completes cleanly in this case; it is the Connect
+  envelope sequence that is missing its terminus, so connect-go and other
+  gRPC stacks classify it as a wire-level error in the same family as a
+  failed decompression or an unparseable response, rather than the
+  transport flakiness [#140]'s entry described. **Clients on 0.7.0 that
+  match `Unavailable` for a truncated Connect stream must match `Internal`
+  after this release**, and generic retry middleware that retries on
+  `unavailable` will now treat this case as terminal — a server that omits
+  END_STREAM is not expected to start sending it on retry. The
+  client-streaming check from [#163] ships with the same `internal` code.
+  (The 0.7.0 [#140] entry's "matching connect-go" parenthetical was also
+  inaccurate as to the code, but correct that connect-go is the reference:
+  it returns `internal` for this path.)
+
 ### Fixed
 
 - **Connect client-streaming responses require the END_STREAM envelope**
   ([#163]). A response that ended after its single data message but before
   the END_STREAM envelope was accepted as a success with empty trailers, so
   a truncated response was indistinguishable from a complete one. It now
-  returns `Err(unavailable)`, matching the `ServerStream` Connect EOF path
-  ([#140]); complete responses are unchanged.
+  returns `Err(internal)` (see [#168]); complete responses are unchanged.
 
 [#151]: https://github.com/anthropics/connect-rust/issues/151
 [#163]: https://github.com/anthropics/connect-rust/pull/163
 [#164]: https://github.com/anthropics/connect-rust/pull/164
+[#168]: https://github.com/anthropics/connect-rust/pull/168
 [#172]: https://github.com/anthropics/connect-rust/pull/172
 [#178]: https://github.com/anthropics/connect-rust/issues/178
+[connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
 ## [0.7.0] - 2026-06-10
 
