@@ -2062,7 +2062,13 @@ where
                 let trailer_len =
                     u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
                         as usize;
-                if self.buf.len() >= 5 + trailer_len {
+                // `saturating_add`: `trailer_len` is a server-controlled u32, so
+                // on a 32-bit target (e.g. the supported `wasm32` gRPC-Web
+                // client) `5 + trailer_len` can overflow `usize` and panic in a
+                // debug build. Matches the sibling framing sites, which already
+                // saturate. A saturated sum is never `<= buf.len()`, so an
+                // over-large prefix simply waits for bytes that never arrive.
+                if self.buf.len() >= trailer_len.saturating_add(5) {
                     // Complete trailer frame — parse and classify. An
                     // unparseable frame classifies as `None` (no usable
                     // termination metadata).
