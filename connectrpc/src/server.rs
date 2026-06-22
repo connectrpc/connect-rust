@@ -1765,10 +1765,9 @@ mod tests {
 
     #[test]
     fn http2_config_default_enables_adaptive_window() {
-        assert!(DEFAULT_HTTP2_ADAPTIVE_WINDOW);
-
         let config = Http2Config::default();
         assert!(config.adaptive_window);
+        assert_eq!(config.adaptive_window, DEFAULT_HTTP2_ADAPTIVE_WINDOW);
         assert_eq!(config.initial_stream_window_size, None);
         assert_eq!(config.initial_connection_window_size, None);
     }
