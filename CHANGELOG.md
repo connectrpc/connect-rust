@@ -8,102 +8,10 @@ with the [Rust 0.x convention](https://doc.rust-lang.org/cargo/reference/semver.
 breaking changes increment the minor version (0.2 → 0.3), additive changes
 increment the patch version.
 
-## [Unreleased]
-
-### Added
-
-- **Optional `json` cargo feature for proto-only builds** ([#172]). The
-  Connect JSON codec requires `serde::Serialize`/`Deserialize` on every
-  message type, so the code generator derives them by default — pure cost for
-  crates that only speak binary proto. The new default-on `json` feature, when
-  disabled (`connectrpc = { default-features = false }`), relaxes the runtime's
-  message-type bounds to just `buffa::Message` via the new
-  `JsonSerialize`/`JsonDeserialize` marker traits, so message types
-  generated with the codegen `no_json` option (no serde derives) compile
-  against the runtime. A proto-only server declines JSON at content
-  negotiation — `application/json` / `application/connect+json` (and the
-  Connect GET `encoding=json` parameter) return HTTP 415, and
-  `application/grpc+json` / `application/grpc-web+json` return a gRPC error
-  status — with message-level encode/decode returning `Unimplemented` as a
-  backstop; the client's `ClientConfig::json` selector is removed from the API
-  in that build. The Connect error/end-stream wire format
-  is always JSON per spec, so `serde`/`serde_json` remain required
-  dependencies. See the
-  [proto-only build guide](docs/guide.md#proto-only-no-json-builds).
-- **Top-down service registration on `Router`** ([#164]). `Router::add_service`
-  registers a generated service from the router outward
-  (`Router::new().add_service(Arc::new(svc))`), the discoverable counterpart to
-  the existing `FooServiceExt::register` extension method, which remains
-  available. New `Router::merge` / `Router::merge_in_place` combine routers, and
-  a new public `ServiceRegister` trait (implemented by codegen) backs
-  `add_service`. Registering or merging a method path that already exists now
-  fails by default so an accidental collision — such as adding the same service
-  twice — surfaces loudly instead of silently shadowing a route: `add_service`,
-  `register`, `merge`, `merge_in_place`, and `merge_routers` panic. Call
-  `Router::allow_overrides` to opt into last-wins replacement across all of
-  them. For assembling routers from dynamic input, `Router::try_merge` /
-  `Router::try_merge_in_place` return a `RouterMergeError` listing the
-  conflicting paths instead of panicking.
-- **Maximum connection age for the built-in server** ([#151]).
-  `with_max_connection_age` (on both `Server` and `BoundServer`) retires
-  long-lived HTTP/2 connections by sending a GOAWAY once a connection reaches
-  the configured age, then force-closing after a grace period
-  (`with_max_connection_age_grace`, default 5s); HTTP/1.1 connections have
-  keep-alive disabled instead. A symmetric ±10% jitter is applied per
-  connection to avoid reconnect bursts. Disabled by default; whole-server
-  graceful shutdown still drains in-flight requests indefinitely.
-
-### Changed
-
-- **Connect streaming EOF without END_STREAM now returns `internal`**
-  ([#168]). The `ServerStream` Connect EOF path that 0.7.0's [#140]
-  introduced as `unavailable` now returns `internal` — the code
-  connect-go reports for this path, and the primary expected code in the
-  upstream conformance suite addition ([connectrpc/conformance#1104]).
-  The HTTP body completes cleanly in this case; it is the Connect
-  envelope sequence that is missing its terminus, so connect-go and other
-  gRPC stacks classify it as a wire-level error in the same family as a
-  failed decompression or an unparseable response, rather than the
-  transport flakiness [#140]'s entry described. **Clients on 0.7.0 that
-  match `Unavailable` for a truncated Connect stream must match `Internal`
-  after this release**, and generic retry middleware that retries on
-  `unavailable` will now treat this case as terminal — a server that omits
-  END_STREAM is not expected to start sending it on retry. The
-  client-streaming check from [#163] ships with the same `internal` code.
-  (The 0.7.0 [#140] entry's "matching connect-go" parenthetical was also
-  inaccurate as to the code, but correct that connect-go is the reference:
-  it returns `internal` for this path.)
-- **Connect Unary-Get query parameters are emitted in the spec-recommended
-  order** ([#167]): `connect`, `base64`, `compression`, `encoding`, `message`.
-  Servers must accept any order, so this is not a wire-compatibility change;
-  the recommended order keeps the variable-length `message` last so the URL
-  prefix is stable for shared caches. Aligns with the order check added to
-  the upstream conformance suite.
-- **Unsupported gRPC/gRPC-Web message codecs return `unimplemented`**
-  ([#180]). A request with a valid `application/grpc` / `application/grpc-web`
-  prefix but a codec the server does not speak (for example
-  `application/grpc+thrift`, or `application/grpc+json` in a proto-only build)
-  now returns grpc-status `unimplemented` (12) instead of `internal` (13).
-  This matches the compression axis, which already returns `unimplemented` for
-  an unsupported `grpc-encoding`. Clients that branch on grpc-status will
-  observe 13 → 12 for this case on upgrade.
-
-### Fixed
-
-- **Connect client-streaming responses require the END_STREAM envelope**
-  ([#163]). A response that ended after its single data message but before
-  the END_STREAM envelope was accepted as a success with empty trailers, so
-  a truncated response was indistinguishable from a complete one. It now
-  returns `Err(internal)` (see [#168]); complete responses are unchanged.
-
-[#151]: https://github.com/anthropics/connect-rust/issues/151
-[#163]: https://github.com/anthropics/connect-rust/pull/163
-[#164]: https://github.com/anthropics/connect-rust/pull/164
-[#167]: https://github.com/anthropics/connect-rust/pull/167
-[#168]: https://github.com/anthropics/connect-rust/pull/168
-[#172]: https://github.com/anthropics/connect-rust/pull/172
-[#180]: https://github.com/anthropics/connect-rust/issues/180
-[connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
+Entries for unreleased changes live as fragment files under
+[`.changes/unreleased/`](.changes/unreleased/); run `task changelog-new` to add
+one. This file is assembled from `.changes/` at release time — do not edit it
+directly.
 
 ## [0.7.0] - 2026-06-10
 
