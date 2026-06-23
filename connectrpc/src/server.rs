@@ -53,6 +53,10 @@
 //! elapses. Retirement is independent of whole-server graceful shutdown, which
 //! still drains in-flight requests indefinitely even while a connection is in
 //! its grace window.
+//!
+//! For transport and HTTP/2 knobs that [`Server`] does not expose, drive
+//! [`ConnectRpcService`] directly from a hyper accept loop. The crate guide's
+//! "Advanced transport configuration" section shows the `hyper_util` pattern.
 
 use std::any::Any;
 use std::collections::hash_map::RandomState;

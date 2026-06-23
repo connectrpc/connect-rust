@@ -1045,7 +1045,69 @@ Server::new(connect_router)
 The standalone `Server` handles HTTP/1.1, HTTP/2 with prior knowledge,
 and graceful shutdown. It's a single dispatcher with no per-route
 configuration, so add things like health endpoints either as RPC
-methods or by switching to the axum path.
+methods or by mounting the Connect service in axum.
+
+For connection and HTTP/2 settings that `Server` does not expose, drop
+down to raw hyper instead.
+
+### Advanced transport configuration
+
+The built-in `Server` exposes the common connection knobs, but it does
+not try to mirror every hyper option. For long-tail transport tuning —
+flow-control windows, HPACK table size, frame size, or exact keepalive
+behavior — drive the Connect service from your own hyper accept loop.
+
+Add `hyper-util` as a direct dependency with the `server-auto`,
+`service`, and `tokio` features enabled. Then wrap `ConnectRpcService`
+with `TowerToHyperService` before handing each connection to hyper's
+auto builder:
+
+```rust,ignore
+use connectrpc::{ConnectRpcService, Router};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as AutoBuilder,
+    service::TowerToHyperService,
+};
+
+let connect_router = Router::new().add_service(greeter_service);
+let connect_service = ConnectRpcService::new(connect_router);
+
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+let mut builder = AutoBuilder::new(TokioExecutor::new());
+builder
+    .http2()
+    .max_concurrent_streams(1_000)
+    .max_frame_size(1 << 20)
+    .adaptive_window(true);
+
+loop {
+    let (stream, _peer_addr) = listener.accept().await?;
+    let conn = builder
+        .serve_connection(
+            TokioIo::new(stream),
+            TowerToHyperService::new(connect_service.clone()),
+        )
+        .into_owned();
+
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            eprintln!("connection ended with error: {err}");
+        }
+    });
+}
+```
+
+This is the escape hatch for connection- and protocol-level settings.
+Axum remains the better fit for routing, health checks, ordinary HTTP
+endpoints, and request-level Tower middleware such as auth, timeouts,
+or rate limiting.
+
+Unlike the built-in `Server` and `connectrpc::axum::serve_tls`, a raw
+hyper loop does not automatically insert `PeerAddr` or `PeerCerts` into
+request extensions. If handlers call `ctx.peer_addr()` or
+`ctx.peer_certs()`, insert those extensions in your own Tower layer or
+service wrapper before the request reaches `ConnectRpcService`.
 
 ### TLS
 
