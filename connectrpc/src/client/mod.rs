@@ -1301,7 +1301,7 @@ where
 /// Make an idempotent unary RPC call via HTTP GET (Connect protocol only).
 ///
 /// The request is encoded into URL query parameters per the Connect spec:
-/// `?connect=v1&encoding=<codec>&message=<payload>[&base64=1][&compression=<enc>]`.
+/// `?connect=v1[&base64=1][&compression=<enc>]&encoding=<codec>&message=<payload>`.
 ///
 /// For proto (or any binary codec), the message is URL-safe base64-encoded
 /// without padding and `base64=1` is set. For JSON, the message is
@@ -1392,17 +1392,8 @@ where
         CodecFormat::Json => "json",
     };
 
-    // Assemble query string. Parameter order doesn't matter per spec, but
-    // a deterministic order aids caching. connect-go puts connect/encoding
-    // first, message/base64/compression after.
-    let mut query = format!("connect=v1&encoding={encoding_name}&message={encoded_message}");
-    if use_base64 {
-        query.push_str("&base64=1");
-    }
-    if let Some(enc) = compressed_with {
-        query.push_str("&compression=");
-        query.push_str(enc);
-    }
+    let query =
+        build_connect_get_query(use_base64, compressed_with, encoding_name, &encoded_message);
 
     let full_uri = format!("{base_str}/{service}/{method}?{query}");
     let uri: Uri = full_uri
@@ -1447,6 +1438,44 @@ where
         parse_connect_unary_response(response, config, &options).await
     })
     .await
+}
+
+/// Assemble the Connect Unary-Get query string.
+///
+/// Servers must accept any parameter order; the spec's Query-Get ABNF rule
+/// fixes the order so the variable-length `message` comes last and the
+/// prefix is stable for shared HTTP caches: `connect`, `base64`,
+/// `compression`, `encoding`, `message` ("Clients should order parameters as
+/// shown in the Query-Get rule above to maximize hit rates on shared
+/// caches" — <https://connectrpc.com/docs/protocol#unary-get-request>).
+/// connect-go and the conformance reference-server order check both follow
+/// this rule.
+fn build_connect_get_query(
+    use_base64: bool,
+    compression: Option<&str>,
+    encoding: &str,
+    encoded_message: &str,
+) -> String {
+    let mut query = String::with_capacity(
+        "connect=v1&encoding=&message=".len()
+            + if use_base64 { "&base64=1".len() } else { 0 }
+            + compression.map_or(0, |c| "&compression=".len() + c.len())
+            + encoding.len()
+            + encoded_message.len(),
+    );
+    query.push_str("connect=v1");
+    if use_base64 {
+        query.push_str("&base64=1");
+    }
+    if let Some(enc) = compression {
+        query.push_str("&compression=");
+        query.push_str(enc);
+    }
+    query.push_str("&encoding=");
+    query.push_str(encoding);
+    query.push_str("&message=");
+    query.push_str(encoded_message);
+    query
 }
 
 /// Remap decompression error codes for payloads received from the server.
@@ -2019,7 +2048,7 @@ where
     ///
     /// A response body that ends without its protocol's termination
     /// metadata is not a clean end and returns `Err` rather than
-    /// `Ok(None)`: `unavailable` for a Connect stream missing its
+    /// `Ok(None)`: `internal` for a Connect stream missing its
     /// END_STREAM envelope; for gRPC/gRPC-Web, `internal` when no
     /// trailers arrived at all, `unknown` when trailers arrived without a
     /// `grpc-status`, and `unknown` for a malformed `grpc-status` value —
@@ -2062,7 +2091,13 @@ where
                 let trailer_len =
                     u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
                         as usize;
-                if self.buf.len() >= 5 + trailer_len {
+                // `saturating_add`: `trailer_len` is a server-controlled u32, so
+                // on a 32-bit target (e.g. the supported `wasm32` gRPC-Web
+                // client) `5 + trailer_len` can overflow `usize` and panic in a
+                // debug build. Matches the sibling framing sites, which already
+                // saturate. A saturated sum is never `<= buf.len()`, so an
+                // over-large prefix simply waits for bytes that never arrive.
+                if self.buf.len() >= trailer_len.saturating_add(5) {
                     // Complete trailer frame — parse and classify. An
                     // unparseable frame classifies as `None` (no usable
                     // termination metadata).
@@ -2125,7 +2160,12 @@ where
                     }
                     BodyPoll::Eof => {
                         if matches!(self.protocol, Protocol::Connect) {
-                            return Err(ConnectError::unavailable(
+                            // The HTTP body completed cleanly but the Connect
+                            // envelope sequence is missing its terminus: a
+                            // wire-level error, classified as `internal` the
+                            // same way connect-go and other gRPC stacks treat a
+                            // failed decompression or an unparseable response.
+                            return Err(ConnectError::internal(
                                 "Connect streaming response ended without END_STREAM envelope",
                             )
                             .into());
@@ -2328,16 +2368,7 @@ where
 
         let trailers = end_stream.metadata.map(|metadata| {
             let mut trailers = http::HeaderMap::new();
-            for (name, values) in metadata {
-                for value in values {
-                    if let (Ok(name), Ok(value)) = (
-                        http::header::HeaderName::from_bytes(name.as_bytes()),
-                        http::header::HeaderValue::from_str(&value),
-                    ) {
-                        trailers.append(name, value);
-                    }
-                }
-            }
+            append_metadata_capped(&mut trailers, metadata);
             trailers
         });
 
@@ -3211,8 +3242,10 @@ where
 /// envelope, the protocol-level terminus: it supplies the trailers (or a
 /// terminal Connect error) and marks the response complete. A body that
 /// yields the data message and then ends before END_STREAM is truncated, not
-/// successful, and is rejected with `unavailable`, matching the `ServerStream`
-/// Connect EOF behavior. Returns the (still encoded) message payload and any
+/// successful, and is rejected with `internal` (matching the `ServerStream`
+/// Connect EOF behavior and connect-go's classification of a missing
+/// terminus as a wire-level error). Returns the (still encoded) message
+/// payload and any
 /// trailers carried in the END_STREAM metadata.
 ///
 /// Scanning stops at END_STREAM, so anything after it is ignored rather than
@@ -3254,16 +3287,7 @@ fn parse_connect_client_stream_envelopes(
                 serde_json::from_slice(&end_stream_data).unwrap_or_default();
 
             if let Some(metadata) = end_stream.metadata {
-                for (name, values) in metadata {
-                    for value in values {
-                        if let (Ok(name), Ok(value)) = (
-                            http::header::HeaderName::from_bytes(name.as_bytes()),
-                            http::header::HeaderValue::from_str(&value),
-                        ) {
-                            trailers.append(name, value);
-                        }
-                    }
-                }
+                append_metadata_capped(&mut trailers, metadata);
             }
 
             if let Some(err) = end_stream.error {
@@ -3328,7 +3352,7 @@ fn parse_connect_client_stream_envelopes(
     // is a truncated response, not a completed one — match ServerStream's
     // Connect EOF handling rather than reporting success with no trailers.
     if !saw_end_stream {
-        return Err(ConnectError::unavailable(
+        return Err(ConnectError::internal(
             "Connect streaming response ended without END_STREAM envelope",
         ));
     }
@@ -3712,10 +3736,42 @@ fn parse_grpc_web_trailer_frame_with_compression(
                 http::HeaderValue::from_str(value.trim()),
             )
         {
-            headers.append(name, val);
+            // Use the fallible `try_append`: `HeaderMap` panics in
+            // `append` once the number of stored entries would exceed its
+            // hard ceiling (`MAX_SIZE = 1 << 15`). A hostile server can pack
+            // tens of thousands of short trailer lines into a payload that
+            // stays under `MAX_TRAILER_SIZE` (bytes, not entries), so the
+            // byte cap alone does not prevent the panic. Stop accumulating at
+            // the ceiling rather than crashing the RPC task.
+            if headers.try_append(name, val).is_err() {
+                break;
+            }
         }
     }
     Some(headers)
+}
+
+/// Append Connect end-stream `metadata` into `trailers`, capping at the
+/// `HeaderMap` entry ceiling.
+///
+/// `metadata` is deserialized from a server-supplied JSON end-stream frame, so
+/// its size is attacker-controlled. `HeaderMap::append` panics once the number
+/// of stored entries would exceed its hard ceiling (`MAX_SIZE = 1 << 15`); a
+/// hostile server could send tens of thousands of distinct keys in a few
+/// hundred KB of JSON and crash the RPC task. Use the fallible `try_append`
+/// and stop at the ceiling instead.
+fn append_metadata_capped(trailers: &mut http::HeaderMap, metadata: HashMap<String, Vec<String>>) {
+    'outer: for (name, values) in metadata {
+        for value in values {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                http::header::HeaderValue::from_str(&value),
+            ) && trailers.try_append(name, value).is_err()
+            {
+                break 'outer;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3909,7 +3965,7 @@ mod tests {
             Ok(Some(_)) => panic!("truncated stream unexpectedly yielded another message"),
             Ok(None) => panic!("truncated stream ended cleanly without END_STREAM"),
         };
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert!(
             err.to_string().contains("END_STREAM"),
             "unexpected error: {err}"
@@ -3921,7 +3977,7 @@ mod tests {
             .message()
             .await
             .expect_err("truncation error must be sticky");
-        assert_eq!(again.code, ErrorCode::Unavailable);
+        assert_eq!(again.code, ErrorCode::Internal);
     }
 
     /// A Connect streaming response whose body is empty (zero envelopes,
@@ -3952,7 +4008,7 @@ mod tests {
             Ok(Some(_)) => panic!("empty body unexpectedly yielded a message"),
             Ok(None) => panic!("empty body without END_STREAM ended cleanly"),
         };
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert!(
             err.to_string().contains("END_STREAM"),
             "unexpected error: {err}"
@@ -3962,7 +4018,7 @@ mod tests {
             .message()
             .await
             .expect_err("truncation error must be sticky");
-        assert_eq!(again.code, ErrorCode::Unavailable);
+        assert_eq!(again.code, ErrorCode::Internal);
     }
 
     /// `Ok(None)` means the RPC succeeded — a Connect END_STREAM envelope
@@ -4725,6 +4781,66 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_grpc_web_trailer_floods_do_not_panic() {
+        // A hostile server can pack far more distinct trailer names than
+        // `HeaderMap` can hold (`MAX_SIZE = 1 << 15 = 32_768`) into a payload
+        // that stays under the 1 MiB byte cap. Each `hN:` line is short, so
+        // 40_000 distinct names is only ~300 KiB. The parser must not panic.
+        let mut payload = String::new();
+        for i in 0..40_000u32 {
+            payload.push_str(&format!("h{i}:\n"));
+        }
+        let payload = payload.into_bytes();
+        assert!(
+            payload.len() < 1024 * 1024,
+            "payload must stay under byte cap"
+        );
+
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0x80);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        // Before the fix this panicked with "size overflows MAX_SIZE".
+        let headers = parse_grpc_web_trailer_frame_with_compression(&frame, None)
+            .expect("flood frame is well-formed and should parse");
+        // The map fills up to the type's hard ceiling and stops: it accepts
+        // entries (the loop didn't drop everything) but never exceeds the cap.
+        assert!(headers.keys_len() > 0, "early trailers should be retained");
+        assert!(headers.keys_len() <= 1 << 15);
+    }
+
+    #[test]
+    fn test_append_metadata_capped_copies_entries() {
+        let mut metadata = HashMap::new();
+        metadata.insert("grpc-status".to_string(), vec!["0".to_string()]);
+        metadata.insert(
+            "x-custom".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+        let mut trailers = http::HeaderMap::new();
+        append_metadata_capped(&mut trailers, metadata);
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert_eq!(trailers.get_all("x-custom").iter().count(), 2);
+    }
+
+    #[test]
+    fn test_append_metadata_capped_does_not_panic_on_flood() {
+        // A Connect end-stream `metadata` map is deserialized from server JSON,
+        // so its key count is attacker-controlled. Feeding more distinct keys
+        // than the `HeaderMap` ceiling (`MAX_SIZE = 1 << 15`) must cap rather
+        // than panic with "size overflows MAX_SIZE".
+        let mut metadata = HashMap::new();
+        for i in 0..40_000u32 {
+            metadata.insert(format!("h{i}"), vec![String::new()]);
+        }
+        let mut trailers = http::HeaderMap::new();
+        append_metadata_capped(&mut trailers, metadata);
+        assert!(trailers.keys_len() > 0, "early entries should be retained");
+        assert!(trailers.keys_len() <= 1 << 15);
+    }
+
+    #[test]
     fn test_parse_grpc_web_trailer_newline_only() {
         // Some implementations use \n instead of \r\n
         let payload = b"grpc-status: 0\n";
@@ -5304,6 +5420,62 @@ mod tests {
     // call_unary_get query encoding (Connect GET protocol)
     // ========================================================================
 
+    /// The order the conformance suite checks for: `connect`, `base64`,
+    /// `compression`, `encoding`, `message`. Servers accept any order; the
+    /// recommended order keeps the variable-length `message` last so the
+    /// prefix is stable for shared caches.
+    fn assert_connect_get_param_order(query: &str) {
+        const RANK: &[&str] = &["connect", "base64", "compression", "encoding", "message"];
+        let mut last = 0;
+        for pair in query.split('&') {
+            let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+            let rank = RANK
+                .iter()
+                .position(|k| *k == key)
+                .unwrap_or_else(|| panic!("unknown query parameter {key:?} in {query:?}"));
+            assert!(
+                rank >= last,
+                "parameter {key:?} out of recommended order in {query:?}",
+            );
+            last = rank;
+        }
+    }
+
+    #[test]
+    fn get_query_param_order_proto() {
+        let q = build_connect_get_query(true, None, "proto", "AAAA");
+        assert_eq!(q, "connect=v1&base64=1&encoding=proto&message=AAAA");
+        assert_connect_get_param_order(&q);
+    }
+
+    #[test]
+    fn get_query_param_order_json_uncompressed() {
+        let q = build_connect_get_query(false, None, "json", "%7B%7D");
+        assert_eq!(q, "connect=v1&encoding=json&message=%7B%7D");
+        assert_connect_get_param_order(&q);
+    }
+
+    #[test]
+    fn get_query_param_order_compressed() {
+        let q = build_connect_get_query(true, Some("gzip"), "proto", "H4sI");
+        assert_eq!(
+            q,
+            "connect=v1&base64=1&compression=gzip&encoding=proto&message=H4sI",
+        );
+        assert_connect_get_param_order(&q);
+    }
+
+    #[test]
+    fn get_query_param_order_json_compressed() {
+        // Compressed JSON forces base64 (compressed bytes are binary).
+        let q = build_connect_get_query(true, Some("gzip"), "json", "H4sI");
+        assert_eq!(
+            q,
+            "connect=v1&base64=1&compression=gzip&encoding=json&message=H4sI",
+        );
+        assert_connect_get_param_order(&q);
+    }
+
     #[test]
     fn get_base64_encoding_matches_rfc4648_urlsafe_no_pad() {
         // Verify we use the exact encoding the spec requires: RFC 4648 §5
@@ -5554,7 +5726,7 @@ mod tests {
 
     /// A data envelope followed by EOF, with no END_STREAM envelope, is a
     /// truncated response rather than a completed one: it is rejected with
-    /// `unavailable` instead of succeeding with empty trailers, matching the
+    /// `internal` instead of succeeding with empty trailers, matching the
     /// `ServerStream` Connect EOF behavior.
     #[test]
     fn client_stream_response_requires_end_stream_after_message() {
@@ -5570,7 +5742,7 @@ mod tests {
             &http::HeaderMap::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert_eq!(
             err.message.as_deref(),
             Some("Connect streaming response ended without END_STREAM envelope"),
@@ -5580,7 +5752,7 @@ mod tests {
     /// A data envelope followed by a truncated END_STREAM envelope (its
     /// declared payload never arrives) is also a truncated response: the
     /// partial envelope decodes to "needs more data", so END_STREAM is never
-    /// observed and the response is rejected with `unavailable`.
+    /// observed and the response is rejected with `internal`.
     #[test]
     fn client_stream_response_requires_complete_end_stream_after_message() {
         let registry = crate::compression::CompressionRegistry::new();
@@ -5600,7 +5772,7 @@ mod tests {
             &http::HeaderMap::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.code, ErrorCode::Internal);
         assert_eq!(
             err.message.as_deref(),
             Some("Connect streaming response ended without END_STREAM envelope"),

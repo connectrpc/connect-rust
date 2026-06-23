@@ -55,6 +55,10 @@
 //! retired. The window is evaluated lazily, so retirement happens between one
 //! and two times the configured duration after the last activity. When both
 //! limits are configured, whichever fires first wins.
+//!
+//! For transport and HTTP/2 knobs that [`Server`] does not expose, drive
+//! [`ConnectRpcService`] directly from a hyper accept loop. The crate guide's
+//! "Advanced transport configuration" section shows the `hyper_util` pattern.
 
 use std::any::Any;
 use std::collections::hash_map::RandomState;
