@@ -351,7 +351,7 @@ enum HttpClientInner {
 /// Wraps the built-in `HttpConnector` (plaintext) or hyper-rustls's
 /// `HttpsConnector` (TLS). When `timeout` is `Some`, a connect that doesn't
 /// resolve in time is cancelled (dropping the in-flight TCP/TLS work) and
-/// surfaced as a `deadline_exceeded` error. When `None`, the inner connector's
+/// surfaced as an `unavailable` error. When `None`, the inner connector's
 /// future is awaited unchanged.
 #[cfg(feature = "client")]
 #[derive(Clone)]
@@ -386,7 +386,7 @@ where
             match timeout {
                 Some(dur) => match tokio::time::timeout(dur, fut).await {
                     Ok(res) => res.map_err(Into::into),
-                    Err(_) => Err(ConnectError::deadline_exceeded(format!(
+                    Err(_) => Err(ConnectError::unavailable(format!(
                         "connection establishment did not complete within {dur:?}"
                     ))
                     .into()),
@@ -502,7 +502,8 @@ impl HttpClientBuilder {
     /// covers only the TCP `connect(2)` call (per resolved address — hyper
     /// divides the timeout evenly across the address set). It does **not**
     /// cover DNS resolution or, for [`with_tls`](Self::with_tls), the TLS
-    /// handshake. Use a per-request timeout (e.g.
+    /// handshake — set [`handshake_timeout`](Self::handshake_timeout) too to
+    /// bound those. Use a per-request timeout (e.g.
     /// [`CallOptions::with_timeout`]) to bound DNS+connect+TLS+request as a
     /// whole.
     ///
@@ -518,8 +519,8 @@ impl HttpClientBuilder {
         self
     }
 
-    /// Bound the whole connector establishment: the TCP connect plus, for
-    /// [`with_tls`](Self::with_tls), the TLS handshake.
+    /// Bound the whole connector establishment: DNS resolution, the TCP connect,
+    /// and, for [`with_tls`](Self::with_tls), the TLS handshake.
     ///
     /// Unlike [`connect_timeout`](Self::connect_timeout) (which bounds only the
     /// per-address TCP `connect(2)` call), this is a single wall-clock bound on
@@ -530,10 +531,9 @@ impl HttpClientBuilder {
     ///
     /// Because `HttpClient` pools connections through hyper's legacy client, the
     /// HTTP/2 preface runs *inside* the pool and is not separately observable
-    /// here — this bound covers **TCP and TLS, not the h2 preface**. This
-    /// differs from [`Http2Connection`], whose handshake bound covers the TLS
-    /// handshake *and* the h2 preface while bounding TCP separately via its own
-    /// `connect_timeout`. Use a per-request timeout (e.g.
+    /// here — this bound covers **TCP and TLS, not the h2 preface**.
+    /// [`Http2Connection`]'s handshake bound additionally covers the h2 preface
+    /// (and DNS resolution). Use a per-request timeout (e.g.
     /// [`CallOptions::with_timeout`]) for a true end-to-end bound. For a
     /// transport that bounds the h2 preface too, use [`Http2Connection`].
     ///
