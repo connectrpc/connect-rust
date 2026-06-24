@@ -141,6 +141,13 @@ async fn fetch(
             let Some(val) = pair.get(1).as_string() else {
                 continue;
             };
+            // If the content-encoding is gzip, we skip it because the browser automatically
+            // decompresses the response body, so we don't need to handle it ourselves. If we
+            // didn't skip it, the client would try to decompress an already decompressed body,
+            // which would result in an error.
+            if key.to_lowercase() == "content-encoding" && val == "gzip" {
+                continue;
+            }
             builder = builder.header(key, val);
         }
     }
