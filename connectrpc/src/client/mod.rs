@@ -364,7 +364,7 @@ struct TimeoutConnector<C> {
 impl<C> tower::Service<Uri> for TimeoutConnector<C>
 where
     C: tower::Service<Uri>,
-    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
     C::Future: Send + 'static,
     C::Response: Send + 'static,
 {
@@ -382,18 +382,7 @@ where
     fn call(&mut self, uri: Uri) -> Self::Future {
         let fut = self.inner.call(uri);
         let timeout = self.timeout;
-        Box::pin(async move {
-            match timeout {
-                Some(dur) => match tokio::time::timeout(dur, fut).await {
-                    Ok(res) => res.map_err(Into::into),
-                    Err(_) => Err(ConnectError::unavailable(format!(
-                        "connection establishment did not complete within {dur:?}"
-                    ))
-                    .into()),
-                },
-                None => fut.await.map_err(Into::into),
-            }
-        })
+        Box::pin(http2::run_handshake(fut, timeout))
     }
 }
 

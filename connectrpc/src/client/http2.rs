@@ -276,15 +276,14 @@ impl Http2Connection {
     /// Eagerly establish a **plaintext** h2c connection now.
     /// Only for `http://` URIs.
     ///
-    /// Returns an error if the URI scheme is `https://` (use
-    /// [`connect_tls`](Self::connect_tls) instead), or if the initial TCP
-    /// connect or h2 handshake fails. After the initial connect succeeds,
-    /// reconnect-on-failure is handled automatically by the next `poll_ready`.
+    /// After the initial connect succeeds, reconnect-on-failure is handled
+    /// automatically by the next `poll_ready`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the URI scheme is `https://` or the initial TCP
-    /// connect or h2 handshake fails.
+    /// Returns an error if the URI scheme is `https://` (use
+    /// [`connect_tls`](Self::connect_tls) instead) or the initial TCP connect
+    /// or h2 handshake fails.
     pub async fn connect_plaintext(uri: Uri) -> Result<Self, ConnectError> {
         Self::builder().connect_plaintext(uri).await
     }
@@ -423,9 +422,6 @@ impl Http2Connection {
     /// Eagerly establish a **TLS** h2 connection now. Only for `https://` URIs.
     ///
     /// See [`lazy_tls`](Self::lazy_tls) for ALPN and cert rotation details.
-    ///
-    /// Returns an error if the URI scheme is `http://`, if the TCP/TLS
-    /// handshake fails, or if the server doesn't negotiate h2 via ALPN.
     ///
     /// # Errors
     ///
@@ -784,21 +780,51 @@ impl Http2ConnectionBuilder {
             .await
     }
 
+    /// Built-in TCP connector with `nodelay` and the configured
+    /// `connect_timeout` applied. Mirrors `HttpClientBuilder::http_connector`.
+    fn http_connector(&self) -> hyper_util::client::legacy::connect::HttpConnector {
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        connector.set_nodelay(true);
+        connector.set_connect_timeout(self.connect_timeout);
+        connector
+    }
+
     fn make_plaintext(self) -> MakeSendRequest {
-        MakeSendRequest::with_builder(self.h2_builder)
-            .with_timeouts(self.connect_timeout, self.handshake_timeout)
+        MakeSendRequest {
+            connector: self.http_connector(),
+            builder: self.h2_builder,
+            #[cfg(feature = "client-tls")]
+            tls: None,
+            custom: None,
+            handshake_timeout: self.handshake_timeout,
+        }
     }
 
     #[cfg(feature = "client-tls")]
     fn make_tls(self, tls_config: Arc<rustls::ClientConfig>) -> MakeSendRequest {
-        MakeSendRequest::with_builder_tls(self.h2_builder, tls_config)
-            .with_timeouts(self.connect_timeout, self.handshake_timeout)
+        let mut connector = self.http_connector();
+        connector.enforce_http(false);
+        MakeSendRequest {
+            connector,
+            builder: self.h2_builder,
+            tls: Some(prepare_tls_for_h2(&tls_config)),
+            custom: None,
+            handshake_timeout: self.handshake_timeout,
+        }
     }
 
     fn make_custom(self, conn: BoxedConnector) -> MakeSendRequest {
-        // `connect_timeout` is intentionally dropped: it's the per-address TCP
-        // bound on the built-in `HttpConnector`, which is not in play here.
-        MakeSendRequest::new_custom(self.h2_builder, conn, self.handshake_timeout)
+        MakeSendRequest {
+            // Unused when `custom` is Some — `call()` branches to the custom
+            // connector before touching it. `connect_timeout` is therefore
+            // dropped here (it's the per-address TCP bound on this connector).
+            connector: hyper_util::client::legacy::connect::HttpConnector::new(),
+            builder: self.h2_builder,
+            #[cfg(feature = "client-tls")]
+            tls: None,
+            custom: Some(conn),
+            handshake_timeout: self.handshake_timeout,
+        }
     }
 }
 
@@ -959,74 +985,6 @@ struct MakeSendRequest {
     handshake_timeout: Option<Duration>,
 }
 
-impl MakeSendRequest {
-    fn with_builder(
-        builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
-    ) -> Self {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-        connector.set_nodelay(true);
-        Self {
-            connector,
-            builder,
-            #[cfg(feature = "client-tls")]
-            tls: None,
-            custom: None,
-            handshake_timeout: None,
-        }
-    }
-
-    fn new_custom(
-        builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
-        conn: BoxedConnector,
-        handshake_timeout: Option<Duration>,
-    ) -> Self {
-        Self {
-            // Unused when `custom` is Some — `call()` branches to the custom
-            // connector before touching it. `HttpConnector::new()` is cheap.
-            connector: hyper_util::client::legacy::connect::HttpConnector::new(),
-            builder,
-            #[cfg(feature = "client-tls")]
-            tls: None,
-            custom: Some(conn),
-            handshake_timeout,
-        }
-    }
-
-    #[cfg(feature = "client-tls")]
-    fn with_builder_tls(
-        builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
-        tls: Arc<rustls::ClientConfig>,
-    ) -> Self {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.enforce_http(false);
-        Self {
-            connector,
-            builder,
-            tls: Some(prepare_tls_for_h2(&tls)),
-            custom: None,
-            handshake_timeout: None,
-        }
-    }
-
-    /// Apply connection-establishment bounds. `connect_timeout` is pushed into
-    /// the built-in `HttpConnector` (per-address TCP connect);
-    /// `handshake_timeout` is stored and applied around the whole
-    /// establishment future (DNS, TCP, TLS handshake, HTTP/2 preface) in
-    /// `call()`.
-    fn with_timeouts(
-        mut self,
-        connect_timeout: Option<Duration>,
-        handshake_timeout: Option<Duration>,
-    ) -> Self {
-        if let Some(dur) = connect_timeout {
-            self.connector.set_connect_timeout(Some(dur));
-        }
-        self.handshake_timeout = handshake_timeout;
-        self
-    }
-}
-
 impl tower::Service<Uri> for MakeSendRequest {
     type Response = SendRequest;
     type Error = BoxError;
@@ -1160,10 +1118,10 @@ impl tower::Service<Uri> for MakeSendRequest {
 /// `None` runs it unbounded; `Some(dur)` cancels it (dropping the in-flight
 /// handshake) and returns an `unavailable` error if it doesn't finish within
 /// `dur`. The future's own error type is coerced to [`BoxError`].
-async fn run_handshake<F, T, E>(fut: F, timeout: Option<Duration>) -> Result<T, BoxError>
+pub(super) async fn run_handshake<F, T, E>(fut: F, timeout: Option<Duration>) -> Result<T, BoxError>
 where
     F: Future<Output = Result<T, E>>,
-    E: Into<BoxError>,
+    E: Into<BoxError> + 'static,
 {
     match timeout {
         Some(dur) => match tokio::time::timeout(dur, fut).await {
