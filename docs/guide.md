@@ -1388,6 +1388,24 @@ A `plaintext()` client refuses `https://` URIs and a `with_tls()`
 client refuses `http://` URIs - this catches misconfiguration loudly
 rather than silently downgrading.
 
+### Connection-establishment bounds and keep-alive
+
+Both `HttpClient` and `Http2Connection` bound connection establishment by default: a 20-second wall-clock budget on the whole DNS + TCP + TLS chain (`DEFAULT_ESTABLISHMENT_TIMEOUT`) with an additional 5-second per-address TCP bound (`DEFAULT_TCP_CONNECT_TIMEOUT`). Exceeding either surfaces as `ErrorCode::Unavailable`, so a server that accepts the TCP connection but stalls the TLS handshake cannot park `poll_ready` indefinitely. To adjust or opt out, use the `builder()` entry point on either transport:
+
+```rust
+use std::time::Duration;
+use connectrpc::client::Http2Connection;
+
+let conn = Http2Connection::builder()
+    .establishment_timeout(Duration::from_secs(10))
+    .keep_alive_interval(Duration::from_secs(30))
+    .keep_alive_while_idle(true)
+    .connect_tls(uri, tls_config)
+    .await?;
+```
+
+`Http2ConnectionBuilder` also proxies hyper's HTTP/2 keep-alive and flow-control knobs (`keep_alive_interval`, `keep_alive_timeout`, `keep_alive_while_idle`, `initial_stream_window_size`, `initial_connection_window_size`, `adaptive_window`), with a `TokioTimer` pre-wired so the keep-alive setters work without further plumbing. The `h2_settings(|b| ...)` escape hatch exposes the underlying hyper builder for knobs not surfaced directly. To restore the unbounded pre-0.8.0 behaviour, chain `.no_establishment_timeout().no_tcp_connect_timeout()`.
+
 ### ClientConfig
 
 `ClientConfig` carries the base URI and per-call defaults that apply
