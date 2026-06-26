@@ -69,6 +69,19 @@ increment the patch version.
   keep-alive disabled instead. A symmetric ±10% jitter is applied per
   connection to avoid reconnect bursts. Disabled by default; whole-server
   graceful shutdown still drains in-flight requests indefinitely.
+- **HTTP/2 adaptive flow-control window, on by default** ([#178]). The built-in
+  server now enables hyper's adaptive (BDP-based) flow-control window sizing by
+  default, so HTTP/2 stream and connection windows grow with the measured
+  bandwidth-delay product instead of staying pinned at hyper's fixed 64 KiB.
+  This is a behaviour change: throughput improves on high-latency,
+  high-bandwidth links (cross-region, high-throughput streaming), at the cost
+  of slightly higher per-connection memory under load. It matches grpc-go and
+  grpc-java, which both autotune by default. New setters on `Server` and
+  `BoundServer` give explicit control: `with_http2_adaptive_window(bool)`
+  toggles autotuning, and `with_http2_initial_stream_window_size` /
+  `with_http2_initial_connection_window_size` set fixed windows (supplying a
+  fixed window turns adaptive sizing off, mirroring grpc-go). The new default
+  is exposed as the `DEFAULT_HTTP2_ADAPTIVE_WINDOW` constant.
 
 ### Changed
 
@@ -144,6 +157,7 @@ increment the patch version.
 [#167]: https://github.com/anthropics/connect-rust/pull/167
 [#168]: https://github.com/anthropics/connect-rust/pull/168
 [#172]: https://github.com/anthropics/connect-rust/pull/172
+[#178]: https://github.com/anthropics/connect-rust/issues/178
 [#180]: https://github.com/anthropics/connect-rust/issues/180
 [#197]: https://github.com/anthropics/connect-rust/pull/197
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
