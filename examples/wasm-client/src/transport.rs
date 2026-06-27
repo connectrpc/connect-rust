@@ -141,11 +141,15 @@ async fn fetch(
             let Some(val) = pair.get(1).as_string() else {
                 continue;
             };
-            // If the content-encoding is gzip, we skip it because the browser automatically
-            // decompresses the response body, so we don't need to handle it ourselves. If we
-            // didn't skip it, the client would try to decompress an already decompressed body,
-            // which would result in an error.
-            if key.to_lowercase() == "content-encoding" && val == "gzip" {
+            // Fetch transparently decodes the response body per Content-Encoding
+            // (gzip/deflate/br/zstd) but leaves the original Content-Encoding and
+            // Content-Length headers in place. Both are stale relative to the
+            // decoded body returned by `array_buffer()` below, so drop them —
+            // otherwise the connectrpc client will try to decompress an
+            // already-decoded body.
+            if key.eq_ignore_ascii_case(http::header::CONTENT_ENCODING.as_str())
+                || key.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str())
+            {
                 continue;
             }
             builder = builder.header(key, val);
