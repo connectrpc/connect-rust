@@ -124,7 +124,12 @@ impl Envelope {
             )));
         }
 
-        if buf.len() < HEADER_SIZE + length {
+        // `saturating_add`: `length` is an untrusted u32 from the wire. On a
+        // 32-bit target `HEADER_SIZE + length` can overflow `usize` and panic
+        // in a debug build. Via `decode` (max_size = usize::MAX) the size check
+        // above does not bound `length`, so saturate here. A saturated sum is
+        // never <= buf.len(), so an over-large frame waits for more data.
+        if buf.len() < HEADER_SIZE.saturating_add(length) {
             return Ok(None);
         }
 
@@ -383,6 +388,19 @@ mod tests {
         let result = Envelope::decode_with_limit(&mut buf, 1024 * 1024);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_envelope_unlimited_decode_huge_length_no_panic() {
+        // `decode` uses max_size = usize::MAX, so the size check does not bound
+        // `length`. A header claiming u32::MAX bytes must return `Ok(None)`
+        // (waiting for data that never comes), not panic on `HEADER_SIZE +
+        // length`. On a 32-bit target the unsaturated add would overflow.
+        let mut buf = BytesMut::new();
+        buf.put_u8(0); // flags
+        buf.put_u32(u32::MAX); // length prefix
+        let result = Envelope::decode(&mut buf);
+        assert!(matches!(result, Ok(None)));
     }
 
     // ── EnvelopeDecoder tests ───────────────────────────────────────

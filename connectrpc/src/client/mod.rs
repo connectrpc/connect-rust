@@ -263,7 +263,13 @@ mod http2;
 pub use http2::Http2Connection;
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+pub use http2::Http2ConnectionBuilder;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub use http2::SharedHttp2Connection;
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+pub use http2::{DEFAULT_ESTABLISHMENT_TIMEOUT, DEFAULT_TCP_CONNECT_TIMEOUT};
 
 /// General-purpose HTTP client supporting both HTTP/1.1 and HTTP/2.
 ///
@@ -315,16 +321,17 @@ impl std::fmt::Debug for HttpClient {
 
 /// Inner hyper client, parameterized over connector type via an enum.
 ///
-/// This keeps the plaintext case exactly as before (zero cost) while
-/// allowing the TLS variant to use a different connector type without
-/// leaking generics into the public `HttpClient` signature.
+/// Both connectors are wrapped in [`TimeoutConnector`] so an optional
+/// `establishment_timeout` can bound the whole connector establishment. When no
+/// timeout is set the wrapper forwards each connect unchanged (a single boxed
+/// future per *connection*, not per request — negligible).
 #[cfg(feature = "client")]
 #[derive(Clone)]
 enum HttpClientInner {
     /// Plaintext HTTP (http:// only). Rejects https:// at send-time.
     Plain(
         hyper_util::client::legacy::Client<
-            hyper_util::client::legacy::connect::HttpConnector,
+            TimeoutConnector<hyper_util::client::legacy::connect::HttpConnector>,
             ClientBody,
         >,
     ),
@@ -333,10 +340,53 @@ enum HttpClientInner {
     #[cfg(feature = "client-tls")]
     Tls(
         hyper_util::client::legacy::Client<
-            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+            TimeoutConnector<
+                hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+            >,
             ClientBody,
         >,
     ),
+}
+
+/// A `tower::Service<Uri>` connector wrapper that bounds connection
+/// establishment with an optional timeout.
+///
+/// Wraps the built-in `HttpConnector` (plaintext) or hyper-rustls's
+/// `HttpsConnector` (TLS). When `timeout` is `Some`, a connect that doesn't
+/// resolve in time is cancelled (dropping the in-flight TCP/TLS work) and
+/// surfaced as an `unavailable` error. When `None`, the inner connector's
+/// future is awaited unchanged.
+#[cfg(feature = "client")]
+#[derive(Clone)]
+struct TimeoutConnector<C> {
+    inner: C,
+    timeout: Option<Duration>,
+}
+
+#[cfg(feature = "client")]
+impl<C> tower::Service<Uri> for TimeoutConnector<C>
+where
+    C: tower::Service<Uri>,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = BoxFuture<'static, Result<C::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let fut = self.inner.call(uri);
+        let timeout = self.timeout;
+        Box::pin(http2::run_establishment(fut, timeout))
+    }
 }
 
 #[cfg(feature = "client")]
@@ -360,6 +410,10 @@ impl HttpClient {
     /// The client uses connection pooling and supports HTTP/1.1 and HTTP/2
     /// over cleartext. TCP_NODELAY is enabled to avoid Nagle + delayed ACK
     /// latency on small messages.
+    ///
+    /// Connection establishment is bounded by [`DEFAULT_ESTABLISHMENT_TIMEOUT`]
+    /// (and [`DEFAULT_TCP_CONNECT_TIMEOUT`] per address); use
+    /// [`builder()`](Self::builder) to adjust or opt out.
     pub fn plaintext() -> Self {
         Self::builder().plaintext()
     }
@@ -377,6 +431,10 @@ impl HttpClient {
     /// **Note:** For gRPC, prefer [`SharedHttp2Connection`] over this —
     /// it has honest `poll_ready` and composes with `tower::balance`. This
     /// method pins you to one connection per host with no way to scale out.
+    ///
+    /// Connection establishment is bounded by [`DEFAULT_ESTABLISHMENT_TIMEOUT`]
+    /// (and [`DEFAULT_TCP_CONNECT_TIMEOUT`] per address); use
+    /// [`builder()`](Self::builder) to adjust or opt out.
     pub fn plaintext_http2_only() -> Self {
         Self::builder().plaintext_http2_only()
     }
@@ -413,6 +471,10 @@ impl HttpClient {
     /// let http = HttpClient::with_tls(tls_config);
     /// let client = GreetServiceClient::new(http, config);
     /// ```
+    ///
+    /// Connection establishment is bounded by [`DEFAULT_ESTABLISHMENT_TIMEOUT`]
+    /// (and [`DEFAULT_TCP_CONNECT_TIMEOUT`] per address); use
+    /// [`builder()`](Self::builder) to adjust or opt out.
     #[cfg(feature = "client-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
     pub fn with_tls(tls_config: std::sync::Arc<rustls::ClientConfig>) -> Self {
@@ -427,9 +489,27 @@ impl HttpClient {
 /// here, so `HttpClient::plaintext()` is exactly `HttpClient::builder().plaintext()`.
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
+#[must_use = "call a terminal (plaintext / plaintext_http2_only / with_tls) to build the client"]
 pub struct HttpClientBuilder {
-    connect_timeout: Option<Duration>,
+    tcp_connect_timeout: Option<Duration>,
+    establishment_timeout: Option<Duration>,
+}
+
+#[cfg(feature = "client")]
+impl Default for HttpClientBuilder {
+    /// A fresh builder with [`DEFAULT_ESTABLISHMENT_TIMEOUT`] /
+    /// [`DEFAULT_TCP_CONNECT_TIMEOUT`] applied, so a hung server cannot stall
+    /// connection establishment indefinitely. Use
+    /// [`no_establishment_timeout`](HttpClientBuilder::no_establishment_timeout) /
+    /// [`no_tcp_connect_timeout`](HttpClientBuilder::no_tcp_connect_timeout) to
+    /// opt out.
+    fn default() -> Self {
+        Self {
+            tcp_connect_timeout: Some(DEFAULT_TCP_CONNECT_TIMEOUT),
+            establishment_timeout: Some(DEFAULT_ESTABLISHMENT_TIMEOUT),
+        }
+    }
 }
 
 #[cfg(feature = "client")]
@@ -442,34 +522,98 @@ impl HttpClientBuilder {
     /// covers only the TCP `connect(2)` call (per resolved address — hyper
     /// divides the timeout evenly across the address set). It does **not**
     /// cover DNS resolution or, for [`with_tls`](Self::with_tls), the TLS
-    /// handshake. Use a per-request timeout (e.g.
+    /// handshake — set [`establishment_timeout`](Self::establishment_timeout) too to
+    /// bound those. Use a per-request timeout (e.g.
     /// [`CallOptions::with_timeout`]) to bound DNS+connect+TLS+request as a
     /// whole.
     ///
-    /// Unset (the default) means no explicit bound: TCP connect is governed by
-    /// the kernel's `tcp_syn_retries` (typically ~130s on Linux). Set this when
-    /// the network path can silently drop SYNs and you'd rather fail fast than
-    /// stall on kernel retransmits.
+    /// Defaults to [`DEFAULT_TCP_CONNECT_TIMEOUT`]. To disable, use
+    /// [`no_tcp_connect_timeout`](Self::no_tcp_connect_timeout). Passing
+    /// `Duration::ZERO` causes every per-address connect to fail immediately.
     ///
     /// [hyper-ct]: hyper_util::client::legacy::connect::HttpConnector::set_connect_timeout
-    pub fn connect_timeout(mut self, dur: Duration) -> Self {
-        self.connect_timeout = Some(dur);
+    #[doc(alias = "connect_timeout")]
+    pub fn tcp_connect_timeout(mut self, dur: Duration) -> Self {
+        self.tcp_connect_timeout = http2::finite(dur);
+        self
+    }
+
+    /// Alias for [`tcp_connect_timeout`](Self::tcp_connect_timeout).
+    pub fn connect_timeout(self, dur: Duration) -> Self {
+        self.tcp_connect_timeout(dur)
+    }
+
+    /// Disable the per-address TCP connect bound (the
+    /// [`DEFAULT_TCP_CONNECT_TIMEOUT`] default). The whole-connector
+    /// [`establishment_timeout`](Self::establishment_timeout) still applies.
+    pub fn no_tcp_connect_timeout(mut self) -> Self {
+        self.tcp_connect_timeout = None;
+        self
+    }
+
+    /// Bound the whole connector establishment: DNS resolution, the TCP connect,
+    /// and, for [`with_tls`](Self::with_tls), the TLS handshake.
+    ///
+    /// Unlike [`tcp_connect_timeout`](Self::tcp_connect_timeout) (which bounds only the
+    /// per-address TCP `connect(2)` call), this is a single wall-clock bound on
+    /// everything the connector does to produce a usable stream — so on the TLS
+    /// transport the two bounds overlap on the TCP phase.
+    ///
+    /// # What it does and does not cover
+    ///
+    /// Because `HttpClient` pools connections through hyper's legacy client, the
+    /// HTTP/2 preface runs *inside* the pool and is not separately observable
+    /// here — this bound covers **DNS, TCP and TLS, not the h2 preface**.
+    /// [`Http2Connection`]'s handshake bound additionally covers the h2
+    /// preface. Use a per-request timeout (e.g.
+    /// [`CallOptions::with_timeout`]) for a true end-to-end bound. For a
+    /// transport that bounds the h2 preface too, use [`Http2Connection`].
+    ///
+    /// Exceeding this bound surfaces as a [`ConnectError`] with
+    /// [`ErrorCode::Unavailable`] (the connect is retryable); the message names
+    /// the establishment phase.
+    ///
+    /// Defaults to [`DEFAULT_ESTABLISHMENT_TIMEOUT`]. To disable, use
+    /// [`no_establishment_timeout`](Self::no_establishment_timeout). Passing
+    /// `Duration::ZERO` causes every establishment to fail immediately.
+    pub fn establishment_timeout(mut self, dur: Duration) -> Self {
+        self.establishment_timeout = http2::finite(dur);
+        self
+    }
+
+    /// Disable the wall-clock connector-establishment bound (the
+    /// [`DEFAULT_ESTABLISHMENT_TIMEOUT`] default). With both this and
+    /// [`no_tcp_connect_timeout`](Self::no_tcp_connect_timeout), a hung server
+    /// can stall connection establishment indefinitely — the pre-0.8.0
+    /// behaviour.
+    pub fn no_establishment_timeout(mut self) -> Self {
+        self.establishment_timeout = None;
         self
     }
 
     fn http_connector(&self) -> hyper_util::client::legacy::connect::HttpConnector {
         let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         connector.set_nodelay(true);
-        connector.set_connect_timeout(self.connect_timeout);
+        connector.set_connect_timeout(self.tcp_connect_timeout);
         connector
     }
 
+    /// Wrap a connector so `establishment_timeout` (if set) bounds its establishment.
+    fn wrap<C>(&self, connector: C) -> TimeoutConnector<C> {
+        TimeoutConnector {
+            inner: connector,
+            timeout: self.establishment_timeout,
+        }
+    }
+
     /// Finish building as a plaintext client. See [`HttpClient::plaintext`].
+    #[must_use]
     pub fn plaintext(self) -> HttpClient {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
 
-        let client = Client::builder(TokioExecutor::new()).build(self.http_connector());
+        let connector = self.wrap(self.http_connector());
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         HttpClient {
             inner: HttpClientInner::Plain(client),
         }
@@ -477,13 +621,15 @@ impl HttpClientBuilder {
 
     /// Finish building as an h2c-only plaintext client. See
     /// [`HttpClient::plaintext_http2_only`].
+    #[must_use]
     pub fn plaintext_http2_only(self) -> HttpClient {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
 
+        let connector = self.wrap(self.http_connector());
         let client = Client::builder(TokioExecutor::new())
             .http2_only(true)
-            .build(self.http_connector());
+            .build(connector);
         HttpClient {
             inner: HttpClientInner::Plain(client),
         }
@@ -492,6 +638,7 @@ impl HttpClientBuilder {
     /// Finish building as a TLS client. See [`HttpClient::with_tls`].
     #[cfg(feature = "client-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
+    #[must_use]
     pub fn with_tls(self, tls_config: std::sync::Arc<rustls::ClientConfig>) -> HttpClient {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
@@ -518,7 +665,8 @@ impl HttpClientBuilder {
             .enable_all_versions()
             .wrap_connector(http);
 
-        let client = Client::builder(TokioExecutor::new()).build(https);
+        let connector = self.wrap(https);
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         HttpClient {
             inner: HttpClientInner::Tls(client),
         }
@@ -1029,6 +1177,89 @@ fn merge_headers(config_defaults: &http::HeaderMap, options: http::HeaderMap) ->
     merged
 }
 
+const CONNECT_TIMEOUT_MAX_MILLIS: u64 = 9_999_999_999;
+const GRPC_TIMEOUT_MAX_SECONDS: u64 = 99_999_999;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodedTimeout {
+    Connect {
+        millis: u64,
+    },
+    Grpc {
+        value: u64,
+        unit: char,
+        duration: Duration,
+    },
+}
+
+impl EncodedTimeout {
+    fn duration(self) -> Duration {
+        match self {
+            Self::Connect { millis } => Duration::from_millis(millis),
+            Self::Grpc { duration, .. } => duration,
+        }
+    }
+
+    fn header_value(self) -> String {
+        match self {
+            Self::Connect { millis } => millis.to_string(),
+            Self::Grpc { value, unit, .. } => format!("{value}{unit}"),
+        }
+    }
+}
+
+fn grpc_encoded_timeout(value: u128, unit: char, duration: Duration) -> EncodedTimeout {
+    EncodedTimeout::Grpc {
+        value: value as u64,
+        unit,
+        duration,
+    }
+}
+
+/// Encode a timeout for the wire and retain the exact duration that encoding
+/// represents so local deadline enforcement matches the transmitted budget.
+#[allow(clippy::manual_is_multiple_of)]
+fn encoded_timeout(timeout: Duration, protocol: Protocol) -> EncodedTimeout {
+    match protocol {
+        Protocol::Connect => EncodedTimeout::Connect {
+            millis: timeout.as_millis().min(CONNECT_TIMEOUT_MAX_MILLIS as u128) as u64,
+        },
+        Protocol::Grpc | Protocol::GrpcWeb => {
+            let max = GRPC_TIMEOUT_MAX_SECONDS as u128;
+            let nanos = timeout.as_nanos();
+            let secs = timeout.as_secs() as u128;
+            let millis = timeout.as_millis();
+            let micros = timeout.as_micros();
+
+            if nanos == 0 {
+                grpc_encoded_timeout(0, 'n', Duration::ZERO)
+            } else if nanos % 1_000_000_000 == 0 && secs <= max {
+                grpc_encoded_timeout(secs, 'S', Duration::from_secs(secs as u64))
+            } else if nanos % 1_000_000 == 0 && millis <= max {
+                grpc_encoded_timeout(millis, 'm', Duration::from_millis(millis as u64))
+            } else if nanos % 1_000 == 0 && micros <= max {
+                grpc_encoded_timeout(micros, 'u', Duration::from_micros(micros as u64))
+            } else if nanos <= max {
+                grpc_encoded_timeout(nanos, 'n', Duration::from_nanos(nanos as u64))
+            } else if micros <= max {
+                grpc_encoded_timeout(micros, 'u', Duration::from_micros(micros as u64))
+            } else if millis <= max {
+                grpc_encoded_timeout(millis, 'm', Duration::from_millis(millis as u64))
+            } else if secs <= max {
+                grpc_encoded_timeout(secs, 'S', Duration::from_secs(secs as u64))
+            } else {
+                grpc_encoded_timeout(max, 'S', Duration::from_secs(GRPC_TIMEOUT_MAX_SECONDS))
+            }
+        }
+    }
+}
+
+fn client_deadline(timeout: Option<Duration>, protocol: Protocol) -> Option<std::time::Instant> {
+    timeout
+        .map(|t| encoded_timeout(t, protocol).duration())
+        .and_then(|t| std::time::Instant::now().checked_add(t))
+}
+
 /// Enforce a client-side deadline by wrapping a future in `timeout_at`.
 ///
 /// gRPC deadline semantics: the deadline applies to the **entire call** from
@@ -1263,7 +1494,7 @@ where
     // ctx.Deadline() works. The server enforces the same deadline via
     // grpc-timeout, so by the time we check, the elapsed time since
     // request start is what matters.
-    let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
+    let deadline = client_deadline(options.timeout, config.protocol);
 
     // Build the HTTP request with protocol-aware headers
     let mut builder = Request::builder().method(http::Method::POST).uri(uri);
@@ -1400,7 +1631,7 @@ where
         .parse()
         .map_err(|e| ConnectError::internal(format!("invalid GET URI: {e}")))?;
 
-    let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
+    let deadline = client_deadline(options.timeout, Protocol::Connect);
 
     // GET request: no body, no Content-Type, no Content-Encoding.
     // Timeout still goes in the header (spec: "timeouts, if specified,
@@ -2453,7 +2684,7 @@ where
     let request_body = request_buf.freeze();
 
     // Compute deadline BEFORE sending, matching Go's ctx.Deadline() semantics
-    let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
+    let deadline = client_deadline(options.timeout, config.protocol);
 
     // Build the HTTP request with protocol-aware streaming headers
     let mut builder = Request::builder().method(http::Method::POST).uri(uri);
@@ -2953,7 +3184,7 @@ where
         config.compression_policy.with_override(options.compress),
     );
 
-    let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
+    let deadline = client_deadline(options.timeout, config.protocol);
 
     // Build the HTTP request with protocol-aware streaming headers
     let mut builder = Request::builder().method(http::Method::POST).uri(uri);
@@ -3055,7 +3286,7 @@ where
     );
 
     // Compute deadline BEFORE sending, matching Go's ctx.Deadline() semantics
-    let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
+    let deadline = client_deadline(options.timeout, config.protocol);
 
     // Build the HTTP request with protocol-aware streaming headers
     let mut builder = Request::builder().method(http::Method::POST).uri(uri);
@@ -3428,58 +3659,8 @@ fn streaming_request_content_type(config: &ClientConfig) -> &'static str {
 }
 
 /// Format a timeout value for the protocol's timeout header.
-///
-/// gRPC spec requires at most 8 ASCII digits followed by a unit suffix.
-/// We select the largest unit that represents the value without precision
-/// loss and fits within 8 digits.
-#[allow(clippy::manual_is_multiple_of)]
 fn format_timeout(timeout: Duration, protocol: Protocol) -> String {
-    match protocol {
-        Protocol::Connect => {
-            // Connect spec: "at most 10 digits" → max 9_999_999_999 ms ≈ 115 days.
-            // Clamp so a large Duration doesn't produce a spec-violating
-            // header that our own server (and connect-go) will reject.
-            const MAX_MILLIS: u128 = 9_999_999_999;
-            timeout.as_millis().min(MAX_MILLIS).to_string()
-        }
-        Protocol::Grpc | Protocol::GrpcWeb => {
-            const MAX_DIGITS: u128 = 99_999_999; // 8 digits max per gRPC spec
-
-            // Try each unit from largest to smallest, picking the first
-            // that has no precision loss and fits in 8 digits.
-            let nanos = timeout.as_nanos();
-            let secs = timeout.as_secs() as u128;
-            let millis = timeout.as_millis();
-            let micros = timeout.as_micros();
-
-            if nanos == 0 {
-                "0n".to_owned()
-            } else if nanos % 1_000_000_000 == 0 && secs <= MAX_DIGITS {
-                format!("{secs}S")
-            } else if nanos % 1_000_000 == 0 && millis <= MAX_DIGITS {
-                format!("{millis}m")
-            } else if nanos % 1_000 == 0 && micros <= MAX_DIGITS {
-                format!("{micros}u")
-            } else if nanos <= MAX_DIGITS {
-                format!("{nanos}n")
-            } else if micros <= MAX_DIGITS {
-                // Value exceeds 8 nano-digits and has sub-microsecond
-                // precision — truncate to the smallest unit that fits,
-                // minimizing precision loss. Without this branch a
-                // sub-second duration like 100ms+1ns (natural from
-                // `Instant` arithmetic) would fall through to secs=0 →
-                // "0S" → server sees expired deadline.
-                format!("{micros}u")
-            } else if millis <= MAX_DIGITS {
-                format!("{millis}m")
-            } else if secs <= MAX_DIGITS {
-                format!("{secs}S")
-            } else {
-                // Extremely large timeout (>3.17 years) — use max
-                format!("{MAX_DIGITS}S")
-            }
-        }
-    }
+    encoded_timeout(timeout, protocol).header_value()
 }
 
 /// Add protocol-specific headers to a request builder for unary RPCs.
@@ -3806,10 +3987,11 @@ mod tests {
     async fn http_client_connect_timeout_bounds_tcp_connect() {
         use std::time::Instant;
 
-        // RFC 5737 TEST-NET-1: guaranteed unroutable. SYNs are dropped, so an
-        // unbounded connect would stall on kernel retransmits (~130s on Linux
-        // defaults). With a 100ms connect timeout, hyper aborts the connect
-        // future and surfaces the failure promptly.
+        // RFC 5737 TEST-NET-1: reserved for documentation. Most hosts drop
+        // SYNs to it (so an unbounded connect stalls on kernel retransmits,
+        // ~130s on Linux defaults), but RFC 5737 doesn't mandate that — some
+        // CI hosts actively reject. The assertion that matters is the upper
+        // bound: a 100ms timeout must abort well before the kernel retry floor.
         let target = "http://192.0.2.1:9/";
         let timeout = Duration::from_millis(100);
 
@@ -3821,8 +4003,15 @@ mod tests {
             .unwrap();
 
         let start = Instant::now();
-        let err = http.send(req).await.expect_err("connect must fail");
+        // Outer timeout guards a transparent-proxy host that accepts the
+        // connect (so the bound under test never fires) and then never answers
+        // the HTTP/1.1 request — without this the test would hang.
+        let result = tokio::time::timeout(Duration::from_secs(3), http.send(req)).await;
         let elapsed = start.elapsed();
+        let Ok(Err(err)) = result else {
+            eprintln!("skipping: TEST-NET-1 reachable on this host (proxy?) in {elapsed:?}");
+            return;
+        };
 
         // Generous slack for CI scheduling jitter — but well under the
         // multi-second kernel SYN-retry floor we'd hit without the bound.
@@ -3830,6 +4019,84 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "connect_timeout(100ms) should abort within ~2s, took {elapsed:?}: {err}"
         );
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_establishment_timeout_bounds_plaintext_connector() {
+        use std::time::Instant;
+
+        // The establishment_timeout wrapper bounds the whole connector. For
+        // plaintext that's just the TCP connect, so an unroutable TEST-NET-1
+        // address must fail fast rather than stall on kernel SYN retransmits.
+        let target = "http://192.0.2.1:9/";
+        let http = HttpClient::builder()
+            .establishment_timeout(Duration::from_millis(100))
+            .plaintext();
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(target)
+            .body(full_body(Bytes::new()))
+            .unwrap();
+
+        let start = Instant::now();
+        // Outer timeout guards a transparent-proxy host that accepts the
+        // connect (so the bound under test never fires) and then never answers
+        // the HTTP/1.1 request — without this the test would hang.
+        let result = tokio::time::timeout(Duration::from_secs(3), http.send(req)).await;
+        let elapsed = start.elapsed();
+        let Ok(Err(err)) = result else {
+            eprintln!("skipping: TEST-NET-1 reachable on this host (proxy?) in {elapsed:?}");
+            return;
+        };
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "establishment_timeout(100ms) should abort within ~2s, took {elapsed:?}: {err}"
+        );
+    }
+
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn http_client_establishment_timeout_bounds_stalled_tls() {
+        use std::time::Instant;
+
+        // A listener that accepts the TCP connection but never performs the TLS
+        // handshake. The TCP connect succeeds, so only establishment_timeout (which
+        // covers TCP + TLS for the connector) can release the stalled connect.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let tls_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let http = HttpClient::builder()
+            .establishment_timeout(Duration::from_millis(150))
+            .with_tls(tls_config);
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("https://{addr}/"))
+            .body(full_body(Bytes::new()))
+            .unwrap();
+
+        let start = Instant::now();
+        let err = http.send(req).await.expect_err("stalled TLS must fail");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "establishment_timeout(150ms) should fire within ~2s, took {elapsed:?}: {err}"
+        );
+
+        server.abort();
     }
 
     #[test]
@@ -4549,6 +4816,17 @@ mod tests {
     }
 
     #[test]
+    fn connect_huge_timeout_clamps_before_deadline() {
+        let encoded = encoded_timeout(Duration::MAX, Protocol::Connect);
+        assert_eq!(encoded.header_value(), "9999999999");
+        assert_eq!(
+            encoded.duration(),
+            Duration::from_millis(CONNECT_TIMEOUT_MAX_MILLIS)
+        );
+        assert!(client_deadline(Some(Duration::MAX), Protocol::Connect).is_some());
+    }
+
+    #[test]
     fn test_format_timeout_grpc_seconds() {
         assert_eq!(
             format_timeout(Duration::from_secs(30), Protocol::Grpc),
@@ -4600,6 +4878,17 @@ mod tests {
     }
 
     #[test]
+    fn grpc_huge_timeout_clamps_before_deadline() {
+        let encoded = encoded_timeout(Duration::MAX, Protocol::Grpc);
+        assert_eq!(encoded.header_value(), "99999999S");
+        assert_eq!(
+            encoded.duration(),
+            Duration::from_secs(GRPC_TIMEOUT_MAX_SECONDS)
+        );
+        assert!(client_deadline(Some(Duration::MAX), Protocol::Grpc).is_some());
+    }
+
+    #[test]
     fn test_format_timeout_grpc_web_same_as_grpc() {
         assert_eq!(
             format_timeout(Duration::from_millis(500), Protocol::GrpcWeb),
@@ -4616,6 +4905,8 @@ mod tests {
             format_timeout(Duration::from_nanos(100_000_001), Protocol::Grpc),
             "100000u" // 100ms, 1ns truncated
         );
+        let encoded = encoded_timeout(Duration::from_nanos(100_000_001), Protocol::Grpc);
+        assert_eq!(encoded.duration(), Duration::from_micros(100_000));
         // Boundary: exactly 1ns over the 8-digit nano limit.
         assert_eq!(
             format_timeout(Duration::from_nanos(100_000_000), Protocol::Grpc),

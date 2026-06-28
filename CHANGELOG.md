@@ -12,13 +12,30 @@ increment the patch version.
 
 ### Added
 
-- **Configurable codegen client feature gate name** ([#181]).
+- **Configurable codegen client feature gate name** ([#181], [#194]).
   `gate_client_feature=<name>` lets `protoc-gen-connect-rust` emit generated
   client items behind `#[cfg(feature = "<name>")]` instead of the default
   `client`; `connectrpc-build` exposes the same through
   `Config::client_feature_name`. The existing bare `gate_client_feature`
   option and `Config::gate_client_feature(true)` behavior continue to use
   `client`.
+- **`Http2ConnectionBuilder` with establishment-timeout and HTTP/2 keep-alive
+  knobs** ([#137], [#197]). `Http2Connection::builder()` is now the single
+  configuration surface for every transport flavour (plaintext, TLS,
+  caller-supplied connector, Unix socket); the existing `Http2Connection`
+  constructors are shortcuts for it with default settings. The builder adds
+  `establishment_timeout` (a wall-clock bound on DNS + TCP + TLS + HTTP/2
+  preface as one budget) and `tcp_connect_timeout` (a per-address TCP bound on
+  the built-in connector), and proxies hyper's `keep_alive_interval`,
+  `keep_alive_timeout`, `keep_alive_while_idle`, `initial_stream_window_size`,
+  `initial_connection_window_size`, and `adaptive_window` setters directly,
+  with a `TokioTimer` pre-wired so the keep-alive setters work without hyper's
+  "supply a timer" panic. `h2_settings(|b| ...)` is the escape hatch for hyper
+  knobs not proxied. `HttpClientBuilder` gains the matching
+  `establishment_timeout` (covering DNS + TCP + TLS) and `tcp_connect_timeout`
+  (the canonical name for [#117]'s `connect_timeout`, which remains as an
+  alias). Both builders also expose `no_establishment_timeout` /
+  `no_tcp_connect_timeout` to opt out of the new defaults below.
 - **Optional `json` cargo feature for proto-only builds** ([#172]). The
   Connect JSON codec requires `serde::Serialize`/`Deserialize` on every
   message type, so the code generator derives them by default — pure cost for
@@ -59,9 +76,38 @@ increment the patch version.
   keep-alive disabled instead. A symmetric ±10% jitter is applied per
   connection to avoid reconnect bursts. Disabled by default; whole-server
   graceful shutdown still drains in-flight requests indefinitely.
+- **HTTP/2 adaptive flow-control window, on by default** ([#178]). The built-in
+  server now enables hyper's adaptive (BDP-based) flow-control window sizing by
+  default, so HTTP/2 stream and connection windows grow with the measured
+  bandwidth-delay product instead of staying pinned at hyper's fixed 64 KiB.
+  This is a behaviour change: throughput improves on high-latency,
+  high-bandwidth links (cross-region, high-throughput streaming), at the cost
+  of slightly higher per-connection memory under load. It matches grpc-go and
+  grpc-java, which both autotune by default. New setters on `Server` and
+  `BoundServer` give explicit control: `with_http2_adaptive_window(bool)`
+  toggles autotuning, and `with_http2_initial_stream_window_size` /
+  `with_http2_initial_connection_window_size` set fixed windows (supplying a
+  fixed window turns adaptive sizing off, mirroring grpc-go). The new default
+  is exposed as the `DEFAULT_HTTP2_ADAPTIVE_WINDOW` constant.
 
 ### Changed
 
+- **Client connection establishment is bounded by default** ([#137], [#197]).
+  `Http2Connection` and `HttpClient` now bound connection establishment to
+  `DEFAULT_ESTABLISHMENT_TIMEOUT` (20s, matching grpc-go's `MinConnectTimeout`)
+  with an additional `DEFAULT_TCP_CONNECT_TIMEOUT` (5s) per-address TCP bound
+  on the built-in connector. Previously, a server that accepted the TCP
+  connection but stalled the TLS handshake — for example a draining pod whose
+  kernel backlog still accepts — would stall `poll_ready` indefinitely for
+  every caller sharing the connection. Exceeding either bound surfaces as
+  `ErrorCode::Unavailable`. **This applies to every existing constructor**
+  (they now delegate through the new builders), so this supersedes the [#117]
+  changelog entry's "behaviour is unchanged for callers who don't opt in"
+  statement under 0.7.0. To restore the unbounded pre-0.8.0 behaviour, call
+  `.no_establishment_timeout().no_tcp_connect_timeout()` on the builder. Note
+  that hyper divides the per-address TCP budget across the resolved address
+  set, so a hostname resolving to many addresses on a high-latency link may
+  need a larger `tcp_connect_timeout` than the 5s default.
 - **Connect streaming EOF without END_STREAM now returns `internal`**
   ([#168]). The `ServerStream` Connect EOF path that 0.7.0's [#140]
   introduced as `unavailable` now returns `internal` — the code
@@ -95,6 +141,14 @@ increment the patch version.
   an unsupported `grpc-encoding`. Clients that branch on grpc-status will
   observe 13 → 12 for this case on upgrade.
 
+### Deprecated
+
+- `Http2Connection::with_builder_plaintext` / `with_builder_tls` ([#197]). Use
+  `Http2Connection::builder()` and configure via the proxied keep-alive /
+  window-size setters or `h2_settings(|b| ...)`. The old names collide with the
+  new `builder()` entry point, where "builder" now means
+  `Http2ConnectionBuilder` rather than hyper's HTTP/2 builder.
+
 ### Fixed
 
 - **Connect client-streaming responses require the END_STREAM envelope**
@@ -103,13 +157,18 @@ increment the patch version.
   a truncated response was indistinguishable from a complete one. It now
   returns `Err(internal)` (see [#168]); complete responses are unchanged.
 
+[#137]: https://github.com/anthropics/connect-rust/issues/137
 [#151]: https://github.com/anthropics/connect-rust/issues/151
 [#163]: https://github.com/anthropics/connect-rust/pull/163
 [#164]: https://github.com/anthropics/connect-rust/pull/164
 [#167]: https://github.com/anthropics/connect-rust/pull/167
 [#168]: https://github.com/anthropics/connect-rust/pull/168
 [#172]: https://github.com/anthropics/connect-rust/pull/172
+[#178]: https://github.com/anthropics/connect-rust/issues/178
 [#180]: https://github.com/anthropics/connect-rust/issues/180
+[#181]: https://github.com/anthropics/connect-rust/issues/181
+[#194]: https://github.com/anthropics/connect-rust/pull/194
+[#197]: https://github.com/anthropics/connect-rust/pull/197
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
 ## [0.7.0] - 2026-06-10
@@ -501,7 +560,8 @@ rebuilds `OUT_DIR` automatically.
   call so a silently dropped SYN fails in milliseconds instead of the
   kernel's `tcp_syn_retries` default (~130s). The existing constructors
   delegate to the builder with no timeout, so behaviour is unchanged for
-  current callers. `connect_timeout` covers TCP connect only, not DNS
+  current callers. (**Note:** [#197] in 0.8.0 changes this — the constructors
+  are now bounded by default.) `connect_timeout` covers TCP connect only, not DNS
   resolution or the TLS handshake — use `CallOptions::with_timeout` for
   an end-to-end bound.
 

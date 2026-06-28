@@ -141,6 +141,17 @@ async fn fetch(
             let Some(val) = pair.get(1).as_string() else {
                 continue;
             };
+            // Fetch transparently decodes the response body per Content-Encoding
+            // (gzip/deflate/br/zstd) but leaves the original Content-Encoding and
+            // Content-Length headers in place. Both are stale relative to the
+            // decoded body returned by `array_buffer()` below, so drop them —
+            // otherwise the connectrpc client will try to decompress an
+            // already-decoded body.
+            if key.eq_ignore_ascii_case(http::header::CONTENT_ENCODING.as_str())
+                || key.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str())
+            {
+                continue;
+            }
             builder = builder.header(key, val);
         }
     }
