@@ -164,13 +164,15 @@ increment the patch version.
 
 ### Fixed
 
-- **Malformed Connect END_STREAM JSON now returns `internal`** ([#192]).
-  A streaming Connect response whose END_STREAM envelope body was not valid
-  JSON was silently treated as a clean `Ok(None)` close (the parse error fell
-  through `unwrap_or_default()`). It now returns `Err(internal)` with the
+- **Malformed Connect END_STREAM JSON now returns `internal`** ([#192],
+  [#201]). A streaming Connect response whose END_STREAM envelope body was not
+  valid JSON was silently treated as a clean `Ok(None)` close (the parse error
+  fell through `unwrap_or_default()`). It now returns `Err(internal)` with the
   serde error in the message, matching connect-go's behaviour for the same
-  case. Well-formed END_STREAM payloads (including the `null-error`,
-  `missing-code`, and unknown-field conformance shapes) are unchanged.
+  case, and the error carries the response headers on both the
+  server-streaming and client-streaming paths. Well-formed END_STREAM payloads
+  (including the `null-error`, `missing-code`, and unknown-field conformance
+  shapes) are unchanged.
 - **Connect client-streaming responses require the END_STREAM envelope**
   ([#163]). A response that ended after its single data message but before
   the END_STREAM envelope was accepted as a success with empty trailers, so
@@ -191,6 +193,7 @@ increment the patch version.
 [#194]: https://github.com/anthropics/connect-rust/pull/194
 [#197]: https://github.com/anthropics/connect-rust/pull/197
 [#199]: https://github.com/anthropics/connect-rust/pull/199
+[#201]: https://github.com/anthropics/connect-rust/pull/201
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
 ## [0.7.0] - 2026-06-10

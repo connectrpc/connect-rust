@@ -2639,7 +2639,10 @@ where
 
         let end_stream = match parse_connect_end_stream(&end_stream_data) {
             Ok(end_stream) => end_stream,
-            Err(e) => return e.into(),
+            Err(mut e) => {
+                e.set_response_headers(self.headers.clone());
+                return e.into();
+            }
         };
 
         let trailers = end_stream.metadata.map(|metadata| {
@@ -4427,8 +4430,11 @@ mod tests {
         );
         body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"not json")).encode());
 
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
-            headers: http::HeaderMap::new(),
+            headers,
             body: Full::new(body.freeze()),
             buf: BytesMut::new(),
             encoding: None,
@@ -4459,12 +4465,17 @@ mod tests {
                 .contains("malformed Connect END_STREAM JSON"),
             "unexpected error: {err}"
         );
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
 
         let again = stream
             .message()
             .await
             .expect_err("malformed END_STREAM error must be sticky");
         assert_eq!(again.code, ErrorCode::Internal);
+        assert_eq!(
+            again.response_headers().get("x-from-headers").unwrap(),
+            "yes"
+        );
     }
 
     /// Same contract for gRPC: an error in HTTP/2 trailers is a failed RPC
