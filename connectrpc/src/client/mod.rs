@@ -2594,8 +2594,10 @@ where
             Err(e) => return e.into(),
         };
 
-        let end_stream: ClientEndStreamResponse =
-            serde_json::from_slice(&end_stream_data).unwrap_or_default();
+        let end_stream = match parse_connect_end_stream(&end_stream_data) {
+            Ok(end_stream) => end_stream,
+            Err(e) => return e.into(),
+        };
 
         let trailers = end_stream.metadata.map(|metadata| {
             let mut trailers = http::HeaderMap::new();
@@ -2604,17 +2606,7 @@ where
         });
 
         let outcome = match end_stream.error {
-            Some(err) => {
-                let mut connect_error = ConnectError::new(
-                    err.code
-                        .as_deref()
-                        .and_then(|c| c.parse().ok())
-                        .unwrap_or(ErrorCode::Unknown),
-                    err.message.unwrap_or_default(),
-                );
-                connect_error.details = err.details;
-                Err(connect_error)
-            }
+            Some(err) => Err(end_stream_error_to_connect_error(err)),
             None => Ok(()),
         };
 
@@ -3514,22 +3506,17 @@ fn parse_connect_client_stream_envelopes(
                 envelope.data
             };
 
-            let end_stream: ClientEndStreamResponse =
-                serde_json::from_slice(&end_stream_data).unwrap_or_default();
+            let end_stream = parse_connect_end_stream(&end_stream_data).map_err(|mut err| {
+                err.set_response_headers(resp_headers.clone());
+                err
+            })?;
 
             if let Some(metadata) = end_stream.metadata {
                 append_metadata_capped(&mut trailers, metadata);
             }
 
             if let Some(err) = end_stream.error {
-                let mut connect_error = ConnectError::new(
-                    err.code
-                        .as_deref()
-                        .and_then(|c| c.parse().ok())
-                        .unwrap_or(ErrorCode::Unknown),
-                    err.message.unwrap_or_default(),
-                );
-                connect_error.details = err.details;
+                let mut connect_error = end_stream_error_to_connect_error(err);
                 connect_error.set_response_headers(resp_headers.clone());
                 connect_error.set_trailers(trailers);
                 return Err(connect_error);
@@ -3592,7 +3579,7 @@ fn parse_connect_client_stream_envelopes(
 }
 
 /// EndStreamResponse as received by the client.
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
 struct ClientEndStreamResponse {
     error: Option<ClientEndStreamError>,
     metadata: Option<HashMap<String, Vec<String>>>,
@@ -3605,6 +3592,31 @@ struct ClientEndStreamError {
     message: Option<String>,
     #[serde(default)]
     details: Vec<ErrorDetail>,
+}
+
+/// Parse the body of a Connect END_STREAM envelope. A malformed body is a
+/// wire-protocol violation, so it surfaces as `Internal` (matching connect-go)
+/// rather than being silently treated as a clean close.
+fn parse_connect_end_stream(data: &[u8]) -> Result<ClientEndStreamResponse, ConnectError> {
+    serde_json::from_slice(data).map_err(|e| {
+        ConnectError::internal(format!(
+            "protocol error: malformed Connect END_STREAM JSON: {e}"
+        ))
+    })
+}
+
+/// Convert the `error` member of a Connect END_STREAM body into the
+/// caller-facing [`ConnectError`], with `Unknown` as the fallback code.
+fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> ConnectError {
+    let mut connect_error = ConnectError::new(
+        err.code
+            .as_deref()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(ErrorCode::Unknown),
+        err.message.unwrap_or_default(),
+    );
+    connect_error.details = err.details;
+    connect_error
 }
 
 /// Error response structure from ConnectRPC.
@@ -4356,6 +4368,60 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("42")
         );
+    }
+
+    /// Malformed Connect END_STREAM JSON is a protocol error. It must not be
+    /// treated as an empty successful end-stream payload.
+    #[tokio::test]
+    async fn connect_malformed_end_stream_json_errors() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(
+            &Envelope::data(StringValue::from("hello").encode_to_bytes()).encode(),
+        );
+        body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"not json")).encode());
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers: http::HeaderMap::new(),
+            body: Full::new(body.freeze()),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(1024),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let msg = stream
+            .message()
+            .await
+            .expect("data envelope should decode")
+            .expect("stream should yield the data message first");
+        assert_eq!(msg.reborrow().value, "hello");
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("malformed END_STREAM must surface as Err, not Ok(None)");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.to_string()
+                .contains("malformed Connect END_STREAM JSON"),
+            "unexpected error: {err}"
+        );
+
+        let again = stream
+            .message()
+            .await
+            .expect_err("malformed END_STREAM error must be sticky");
+        assert_eq!(again.code, ErrorCode::Internal);
     }
 
     /// Same contract for gRPC: an error in HTTP/2 trailers is a failed RPC
@@ -5931,6 +5997,38 @@ mod tests {
             "m",
             "END_STREAM metadata must be attached to the error as trailers"
         );
+    }
+
+    /// Malformed Connect END_STREAM JSON is a protocol error. It must not be
+    /// treated as an empty successful end-stream payload.
+    #[test]
+    fn client_stream_response_malformed_end_stream_json_errors() {
+        let registry = crate::compression::CompressionRegistry::new();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"not json")).encode());
+
+        let mut resp_headers = http::HeaderMap::new();
+        resp_headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            None,
+            1024,
+            &resp_headers,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.to_string()
+                .contains("malformed Connect END_STREAM JSON"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert!(err.trailers().is_empty());
     }
 
     /// A body with no data envelope (END_STREAM only) is rejected.
