@@ -187,12 +187,16 @@ impl Config {
     }
 
     /// Prefix every generated `FooClient<T>` struct and its `impl` block
-    /// with `#[cfg(feature = "client")]` (default: `false`).
+    /// with `#[cfg(feature = "client")]` (default: `false`). Use
+    /// [`Config::client_feature_name`] to gate on a feature other than
+    /// `"client"` — note that calling `client_feature_name` re-enables
+    /// gating, so order it before `gate_client_feature(false)` if you
+    /// need to set a name but leave gating off.
     ///
     /// Opt in when you want a server-only build of your crate to drop
     /// the `connectrpc/client` transport stack from its dependency
-    /// graph. The consumer crate then declares a `client` Cargo feature
-    /// that forwards to `connectrpc/client`; see the `# Client-side cfg
+    /// graph. The consumer crate then declares the gate's Cargo feature
+    /// and forwards it to `connectrpc/client`; see the `# Client-side cfg
     /// gate` section in [`connectrpc_codegen::codegen::generate`]'s
     /// docs for the minimal pattern. With the option off (the default),
     /// generated client items are unconditional — external consumers
@@ -203,15 +207,16 @@ impl Config {
         self
     }
 
-    /// Set the Cargo feature name used by [`Config::gate_client_feature`]
-    /// (default: `"client"`).
+    /// Enable [`Config::gate_client_feature`] and set the Cargo feature name
+    /// it gates on (default: `"client"`).
     ///
     /// Use this when the generated crate exposes its client surface under a
-    /// different feature name, such as `grpc-client` or `transport`. This
-    /// method does not enable gating by itself; pair it with
-    /// `gate_client_feature(true)`.
+    /// different feature name, such as `grpc-client` or `transport`. Calling
+    /// this implies `gate_client_feature(true)`, mirroring the plugin's
+    /// `gate_client_feature=<name>` form, so you don't need both calls.
     #[must_use]
     pub fn client_feature_name(mut self, feature: impl Into<String>) -> Self {
+        self.options.gate_client_feature = true;
         self.options.client_feature_name = feature.into();
         self
     }
@@ -730,6 +735,17 @@ mod tests {
         assert!(cfg.options.gate_client_feature);
         assert_eq!(cfg.options.client_feature_name, "grpc-client");
         assert_eq!(cfg.include_file.as_deref(), Some("_inc.rs"));
+    }
+
+    #[test]
+    fn client_feature_name_enables_gating() {
+        let cfg = Config::new().client_feature_name("grpc-client");
+        assert!(
+            cfg.options.gate_client_feature,
+            "client_feature_name alone must enable gating (mirrors plugin \
+             gate_client_feature=<name>)"
+        );
+        assert_eq!(cfg.options.client_feature_name, "grpc-client");
     }
 
     #[test]

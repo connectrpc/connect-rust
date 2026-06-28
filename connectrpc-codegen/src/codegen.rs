@@ -101,11 +101,37 @@ impl Options {
 
     fn client_feature_name(&self) -> Result<&str> {
         let name = self.client_feature_name.trim();
-        if self.gate_client_feature && name.is_empty() {
-            anyhow::bail!("client feature name must not be empty");
+        if name.is_empty() {
+            if self.gate_client_feature {
+                anyhow::bail!("client feature name must not be empty");
+            }
+            return Ok("client");
         }
-        Ok(if name.is_empty() { "client" } else { name })
+        if !is_valid_feature_name(name) {
+            anyhow::bail!(
+                "client feature name {name:?} is not a valid Cargo feature name \
+                 (must start with an alphanumeric or `_` and contain only \
+                 alphanumerics, `_`, `-`, `+`, `.`)"
+            );
+        }
+        Ok(name)
     }
+}
+
+/// Conservative ASCII subset of Cargo's feature-name grammar (matches the
+/// crates.io constraint): starts with an ASCII alphanumeric or `_`; remainder
+/// drawn from alphanumerics, `_`, `-`, `+`, `.`. An invalid name would emit
+/// `#[cfg(feature = "...")]` that Cargo can never enable, silently suppressing
+/// every generated client item.
+//
+// Once the buffa-codegen dependency is bumped to 0.8, replace this with
+// `buffa_codegen::FeatureGateNames::is_valid_name` (same rule, single source).
+fn is_valid_feature_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
 }
 
 /// Emit one [`GeneratedFile`] per proto file in `file_to_generate` that
@@ -4007,6 +4033,31 @@ mod tests {
         assert!(
             msg.contains("gate_client_feature requires a non-empty feature name"),
             "error should describe the empty feature-name problem: {msg}"
+        );
+    }
+
+    #[test]
+    fn is_valid_feature_name_matches_cargo_grammar() {
+        for ok in ["client", "grpc-client", "_x", "a.b+c", "0abc"] {
+            assert!(is_valid_feature_name(ok), "{ok:?} should be valid");
+        }
+        for bad in ["", "grpc client", "foo/bar", "-leading", ".leading"] {
+            assert!(!is_valid_feature_name(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn options_reject_invalid_client_feature_name() {
+        let opts = Options {
+            gate_client_feature: true,
+            client_feature_name: "grpc client".into(),
+            ..Options::default()
+        };
+        let err = generate_services(&[], &[], &opts)
+            .expect_err("invalid client feature name must be rejected");
+        assert!(
+            err.to_string().contains("not a valid Cargo feature name"),
+            "error should name the grammar problem: {err}"
         );
     }
 
