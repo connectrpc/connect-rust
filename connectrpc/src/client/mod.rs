@@ -148,6 +148,41 @@ pub fn full_body(b: Bytes) -> ClientBody {
     Full::new(b).map_err(|never| match never {}).boxed()
 }
 
+/// Walk an error's `source()` chain looking for a [`ConnectError`].
+///
+/// Boxed trait objects cannot appear as links in the chain: `Box<dyn Error>`
+/// does not itself implement `Error` (the blanket impl requires a sized
+/// type), so every link is a concrete error type and a plain `downcast_ref`
+/// at each link is exhaustive.
+fn find_connect_error_in_chain(
+    mut err: &(dyn std::error::Error + 'static),
+) -> Option<ConnectError> {
+    loop {
+        if let Some(connect_err) = err.downcast_ref::<ConnectError>() {
+            return Some(connect_err.clone());
+        }
+        err = err.source()?;
+    }
+}
+
+/// Map a [`ClientTransport::send`] failure into the error surfaced to the
+/// caller.
+///
+/// Policy: a [`ConnectError`] found anywhere in the transport error's source
+/// chain is returned verbatim (preserving its code, message, details, and
+/// attached metadata; any outer wrappers' `Display` context is dropped).
+/// Both built-in transports already produce classified `ConnectError`s
+/// directly, so for them `context` never appears in the surfaced error.
+/// Errors with no `ConnectError` in their chain are wrapped as `unavailable`
+/// with the `context` prefix.
+fn map_transport_send_error<E>(err: E, context: &str) -> ConnectError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    find_connect_error_in_chain(&err)
+        .unwrap_or_else(|| ConnectError::unavailable(format!("{context}: {err}")))
+}
+
 /// Extra slack added to client-side response buffer caps beyond the message
 /// size itself, to accommodate gRPC-Web trailer frames (which arrive as a
 /// separate 0x80-flagged body frame, not a standard envelope). 64 KiB is
@@ -189,6 +224,14 @@ pub trait ClientTransport: Clone + Send + Sync + 'static {
     /// The response body type.
     type ResponseBody: Body<Data = Bytes> + Send + 'static;
     /// The error type.
+    ///
+    /// If a [`ConnectError`] appears anywhere in this error's `source()`
+    /// chain (or is the error itself), the client call paths surface it to
+    /// the caller verbatim — code, message, details, and attached metadata —
+    /// discarding any outer wrappers' `Display` context. A transport can use
+    /// this to control the surfaced error classification, for example
+    /// returning `deadline_exceeded` from a timeout middleware. Errors with
+    /// no `ConnectError` in their chain are wrapped as `unavailable`.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Send an HTTP request and receive a response.
@@ -1517,7 +1560,7 @@ where
         let response = transport
             .send(http_request)
             .await
-            .map_err(|e| ConnectError::unavailable(format!("request failed: {e}")))?;
+            .map_err(|e| map_transport_send_error(e, "request failed"))?;
 
         match config.protocol {
             Protocol::Connect => parse_connect_unary_response(response, config, &options).await,
@@ -1663,7 +1706,7 @@ where
         let response = transport
             .send(http_request)
             .await
-            .map_err(|e| ConnectError::unavailable(format!("GET request failed: {e}")))?;
+            .map_err(|e| map_transport_send_error(e, "GET request failed"))?;
 
         // Response format is identical to POST unary Connect.
         parse_connect_unary_response(response, config, &options).await
@@ -1927,18 +1970,7 @@ where
         return Err(err);
     }
 
-    // Validate response content-type starts with application/grpc
-    if let Some(ct) = resp_headers.get(http::header::CONTENT_TYPE) {
-        let ct_str = ct.to_str().unwrap_or("");
-        if !ct_str.starts_with("application/grpc") {
-            let mut err = ConnectError::new(
-                ErrorCode::Unknown,
-                format!("unexpected content-type: {ct_str}"),
-            );
-            err.set_response_headers(resp_headers);
-            return Err(err);
-        }
-    }
+    validate_grpc_response_content_type(&resp_headers, config)?;
 
     // Check for unsupported compression before reading the body
     let response_encoding = resp_headers
@@ -2130,6 +2162,65 @@ where
         body: message,
         trailers: grpc_trailers,
     })
+}
+
+/// Validate the `content-type` of a gRPC / gRPC-Web response against the
+/// client's configured protocol and codec, mirroring connect-go's
+/// `grpcValidateResponseContentType`.
+///
+/// Parameters (`; charset=...`) are stripped before comparison. The bare
+/// family types `application/grpc` / `application/grpc-web` are accepted for
+/// any codec, because the bare type means "proto by default" and proxies that
+/// synthesize trailers-only error responses (such as Envoy local replies)
+/// send it regardless of the request's subtype. A missing `content-type`
+/// header is also accepted, preserving this client's previous leniency. A
+/// same-family subtype that doesn't match the configured codec is rejected as
+/// `internal` (a broken server or intermediary); anything else is `unknown`
+/// (not a gRPC response at all), matching connect-go's classification.
+fn validate_grpc_response_content_type(
+    resp_headers: &http::HeaderMap,
+    config: &ClientConfig,
+) -> Result<(), ConnectError> {
+    debug_assert!(
+        matches!(config.protocol, Protocol::Grpc | Protocol::GrpcWeb),
+        "gRPC response content-type validation is only for gRPC/gRPC-Web"
+    );
+
+    let Some(resp_content_type) = resp_headers.get(http::header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+
+    let ct = resp_content_type.to_str().unwrap_or("");
+    let ct_normalized = ct
+        .split_once(';')
+        .map_or(ct, |(media_type, _params)| media_type)
+        .trim();
+    let expected = config
+        .protocol
+        .response_content_type(config.codec_format, false);
+    let (bare, family_prefix) = match config.protocol {
+        Protocol::Grpc => ("application/grpc", "application/grpc+"),
+        Protocol::GrpcWeb => ("application/grpc-web", "application/grpc-web+"),
+        // Unreachable per the debug_assert above; treat as valid rather than
+        // misclassify a Connect response in release builds.
+        Protocol::Connect => return Ok(()),
+    };
+
+    if ct_normalized == expected || ct_normalized == bare {
+        return Ok(());
+    }
+
+    let code = if ct_normalized.starts_with(family_prefix) {
+        ErrorCode::Internal
+    } else {
+        ErrorCode::Unknown
+    };
+    let mut err = ConnectError::new(
+        code,
+        format!("unexpected content-type: {ct} (expected {expected})"),
+    );
+    err.set_response_headers(resp_headers.clone());
+    Err(err)
 }
 
 /// Terminal record for a client stream: why it ended and what trailing
@@ -2596,7 +2687,10 @@ where
 
         let end_stream = match parse_connect_end_stream(&end_stream_data) {
             Ok(end_stream) => end_stream,
-            Err(e) => return e.into(),
+            Err(mut e) => {
+                e.set_response_headers(self.headers.clone());
+                return e.into();
+            }
         };
 
         let trailers = end_stream.metadata.map(|metadata| {
@@ -2699,7 +2793,7 @@ where
         let response = transport
             .send(http_request)
             .await
-            .map_err(|e| ConnectError::unavailable(format!("request failed: {e}")))?;
+            .map_err(|e| map_transport_send_error(e, "request failed"))?;
 
         make_server_stream(
             response,
@@ -3204,7 +3298,7 @@ where
     let response_task = tokio::spawn(async move {
         response_fut
             .await
-            .map_err(|e| ConnectError::unavailable(format!("request failed: {e}")))
+            .map_err(|e| map_transport_send_error(e, "request failed"))
     });
 
     Ok(BidiStream {
@@ -3305,7 +3399,7 @@ where
     let _ = crate::spawn_detached(async move {
         let result = response_fut
             .await
-            .map_err(|e| ConnectError::unavailable(format!("request failed: {e}")));
+            .map_err(|e| map_transport_send_error(e, "request failed"));
         let _ = resp_tx.send(result);
     });
 
@@ -4384,8 +4478,11 @@ mod tests {
         );
         body.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"not json")).encode());
 
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
-            headers: http::HeaderMap::new(),
+            headers,
             body: Full::new(body.freeze()),
             buf: BytesMut::new(),
             encoding: None,
@@ -4416,12 +4513,17 @@ mod tests {
                 .contains("malformed Connect END_STREAM JSON"),
             "unexpected error: {err}"
         );
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
 
         let again = stream
             .message()
             .await
             .expect_err("malformed END_STREAM error must be sticky");
         assert_eq!(again.code, ErrorCode::Internal);
+        assert_eq!(
+            again.response_headers().get("x-from-headers").unwrap(),
+            "yes"
+        );
     }
 
     /// Same contract for gRPC: an error in HTTP/2 trailers is a failed RPC
@@ -4798,6 +4900,150 @@ mod tests {
             .await
             .expect_err("malformed-status error must be sticky");
         assert_eq!(again.code, ErrorCode::Unknown);
+    }
+
+    #[cfg(feature = "client")]
+    fn plaintext_client_with_https_base() -> (HttpClient, ClientConfig) {
+        let client = HttpClient::plaintext();
+        let config = ClientConfig::new("https://localhost:8080".parse().unwrap());
+        (client, config)
+    }
+
+    #[test]
+    fn transport_send_error_mapper_preserves_connect_error_in_source_chain() {
+        #[derive(Debug)]
+        struct WrappedTransportError(ConnectError);
+
+        impl std::fmt::Display for WrappedTransportError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrapped transport failure")
+            }
+        }
+
+        impl std::error::Error for WrappedTransportError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let mapped = map_transport_send_error(
+            WrappedTransportError(ConnectError::invalid_argument("bad client config")),
+            "request failed",
+        );
+        assert_eq!(mapped.code, ErrorCode::InvalidArgument);
+        assert_eq!(mapped.message.as_deref(), Some("bad client config"));
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn call_unary_preserves_transport_connect_error() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (client, config) = plaintext_client_with_https_base();
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &client,
+            &config,
+            "test.Service",
+            "Unary",
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("transport config error must surface from unary call");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.as_deref().unwrap().contains("with_tls"));
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn call_unary_get_preserves_transport_connect_error() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (client, config) = plaintext_client_with_https_base();
+        let err = call_unary_get::<_, StringValue, StringValueView<'static>>(
+            &client,
+            &config,
+            "test.Service",
+            "UnaryGet",
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("transport config error must surface from unary GET");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.as_deref().unwrap().contains("with_tls"));
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn call_server_stream_preserves_transport_connect_error() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (client, config) = plaintext_client_with_https_base();
+        let err = call_server_stream::<_, StringValue, StringValueView<'static>>(
+            &client,
+            &config,
+            "test.Service",
+            "ServerStream",
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("transport config error must surface from server stream");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.as_deref().unwrap().contains("with_tls"));
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn call_bidi_stream_preserves_transport_connect_error() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (client, config) = plaintext_client_with_https_base();
+        let mut stream = call_bidi_stream::<_, StringValue, StringValueView<'static>>(
+            &client,
+            &config,
+            "test.Service",
+            "Bidi",
+            CallOptions::default(),
+        )
+        .await
+        .expect("constructing bidi stream should succeed until the first receive");
+        let err = stream
+            .message()
+            .await
+            .expect_err("transport config error must surface from bidi receive");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.as_deref().unwrap().contains("with_tls"));
+        assert_eq!(
+            stream.error().map(|e| e.code),
+            Some(ErrorCode::InvalidArgument)
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn call_client_stream_preserves_transport_connect_error() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (client, config) = plaintext_client_with_https_base();
+        let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
+            &client,
+            &config,
+            "test.Service",
+            "ClientStream",
+            [StringValue::from("hello")],
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("transport config error must surface from client stream");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.as_deref().unwrap().contains("with_tls"));
     }
 
     #[cfg(feature = "client")]
@@ -5281,6 +5527,180 @@ mod tests {
         assert_eq!(
             response.trailers().get("grpc-status").unwrap(),
             http::HeaderValue::from_static("0")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_accepts_bare_application_grpc_with_parameters() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let data = Envelope::data(StringValue::from("hi").encode_to_bytes()).encode();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::data(data)), Ok(Frame::trailers(trailers))];
+
+        let response = Response::builder()
+            .header(
+                http::header::CONTENT_TYPE,
+                "application/grpc; charset=utf-8",
+            )
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let response = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect("bare application/grpc must be accepted as proto");
+        assert_eq!(response.view().value, "hi");
+        assert_eq!(response.trailers().get("grpc-status").unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_rejects_grpc_web_content_type() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc-web+proto")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("gRPC client must reject gRPC-Web content type");
+        // Cross-family mismatches are `unknown` (not a gRPC response at all),
+        // matching connect-go; only same-family codec mismatches are
+        // `internal`.
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "unexpected content-type: application/grpc-web+proto (expected application/grpc+proto)"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_rejects_mismatched_codec_content_type() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+json")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("gRPC client must reject mismatched response codec");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "unexpected content-type: application/grpc+json (expected application/grpc+proto)"
+            )
+        );
+    }
+
+    #[test]
+    fn grpc_response_content_type_rejects_non_grpc_as_unknown() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = validate_grpc_response_content_type(&headers, &config)
+            .expect_err("non-gRPC content type must be rejected");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("unexpected content-type: text/html (expected application/grpc+proto)")
+        );
+        assert!(
+            err.response_headers()
+                .contains_key(http::header::CONTENT_TYPE)
+        );
+    }
+
+    #[test]
+    fn grpc_response_content_type_accepts_missing_header() {
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+        validate_grpc_response_content_type(&http::HeaderMap::new(), &config)
+            .expect("missing content-type must remain accepted");
+    }
+
+    #[test]
+    fn grpc_response_content_type_accepts_bare_for_json_codec() {
+        // Proxies that synthesize trailers-only error replies (e.g. Envoy)
+        // send bare `application/grpc` regardless of the request subtype, so
+        // the bare type must be accepted for every codec, as in connect-go.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/grpc".parse().unwrap(),
+        );
+        let config = ClientConfig::new("http://localhost".parse().unwrap())
+            .with_protocol(Protocol::Grpc)
+            .with_codec_format(CodecFormat::Json);
+        validate_grpc_response_content_type(&headers, &config)
+            .expect("bare application/grpc must be accepted for a json-codec client");
+    }
+
+    #[test]
+    fn grpc_web_response_content_type_accepts_bare() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/grpc-web".parse().unwrap(),
+        );
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+        validate_grpc_response_content_type(&headers, &config)
+            .expect("bare application/grpc-web must be accepted as proto");
+    }
+
+    #[test]
+    fn grpc_web_response_content_type_rejects_grpc_as_unknown() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/grpc+proto".parse().unwrap(),
+        );
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let err = validate_grpc_response_content_type(&headers, &config)
+            .expect_err("gRPC-Web client must reject plain gRPC content type");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "unexpected content-type: application/grpc+proto (expected application/grpc-web+proto)"
+            )
         );
     }
 

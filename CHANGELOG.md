@@ -92,6 +92,19 @@ increment the patch version.
 
 ### Changed
 
+- **Client transport errors keep their original classification** ([#199]).
+  The client call paths previously wrapped every transport `send` failure as
+  `unavailable` with a `request failed:` prefix, including errors that were
+  already classified `ConnectError`s — so a local configuration mistake such
+  as pointing `HttpClient::plaintext()` at an `https://` URL looked like a
+  retryable outage. A `ConnectError` found anywhere in the transport error's
+  source chain is now surfaced verbatim (code, message, details, and attached
+  metadata; the `request failed:` prefix is gone for the built-in
+  transports). Transport errors with no `ConnectError` in their chain are
+  wrapped as `unavailable`, unchanged. Retry classifiers keyed on
+  `unavailable` keep matching genuine transport outages, and now correctly
+  stop retrying non-retryable local errors; anything matching on the
+  `request failed:` message prefix should match on the error code instead.
 - **Client connection establishment is bounded by default** ([#137], [#197]).
   `Http2Connection` and `HttpClient` now bound connection establishment to
   `DEFAULT_ESTABLISHMENT_TIMEOUT` (20s, matching grpc-go's `MinConnectTimeout`)
@@ -180,13 +193,28 @@ increment the patch version.
 
 ### Fixed
 
-- **Malformed Connect END_STREAM JSON now returns `internal`** ([#192]).
-  A streaming Connect response whose END_STREAM envelope body was not valid
-  JSON was silently treated as a clean `Ok(None)` close (the parse error fell
-  through `unwrap_or_default()`). It now returns `Err(internal)` with the
+- **gRPC unary response content-type validation is protocol- and
+  codec-aware** ([#200]). The client previously accepted any response
+  `content-type` starting with `application/grpc`, so a gRPC client could
+  accept gRPC-Web framing, and a proto-configured client could try to decode
+  JSON bytes as proto. Validation now mirrors connect-go's
+  `grpcValidateResponseContentType`: the exact configured subtype and the
+  bare family type (`application/grpc` / `application/grpc-web`, which imply
+  proto and are what proxies such as Envoy send on trailers-only error
+  replies) are accepted, with `; parameter` suffixes stripped; a same-family
+  codec mismatch is rejected as `internal` and anything else as `unknown`,
+  with the expected content type named in the error message. A missing
+  `content-type` header remains accepted. This also covers gRPC / gRPC-Web
+  client-streaming responses, which share the unary parse path.
+- **Malformed Connect END_STREAM JSON now returns `internal`** ([#192],
+  [#201]). A streaming Connect response whose END_STREAM envelope body was not
+  valid JSON was silently treated as a clean `Ok(None)` close (the parse error
+  fell through `unwrap_or_default()`). It now returns `Err(internal)` with the
   serde error in the message, matching connect-go's behaviour for the same
-  case. Well-formed END_STREAM payloads (including the `null-error`,
-  `missing-code`, and unknown-field conformance shapes) are unchanged.
+  case, and the error carries the response headers on both the
+  server-streaming and client-streaming paths. Well-formed END_STREAM payloads
+  (including the `null-error`, `missing-code`, and unknown-field conformance
+  shapes) are unchanged.
 - **Connect client-streaming responses require the END_STREAM envelope**
   ([#163]). A response that ended after its single data message but before
   the END_STREAM envelope was accepted as a success with empty trailers, so
@@ -207,6 +235,9 @@ increment the patch version.
 [#192]: https://github.com/anthropics/connect-rust/pull/192
 [#194]: https://github.com/anthropics/connect-rust/pull/194
 [#197]: https://github.com/anthropics/connect-rust/pull/197
+[#199]: https://github.com/anthropics/connect-rust/pull/199
+[#200]: https://github.com/anthropics/connect-rust/pull/200
+[#201]: https://github.com/anthropics/connect-rust/pull/201
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
 ## [0.7.0] - 2026-06-10
