@@ -164,6 +164,19 @@ increment the patch version.
 
 ### Fixed
 
+- **gRPC unary response content-type validation is protocol- and
+  codec-aware** ([#200]). The client previously accepted any response
+  `content-type` starting with `application/grpc`, so a gRPC client could
+  accept gRPC-Web framing, and a proto-configured client could try to decode
+  JSON bytes as proto. Validation now mirrors connect-go's
+  `grpcValidateResponseContentType`: the exact configured subtype and the
+  bare family type (`application/grpc` / `application/grpc-web`, which imply
+  proto and are what proxies such as Envoy send on trailers-only error
+  replies) are accepted, with `; parameter` suffixes stripped; a same-family
+  codec mismatch is rejected as `internal` and anything else as `unknown`,
+  with the expected content type named in the error message. A missing
+  `content-type` header remains accepted. This also covers gRPC / gRPC-Web
+  client-streaming responses, which share the unary parse path.
 - **Malformed Connect END_STREAM JSON now returns `internal`** ([#192],
   [#201]). A streaming Connect response whose END_STREAM envelope body was not
   valid JSON was silently treated as a clean `Ok(None)` close (the parse error
@@ -193,6 +206,7 @@ increment the patch version.
 [#194]: https://github.com/anthropics/connect-rust/pull/194
 [#197]: https://github.com/anthropics/connect-rust/pull/197
 [#199]: https://github.com/anthropics/connect-rust/pull/199
+[#200]: https://github.com/anthropics/connect-rust/pull/200
 [#201]: https://github.com/anthropics/connect-rust/pull/201
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
