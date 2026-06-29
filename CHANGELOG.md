@@ -12,7 +12,7 @@ increment the patch version.
 
 ### Added
 
-- **`encodable_impls=all_messages` codegen option** ([#145]).
+- **`encodable_impls=all_messages` codegen option** ([#145], [#205]).
   `protoc-gen-connect-rust` can now emit the `::connectrpc::Encodable` view
   impl pair for every message defined in the targeted protos (not only RPC
   output types), including companion files for protos that declare no
@@ -205,6 +205,7 @@ increment the patch version.
 
 [#137]: https://github.com/anthropics/connect-rust/issues/137
 [#145]: https://github.com/anthropics/connect-rust/issues/145
+[#205]: https://github.com/anthropics/connect-rust/pull/205
 [#151]: https://github.com/anthropics/connect-rust/issues/151
 [#163]: https://github.com/anthropics/connect-rust/pull/163
 [#164]: https://github.com/anthropics/connect-rust/pull/164
