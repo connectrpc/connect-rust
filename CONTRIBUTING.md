@@ -1,7 +1,19 @@
 # Contributing to connect-rust
 
 See [`docs/guide.md`](docs/guide.md) for the user-facing handler/client API
-and the [README](README.md) for the workspace layout.
+and the [README](README.md) for the workspace layout. The current project
+maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
+
+## Developer Certificate of Origin
+
+All commits must be signed off to affirm compliance with the
+[Developer Certificate of Origin](https://developercertificate.org/).
+No Contributor License Agreement is required. Configure your git identity
+to match your GitHub account, then use the `-s` flag when committing:
+
+```console
+$ git commit -s -m "your commit message"
+```
 
 ## Prerequisites
 

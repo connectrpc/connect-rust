@@ -645,7 +645,10 @@ Local copies can be fetched with `task specs:fetch` (see [`docs/specs/`](docs/sp
 
 ## Contributing
 
-By submitting a pull request, you agree to the terms of our [Contributor License Agreement](CLA.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be signed off to
+affirm the [Developer Certificate of Origin](https://developercertificate.org/)
+(`git commit -s`); no Contributor License Agreement is required. The current
+maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 ## License
 
