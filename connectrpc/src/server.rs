@@ -182,6 +182,28 @@ impl PeerInfo {
 #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Default HTTP/1.1 header read timeout.
+///
+/// Bounds how long the server waits to receive a complete set of request
+/// headers, measured from the point hyper begins reading a new request on the
+/// connection. On a keep-alive connection this also bounds the idle wait
+/// between requests, so a peer that opens a connection (or finishes one
+/// request) and then stalls without sending the next request's headers is
+/// disconnected rather than holding a task and file descriptor open
+/// indefinitely. This mitigates slowloris-style connection-exhaustion attacks.
+///
+/// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
+/// connections — use `with_max_connection_age` to retire those by age.
+///
+/// This default is applied to every accepted connection. Earlier releases
+/// installed no connection timer, so the header read timeout never took
+/// effect; it is active by default as of the release that introduced
+/// [`Server::with_header_read_timeout`].
+///
+/// Override via [`Server::with_header_read_timeout`] or
+/// [`BoundServer::with_header_read_timeout`]; pass `None` to disable.
+pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 const DEFAULT_MAX_CONNECTION_AGE_GRACE: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_AGE_JITTER_BASIS_POINTS: u128 = 10_000;
 const MAX_CONNECTION_AGE_JITTER_SPREAD_BASIS_POINTS: u128 = 1_000;
@@ -275,6 +297,7 @@ pub struct Server {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     #[cfg(feature = "server-tls")]
     tls_handshake_timeout: std::time::Duration,
+    header_read_timeout: Option<Duration>,
     max_connection_age: Option<Duration>,
     max_connection_age_grace: Duration,
     http2: Http2Config,
@@ -291,6 +314,7 @@ impl Server {
             tls_config: None,
             #[cfg(feature = "server-tls")]
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
             http2: Http2Config::default(),
@@ -307,6 +331,7 @@ impl Server {
             tls_config: None,
             #[cfg(feature = "server-tls")]
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
             http2: Http2Config::default(),
@@ -352,6 +377,24 @@ impl Server {
     #[must_use]
     pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the HTTP/1.1 header read timeout.
+    ///
+    /// Defaults to [`DEFAULT_HEADER_READ_TIMEOUT`] (30 seconds). Bounds how
+    /// long the server waits to read a complete set of request headers,
+    /// measured from when hyper begins reading a new request; on a keep-alive
+    /// connection this also bounds the idle wait between requests. A peer that
+    /// connects (or finishes a request) and then stalls without sending the
+    /// next request's headers is disconnected, which mitigates slowloris-style
+    /// connection-exhaustion attacks. Pass `None` to disable.
+    ///
+    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
+    /// connections — use `with_max_connection_age` to retire those by age.
+    #[must_use]
+    pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.header_read_timeout = timeout.into();
         self
     }
 
@@ -634,6 +677,7 @@ impl Server {
             self.service,
             tls_acceptor,
             self.http1_keep_alive,
+            self.header_read_timeout,
             #[cfg(feature = "server-tls")]
             self.tls_handshake_timeout,
             None,
@@ -669,6 +713,7 @@ impl Server {
             tls_config: None,
             #[cfg(feature = "server-tls")]
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
             http2: Http2Config::default(),
@@ -689,6 +734,7 @@ impl Server {
             tls_config: None,
             #[cfg(feature = "server-tls")]
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
             max_connection_age: None,
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
             http2: Http2Config::default(),
@@ -705,6 +751,7 @@ pub struct BoundServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     #[cfg(feature = "server-tls")]
     tls_handshake_timeout: std::time::Duration,
+    header_read_timeout: Option<Duration>,
     max_connection_age: Option<Duration>,
     max_connection_age_grace: Duration,
     http2: Http2Config,
@@ -734,6 +781,24 @@ impl BoundServer {
     #[must_use]
     pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the HTTP/1.1 header read timeout.
+    ///
+    /// Defaults to [`DEFAULT_HEADER_READ_TIMEOUT`] (30 seconds). Bounds how
+    /// long the server waits to read a complete set of request headers,
+    /// measured from when hyper begins reading a new request; on a keep-alive
+    /// connection this also bounds the idle wait between requests. A peer that
+    /// connects (or finishes a request) and then stalls without sending the
+    /// next request's headers is disconnected, which mitigates slowloris-style
+    /// connection-exhaustion attacks. Pass `None` to disable.
+    ///
+    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
+    /// connections — use `with_max_connection_age` to retire those by age.
+    #[must_use]
+    pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.header_read_timeout = timeout.into();
         self
     }
 
@@ -1045,6 +1110,7 @@ impl BoundServer {
             service,
             tls_acceptor,
             self.http1_keep_alive,
+            self.header_read_timeout,
             #[cfg(feature = "server-tls")]
             self.tls_handshake_timeout,
             None,
@@ -1081,6 +1147,7 @@ impl BoundServer {
             service,
             tls_acceptor,
             self.http1_keep_alive,
+            self.header_read_timeout,
             #[cfg(feature = "server-tls")]
             self.tls_handshake_timeout,
             Some(Box::pin(signal)),
@@ -1189,6 +1256,7 @@ async fn serve_accepted_stream<D, S>(
     peer: PeerInfo,
     service: Arc<WrappedService<D>>,
     http1_keep_alive: bool,
+    header_read_timeout: Option<Duration>,
     global_shutdown: watch::Receiver<bool>,
     connection_age: Option<ConnectionAgeConfig>,
     http2: Http2Config,
@@ -1229,7 +1297,14 @@ async fn serve_accepted_stream<D, S>(
     });
 
     let mut builder = AutoBuilder::new(TokioExecutor::new());
-    builder.http1().keep_alive(http1_keep_alive);
+    // A timer is required for hyper's header read timeout (and any other
+    // time-based connection behaviour) to take effect; without it the
+    // configured `header_read_timeout` is silently ignored.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .keep_alive(http1_keep_alive)
+        .header_read_timeout(header_read_timeout);
     configure_http2(&mut builder, http2);
 
     let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
@@ -1528,6 +1603,7 @@ async fn serve_with_listener<D: Dispatcher>(
     service: ConnectRpcService<D>,
     tls_acceptor: MaybeTlsAcceptor,
     http1_keep_alive: bool,
+    header_read_timeout: Option<Duration>,
     #[cfg(feature = "server-tls")] tls_handshake_timeout: std::time::Duration,
     shutdown: ShutdownSignal,
     connection_age: Option<ConnectionAgeConfig>,
@@ -1636,6 +1712,7 @@ async fn serve_with_listener<D: Dispatcher>(
                             peer,
                             service,
                             http1_keep_alive,
+                            header_read_timeout,
                             global_shutdown,
                             connection_age,
                             http2,
@@ -1671,6 +1748,7 @@ async fn serve_with_listener<D: Dispatcher>(
                 peer,
                 service,
                 http1_keep_alive,
+                header_read_timeout,
                 global_shutdown,
                 connection_age,
                 http2,
@@ -2174,6 +2252,131 @@ mod tests {
     #[should_panic(expected = "non-zero duration")]
     fn with_max_connection_age_rejects_zero() {
         let _ = Server::new(Router::new()).with_max_connection_age(Duration::ZERO);
+    }
+
+    #[test]
+    fn header_read_timeout_builder_defaults_and_overrides() {
+        // Default is on at DEFAULT_HEADER_READ_TIMEOUT.
+        let server = Server::new(Router::new());
+        assert_eq!(
+            server.header_read_timeout,
+            Some(DEFAULT_HEADER_READ_TIMEOUT)
+        );
+
+        // An explicit value overrides the default.
+        let server =
+            Server::new(Router::new()).with_header_read_timeout(Some(Duration::from_secs(5)));
+        assert_eq!(server.header_read_timeout, Some(Duration::from_secs(5)));
+
+        // `None` disables it.
+        let server = Server::new(Router::new()).with_header_read_timeout(None::<Duration>);
+        assert_eq!(server.header_read_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn bound_server_header_read_timeout_builder_defaults_and_overrides() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = Server::from_listener(listener);
+        assert_eq!(bound.header_read_timeout, Some(DEFAULT_HEADER_READ_TIMEOUT));
+
+        let bound = bound.with_header_read_timeout(Some(Duration::from_secs(2)));
+        assert_eq!(bound.header_read_timeout, Some(Duration::from_secs(2)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = Server::from_listener(listener).with_header_read_timeout(None::<Duration>);
+        assert_eq!(bound.header_read_timeout, None);
+    }
+
+    /// A peer that opens a connection and sends an incomplete header block must
+    /// be disconnected once the header read timeout elapses, rather than
+    /// holding the connection (and its task and file descriptor) open forever.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_closes_stalled_connection() {
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_header_read_timeout(Some(Duration::from_secs(10)));
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(Router::new(), async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        // Send a partial request that never terminates the header block, so
+        // hyper stays in "reading request headers" and arms the timeout.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"POST /svc/Echo HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+
+        // Relies on tokio's paused-clock auto-advance: once the connection
+        // task has armed the header-read timer and parked, the runtime
+        // advances to fire it. The explicit advance keeps the intent obvious.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        yield_to_tasks().await;
+
+        let mut buf = [0; 1];
+        let read = stream.read(&mut buf).await.unwrap();
+        assert_eq!(
+            read, 0,
+            "stalled connection stayed open past the header read timeout"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
+    }
+
+    /// A complete request well within the header read timeout is served
+    /// normally — the timer must not interfere with healthy traffic.
+    #[tokio::test]
+    async fn header_read_timeout_allows_prompt_requests() {
+        let router = Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                |_ctx: crate::RequestContext, _req: buffa_types::Empty| async move {
+                    crate::Response::ok(buffa_types::Empty::default())
+                },
+            ),
+        );
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_header_read_timeout(Some(Duration::from_secs(30)));
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(ECHO_REQ).await.unwrap();
+        let resp = read_http1_response(&mut stream).await;
+        assert!(
+            resp.starts_with(b"HTTP/1.1 2"),
+            "expected 2xx, got: {}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
     }
 
     #[test]

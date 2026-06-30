@@ -60,14 +60,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 use crate::server::{
-    DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerAddr, PeerCerts, is_transient_accept_error,
+    DEFAULT_HEADER_READ_TIMEOUT, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerAddr, PeerCerts,
+    is_transient_accept_error,
 };
 
 /// Serve an `axum::Router` over TLS, exposing peer identity to handlers.
@@ -127,6 +128,7 @@ pub fn serve_tls(
         router,
         acceptor: tokio_rustls::TlsAcceptor::from(tls_config),
         tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+        header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
         shutdown: None,
     }
 }
@@ -142,6 +144,7 @@ pub struct ServeTls {
     router: axum::Router,
     acceptor: tokio_rustls::TlsAcceptor,
     tls_handshake_timeout: Duration,
+    header_read_timeout: Option<Duration>,
     shutdown: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
@@ -152,6 +155,25 @@ impl ServeTls {
     #[must_use = "ServeTls does nothing unless `.await`ed"]
     pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// Override the HTTP/1.1 header read timeout (default
+    /// [`DEFAULT_HEADER_READ_TIMEOUT`], 30 seconds).
+    ///
+    /// Bounds how long the server waits to read a complete set of request
+    /// headers, measured from when hyper begins reading a new request; on a
+    /// keep-alive connection this also bounds the idle wait between requests.
+    /// A peer that connects (or finishes a request) and then stalls without
+    /// sending the next request's headers is disconnected, which mitigates
+    /// slowloris-style connection-exhaustion attacks. Pass `None` to disable.
+    ///
+    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
+    /// connections — use `Server::with_max_connection_age` to retire those by
+    /// age.
+    #[must_use = "ServeTls does nothing unless `.await`ed"]
+    pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.header_read_timeout = timeout.into();
         self
     }
 
@@ -173,6 +195,7 @@ impl std::fmt::Debug for ServeTls {
         f.debug_struct("ServeTls")
             .field("listener", &self.listener)
             .field("tls_handshake_timeout", &self.tls_handshake_timeout)
+            .field("header_read_timeout", &self.header_read_timeout)
             .field("shutdown", &self.shutdown.is_some())
             .finish_non_exhaustive()
     }
@@ -194,6 +217,7 @@ impl ServeTls {
             router,
             acceptor,
             tls_handshake_timeout,
+            header_read_timeout,
             shutdown,
         } = self;
 
@@ -277,7 +301,17 @@ impl ServeTls {
                 // (WebSockets) work out of the box. ConnectRPC routes don't
                 // upgrade, so this is a no-op for them. Keep this divergence —
                 // it matches what `axum::serve` does internally.
-                let conn = AutoBuilder::new(TokioExecutor::new())
+                let mut builder = AutoBuilder::new(TokioExecutor::new());
+                // A timer is required for hyper's header read timeout (and any
+                // other time-based connection behaviour) to take effect;
+                // without it the configured `header_read_timeout` is silently
+                // ignored.
+                builder
+                    .http1()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(header_read_timeout);
+                builder.http2().timer(TokioTimer::new());
+                let conn = builder
                     .serve_connection_with_upgrades(TokioIo::new(tls_stream), svc)
                     .into_owned();
                 if let Err(err) = watcher.watch(conn).await {
@@ -467,6 +501,55 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), serve)
             .await
             .expect("handshake timeout must release the watcher so drain completes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_read_timeout_closes_stalled_connection() {
+        let (server_cfg, client_cfg, _) = pki();
+        let app = axum::Router::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            serve_tls(listener, app, server_cfg)
+                .with_header_read_timeout(Some(Duration::from_millis(150)))
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .into_future(),
+        );
+
+        // Complete the TLS handshake, then send a partial HTTP/1.1 request whose
+        // header block never terminates, so hyper stays in "reading headers".
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(client_cfg);
+        let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.unwrap();
+        tls.write_all(b"POST /svc/Echo HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+
+        // The header read timeout must close the connection. `read_to_end`
+        // resolves on close; if the timeout were not wired, it would hang until
+        // the outer guard fails the test. The server tears the connection down
+        // abruptly when the timeout fires, so rustls reports an `UnexpectedEof`
+        // rather than a clean close — either outcome confirms closure.
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf))
+            .await
+            .expect("server did not close the stalled connection");
+        assert!(
+            !buf.starts_with(b"HTTP/1.1 2"),
+            "stalled request should not have been served: {}",
+            String::from_utf8_lossy(&buf[..buf.len().min(80)])
+        );
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve should shut down")
             .unwrap()
             .unwrap();
     }
