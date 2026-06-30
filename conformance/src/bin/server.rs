@@ -201,7 +201,7 @@ impl ConformanceService for ConformanceServiceImpl {
             "type.googleapis.com/connectrpc.conformance.v1.UnaryRequest",
         );
 
-        let request = request.to_owned_message();
+        let request = request.to_owned_message()?;
         let def = request.response_definition.as_option();
 
         if let Some(def) = def {
@@ -258,7 +258,7 @@ impl ConformanceService for ConformanceServiceImpl {
             "type.googleapis.com/connectrpc.conformance.v1.IdempotentUnaryRequest",
         );
 
-        let request = request.to_owned_message();
+        let request = request.to_owned_message()?;
         let def = request.response_definition.as_option();
 
         if let Some(def) = def {
@@ -326,7 +326,7 @@ impl ConformanceService for ConformanceServiceImpl {
             "type.googleapis.com/connectrpc.conformance.v1.ServerStreamRequest",
         );
 
-        let request = request.to_owned_message();
+        let request = request.to_owned_message()?;
 
         // Handle response definition
         if !request.response_definition.is_set() {
@@ -441,7 +441,7 @@ impl ConformanceService for ConformanceServiceImpl {
         while let Some(r) = requests.next().await {
             let item = r?;
             let bytes = item.bytes().to_vec();
-            let msg = item.to_owned_message();
+            let msg = item.to_owned_message()?;
             all_requests.push((bytes, msg));
         }
 
@@ -555,7 +555,7 @@ impl ConformanceService for ConformanceServiceImpl {
         let mut requests = requests.map(|r| {
             let item = r?;
             let bytes = item.bytes().to_vec();
-            let msg = item.to_owned_message();
+            let msg = item.to_owned_message()?;
             Ok((bytes, msg))
         });
 

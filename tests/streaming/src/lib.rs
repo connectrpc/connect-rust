@@ -51,7 +51,7 @@ mod tests {
             //    takes owned data: convert (or copy fields) first, then move
             //    the owned value into the task. Capturing `request` itself in
             //    a spawned task does not compile.
-            let owned = request.to_owned_message();
+            let owned = request.to_owned_message()?;
             let sequence = tokio::spawn(async move { owned.sequence })
                 .await
                 .expect("spawned background task");
@@ -233,7 +233,7 @@ mod tests {
         // copies all string/bytes fields. Only needed when you want the
         // prost-style `EchoResponse` (e.g. to pass to `fn(&EchoResponse)`
         // or store in a Vec<EchoResponse>).
-        let owned: EchoResponse = client.echo(req()).await.unwrap().into_owned();
+        let owned: EchoResponse = client.echo(req()).await.unwrap().into_owned().unwrap();
         assert_eq!(owned.sequence, 7);
         assert_eq!(owned.data, "test"); // String, allocated
     }

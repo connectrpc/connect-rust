@@ -38,28 +38,16 @@ pub mod client_compat_request {
                         map.serialize_entry("beforeCloseSend", v)?;
                     }
                     Self::AfterCloseSendMs(v) => {
-                        struct _W<'a>(&'a u32);
-                        impl serde::Serialize for _W<'_> {
-                            fn serialize<S2: serde::Serializer>(
-                                &self,
-                                s: S2,
-                            ) -> ::core::result::Result<S2::Ok, S2::Error> {
-                                ::buffa::json_helpers::uint32::serialize(self.0, s)
-                            }
-                        }
-                        map.serialize_entry("afterCloseSendMs", &_W(v))?;
+                        map.serialize_entry(
+                            "afterCloseSendMs",
+                            &::buffa::json_helpers::ProtoJson(v),
+                        )?;
                     }
                     Self::AfterNumResponses(v) => {
-                        struct _W<'a>(&'a u32);
-                        impl serde::Serialize for _W<'_> {
-                            fn serialize<S2: serde::Serializer>(
-                                &self,
-                                s: S2,
-                            ) -> ::core::result::Result<S2::Ok, S2::Error> {
-                                ::buffa::json_helpers::uint32::serialize(self.0, s)
-                            }
-                        }
-                        map.serialize_entry("afterNumResponses", &_W(v))?;
+                        map.serialize_entry(
+                            "afterNumResponses",
+                            &::buffa::json_helpers::ProtoJson(v),
+                        )?;
                     }
                 }
                 map.end()

@@ -7,7 +7,7 @@
 //! Make sure the multiservice-server is running first:
 //!   `cargo run --bin multiservice-server`
 
-use std::collections::HashMap;
+use buffa::Map;
 
 // `value` (lowercase) is the oneof submodule for `Value`'s `kind`
 // oneof, re-exported at the natural path by buffa 0.5+.
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Duration: {}s {}ns", duration.seconds, duration.nanos);
 
     tracing::info!("Testing ProcessMetadata RPC...");
-    let mut fields = HashMap::new();
+    let mut fields = Map::default();
     fields.insert(
         "name".to_string(),
         Value {

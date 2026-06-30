@@ -178,7 +178,7 @@ pub const WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC: ::connectrpc::Spec = ::connec
 /// buffer) and the borrow may be held across `.await` points. Anything
 /// that must outlive the call — `tokio::spawn`, channels, server state,
 /// or data captured by a returned response stream — takes owned data:
-/// call `request.to_owned_message()` (or copy the specific fields)
+/// call `request.to_owned_message()?` (or copy the specific fields)
 /// first.
 ///
 /// **Client-streaming and bidi requests** arrive as
@@ -186,12 +186,12 @@ pub const WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC: ::connectrpc::Spec = ::connec
 /// Each item owns its decoded buffer and is `Send + 'static`, so items
 /// can be buffered or moved into spawned tasks; read fields zero-copy
 /// through the generated accessor methods (`item.name()`) or `.view()`,
-/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// convert with `.to_owned_message()?`, or yield an item back unchanged —
 /// `StreamMessage<M>` implements `Encodable<M>`.
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.7.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -221,7 +221,7 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn create_event<'a>(
         &'a self,
@@ -244,7 +244,7 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn calculate_duration<'a>(
         &'a self,
@@ -267,7 +267,7 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn process_metadata<'a>(
         &'a self,
@@ -291,7 +291,7 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn heartbeat<'a>(
         &'a self,
@@ -729,17 +729,19 @@ for WellKnownTypesServiceServer<T> {
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
-/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned):
+/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned) — fallible,
+/// since rebuilding preserved unknown fields can exceed the unknown-field
+/// allowance:
 ///
 /// ```rust,ignore
-/// let owned = client.create_event(request).await?.into_owned();
+/// let owned = client.create_event(request).await?.into_owned()?;
 /// ```
 ///
 /// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
 /// zero-copy decoded body (an `OwnedView`) without copying; field access on it
 /// goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
 /// received message from `.message().await` — bind `msg.reborrow()` for field
-/// access, or convert with `.to_owned_message()`.
+/// access, or convert with `.to_owned_message()?`.
 #[derive(Clone)]
 pub struct WellKnownTypesServiceClient<T> {
     transport: T,

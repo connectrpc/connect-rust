@@ -551,7 +551,9 @@ async fn do_unary_call(
                     .map_err(|e| ConnectError::internal(format!("decode request: {e}")))?;
                 let resp = do_call!(UnaryRequest, UnaryResponseView<'static>, request);
                 let (headers, message, trailers) = resp.into_parts();
-                let message = message.to_owned_message();
+                let message = message
+                    .to_owned_message()
+                    .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
                 let payload = if message.payload.is_set() {
                     message.payload.as_option().unwrap().clone()
                 } else {
@@ -569,7 +571,9 @@ async fn do_unary_call(
                     request
                 );
                 let (headers, message, trailers) = resp.into_parts();
-                let message = message.to_owned_message();
+                let message = message
+                    .to_owned_message()
+                    .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
                 let payload = if message.payload.is_set() {
                     message.payload.as_option().unwrap().clone()
                 } else {
@@ -583,7 +587,9 @@ async fn do_unary_call(
                 let request = UnaryRequest::decode_from_slice(proto_bytes).unwrap_or_default();
                 let resp = do_call!(UnaryRequest, UnaryResponseView<'static>, request);
                 let (headers, message, trailers) = resp.into_parts();
-                let message = message.to_owned_message();
+                let message = message
+                    .to_owned_message()
+                    .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
                 let payload = if message.payload.is_set() {
                     message.payload.as_option().unwrap().clone()
                 } else {
@@ -917,7 +923,9 @@ async fn do_server_stream_call(
 
         match msg {
             Ok(Some(resp)) => {
-                let resp = resp.to_owned_message();
+                let resp = resp
+                    .to_owned_message()
+                    .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
                 let payload = if resp.payload.is_set() {
                     resp.payload.as_option().unwrap().clone()
                 } else {
@@ -1046,7 +1054,9 @@ async fn do_client_stream_call(
         )
         .await?;
         let (headers, message, trailers) = resp.into_parts();
-        let message = message.to_owned_message();
+        let message = message
+            .to_owned_message()
+            .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
         let payload = if message.payload.is_set() {
             message.payload.as_option().unwrap().clone()
         } else {
@@ -1320,7 +1330,9 @@ async fn do_bidi_stream_call(
                     deadline_exceeded!(num_unsent);
                 }
                 Ok(Ok(Some(resp))) => {
-                    let resp = resp.to_owned_message();
+                    let resp = resp
+                        .to_owned_message()
+                        .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
                     let payload = if resp.payload.is_set() {
                         resp.payload.as_option().unwrap().clone()
                     } else {
@@ -1467,7 +1479,9 @@ async fn do_bidi_stream_call(
 
         match msg {
             Ok(Some(resp)) => {
-                let resp = resp.to_owned_message();
+                let resp = resp
+                    .to_owned_message()
+                    .map_err(|e| ConnectError::internal(format!("convert response: {e}")))?;
                 let payload = if resp.payload.is_set() {
                     resp.payload.as_option().unwrap().clone()
                 } else {

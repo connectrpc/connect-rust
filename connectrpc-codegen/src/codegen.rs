@@ -59,11 +59,11 @@ pub struct Options {
     /// [`generate_files`] (the unified `super::`-relative path).
     ///
     /// Every `extern_path` target must be buffa-generated code from
-    /// buffa ≥ 0.7.0 with views enabled (and, if the crate feature-gates
+    /// buffa ≥ 0.8.0 with views enabled (and, if the crate feature-gates
     /// its generated impls, with that feature turned on): the service
     /// stubs rely on the `buffa::HasMessageView` impls and `FooOwnedView`
     /// wrappers emitted alongside each message, the same way they rely on
-    /// the JSON/`Serialize` impls. `buffa-types` 0.7+ satisfies this for
+    /// the JSON/`Serialize` impls. `buffa-types` 0.8+ satisfies this for
     /// the well-known types. A crate generated without them fails to
     /// compile against the stubs (missing `HasMessageView` impl).
     pub buffa: CodeGenConfig,
@@ -157,7 +157,7 @@ impl Options {
             }
             return Ok("client");
         }
-        if !is_valid_feature_name(name) {
+        if !buffa_codegen::FeatureGateNames::is_valid_name(name) {
             anyhow::bail!(
                 "client feature name {name:?} is not a valid Cargo feature name \
                  (must start with an alphanumeric or `_` and contain only \
@@ -166,22 +166,6 @@ impl Options {
         }
         Ok(name)
     }
-}
-
-/// Conservative ASCII subset of Cargo's feature-name grammar (matches the
-/// crates.io constraint): starts with an ASCII alphanumeric or `_`; remainder
-/// drawn from alphanumerics, `_`, `-`, `+`, `.`. An invalid name would emit
-/// `#[cfg(feature = "...")]` that Cargo can never enable, silently suppressing
-/// every generated client item.
-//
-// Once the buffa-codegen dependency is bumped to 0.8, replace this with
-// `buffa_codegen::FeatureGateNames::is_valid_name` (same rule, single source).
-fn is_valid_feature_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
 }
 
 /// Emit one [`GeneratedFile`] per proto file in `file_to_generate` that
@@ -555,9 +539,9 @@ pub fn generate_services(
 ///   `extern_path=.=<path>` is the catch-all (equivalent to `buffa_module`).
 ///   At least one catch-all mapping is required so every type resolves.
 ///   Every mapped path must point at buffa-generated code from
-///   buffa ≥ 0.7.0 with views enabled — the stubs use the
+///   buffa ≥ 0.8.0 with views enabled — the stubs use the
 ///   `buffa::HasMessageView` impls and owned-view wrappers generated with
-///   each message (`buffa-types` 0.7+ qualifies for the well-known types).
+///   each message (`buffa-types` 0.8+ qualifies for the well-known types).
 /// - `file_per_package` — emit one `<dotted.pkg>.rs` per proto package
 ///   instead of the per-proto split + stitcher. Set `protoc-gen-buffa`'s
 ///   own `file_per_package` option to the same value — the BSR/`tonic`
@@ -995,7 +979,7 @@ fn alias_collides(batch: &BatchState, current_package: &str, proto_fqn: &str) ->
 /// input type, including ones mapped via `extern_path`: the backing
 /// `buffa::HasMessageView` impl is emitted by buffa's codegen in the crate
 /// that owns the type (`extern_path` targets are required to be generated
-/// with buffa ≥ 0.7.0 and views enabled).
+/// with buffa ≥ 0.8.0 and views enabled).
 fn router_stream_items_tokens(
     resolver: &TypeResolver<'_>,
     method: &MethodDescriptorProto,
@@ -1025,7 +1009,7 @@ fn stream_items_doc(method: &MethodDescriptorProto) -> TokenStream {
         #[doc = " Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):"]
         #[doc = " it owns its buffer, is `Send + 'static`, and exposes zero-copy"]
         #[doc = " accessor methods (`item.name()`), `.view()`, and"]
-        #[doc = " `.to_owned_message()`."]
+        #[doc = " `.to_owned_message()?`."]
     };
     if method.input_type == method.output_type {
         doc.extend(quote! {
@@ -1363,18 +1347,18 @@ fn generate_service(
          buffer) and the borrow may be held across `.await` points. Anything\n\
          that must outlive the call — `tokio::spawn`, channels, server state,\n\
          or data captured by a returned response stream — takes owned data:\n\
-         call `request.to_owned_message()` (or copy the specific fields)\n\
+         call `request.to_owned_message()?` (or copy the specific fields)\n\
          first.\n\n\
          **Client-streaming and bidi requests** arrive as\n\
          `ServiceStream<`[`StreamMessage<Req>`](::connectrpc::StreamMessage)`>`.\n\
          Each item owns its decoded buffer and is `Send + 'static`, so items\n\
          can be buffered or moved into spawned tasks; read fields zero-copy\n\
          through the generated accessor methods (`item.name()`) or `.view()`,\n\
-         convert with `.to_owned_message()`, or yield an item back unchanged —\n\
+         convert with `.to_owned_message()?`, or yield an item back unchanged —\n\
          `StreamMessage<M>` implements `Encodable<M>`.\n\n\
          Request types resolved through `extern_path` (e.g. well-known types\n\
          from another crate) use the same wrappers; the crate that owns the\n\
-         type must be generated with buffa ≥ 0.7.0 and views enabled so the\n\
+         type must be generated with buffa ≥ 0.8.0 and views enabled so the\n\
          backing `HasMessageView` impl exists.\n\n\
          The `impl Encodable<Out>` return bound accepts the owned `Out`, the\n\
          generated `OutView<'_>` / `OwnedOutView`,\n\
@@ -1629,17 +1613,19 @@ let name: &str = resp.view().name;  // borrow into the response buffer
 ```
 
 If you need the owned struct (e.g. to store or pass by value), use
-[`into_owned()`](::connectrpc::client::UnaryResponse::into_owned):
+[`into_owned()`](::connectrpc::client::UnaryResponse::into_owned) — fallible,
+since rebuilding preserved unknown fields can exceed the unknown-field
+allowance:
 
 ```rust,ignore
-let owned = client.{example_method}(request).await?.into_owned();
+let owned = client.{example_method}(request).await?.into_owned()?;
 ```
 
 [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
 zero-copy decoded body (an `OwnedView`) without copying; field access on it
 goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
 received message from `.message().await` — bind `msg.reborrow()` for field
-access, or convert with `.to_owned_message()`."#
+access, or convert with `.to_owned_message()?`."#
     );
     let client_doc_tokens = doc_attrs(&client_doc);
     // Opt-in feature cfg on every client-side item.
@@ -2136,7 +2122,7 @@ fn generate_trait_method(
             #[doc = " duration of the call (until the response stream is returned);"]
             #[doc = " message fields are read directly on it (zero-copy). Data the"]
             #[doc = " returned stream needs must be copied out or converted via"]
-            #[doc = " `.to_owned_message()`."]
+            #[doc = " `.to_owned_message()?`."]
         };
         Ok(quote! {
             #method_doc_tokens
@@ -2199,7 +2185,7 @@ fn generate_trait_method(
             #[doc = " `request` is borrowed from the request body and is valid for the"]
             #[doc = " duration of the call; message fields are read directly on it"]
             #[doc = " (zero-copy). The response cannot borrow from `request` — use"]
-            #[doc = " `.to_owned_message()` (or copy the specific fields) for anything"]
+            #[doc = " `.to_owned_message()?` (or copy the specific fields) for anything"]
             #[doc = " returned, stored, or moved into `tokio::spawn`."]
         };
         Ok(quote! {
@@ -2729,7 +2715,7 @@ mod tests {
         );
         // `.google.protobuf.Empty` resolves through the default extern_path to
         // `::buffa_types::…`. extern_path targets are required to be
-        // buffa ≥ 0.7.0 generated code with views enabled, so the unary input
+        // buffa ≥ 0.8.0 generated code with views enabled, so the unary input
         // uses the same `ServiceRequest<'_, Req>` form as local types — the
         // backing `buffa::HasMessageView` impl ships with buffa-types.
         assert!(
@@ -4213,16 +4199,6 @@ mod tests {
             msg.contains("gate_client_feature requires a non-empty feature name"),
             "error should describe the empty feature-name problem: {msg}"
         );
-    }
-
-    #[test]
-    fn is_valid_feature_name_matches_cargo_grammar() {
-        for ok in ["client", "grpc-client", "_x", "a.b+c", "0abc"] {
-            assert!(is_valid_feature_name(ok), "{ok:?} should be valid");
-        }
-        for bad in ["", "grpc client", "foo/bar", "-leading", ".leading"] {
-            assert!(!is_valid_feature_name(bad), "{bad:?} should be invalid");
-        }
     }
 
     #[test]

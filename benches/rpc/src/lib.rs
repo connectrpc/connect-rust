@@ -15,7 +15,7 @@ pub use connect::bench::v1::*;
 // `__buffa::view::FooView` path for that type if it happens.
 pub use proto::bench::v1::*;
 
-use std::collections::HashMap;
+use buffa::Map;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ impl BenchService for BenchServiceImpl {
         _ctx: RequestContext,
         req: ServiceRequest<'_, BenchRequest>,
     ) -> ServiceResult<BenchResponse> {
-        let req = req.to_owned_message();
+        let req = req.to_owned_message()?;
         Response::ok(BenchResponse {
             payload: req.payload,
             ..Default::default()
@@ -47,7 +47,7 @@ impl BenchService for BenchServiceImpl {
         _ctx: RequestContext,
         req: ServiceRequest<'_, BenchRequest>,
     ) -> ServiceResult<ServiceStream<BenchResponse>> {
-        let req = req.to_owned_message();
+        let req = req.to_owned_message()?;
         let count = req.response_count;
         let payload = req.payload;
         let stream = futures::stream::unfold(0, move |i| {
@@ -75,7 +75,7 @@ impl BenchService for BenchServiceImpl {
     ) -> ServiceResult<BenchResponse> {
         let mut last_payload = Default::default();
         while let Some(req) = requests.next().await {
-            let req = req?.to_owned_message();
+            let req = req?.to_owned_message()?;
             last_payload = req.payload;
         }
         Response::ok(BenchResponse {
@@ -104,7 +104,7 @@ impl BenchService for BenchServiceImpl {
         req: ServiceRequest<'_, LogRequest>,
     ) -> ServiceResult<LogResponse> {
         // Same handler logic but using owned types (pre-borrowed-view path).
-        let req = req.to_owned_message();
+        let req = req.to_owned_message()?;
         let count = process_log_records_owned(&req.records);
         Response::ok(LogResponse {
             count,
@@ -119,7 +119,7 @@ impl BenchService for BenchServiceImpl {
     ) -> ServiceResult<ServiceStream<BenchResponse>> {
         // `StreamMessage` items are Send + 'static; convert to owned where the
         // response construction needs the owned payload by value.
-        let mut requests = Box::pin(requests.map(|r| r.map(|v| v.to_owned_message())));
+        let mut requests = Box::pin(requests.map(|r| r.and_then(|v| v.to_owned_message())));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<BenchResponse, ConnectError>>(1);
         tokio::spawn(async move {
             while let Some(req) = requests.next().await {
@@ -261,7 +261,7 @@ pub fn large_request() -> BenchRequest {
 }
 
 pub fn small_payload() -> Payload {
-    let mut attributes = HashMap::new();
+    let mut attributes = Map::default();
     for i in 0..5 {
         attributes.insert(format!("key-{i}"), format!("value-{i}"));
     }
@@ -282,7 +282,7 @@ pub fn small_payload() -> Payload {
             request_id: "req-abc-123-def-456".into(),
             user_agent: "connectrpc-rs/bench/1.0".into(),
             created_at: 1_700_000_000,
-            headers: HashMap::from([
+            headers: Map::from_iter([
                 ("x-request-id".into(), "abc123".into()),
                 ("authorization".into(), "Bearer tok".into()),
             ]),
@@ -305,7 +305,7 @@ pub fn small_payload() -> Payload {
 pub fn log_request(n: usize) -> LogRequest {
     let records = (0..n)
         .map(|i| {
-            let mut labels = HashMap::new();
+            let mut labels = Map::default();
             for j in 0..6 {
                 labels.insert(format!("label-key-{j}"), format!("label-value-{i}-{j}"));
             }
@@ -343,7 +343,7 @@ pub fn log_request(n: usize) -> LogRequest {
 }
 
 pub fn large_payload() -> Payload {
-    let mut attributes = HashMap::new();
+    let mut attributes = Map::default();
     for i in 0..50 {
         attributes.insert(
             format!("attribute-key-{i:03}"),
@@ -351,7 +351,7 @@ pub fn large_payload() -> Payload {
         );
     }
 
-    let mut headers = HashMap::new();
+    let mut headers = Map::default();
     for i in 0..20 {
         headers.insert(format!("x-header-{i:03}"), format!("header-value-{i:03}"));
     }

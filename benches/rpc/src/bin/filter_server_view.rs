@@ -22,7 +22,7 @@ impl FilterService for Impl {
             // (zero-copy) and keep the ViewEncode response path under test.
             return Response::ok(MaybeBorrowed::Borrowed(request.to_owned_view()));
         }
-        let mut owned = request.to_owned_message();
+        let mut owned = request.to_owned_message()?;
         scrub(&mut owned);
         Response::ok(MaybeBorrowed::Owned(owned))
     }

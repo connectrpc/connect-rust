@@ -40,12 +40,7 @@ impl AddRequest {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.math.v1.AddRequest";
 }
-impl ::buffa::DefaultInstance for AddRequest {
-    fn default_instance() -> &'static Self {
-        static VALUE: ::buffa::__private::OnceBox<AddRequest> = ::buffa::__private::OnceBox::new();
-        VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
-    }
-}
+::buffa::impl_default_instance!(AddRequest);
 impl ::buffa_descriptor::reflect::Reflectable for AddRequest {
     /// Bridge-mode reflective handle: encodes `self` and decodes
     /// it into a [`DynamicMessage`](::buffa_descriptor::reflect::DynamicMessage)
@@ -134,14 +129,10 @@ impl ::buffa::Message for AddRequest {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if self.a != 0i32 {
-            ::buffa::encoding::Tag::new(1u32, ::buffa::encoding::WireType::Varint)
-                .encode(buf);
-            ::buffa::types::encode_int32(self.a, buf);
+            ::buffa::types::put_int32_field(1u32, self.a, buf);
         }
         if self.b != 0i32 {
-            ::buffa::encoding::Tag::new(2u32, ::buffa::encoding::WireType::Varint)
-                .encode(buf);
-            ::buffa::types::encode_int32(self.b, buf);
+            ::buffa::types::put_int32_field(2u32, self.b, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -149,7 +140,7 @@ impl ::buffa::Message for AddRequest {
         &mut self,
         tag: ::buffa::encoding::Tag,
         buf: &mut impl ::buffa::bytes::Buf,
-        depth: u32,
+        ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<(), ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::bytes::Buf as _;
@@ -157,28 +148,22 @@ impl ::buffa::Message for AddRequest {
         use ::buffa::Enumeration as _;
         match tag.field_number() {
             1u32 => {
-                if tag.wire_type() != ::buffa::encoding::WireType::Varint {
-                    return ::core::result::Result::Err(::buffa::DecodeError::WireTypeMismatch {
-                        field_number: 1u32,
-                        expected: 0u8,
-                        actual: tag.wire_type() as u8,
-                    });
-                }
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
                 self.a = ::buffa::types::decode_int32(buf)?;
             }
             2u32 => {
-                if tag.wire_type() != ::buffa::encoding::WireType::Varint {
-                    return ::core::result::Result::Err(::buffa::DecodeError::WireTypeMismatch {
-                        field_number: 2u32,
-                        expected: 0u8,
-                        actual: tag.wire_type() as u8,
-                    });
-                }
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
                 self.b = ::buffa::types::decode_int32(buf)?;
             }
             _ => {
                 self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, depth)?);
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
             }
         }
         ::core::result::Result::Ok(())
@@ -248,12 +233,7 @@ impl AddResponse {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/anthropic.connectrpc.math.v1.AddResponse";
 }
-impl ::buffa::DefaultInstance for AddResponse {
-    fn default_instance() -> &'static Self {
-        static VALUE: ::buffa::__private::OnceBox<AddResponse> = ::buffa::__private::OnceBox::new();
-        VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
-    }
-}
+::buffa::impl_default_instance!(AddResponse);
 impl ::buffa_descriptor::reflect::Reflectable for AddResponse {
     /// Bridge-mode reflective handle: encodes `self` and decodes
     /// it into a [`DynamicMessage`](::buffa_descriptor::reflect::DynamicMessage)
@@ -339,9 +319,7 @@ impl ::buffa::Message for AddResponse {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if self.result != 0i32 {
-            ::buffa::encoding::Tag::new(1u32, ::buffa::encoding::WireType::Varint)
-                .encode(buf);
-            ::buffa::types::encode_int32(self.result, buf);
+            ::buffa::types::put_int32_field(1u32, self.result, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -349,7 +327,7 @@ impl ::buffa::Message for AddResponse {
         &mut self,
         tag: ::buffa::encoding::Tag,
         buf: &mut impl ::buffa::bytes::Buf,
-        depth: u32,
+        ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<(), ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::bytes::Buf as _;
@@ -357,18 +335,15 @@ impl ::buffa::Message for AddResponse {
         use ::buffa::Enumeration as _;
         match tag.field_number() {
             1u32 => {
-                if tag.wire_type() != ::buffa::encoding::WireType::Varint {
-                    return ::core::result::Result::Err(::buffa::DecodeError::WireTypeMismatch {
-                        field_number: 1u32,
-                        expected: 0u8,
-                        actual: tag.wire_type() as u8,
-                    });
-                }
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
                 self.result = ::buffa::types::decode_int32(buf)?;
             }
             _ => {
                 self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, depth)?);
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
             }
         }
         ::core::result::Result::Ok(())

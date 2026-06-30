@@ -7,11 +7,11 @@
 //! string == bytes in proto encoding), but the service path differs and
 //! the Rust request type uses `Vec<u8>` for strings.
 
+use buffa::Map;
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection};
 use rpc_bench::connect::bench::noutf8::v1::*;
 use rpc_bench::proto::bench::noutf8::v1::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 fn build_request(n: usize) -> LogRequest {
     let records = (0..n)
         .map(|i| {
-            let mut labels = HashMap::new();
+            let mut labels = Map::default();
             for j in 0..6 {
                 labels.insert(
                     format!("label-key-{j}").into_bytes(),

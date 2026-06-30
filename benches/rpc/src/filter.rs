@@ -1,6 +1,6 @@
 //! Shared types and helpers for the filter (redaction) benchmark.
 
-use std::collections::HashMap;
+use buffa::Map;
 
 pub use crate::connect::anthropic::connectrpc::filter::v1::*;
 pub use crate::proto::anthropic::connectrpc::filter::v1::{Record, RecordView};
@@ -37,7 +37,7 @@ pub fn sample_record(i: u32, sensitive: bool) -> Record {
             "gamma".into(),
             "delta".into(),
         ],
-        attributes: HashMap::from([
+        attributes: Map::from_iter([
             ("region".into(), "us-west-2".into()),
             ("tier".into(), "gold".into()),
             ("source".into(), "api".into()),

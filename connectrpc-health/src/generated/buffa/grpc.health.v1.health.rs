@@ -28,12 +28,7 @@ impl HealthCheckRequest {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/grpc.health.v1.HealthCheckRequest";
 }
-impl ::buffa::DefaultInstance for HealthCheckRequest {
-    fn default_instance() -> &'static Self {
-        static VALUE: ::buffa::__private::OnceBox<HealthCheckRequest> = ::buffa::__private::OnceBox::new();
-        VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
-    }
-}
+::buffa::impl_default_instance!(HealthCheckRequest);
 impl ::buffa::MessageName for HealthCheckRequest {
     const PACKAGE: &'static str = "grpc.health.v1";
     const NAME: &'static str = "HealthCheckRequest";
@@ -65,12 +60,7 @@ impl ::buffa::Message for HealthCheckRequest {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if !self.service.is_empty() {
-            ::buffa::encoding::Tag::new(
-                    1u32,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )
-                .encode(buf);
-            ::buffa::types::encode_string(&self.service, buf);
+            ::buffa::types::put_string_field(1u32, &self.service, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -78,7 +68,7 @@ impl ::buffa::Message for HealthCheckRequest {
         &mut self,
         tag: ::buffa::encoding::Tag,
         buf: &mut impl ::buffa::bytes::Buf,
-        depth: u32,
+        ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<(), ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::bytes::Buf as _;
@@ -86,18 +76,15 @@ impl ::buffa::Message for HealthCheckRequest {
         use ::buffa::Enumeration as _;
         match tag.field_number() {
             1u32 => {
-                if tag.wire_type() != ::buffa::encoding::WireType::LengthDelimited {
-                    return ::core::result::Result::Err(::buffa::DecodeError::WireTypeMismatch {
-                        field_number: 1u32,
-                        expected: 2u8,
-                        actual: tag.wire_type() as u8,
-                    });
-                }
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
                 ::buffa::types::merge_string(&mut self.service, buf)?;
             }
             _ => {
                 self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, depth)?);
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
             }
         }
         ::core::result::Result::Ok(())
@@ -163,12 +150,7 @@ impl HealthCheckResponse {
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/grpc.health.v1.HealthCheckResponse";
 }
-impl ::buffa::DefaultInstance for HealthCheckResponse {
-    fn default_instance() -> &'static Self {
-        static VALUE: ::buffa::__private::OnceBox<HealthCheckResponse> = ::buffa::__private::OnceBox::new();
-        VALUE.get_or_init(|| ::buffa::alloc::boxed::Box::new(Self::default()))
-    }
-}
+::buffa::impl_default_instance!(HealthCheckResponse);
 impl ::buffa::MessageName for HealthCheckResponse {
     const PACKAGE: &'static str = "grpc.health.v1";
     const NAME: &'static str = "HealthCheckResponse";
@@ -205,9 +187,7 @@ impl ::buffa::Message for HealthCheckResponse {
         {
             let val = self.status.to_i32();
             if val != 0 {
-                ::buffa::encoding::Tag::new(1u32, ::buffa::encoding::WireType::Varint)
-                    .encode(buf);
-                ::buffa::types::encode_int32(val, buf);
+                ::buffa::types::put_int32_field(1u32, val, buf);
             }
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -216,7 +196,7 @@ impl ::buffa::Message for HealthCheckResponse {
         &mut self,
         tag: ::buffa::encoding::Tag,
         buf: &mut impl ::buffa::bytes::Buf,
-        depth: u32,
+        ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<(), ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::bytes::Buf as _;
@@ -224,20 +204,17 @@ impl ::buffa::Message for HealthCheckResponse {
         use ::buffa::Enumeration as _;
         match tag.field_number() {
             1u32 => {
-                if tag.wire_type() != ::buffa::encoding::WireType::Varint {
-                    return ::core::result::Result::Err(::buffa::DecodeError::WireTypeMismatch {
-                        field_number: 1u32,
-                        expected: 0u8,
-                        actual: tag.wire_type() as u8,
-                    });
-                }
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
                 self.status = ::buffa::EnumValue::from(
                     ::buffa::types::decode_int32(buf)?,
                 );
             }
             _ => {
                 self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, depth)?);
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
             }
         }
         ::core::result::Result::Ok(())

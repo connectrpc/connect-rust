@@ -38,9 +38,12 @@ async-trait = { workspace = true }
 # no buffa JSON. `std` is kept explicitly — `default-features = false` drops it
 # along with `json`, but `connectrpc` is unconditionally a std crate (tokio,
 # hyper), so building buffa as no_std would buy nothing and only risk a future
-# buffa change std-gating a core path we rely on. Keep the version in sync with
-# the `[workspace.dependencies]` `buffa` entry (which documents the 0.7 floor).
-buffa = { version = "0.7", default-features = false, features = ["std"] }
+# buffa change std-gating a core path we rely on. `fast-utf8` is kept
+# explicitly for the same reason: it is in buffa's default set (validated
+# string decoding on the hot path), and `default-features = false` would
+# silently drop it. Keep the version in sync with the
+# `[workspace.dependencies]` `buffa` entry (which documents the 0.8 floor).
+buffa = { version = "0.8", default-features = false, features = ["std", "fast-utf8"] }
 
 # Serialization. Non-optional even in proto-only builds: the Connect error and
 # streaming end-of-stream wire frames are always JSON regardless of the message

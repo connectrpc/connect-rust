@@ -176,7 +176,7 @@ pub const BENCH_SERVICE_LOG_UNARY_OWNED_SPEC: ::connectrpc::Spec = ::connectrpc:
 /// buffer) and the borrow may be held across `.await` points. Anything
 /// that must outlive the call — `tokio::spawn`, channels, server state,
 /// or data captured by a returned response stream — takes owned data:
-/// call `request.to_owned_message()` (or copy the specific fields)
+/// call `request.to_owned_message()?` (or copy the specific fields)
 /// first.
 ///
 /// **Client-streaming and bidi requests** arrive as
@@ -184,12 +184,12 @@ pub const BENCH_SERVICE_LOG_UNARY_OWNED_SPEC: ::connectrpc::Spec = ::connectrpc:
 /// Each item owns its decoded buffer and is `Send + 'static`, so items
 /// can be buffered or moved into spawned tasks; read fields zero-copy
 /// through the generated accessor methods (`item.name()`) or `.view()`,
-/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// convert with `.to_owned_message()?`, or yield an item back unchanged —
 /// `StreamMessage<M>` implements `Encodable<M>`.
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.7.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -219,7 +219,7 @@ pub trait BenchService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn unary<'a>(
         &'a self,
@@ -238,7 +238,7 @@ pub trait BenchService: Send + Sync + 'static {
     /// duration of the call (until the response stream is returned);
     /// message fields are read directly on it (zero-copy). Data the
     /// returned stream needs must be copied out or converted via
-    /// `.to_owned_message()`.
+    /// `.to_owned_message()?`.
     fn server_stream(
         &self,
         ctx: ::connectrpc::RequestContext,
@@ -259,7 +259,7 @@ pub trait BenchService: Send + Sync + 'static {
     /// Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):
     /// it owns its buffer, is `Send + 'static`, and exposes zero-copy
     /// accessor methods (`item.name()`), `.view()`, and
-    /// `.to_owned_message()`.
+    /// `.to_owned_message()?`.
     fn client_stream<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
@@ -278,7 +278,7 @@ pub trait BenchService: Send + Sync + 'static {
     /// Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):
     /// it owns its buffer, is `Send + 'static`, and exposes zero-copy
     /// accessor methods (`item.name()`), `.view()`, and
-    /// `.to_owned_message()`.
+    /// `.to_owned_message()?`.
     fn bidi_stream(
         &self,
         ctx: ::connectrpc::RequestContext,
@@ -301,7 +301,7 @@ pub trait BenchService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn log_unary<'a>(
         &'a self,
@@ -321,7 +321,7 @@ pub trait BenchService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn log_unary_owned<'a>(
         &'a self,
@@ -824,17 +824,19 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
-/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned):
+/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned) — fallible,
+/// since rebuilding preserved unknown fields can exceed the unknown-field
+/// allowance:
 ///
 /// ```rust,ignore
-/// let owned = client.unary(request).await?.into_owned();
+/// let owned = client.unary(request).await?.into_owned()?;
 /// ```
 ///
 /// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
 /// zero-copy decoded body (an `OwnedView`) without copying; field access on it
 /// goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
 /// received message from `.message().await` — bind `msg.reborrow()` for field
-/// access, or convert with `.to_owned_message()`.
+/// access, or convert with `.to_owned_message()?`.
 #[derive(Clone)]
 pub struct BenchServiceClient<T> {
     transport: T,
@@ -1119,7 +1121,7 @@ pub const ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
 /// buffer) and the borrow may be held across `.await` points. Anything
 /// that must outlive the call — `tokio::spawn`, channels, server state,
 /// or data captured by a returned response stream — takes owned data:
-/// call `request.to_owned_message()` (or copy the specific fields)
+/// call `request.to_owned_message()?` (or copy the specific fields)
 /// first.
 ///
 /// **Client-streaming and bidi requests** arrive as
@@ -1127,12 +1129,12 @@ pub const ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
 /// Each item owns its decoded buffer and is `Send + 'static`, so items
 /// can be buffered or moved into spawned tasks; read fields zero-copy
 /// through the generated accessor methods (`item.name()`) or `.view()`,
-/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// convert with `.to_owned_message()?`, or yield an item back unchanged —
 /// `StreamMessage<M>` implements `Encodable<M>`.
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.7.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -1162,7 +1164,7 @@ pub trait EchoService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn echo<'a>(
         &'a self,
@@ -1422,17 +1424,19 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
-/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned):
+/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned) — fallible,
+/// since rebuilding preserved unknown fields can exceed the unknown-field
+/// allowance:
 ///
 /// ```rust,ignore
-/// let owned = client.echo(request).await?.into_owned();
+/// let owned = client.echo(request).await?.into_owned()?;
 /// ```
 ///
 /// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
 /// zero-copy decoded body (an `OwnedView`) without copying; field access on it
 /// goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
 /// received message from `.message().await` — bind `msg.reborrow()` for field
-/// access, or convert with `.to_owned_message()`.
+/// access, or convert with `.to_owned_message()?`.
 #[derive(Clone)]
 pub struct EchoServiceClient<T> {
     transport: T,
@@ -1519,7 +1523,7 @@ pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spe
 /// buffer) and the borrow may be held across `.await` points. Anything
 /// that must outlive the call — `tokio::spawn`, channels, server state,
 /// or data captured by a returned response stream — takes owned data:
-/// call `request.to_owned_message()` (or copy the specific fields)
+/// call `request.to_owned_message()?` (or copy the specific fields)
 /// first.
 ///
 /// **Client-streaming and bidi requests** arrive as
@@ -1527,12 +1531,12 @@ pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spe
 /// Each item owns its decoded buffer and is `Send + 'static`, so items
 /// can be buffered or moved into spawned tasks; read fields zero-copy
 /// through the generated accessor methods (`item.name()`) or `.view()`,
-/// convert with `.to_owned_message()`, or yield an item back unchanged —
+/// convert with `.to_owned_message()?`, or yield an item back unchanged —
 /// `StreamMessage<M>` implements `Encodable<M>`.
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.7.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -1562,7 +1566,7 @@ pub trait LogIngestService: Send + Sync + 'static {
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call; message fields are read directly on it
     /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// `.to_owned_message()?` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
     fn ingest<'a>(
         &'a self,
@@ -1824,17 +1828,19 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
 /// ```
 ///
 /// If you need the owned struct (e.g. to store or pass by value), use
-/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned):
+/// [`into_owned()`](::connectrpc::client::UnaryResponse::into_owned) — fallible,
+/// since rebuilding preserved unknown fields can exceed the unknown-field
+/// allowance:
 ///
 /// ```rust,ignore
-/// let owned = client.ingest(request).await?.into_owned();
+/// let owned = client.ingest(request).await?.into_owned()?;
 /// ```
 ///
 /// [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
 /// zero-copy decoded body (an `OwnedView`) without copying; field access on it
 /// goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
 /// received message from `.message().await` — bind `msg.reborrow()` for field
-/// access, or convert with `.to_owned_message()`.
+/// access, or convert with `.to_owned_message()?`.
 #[derive(Clone)]
 pub struct LogIngestServiceClient<T> {
     transport: T,

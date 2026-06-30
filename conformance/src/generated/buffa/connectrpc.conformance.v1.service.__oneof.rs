@@ -29,16 +29,10 @@ pub mod unary_response_definition {
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::ResponseData(v) => {
-                    struct _W<'a>(&'a ::buffa::alloc::vec::Vec<u8>);
-                    impl serde::Serialize for _W<'_> {
-                        fn serialize<S2: serde::Serializer>(
-                            &self,
-                            s: S2,
-                        ) -> ::core::result::Result<S2::Ok, S2::Error> {
-                            ::buffa::json_helpers::bytes::serialize(self.0, s)
-                        }
-                    }
-                    map.serialize_entry("responseData", &_W(v))?;
+                    map.serialize_entry(
+                        "responseData",
+                        &::buffa::json_helpers::ProtoJson(v),
+                    )?;
                 }
                 Self::Error(v) => {
                     map.serialize_entry("error", v)?;
@@ -121,16 +115,7 @@ pub mod message_contents {
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Binary(v) => {
-                    struct _W<'a>(&'a ::buffa::alloc::vec::Vec<u8>);
-                    impl serde::Serialize for _W<'_> {
-                        fn serialize<S2: serde::Serializer>(
-                            &self,
-                            s: S2,
-                        ) -> ::core::result::Result<S2::Ok, S2::Error> {
-                            ::buffa::json_helpers::bytes::serialize(self.0, s)
-                        }
-                    }
-                    map.serialize_entry("binary", &_W(v))?;
+                    map.serialize_entry("binary", &::buffa::json_helpers::ProtoJson(v))?;
                 }
                 Self::Text(v) => {
                     map.serialize_entry("text", v)?;

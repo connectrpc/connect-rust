@@ -13,7 +13,7 @@ impl FilterService for Impl {
         _ctx: RequestContext,
         request: ServiceRequest<'_, Record>,
     ) -> ServiceResult<Record> {
-        let mut owned = request.to_owned_message();
+        let mut owned = request.to_owned_message()?;
         if has_sensitive(request.view()) {
             scrub(&mut owned);
         }

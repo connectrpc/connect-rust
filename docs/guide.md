@@ -41,7 +41,7 @@ Add the runtime to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-connectrpc = "0.7"
+connectrpc = "0.8"
 ```
 
 The runtime depends on [`buffa`](https://github.com/anthropics/buffa)
@@ -76,16 +76,16 @@ Common combinations:
 
 ```toml
 # Just the server, behind axum
-connectrpc = { version = "0.7", features = ["axum"] }
+connectrpc = { version = "0.8", features = ["axum"] }
 
 # Server + client, both with TLS
-connectrpc = { version = "0.7", features = ["axum", "client", "tls"] }
+connectrpc = { version = "0.8", features = ["axum", "client", "tls"] }
 
 # Built-in server (no axum)
-connectrpc = { version = "0.7", features = ["server"] }
+connectrpc = { version = "0.8", features = ["server"] }
 
 # Minimal (wasm-friendly: no networking, no native compression)
-connectrpc = { version = "0.7", default-features = false }
+connectrpc = { version = "0.8", default-features = false }
 ```
 
 ### Proto-only (no-JSON) builds
@@ -111,7 +111,7 @@ It takes two coordinated settings:
    # `default-features = false` is the only way to drop `json`, so it also drops
    # the default compression features (`gzip`/`zstd`/`streaming`) — re-list the
    # ones you still want.
-   connectrpc = { version = "0.7", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
+   connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
    ```
 
 With `json` off, the `Message + serde` requirement is replaced by the
@@ -170,7 +170,7 @@ Generate code with `connectrpc-build` in `build.rs`:
 
 ```toml
 [build-dependencies]
-connectrpc-build = "0.7"
+connectrpc-build = "0.8"
 ```
 
 ```rust
@@ -358,7 +358,11 @@ allocating - `req.name` is a `&str` directly into the request bytes,
 and the borrow may be held across `.await` points. The request is
 borrowed from the dispatcher-owned body, so the response (and anything
 moved into `tokio::spawn`) cannot borrow from it - call
-`.to_owned_message()` to get the owned struct when you need one.
+`.to_owned_message()?` to get the owned struct when you need one. The
+conversion is fallible: re-materializing the request's preserved
+unknown fields can exceed the unknown-field allowance, and the error
+is already a `ConnectError` (`invalid_argument`), so `?` works
+directly in handlers.
 
 ### `RequestContext` and `Response`
 
@@ -489,7 +493,7 @@ async fn redact(
         // refcount + decode walk), then re-encode via ViewEncode.
         return Response::ok(MaybeBorrowed::Borrowed(req.to_owned_view()));
     }
-    let mut owned = req.to_owned_message();
+    let mut owned = req.to_owned_message()?;
     owned.email.clear();
     owned.ssn.clear();
     Response::ok(MaybeBorrowed::Owned(owned))
@@ -1174,8 +1178,8 @@ route for `httpGet:` probes; add the gRPC service for `grpc:` probes.
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", features = ["server"] }
-connectrpc-health = "0.7"
+connectrpc = { version = "0.8", features = ["server"] }
+connectrpc-health = "0.8"
 ```
 
 ```rust,no_run
@@ -1215,8 +1219,8 @@ Server-only deployments turn it off:
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", features = ["server"] }
-connectrpc-health = { version = "0.7", default-features = false }
+connectrpc = { version = "0.8", features = ["server"] }
+connectrpc-health = { version = "0.8", default-features = false }
 ```
 
 That drops `connectrpc/client` (the HTTP/2 transport stack) from the
@@ -1244,8 +1248,8 @@ gRPC, gRPC-Web, and the Connect protocol alike.
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", features = ["server"] }
-connectrpc-reflection = "0.7"
+connectrpc = { version = "0.8", features = ["server"] }
+connectrpc-reflection = "0.8"
 ```
 
 Emit a descriptor set from your build script (see
@@ -1470,8 +1474,10 @@ let msg = client.greet(req).await?.into_view();
 let greeting: &str = msg.reborrow().greeting;
 
 // Pattern 3: .into_owned() for the prost-style owned struct.
-// Allocates and copies all string/bytes fields.
-let owned: GreetResponse = client.greet(req).await?.into_owned();
+// Allocates and copies all string/bytes fields. Fallible: rebuilding
+// the response's preserved unknown fields can exceed the
+// unknown-field allowance, surfaced as an `internal` ConnectError.
+let owned: GreetResponse = client.greet(req).await?.into_owned()?;
 ```
 
 ### Custom transports

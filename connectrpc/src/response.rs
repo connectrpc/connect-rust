@@ -588,7 +588,7 @@ pub fn encode_view_body<'a, V: ViewEncode<'a>>(
 ///         // pass-through: re-encode straight from the request bytes
 ///         return Response::ok(MaybeBorrowed::Borrowed(req));
 ///     }
-///     let mut owned = req.to_owned_message();
+///     let mut owned = req.to_owned_message()?;
 ///     owned.email.clear();
 ///     owned.ssn.clear();
 ///     Response::ok(MaybeBorrowed::Owned(owned))

@@ -122,7 +122,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
         _ctx: RequestContext,
         request: ServiceRequest<'_, CreateEventRequest>,
     ) -> ServiceResult<CreateEventResponse> {
-        let request = request.to_owned_message();
+        let request = request.to_owned_message()?;
         tracing::info!("Received create_event request: {:?}", request.name);
 
         let now = SystemTime::now();
@@ -172,7 +172,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
         _ctx: RequestContext,
         request: ServiceRequest<'_, CalculateDurationRequest>,
     ) -> ServiceResult<CalculateDurationResponse> {
-        let request = request.to_owned_message();
+        let request = request.to_owned_message()?;
         tracing::info!("Received calculate_duration request");
 
         let start = request
@@ -206,7 +206,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
         _ctx: RequestContext,
         request: ServiceRequest<'_, ProcessMetadataRequest>,
     ) -> ServiceResult<ProcessMetadataResponse> {
-        let request = request.to_owned_message();
+        let request = request.to_owned_message()?;
         tracing::info!("Received process_metadata request");
 
         let input_metadata = if request.metadata.is_set() {

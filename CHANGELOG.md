@@ -103,6 +103,26 @@ increment the patch version.
 
 ### Changed
 
+- **buffa 0.8 adoption: owned-message conversion is now fallible**
+  ([#209]). The buffa dependency floor moves from 0.7 to 0.8. In buffa
+  0.8, re-materializing a decoded view into the owned struct counts each
+  preserved unknown field individually, so a message that decoded fine as
+  a view can exceed the unknown-field allowance during conversion — and
+  since the input is remote-controlled, that failure must surface as an
+  error, not a panic. Three public APIs change signature accordingly:
+  `ServiceRequest::to_owned_message` and `StreamMessage::to_owned_message`
+  now return `Result<M, ConnectError>` (failures map to
+  `invalid_argument`, matching request-decode errors), and the client
+  response's `into_owned` returns `Result<V::Owned, ConnectError>`
+  (failures map to `internal`, matching response-decode errors). In
+  handlers, append `?` — `ServiceResult` already carries `ConnectError`.
+  Two further 0.8 changes are absorbed without API impact: generated map
+  fields are now `buffa::Map<K, V>` instead of `std::collections::HashMap`
+  (hand-written code constructing owned map fields needs the type swap),
+  and the `fast-utf8` decode path that buffa 0.8 ships as a default
+  feature is explicitly enabled, since `connectrpc` builds buffa with
+  `default-features = false`. All checked-in generated code is
+  regenerated against buffa 0.8.0.
 - **Client transport errors keep their original classification** ([#199]).
   The client call paths previously wrapped every transport `send` failure as
   `unavailable` with a `request failed:` prefix, including errors that were
@@ -251,6 +271,7 @@ increment the patch version.
 [#199]: https://github.com/anthropics/connect-rust/pull/199
 [#200]: https://github.com/anthropics/connect-rust/pull/200
 [#201]: https://github.com/anthropics/connect-rust/pull/201
+[#209]: https://github.com/connectrpc/connect-rust/issues/209
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
 ## [0.7.0] - 2026-06-10

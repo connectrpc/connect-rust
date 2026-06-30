@@ -66,9 +66,20 @@ impl<M: HasMessageView> StreamMessage<M> {
     ///
     /// `bytes` fields are sliced zero-copy out of the retained buffer where
     /// possible; string and repeated fields are allocated.
-    #[must_use]
-    pub fn to_owned_message(&self) -> M {
-        self.inner.as_ref().to_owned_message()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`invalid_argument`](ConnectError::invalid_argument) if
+    /// re-materializing the message's preserved unknown fields fails — the
+    /// owned message counts each unknown field individually, so a message
+    /// can exceed the unknown-field allowance it was decoded under. Known
+    /// fields cannot fail: the view already validated them.
+    pub fn to_owned_message(&self) -> Result<M, ConnectError> {
+        self.inner.as_ref().to_owned_message().map_err(|e| {
+            ConnectError::invalid_argument(format!(
+                "failed to convert stream message to owned message: {e}"
+            ))
+        })
     }
 
     /// The message's protobuf wire bytes.
@@ -135,7 +146,7 @@ where
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError> {
         match codec {
             CodecFormat::Proto => Ok(self.inner.as_ref().bytes().clone()),
-            CodecFormat::Json => encode_json(&self.to_owned_message()),
+            CodecFormat::Json => encode_json(&self.to_owned_message()?),
         }
     }
 }
@@ -161,7 +172,7 @@ mod tests {
     fn view_to_owned_and_bytes() {
         let msg = message("streamed");
         assert_eq!(msg.view().value, "streamed");
-        assert_eq!(msg.to_owned_message().value, "streamed");
+        assert_eq!(msg.to_owned_message().unwrap().value, "streamed");
 
         // The view borrows from the retained buffer, not a copy.
         let range = msg.bytes().as_ptr_range();
@@ -185,8 +196,30 @@ mod tests {
 
         // JSON matches what the owned message would produce.
         let json = msg.encode(CodecFormat::Json).expect("json encode");
-        let owned_json = serde_json::to_vec(&msg.to_owned_message()).unwrap();
+        let owned_json = serde_json::to_vec(&msg.to_owned_message().unwrap()).unwrap();
         assert_eq!(json.as_ref(), owned_json.as_slice());
+        // Guard against serializing the `Result` wrapper instead of the
+        // message: StringValue's proto-JSON form is the bare value, so a
+        // wrapper would show up as `{"Ok":"forward me"}`.
+        assert_eq!(json.as_ref(), br#""forward me""#);
+    }
+
+    #[test]
+    fn to_owned_message_unknown_field_overflow_is_invalid_argument() {
+        let body = crate::request::tests::unknown_field_overflow_body();
+        let msg: StreamMessage<StringValue> =
+            StreamMessage::from_owned_view(OwnedView::decode(body).expect("view decode"));
+
+        let err = msg.to_owned_message().unwrap_err();
+        assert_eq!(err.code, crate::ErrorCode::InvalidArgument);
+
+        // The JSON Encodable arm goes through the same conversion, so the
+        // failure propagates out of encode() instead of being serialized.
+        #[cfg(feature = "json")]
+        {
+            let err = msg.encode(CodecFormat::Json).unwrap_err();
+            assert_eq!(err.code, crate::ErrorCode::InvalidArgument);
+        }
     }
 
     #[cfg(not(feature = "json"))]

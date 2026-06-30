@@ -22,7 +22,7 @@
 //! row. For "build response from already-resident state" (no decode at all),
 //! see buffa's `build_encode` benchmarks.
 
-use std::collections::HashMap;
+use buffa::Map;
 
 use buffa::{Message, MessageView, ViewEncode};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -324,7 +324,7 @@ mod many_small_strings {
             note: "validated against allowlist; forwarded as-is".into(),
             ..Default::default()
         };
-        let labels: HashMap<String, String> = (0..11)
+        let labels: Map<String, String> = (0..11)
             .map(|i| {
                 (
                     format!("k8s.label.app.example.com/tier-{i:02}"),
@@ -614,7 +614,7 @@ mod deep_nested {
 
     pub fn view_owned(input: &[u8]) -> Vec<u8> {
         let r = DeepNestedView::decode_view(input).unwrap();
-        r.to_owned_message().encode_to_vec()
+        r.to_owned_message().unwrap().encode_to_vec()
     }
 
     pub fn owned_view(input: &[u8]) -> Vec<u8> {
@@ -774,7 +774,7 @@ mod map_dominated {
     use super::*;
 
     pub fn payload() -> MapDominated {
-        let labels: HashMap<String, String> = (0..30)
+        let labels: Map<String, String> = (0..30)
             .map(|i| {
                 (
                     format!("k{i:02}"),

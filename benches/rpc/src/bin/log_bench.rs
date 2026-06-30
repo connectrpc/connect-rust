@@ -259,10 +259,10 @@ async fn bench_server_noutf8(
     // but Vec<u8> for strings. Matches the utf8 request field-for-field
     // so wire payloads are byte-identical.
     let request: noutf8::v1::LogRequest = {
-        use std::collections::HashMap;
+        use buffa::Map;
         let records = (0..records_per_batch)
             .map(|i| {
-                let mut labels = HashMap::new();
+                let mut labels = Map::default();
                 for j in 0..6 {
                     labels.insert(
                         format!("label-key-{j}").into_bytes(),
