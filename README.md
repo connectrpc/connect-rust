@@ -2,9 +2,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/connectrpc.svg)](https://crates.io/crates/connectrpc)
 [![docs.rs](https://img.shields.io/docsrs/connectrpc)](https://docs.rs/connectrpc)
-[![CI](https://github.com/anthropics/connect-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/anthropics/connect-rust/actions/workflows/ci.yml)
+[![CI](https://github.com/connectrpc/connect-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/connectrpc/connect-rust/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/crates/msrv/connectrpc)](Cargo.toml)
-[![deps.rs](https://deps.rs/repo/github/anthropics/connect-rust/status.svg)](https://deps.rs/repo/github/anthropics/connect-rust)
+[![deps.rs](https://deps.rs/repo/github/connectrpc/connect-rust/status.svg)](https://deps.rs/repo/github/connectrpc/connect-rust)
 [![License](https://img.shields.io/crates/l/connectrpc)](LICENSE)
 
 A [Tower](https://docs.rs/tower/latest/tower/)-based Rust implementation of [ConnectRPC](https://connectrpc.com/), serving Connect, gRPC, and gRPC-Web clients over HTTP with binary or JSON protobuf messages.
@@ -82,7 +82,7 @@ ship Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows
 ```sh
 VERSION=v0.8.0
 PLATFORM=linux-x86_64        # or darwin-aarch64, etc.
-BASE=https://github.com/anthropics/connect-rust/releases/download/${VERSION}
+BASE=https://github.com/connectrpc/connect-rust/releases/download/${VERSION}
 BIN=protoc-gen-connect-rust-${VERSION}-${PLATFORM}
 
 curl -fSL -o "${BIN}"        "${BASE}/${BIN}"
@@ -94,13 +94,13 @@ curl -fSL -o checksums-sha256.txt "${BASE}/checksums-sha256.txt"
 grep " ${BIN}\$" checksums-sha256.txt | sha256sum -c -
 
 # Verify the GitHub-native attestation (no .sig/.pem download needed).
-gh attestation verify "${BIN}" --repo anthropics/connect-rust
+gh attestation verify "${BIN}" --repo connectrpc/connect-rust
 
 # Or verify the cosign signature directly.
 cosign verify-blob \
   --certificate "${BIN}.pem" \
   --signature "${BIN}.sig" \
-  --certificate-identity "https://github.com/anthropics/connect-rust/.github/workflows/release.yml@refs/tags/${VERSION}" \
+  --certificate-identity "https://github.com/connectrpc/connect-rust/.github/workflows/release.yml@refs/tags/${VERSION}" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   "${BIN}"
 
@@ -116,7 +116,7 @@ cargo install --locked connectrpc-codegen
 ```
 
 **3. Buf Schema Registry remote plugin (planned).** Once accepted upstream
-the plugin will be runnable as `remote: buf.build/anthropics/connect-rust`
+the plugin will be runnable as `remote: buf.build/connectrpc/connect-rust`
 in `buf.gen.yaml`, with no local install step.
 
 ```yaml
