@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/anthropics/connect-rust"
+repository = "https://github.com/connectrpc/connect-rust"
 keywords = ["connectrpc", "grpc", "rpc", "protobuf", "tower"]
 categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
 

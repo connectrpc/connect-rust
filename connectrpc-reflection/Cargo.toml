@@ -1,6 +1,6 @@
 [package]
 name = "connectrpc-reflection"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -24,7 +24,7 @@ default = ["client"]
 client = ["connectrpc/client"]
 
 [dependencies]
-connectrpc = { path = "../connectrpc", version = "0.7", features = ["server"] }
+connectrpc = { path = "../connectrpc", version = "0.8", features = ["server"] }
 
 # Protobuf + serde (pulled in by the generated module paths)
 buffa = { workspace = true }

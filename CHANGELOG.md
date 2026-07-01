@@ -8,7 +8,7 @@ with the [Rust 0.x convention](https://doc.rust-lang.org/cargo/reference/semver.
 breaking changes increment the minor version (0.2 → 0.3), additive changes
 increment the patch version.
 
-## [Unreleased]
+## [0.8.0] - 2026-07-01
 
 ### Added
 
@@ -100,6 +100,22 @@ increment the patch version.
   `with_http2_initial_connection_window_size` set fixed windows (supplying a
   fixed window turns adaptive sizing off, mirroring grpc-go). The new default
   is exposed as the `DEFAULT_HTTP2_ADAPTIVE_WINDOW` constant.
+
+- **Connection-level HTTP/1.1 header read timeout** ([#135]). The built-in
+  `Server`/`BoundServer` and the axum `serve_tls` path now install a
+  `TokioTimer` on every accepted connection and apply a header read timeout,
+  configurable via `with_header_read_timeout(Option<Duration>)` (default
+  `DEFAULT_HEADER_READ_TIMEOUT`, 30 seconds; pass `None` to disable). The
+  timeout bounds how long the server waits to read a complete request header
+  block, measured from when hyper begins reading a new request; on a keep-alive
+  connection it also bounds the idle wait between requests. A peer that opens a
+  connection — or finishes one request — and then stalls without sending the
+  next request's headers is now disconnected instead of holding a task and file
+  descriptor open indefinitely, which mitigates slowloris-style
+  connection-exhaustion attacks. Previously no timer was installed, so hyper's
+  built-in header read timeout never took effect; the default is now active.
+  Applies to HTTP/1.1 only — HTTP/2 connection liveness (keep-alive pings) and
+  idle-connection reaping are tracked separately.
 
 ### Changed
 
@@ -229,32 +245,6 @@ increment the patch version.
   an unsupported `grpc-encoding`. Clients that branch on grpc-status will
   observe 13 → 12 for this case on upgrade.
 
-### Deprecated
-
-- `Http2Connection::with_builder_plaintext` / `with_builder_tls` ([#197]). Use
-  `Http2Connection::builder()` and configure via the proxied keep-alive /
-  window-size setters or `h2_settings(|b| ...)`. The old names collide with the
-  new `builder()` entry point, where "builder" now means
-  `Http2ConnectionBuilder` rather than hyper's HTTP/2 builder.
-
-- **Connection-level HTTP/1.1 header read timeout** ([#135]). The built-in
-  `Server`/`BoundServer` and the axum `serve_tls` path now install a
-  `TokioTimer` on every accepted connection and apply a header read timeout,
-  configurable via `with_header_read_timeout(Option<Duration>)` (default
-  `DEFAULT_HEADER_READ_TIMEOUT`, 30 seconds; pass `None` to disable). The
-  timeout bounds how long the server waits to read a complete request header
-  block, measured from when hyper begins reading a new request; on a keep-alive
-  connection it also bounds the idle wait between requests. A peer that opens a
-  connection — or finishes one request — and then stalls without sending the
-  next request's headers is now disconnected instead of holding a task and file
-  descriptor open indefinitely, which mitigates slowloris-style
-  connection-exhaustion attacks. Previously no timer was installed, so hyper's
-  built-in header read timeout never took effect; the default is now active.
-  Applies to HTTP/1.1 only — HTTP/2 connection liveness (keep-alive pings) and
-  idle-connection reaping are tracked separately.
-
-### Changed
-
 - **The built-in server now closes idle/stalled HTTP/1.1 connections by
   default** ([#135]). Because a connection timer is now installed (see the
   Added entry above), the 30-second header read timeout is active by default
@@ -265,6 +255,16 @@ increment the patch version.
   an HTTP/1.1 client that pools a connection across long idle gaps must
   reconnect. Raise the duration with `with_header_read_timeout(Some(d))` or
   disable it with `with_header_read_timeout(None)`.
+
+### Deprecated
+
+- `Http2Connection::with_builder_plaintext` / `with_builder_tls` ([#197]). Use
+  `Http2Connection::builder()` and configure via the proxied keep-alive /
+  window-size setters or `h2_settings(|b| ...)`. The old names collide with the
+  new `builder()` entry point, where "builder" now means
+  `Http2ConnectionBuilder` rather than hyper's HTTP/2 builder.
+
+
 
 ### Fixed
 
@@ -296,25 +296,25 @@ increment the patch version.
   a truncated response was indistinguishable from a complete one. It now
   returns `Err(internal)` (see [#168]); complete responses are unchanged.
 
-[#135]: https://github.com/anthropics/connect-rust/issues/135
-[#137]: https://github.com/anthropics/connect-rust/issues/137
-[#145]: https://github.com/anthropics/connect-rust/issues/145
-[#205]: https://github.com/anthropics/connect-rust/pull/205
-[#151]: https://github.com/anthropics/connect-rust/issues/151
-[#163]: https://github.com/anthropics/connect-rust/pull/163
-[#164]: https://github.com/anthropics/connect-rust/pull/164
-[#167]: https://github.com/anthropics/connect-rust/pull/167
-[#168]: https://github.com/anthropics/connect-rust/pull/168
-[#172]: https://github.com/anthropics/connect-rust/pull/172
-[#178]: https://github.com/anthropics/connect-rust/issues/178
-[#180]: https://github.com/anthropics/connect-rust/issues/180
-[#181]: https://github.com/anthropics/connect-rust/issues/181
-[#192]: https://github.com/anthropics/connect-rust/pull/192
-[#194]: https://github.com/anthropics/connect-rust/pull/194
-[#197]: https://github.com/anthropics/connect-rust/pull/197
-[#199]: https://github.com/anthropics/connect-rust/pull/199
-[#200]: https://github.com/anthropics/connect-rust/pull/200
-[#201]: https://github.com/anthropics/connect-rust/pull/201
+[#135]: https://github.com/connectrpc/connect-rust/issues/135
+[#137]: https://github.com/connectrpc/connect-rust/issues/137
+[#145]: https://github.com/connectrpc/connect-rust/issues/145
+[#205]: https://github.com/connectrpc/connect-rust/pull/205
+[#151]: https://github.com/connectrpc/connect-rust/issues/151
+[#163]: https://github.com/connectrpc/connect-rust/pull/163
+[#164]: https://github.com/connectrpc/connect-rust/pull/164
+[#167]: https://github.com/connectrpc/connect-rust/pull/167
+[#168]: https://github.com/connectrpc/connect-rust/pull/168
+[#172]: https://github.com/connectrpc/connect-rust/pull/172
+[#178]: https://github.com/connectrpc/connect-rust/issues/178
+[#180]: https://github.com/connectrpc/connect-rust/issues/180
+[#181]: https://github.com/connectrpc/connect-rust/issues/181
+[#192]: https://github.com/connectrpc/connect-rust/pull/192
+[#194]: https://github.com/connectrpc/connect-rust/pull/194
+[#197]: https://github.com/connectrpc/connect-rust/pull/197
+[#199]: https://github.com/connectrpc/connect-rust/pull/199
+[#200]: https://github.com/connectrpc/connect-rust/pull/200
+[#201]: https://github.com/connectrpc/connect-rust/pull/201
 [#209]: https://github.com/connectrpc/connect-rust/issues/209
 [connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
 
@@ -532,18 +532,18 @@ regenerate with this release's toolchain and buffa ≥ 0.7.0.**
   intended behavior change beyond [#159]; the streaming contract tests'
   assertions are unchanged.
 
-[#127]: https://github.com/anthropics/connect-rust/pull/127
-[#128]: https://github.com/anthropics/connect-rust/pull/128
-[#136]: https://github.com/anthropics/connect-rust/issues/136
-[#139]: https://github.com/anthropics/connect-rust/issues/139
-[#140]: https://github.com/anthropics/connect-rust/issues/140
-[#141]: https://github.com/anthropics/connect-rust/pull/141
-[#143]: https://github.com/anthropics/connect-rust/pull/143
-[#147]: https://github.com/anthropics/connect-rust/pull/147
-[#150]: https://github.com/anthropics/connect-rust/pull/150
-[#157]: https://github.com/anthropics/connect-rust/pull/157
-[#159]: https://github.com/anthropics/connect-rust/pull/159
-[#160]: https://github.com/anthropics/connect-rust/pull/160
+[#127]: https://github.com/connectrpc/connect-rust/pull/127
+[#128]: https://github.com/connectrpc/connect-rust/pull/128
+[#136]: https://github.com/connectrpc/connect-rust/issues/136
+[#139]: https://github.com/connectrpc/connect-rust/issues/139
+[#140]: https://github.com/connectrpc/connect-rust/issues/140
+[#141]: https://github.com/connectrpc/connect-rust/pull/141
+[#143]: https://github.com/connectrpc/connect-rust/pull/143
+[#147]: https://github.com/connectrpc/connect-rust/pull/147
+[#150]: https://github.com/connectrpc/connect-rust/pull/150
+[#157]: https://github.com/connectrpc/connect-rust/pull/157
+[#159]: https://github.com/connectrpc/connect-rust/pull/159
+[#160]: https://github.com/connectrpc/connect-rust/pull/160
 
 ## [0.6.1] - 2026-05-27
 
@@ -579,10 +579,10 @@ now 1.6.
 
 - The minimum supported `bytes` version is now 1.6 ([#132]).
 
-[#130]: https://github.com/anthropics/connect-rust/pull/130
-[#131]: https://github.com/anthropics/connect-rust/pull/131
-[#132]: https://github.com/anthropics/connect-rust/pull/132
-[#133]: https://github.com/anthropics/connect-rust/pull/133
+[#130]: https://github.com/connectrpc/connect-rust/pull/130
+[#131]: https://github.com/connectrpc/connect-rust/pull/131
+[#132]: https://github.com/connectrpc/connect-rust/pull/132
+[#133]: https://github.com/connectrpc/connect-rust/pull/133
 
 ## [0.6.0] - 2026-05-20
 
@@ -718,19 +718,19 @@ rebuilds `OUT_DIR` automatically.
   register interceptors without dropping down to
   `Server::from_service(ConnectRpcService::new(...).with_interceptor(...))`.
 
-[#87]: https://github.com/anthropics/connect-rust/issues/87
-[#105]: https://github.com/anthropics/connect-rust/pull/105
-[#110]: https://github.com/anthropics/connect-rust/issues/110
-[#112]: https://github.com/anthropics/connect-rust/pull/112
-[#113]: https://github.com/anthropics/connect-rust/pull/113
-[#114]: https://github.com/anthropics/connect-rust/pull/114
-[#116]: https://github.com/anthropics/connect-rust/pull/116
-[#117]: https://github.com/anthropics/connect-rust/pull/117
-[#118]: https://github.com/anthropics/connect-rust/pull/118
-[#119]: https://github.com/anthropics/connect-rust/pull/119
-[#120]: https://github.com/anthropics/connect-rust/pull/120
-[#121]: https://github.com/anthropics/connect-rust/pull/121
-[#123]: https://github.com/anthropics/connect-rust/pull/123
+[#87]: https://github.com/connectrpc/connect-rust/issues/87
+[#105]: https://github.com/connectrpc/connect-rust/pull/105
+[#110]: https://github.com/connectrpc/connect-rust/issues/110
+[#112]: https://github.com/connectrpc/connect-rust/pull/112
+[#113]: https://github.com/connectrpc/connect-rust/pull/113
+[#114]: https://github.com/connectrpc/connect-rust/pull/114
+[#116]: https://github.com/connectrpc/connect-rust/pull/116
+[#117]: https://github.com/connectrpc/connect-rust/pull/117
+[#118]: https://github.com/connectrpc/connect-rust/pull/118
+[#119]: https://github.com/connectrpc/connect-rust/pull/119
+[#120]: https://github.com/connectrpc/connect-rust/pull/120
+[#121]: https://github.com/connectrpc/connect-rust/pull/121
+[#123]: https://github.com/connectrpc/connect-rust/pull/123
 [`Spec`]: https://docs.rs/connectrpc/latest/connectrpc/spec/struct.Spec.html
 [`Payload`]: https://docs.rs/connectrpc/latest/connectrpc/payload/struct.Payload.html
 [`AnyMessage`]: https://docs.rs/connectrpc/latest/connectrpc/payload/trait.AnyMessage.html
@@ -987,15 +987,15 @@ mechanical: direct field reads become accessor calls (`ctx.headers` →
   The directives are now suppressed in Buf mode, completing the fix #56
   applied to `Precompiled` mode. Manual `protoc` mode is unchanged.
 
-[#59]: https://github.com/anthropics/connect-rust/pull/59
-[#98]: https://github.com/anthropics/connect-rust/pull/98
-[#100]: https://github.com/anthropics/connect-rust/pull/100
-[#101]: https://github.com/anthropics/connect-rust/pull/101
-[#103]: https://github.com/anthropics/connect-rust/pull/103
-[#105]: https://github.com/anthropics/connect-rust/pull/105
-[#108]: https://github.com/anthropics/connect-rust/pull/108
-[#109]: https://github.com/anthropics/connect-rust/pull/109
-[#111]: https://github.com/anthropics/connect-rust/pull/111
+[#59]: https://github.com/connectrpc/connect-rust/pull/59
+[#98]: https://github.com/connectrpc/connect-rust/pull/98
+[#100]: https://github.com/connectrpc/connect-rust/pull/100
+[#101]: https://github.com/connectrpc/connect-rust/pull/101
+[#103]: https://github.com/connectrpc/connect-rust/pull/103
+[#105]: https://github.com/connectrpc/connect-rust/pull/105
+[#108]: https://github.com/connectrpc/connect-rust/pull/108
+[#109]: https://github.com/connectrpc/connect-rust/pull/109
+[#111]: https://github.com/connectrpc/connect-rust/pull/111
 [@Yong-yuan-X]: https://github.com/Yong-yuan-X
 [@hobostay]: https://github.com/hobostay
 
@@ -1246,13 +1246,13 @@ rebuilds `OUT_DIR` automatically.
   `build.rs` context (e.g. from a Bazel genrule or standalone host tool).
   Default remains `true`.
 
-[#80]: https://github.com/anthropics/connect-rust/pull/80
-[#7]: https://github.com/anthropics/connect-rust/issues/7
-[#34]: https://github.com/anthropics/connect-rust/issues/34
-[#50]: https://github.com/anthropics/connect-rust/issues/50
-[#55]: https://github.com/anthropics/connect-rust/pull/55
-[#61]: https://github.com/anthropics/connect-rust/issues/61
-[#63]: https://github.com/anthropics/connect-rust/pull/63
+[#80]: https://github.com/connectrpc/connect-rust/pull/80
+[#7]: https://github.com/connectrpc/connect-rust/issues/7
+[#34]: https://github.com/connectrpc/connect-rust/issues/34
+[#50]: https://github.com/connectrpc/connect-rust/issues/50
+[#55]: https://github.com/connectrpc/connect-rust/pull/55
+[#61]: https://github.com/connectrpc/connect-rust/issues/61
+[#63]: https://github.com/connectrpc/connect-rust/pull/63
 [buffa#22]: https://github.com/anthropics/buffa/pull/22
 [buffa#55]: https://github.com/anthropics/buffa/pull/55
 [buffa#62]: https://github.com/anthropics/buffa/pull/62
@@ -1285,10 +1285,10 @@ rebuilds `OUT_DIR` automatically.
 - New `examples/streaming-tour` and `examples/middleware` crates,
   plus a user guide under `docs/guide.md` ([#46], [#48]).
 
-[#44]: https://github.com/anthropics/connect-rust/pull/44
-[#46]: https://github.com/anthropics/connect-rust/pull/46
-[#48]: https://github.com/anthropics/connect-rust/pull/48
-[#56]: https://github.com/anthropics/connect-rust/pull/56
+[#44]: https://github.com/connectrpc/connect-rust/pull/44
+[#46]: https://github.com/connectrpc/connect-rust/pull/46
+[#48]: https://github.com/connectrpc/connect-rust/pull/48
+[#56]: https://github.com/connectrpc/connect-rust/pull/56
 
 ## [0.3.2] - 2026-04-03
 
@@ -1328,10 +1328,10 @@ rebuilds `OUT_DIR` automatically.
   Currently exercises unary calls without deadlines; timeouts and
   streaming require additional setup beyond the example.
 
-[#16]: https://github.com/anthropics/connect-rust/pull/16
-[#19]: https://github.com/anthropics/connect-rust/pull/19
-[#32]: https://github.com/anthropics/connect-rust/pull/32
-[#37]: https://github.com/anthropics/connect-rust/pull/37
+[#16]: https://github.com/connectrpc/connect-rust/pull/16
+[#19]: https://github.com/connectrpc/connect-rust/pull/19
+[#32]: https://github.com/connectrpc/connect-rust/pull/32
+[#37]: https://github.com/connectrpc/connect-rust/pull/37
 
 ## [0.3.1] - 2026-04-02
 
@@ -1346,7 +1346,7 @@ rebuilds `OUT_DIR` automatically.
   `no_register_fn` parameter for path-compat with the unified `connectrpc-build`
   flow.
 
-[#35]: https://github.com/anthropics/connect-rust/pull/35
+[#35]: https://github.com/connectrpc/connect-rust/pull/35
 
 ## [0.3.0] - 2026-04-02
 
@@ -1399,14 +1399,14 @@ rebuilds `OUT_DIR` automatically.
   trait is suffixed to `Self_`; the `SelfExt` / `SelfClient` / `SelfServer`
   derivatives are unaffected since the suffix already de-keywords them.
 
-[#15]: https://github.com/anthropics/connect-rust/pull/15
-[#22]: https://github.com/anthropics/connect-rust/pull/22
-[#23]: https://github.com/anthropics/connect-rust/issues/23
-[#24]: https://github.com/anthropics/connect-rust/pull/24
-[#26]: https://github.com/anthropics/connect-rust/pull/26
-[#27]: https://github.com/anthropics/connect-rust/pull/27
-[#28]: https://github.com/anthropics/connect-rust/pull/28
-[#31]: https://github.com/anthropics/connect-rust/pull/31
+[#15]: https://github.com/connectrpc/connect-rust/pull/15
+[#22]: https://github.com/connectrpc/connect-rust/pull/22
+[#23]: https://github.com/connectrpc/connect-rust/issues/23
+[#24]: https://github.com/connectrpc/connect-rust/pull/24
+[#26]: https://github.com/connectrpc/connect-rust/pull/26
+[#27]: https://github.com/connectrpc/connect-rust/pull/27
+[#28]: https://github.com/connectrpc/connect-rust/pull/28
+[#31]: https://github.com/connectrpc/connect-rust/pull/31
 
 ## [0.2.1] - 2026-03-18
 
@@ -1429,14 +1429,14 @@ rebuilds `OUT_DIR` automatically.
   `readme = "../README.md"`, so the crates.io page for 0.2.0 shows the
   stale version; this release updates it.
 
-[#1]: https://github.com/anthropics/connect-rust/issues/1
-[#2]: https://github.com/anthropics/connect-rust/issues/2
-[#3]: https://github.com/anthropics/connect-rust/pull/3
-[#4]: https://github.com/anthropics/connect-rust/pull/4
+[#1]: https://github.com/connectrpc/connect-rust/issues/1
+[#2]: https://github.com/connectrpc/connect-rust/issues/2
+[#3]: https://github.com/connectrpc/connect-rust/pull/3
+[#4]: https://github.com/connectrpc/connect-rust/pull/4
 
 ## [0.2.0] - 2026-03-17
 
-First release from the [anthropics/connect-rust](https://github.com/anthropics/connect-rust)
+First release from the [anthropics/connect-rust](https://github.com/connectrpc/connect-rust)
 repository. This is a complete from-scratch implementation — not a continuation
 of the 0.1.x releases previously published under the `connectrpc` crate name,
 which have been superseded.
