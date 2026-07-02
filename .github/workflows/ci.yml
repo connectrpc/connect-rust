@@ -36,14 +36,24 @@ jobs:
       - run: cargo check --workspace --all-features --all-targets
 
   msrv-check:
-    name: MSRV (1.88)
+    name: MSRV
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # The MSRV is declared once, in the workspace Cargo.toml; this job
+      # derives its toolchain from it so the declaration and the check can
+      # never drift apart.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $version"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.88'
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (sha-pinned)
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0 (sha-pinned)
         with:

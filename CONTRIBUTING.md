@@ -17,7 +17,8 @@ $ git commit -s -m "your commit message"
 
 ## Prerequisites
 
-- **Rust 1.88+** (MSRV; the codebase uses let-chains).
+- **Rust 1.88+** (MSRV; source of truth is `rust-version` in the workspace
+  `Cargo.toml` — the codebase uses let-chains).
 - **`protoc` v27+** — the test and example protos use editions syntax
   (`edition = "2023"`). Ubuntu's apt `protobuf-compiler` (v21) is too old;
   install from the [protobuf releases] page or via `arduino/setup-protoc`
@@ -181,7 +182,8 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
 - **Check generated code** — runs `task generate:all` and verifies the
   checked-in generated directories have no diff
 - **Documentation** — `cargo doc` with broken-intra-doc-links denied
-- **MSRV (1.88)** — `cargo check` on the pinned minimum toolchain
+- **MSRV** — `cargo check` on the minimum toolchain, read from `rust-version`
+  in the workspace `Cargo.toml` so the declaration and the check cannot drift
 - **Examples** — builds and runs the example crates
 - **Minimal features** — `cargo check -p connectrpc --no-default-features`
 - **Wasm** — `wasm32-unknown-unknown` build of the client example

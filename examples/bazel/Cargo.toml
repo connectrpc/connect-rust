@@ -7,6 +7,9 @@
 name = "connectrpc-bazel-example-deps"
 version = "0.0.0"
 edition = "2021"
+# Kept in sync with the workspace rust-version by hand: this manifest is
+# standalone (excluded from the workspace) so it cannot inherit it.
+rust-version = "1.88"
 publish = false
 
 # crates_universe needs a [package] target. We point at a stub source so
