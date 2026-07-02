@@ -83,6 +83,77 @@ tasks:
       - cargo test -p connectrpc --no-default-features
 
   # ===========================================================================
+  # Changelog (changie)
+  # ===========================================================================
+
+  install-changie:
+    desc: >-
+      Download changie (changelog fragment manager) into .local/bin/ via
+      gh release download. The changelog-* tasks depend on this, so a direct
+      install is rarely needed.
+    vars:
+      CHANGIE_VERSION: 1.24.2
+      CHANGIE_OS:
+        sh: uname -s | sed 's/Linux/linux/;s/Darwin/darwin/'
+      CHANGIE_ARCH:
+        sh: uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'
+      # Per-platform SHA-256 from the release's checksums.txt, pinned so a
+      # tampered or substituted asset fails closed before extraction.
+      CHANGIE_SHA256:
+        sh: |
+          case "{{.CHANGIE_OS}}_{{.CHANGIE_ARCH}}" in
+            linux_amd64)  echo 31535a9d8dc548d6d8f315762bfd5b1fba34e707b7600748c8bb8a609649007d ;;
+            linux_arm64)  echo c21bf5509c3cd6e86e0f290b497a12bed52849c40566d171c5d1cbdef19b156c ;;
+            darwin_amd64) echo c0e08369c501181fab579c9f40a3d53144f7cc6754c56bff4c7f72949afe57b3 ;;
+            darwin_arm64) echo 88bd40117ec48da017e030754f3ba9bcaa91a0e67cfcaaa9d0d02bf54db3a156 ;;
+            *) echo "unsupported platform" >&2; exit 1 ;;
+          esac
+    status:
+      - .local/bin/changie --version 2>/dev/null | grep -qF "v{{.CHANGIE_VERSION}}"
+    preconditions:
+      - sh: gh auth status
+        msg: "gh CLI must be authenticated. Run: gh auth login"
+    cmds:
+      - mkdir -p .local/bin
+      - gh release download 'v{{.CHANGIE_VERSION}}'
+          --repo miniscruff/changie
+          --pattern 'changie_{{.CHANGIE_VERSION}}_{{.CHANGIE_OS}}_{{.CHANGIE_ARCH}}.tar.gz'
+          --output .local/changie.tar.gz --clobber
+      - echo '{{.CHANGIE_SHA256}}  .local/changie.tar.gz' | { sha256sum -c - 2>/dev/null || shasum -a 256 -c -; }
+      - tar -xzf .local/changie.tar.gz -C .local/bin changie
+      - rm .local/changie.tar.gz
+      - .local/bin/changie --version
+
+  changelog-new:
+    desc: >-
+      Create a new changelog fragment under .changes/unreleased/. Prompts for
+      kind (Added, Changed, Fixed, etc.) and a multi-line body. Run this in
+      your PR instead of editing CHANGELOG.md directly. Pass flags after `--`
+      for non-interactive use, e.g.: task changelog-new -- -k Fixed -b "Body."
+    deps: [install-changie]
+    cmds:
+      - .local/bin/changie new {{.CLI_ARGS}}
+
+  changelog-batch:
+    desc: >-
+      Roll all .changes/unreleased/ fragments into .changes/<version>.md and
+      delete the fragments. Usage: task changelog-batch -- 0.8.0. Release-time
+      only — run from the cut-release flow, then edit the generated section to
+      add any release-notes prose before changelog-merge.
+    deps: [install-changie]
+    cmds:
+      - .local/bin/changie batch {{.CLI_ARGS}}
+
+  changelog-merge:
+    desc: >-
+      Regenerate CHANGELOG.md from .changes/header.tpl.md and the per-version
+      .changes/*.md files. CHANGELOG.md is a generated artifact — never edit it
+      directly; edit the source files and re-run this task.
+    deps: [install-changie]
+    cmds:
+      - .local/bin/changie merge
+
+  # ===========================================================================
   # Code generator
   # ===========================================================================
 

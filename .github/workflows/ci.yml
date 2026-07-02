@@ -8,6 +8,11 @@ on:
   # Run required checks on merge queue groups so queued PRs can land.
   merge_group:
 
+# CI only reads the repo; nothing here publishes or writes. Keeps the job
+# token inert even if a fetched tool were compromised.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -97,6 +102,34 @@ jobs:
           toolchain: nightly-2026-02-27
           components: rustfmt
       - run: cargo +nightly-2026-02-27 fmt --all -- --check
+
+  # CHANGELOG.md is generated from .changes/ via changie. Fail if it has been
+  # edited directly or is stale relative to the per-version source files.
+  check-changelog:
+    name: Check changelog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install changie
+        env:
+          CHANGIE_VERSION: 1.24.2
+          # linux_amd64 entry from the release's checksums.txt; a tampered
+          # or substituted asset fails closed before extraction.
+          CHANGIE_SHA256: 31535a9d8dc548d6d8f315762bfd5b1fba34e707b7600748c8bb8a609649007d
+        run: |
+          curl -fsSL -o changie.tar.gz "https://github.com/miniscruff/changie/releases/download/v${CHANGIE_VERSION}/changie_${CHANGIE_VERSION}_linux_amd64.tar.gz"
+          echo "${CHANGIE_SHA256}  changie.tar.gz" | sha256sum -c -
+          sudo tar -xzf changie.tar.gz -C /usr/local/bin changie
+          rm changie.tar.gz
+          changie --version
+      - name: Verify CHANGELOG.md is in sync
+        run: |
+          changie merge
+          git diff --exit-code -- CHANGELOG.md || {
+            echo '::error file=CHANGELOG.md::CHANGELOG.md is out of sync. Do not edit it directly — add a fragment via `task changelog-new` (see CONTRIBUTING.md), or run `task changelog-merge` if you edited a .changes/ file.'
+            exit 1
+          }
 
   check-generated-code:
     name: Check generated code

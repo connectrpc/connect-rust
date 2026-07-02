@@ -1,0 +1,27 @@
+changesDir: .changes
+unreleasedDir: unreleased
+headerPath: header.tpl.md
+changelogPath: CHANGELOG.md
+versionExt: md
+versionFormat: '## [{{.Version}}] - {{.Time.Format "2006-01-02"}}'
+kindFormat: '### {{.Kind}}'
+# Body may be multi-line; indent continuation lines by 2 so they hang under `- `.
+changeFormat: '- {{.Body | trim | splitList "\n" | join "\n  "}}'
+# Fragment filenames: kind + timestamp. Timestamps keep concurrent PRs from
+# colliding on the same filename (the whole point of this setup).
+fragmentFileFormat: '{{.Kind}}-{{.Time.Format "20060102-150405"}}'
+body:
+  block: true
+kinds:
+  - label: Added
+  - label: Changed
+  - label: Deprecated
+  - label: Removed
+  - label: Fixed
+  - label: Security
+newlines:
+  beforeChangelogVersion: 1
+  beforeKind: 1
+  beforeChange: 1
+  endOfVersion: 1
+envPrefix: CHANGIE_

@@ -21,3 +21,6 @@ benches/rpc-go/fortune-connect-go
 # Local buffa path override (opt-in via `task buffa:link`).
 # The .example file is tracked; the live config.toml is not.
 /.cargo/config.toml
+
+# Tool downloads (changie, etc.) — see Taskfile install-* tasks
+.local/

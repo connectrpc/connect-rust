@@ -8,6 +8,11 @@ with the [Rust 0.x convention](https://doc.rust-lang.org/cargo/reference/semver.
 breaking changes increment the minor version (0.2 → 0.3), additive changes
 increment the patch version.
 
+Entries for unreleased changes live as fragment files under
+[`.changes/unreleased/`](.changes/unreleased/); run `task changelog-new` to add
+one. This file is assembled from `.changes/` at release time — do not edit it
+directly.
+
 ## [0.8.0] - 2026-07-01
 
 ### Added

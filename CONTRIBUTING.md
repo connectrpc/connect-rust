@@ -37,6 +37,37 @@ excluding test files and `*/generated/*`) wherever possible. If a task
 naturally exceeds that, split it into focused, self-contained PRs or
 commits.
 
+## Changelog
+
+`CHANGELOG.md` is **generated** — do not edit it directly. Each change is
+recorded as a small fragment file under `.changes/unreleased/`, so two PRs
+never touch the same lines and the changelog never causes a merge conflict.
+
+Add a fragment for any user-visible change:
+
+```bash
+task changelog-new          # prompts for kind (Added/Changed/Fixed/…) and a body
+# or, non-interactively:
+task changelog-new -- -k Fixed -b "One-line description of the change."
+```
+
+This writes `.changes/unreleased/<Kind>-<timestamp>.yaml`; commit it with your
+change. Bodies may span multiple lines and use the same Markdown (`` `code` ``,
+`[#NNN]` issue/PR references) as the existing entries. Skip the fragment only
+for changes with no changelog impact (internal refactors, test-only edits, CI
+tweaks).
+
+The `check-changelog` CI job regenerates `CHANGELOG.md` with `changie merge`
+and fails if it differs from what is committed, so a directly-edited or stale
+`CHANGELOG.md` will be caught.
+
+At release time the maintainer rolls the fragments into a version section:
+
+```bash
+task changelog-batch -- 0.8.0   # fragments → .changes/0.8.0.md (edit for prose)
+task changelog-merge            # regenerate CHANGELOG.md
+```
+
 ## Test Coverage
 
 Every change must include unit tests. Target **≥ 80% line coverage** for
