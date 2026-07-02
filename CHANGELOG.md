@@ -13,6 +13,14 @@ Entries for unreleased changes live as fragment files under
 one. This file is assembled from `.changes/` at release time — do not edit it
 directly.
 
+## [0.8.1] - 2026-07-02
+
+### Fixed
+
+- Client stream `message()` futures are `Send` again with concrete generated view types ([#214]). 0.8.0's bound shape on `ServerStream::message`/`BidiStream::message` (projecting `RespView::Owned` in the where-clause) tripped rustc's coroutine-witness auto-trait check on monomorphization, so a server-stream could not be consumed inside `tokio::spawn`; the bound is reshaped as an output type parameter (`RespView: MessageView<'static, Owned = M>`), which is equivalent for every caller and restores `Send`. Call sites are unaffected — `M` is inferred.
+  
+  [#214]: https://github.com/connectrpc/connect-rust/issues/214
+
 ## [0.8.0] - 2026-07-01
 
 ### Added
