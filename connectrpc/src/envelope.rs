@@ -28,6 +28,17 @@ pub mod flags {
 /// Size of the envelope header in bytes.
 pub const HEADER_SIZE: usize = 5;
 
+/// Minimum payload size for chaining a payload as its own body frame
+/// instead of copying it into the contiguous framing buffer.
+///
+/// The trade-off is a payload-sized memcpy (tens of GiB/s) against the cost
+/// of an extra body frame: one more `poll_frame` cycle, a 9-byte HTTP/2
+/// frame header for the 5-byte envelope-header frame, and refcount
+/// bookkeeping. The crossover is low (single-digit KiB); 16 KiB is
+/// conservative and matches h2's default `max_frame_size`, above which the
+/// transport splits the payload into multiple DATA frames anyway.
+pub(crate) const MIN_CHAIN_SIZE: usize = 16 * 1024;
+
 /// An envelope-framed message.
 #[derive(Debug, Clone)]
 pub struct Envelope {
@@ -84,6 +95,28 @@ impl Envelope {
         write_envelope(self.flags, &self.data, &mut buf)
             .expect("envelope payload exceeds u32::MAX");
         buf.freeze()
+    }
+
+    /// Encode this envelope as a head segment plus an optionally chained
+    /// payload.
+    ///
+    /// Payloads of at least `min_chain` bytes return `(header, Some(payload))`
+    /// — the 5-byte header alone, with the payload passed through by refcount
+    /// for the caller to emit as its own body frame. Smaller payloads return
+    /// the full contiguous encoding and `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload exceeds `u32::MAX` bytes, like
+    /// [`encode`](Self::encode).
+    pub(crate) fn encode_parts(self, min_chain: usize) -> (Bytes, Option<Bytes>) {
+        if self.data.len() < min_chain {
+            return (self.encode(), None);
+        }
+        let mut head = BytesMut::with_capacity(HEADER_SIZE);
+        write_envelope_header(self.flags, self.data.len(), &mut head)
+            .expect("envelope payload exceeds u32::MAX");
+        (head.freeze(), Some(self.data))
     }
 
     /// Decode an envelope from bytes.
@@ -297,34 +330,77 @@ impl EnvelopeEncoder {
     ) -> Result<(), ConnectError> {
         write_envelope(flags::END_STREAM, &data, dst)
     }
+
+    /// Encode a data envelope, avoiding the payload copy for large messages.
+    ///
+    /// When the on-wire payload (post-compression, if negotiated) is at
+    /// least `min_chain` bytes, only the 5-byte envelope header is written
+    /// into `dst` and the payload is returned for the caller to emit as its
+    /// own body frame — a refcount move instead of a payload-sized memcpy.
+    /// Smaller payloads are written contiguously into `dst` and `None` is
+    /// returned.
+    ///
+    /// This is the single implementation of the envelope-encode policy —
+    /// the [`Encoder`](tokio_util::codec::Encoder) impl delegates here with
+    /// `min_chain = usize::MAX` (never chain) — so the compression decision
+    /// and the chaining decision cannot drift apart.
+    ///
+    /// gRPC/Connect envelope framing is independent of HTTP-level frame
+    /// boundaries, so splitting the header and payload across body frames
+    /// does not change the wire protocol.
+    pub(crate) fn encode_chained(
+        &mut self,
+        data: Bytes,
+        dst: &mut BytesMut,
+        min_chain: usize,
+    ) -> Result<Option<Bytes>, ConnectError> {
+        let (flag, payload) = if let Some((ref comp, ref encoding)) = self.compression
+            && self.policy.should_compress(data.len())
+        {
+            (flags::COMPRESSED, comp.compress(encoding, &data)?)
+        } else {
+            (flags::DATA, data)
+        };
+        if payload.len() < min_chain {
+            write_envelope(flag, &payload, dst)?;
+            return Ok(None);
+        }
+        write_envelope_header(flag, payload.len(), dst)?;
+        Ok(Some(payload))
+    }
 }
 
 impl tokio_util::codec::Encoder<Bytes> for EnvelopeEncoder {
     type Error = ConnectError;
 
     fn encode(&mut self, data: Bytes, dst: &mut BytesMut) -> Result<(), ConnectError> {
-        if let Some((ref comp, ref encoding)) = self.compression
-            && self.policy.should_compress(data.len())
-        {
-            let compressed = comp.compress(encoding, &data)?;
-            return write_envelope(flags::COMPRESSED, &compressed, dst);
-        }
-        write_envelope(flags::DATA, &data, dst)
+        // `usize::MAX` threshold: the contiguous entry point never chains.
+        let chained = self.encode_chained(data, dst, usize::MAX)?;
+        debug_assert!(chained.is_none(), "usize::MAX threshold cannot chain");
+        Ok(())
     }
 }
 
 /// Write a single envelope (header + payload) into a `BytesMut` buffer.
+/// The length is validated (via [`write_envelope_header`]) before any
+/// buffer growth, so an oversized payload errors without allocating.
 fn write_envelope(flag: u8, data: &[u8], dst: &mut BytesMut) -> Result<(), ConnectError> {
-    if data.len() > u32::MAX as usize {
+    write_envelope_header(flag, data.len(), dst)?;
+    dst.put_slice(data);
+    Ok(())
+}
+
+/// Write only the 5-byte envelope header (flag + big-endian length) into
+/// `dst`, for callers that emit the payload as its own body frame.
+fn write_envelope_header(flag: u8, len: usize, dst: &mut BytesMut) -> Result<(), ConnectError> {
+    if len > u32::MAX as usize {
         return Err(ConnectError::resource_exhausted(format!(
-            "envelope payload {} bytes exceeds u32::MAX",
-            data.len()
+            "envelope payload {len} bytes exceeds u32::MAX"
         )));
     }
-    dst.reserve(HEADER_SIZE + data.len());
+    dst.reserve(HEADER_SIZE);
     dst.put_u8(flag);
-    dst.put_u32(data.len() as u32);
-    dst.put_slice(data);
+    dst.put_u32(len as u32);
     Ok(())
 }
 
@@ -344,6 +420,69 @@ mod tests {
     }
 
     // ── Envelope tests ──────────────────────────────────────────────
+
+    #[test]
+    fn encode_parts_chains_large_payload_by_refcount() {
+        let payload = Bytes::from(vec![7u8; 64]);
+        let ptr = payload.as_ptr();
+        let (head, chained) = Envelope::data(payload.clone()).encode_parts(64);
+        assert_eq!(head.len(), HEADER_SIZE);
+        let chained = chained.expect("payload at threshold must chain");
+        assert!(std::ptr::eq(chained.as_ptr(), ptr), "must not copy");
+
+        // Reassembled bytes are identical to the contiguous encoding.
+        let mut reassembled = BytesMut::from(&head[..]);
+        reassembled.put_slice(&chained);
+        assert_eq!(
+            reassembled.freeze(),
+            Envelope::data(payload).encode(),
+            "chained wire bytes must match contiguous encoding"
+        );
+    }
+
+    /// A payload that compresses is chained on the COMPRESSED payload's
+    /// size, with the COMPRESSED flag in the header segment.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn encode_chained_chains_large_compressed_payload() {
+        let registry = Arc::new(CompressionRegistry::default());
+        let mut enc = EnvelopeEncoder::new(
+            Some((Arc::clone(&registry), "gzip")),
+            CompressionPolicy::default().min_size(0),
+        );
+        // Incompressible-ish random-ish payload so the compressed form stays
+        // above the chain threshold.
+        let data: Vec<u8> = (0..64 * 1024u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut dst = BytesMut::new();
+        let chained = enc
+            .encode_chained(Bytes::from(data), &mut dst, 1024)
+            .unwrap()
+            .expect("large compressed payload must chain");
+
+        assert_eq!(dst.len(), HEADER_SIZE);
+        assert_eq!(dst[0], flags::COMPRESSED);
+        assert_eq!(
+            u32::from_be_bytes([dst[1], dst[2], dst[3], dst[4]]) as usize,
+            chained.len()
+        );
+
+        // Reassembled envelope decodes back to the original payload.
+        let mut wire = dst;
+        wire.put_slice(&chained);
+        let mut dec = EnvelopeDecoder::new(1024 * 1024, Some("gzip".to_owned()), registry);
+        let decoded = Decoder::decode(&mut dec, &mut wire).unwrap().unwrap();
+        assert_eq!(decoded.len(), 64 * 1024);
+    }
+
+    #[test]
+    fn encode_parts_small_payload_stays_contiguous() {
+        let payload = Bytes::from_static(b"tiny");
+        let (head, chained) = Envelope::data(payload.clone()).encode_parts(64);
+        assert!(chained.is_none());
+        assert_eq!(head, Envelope::data(payload).encode());
+    }
 
     #[test]
     fn test_envelope_roundtrip() {
