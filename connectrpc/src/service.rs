@@ -943,7 +943,8 @@ struct BatchingEnvelopeStream {
     finalizer: StreamFinalizer,
     /// Finalizer frame staged for the next poll (when buf was non-empty at end).
     pending_final: Option<Frame<Bytes>>,
-    /// Large uncompressed payload staged for the next poll: emitted as its
+    /// Large payload (post-compression, when negotiated) staged for the next
+    /// poll: emitted as its
     /// own data frame (refcount clone) right after the header flush, instead
     /// of being copied into `buf`. See [`EnvelopeEncoder::encode_chained`].
     ///
@@ -1066,7 +1067,7 @@ impl Stream for BatchingEnvelopeStream {
                             }
                         }
                         Ok(Some(payload)) => {
-                            // Large uncompressed payload: `buf` now ends with
+                            // Large payload: `buf` now ends with
                             // its 5-byte envelope header. Flush the buffer and
                             // stage the payload as the next frame, unmoved.
                             self.pending_payload = Some(payload);
@@ -1321,7 +1322,8 @@ impl<D: Dispatcher> ConnectRpcService<D> {
 /// `EnvelopeEncoder` for the common unary case.
 pub struct GrpcUnaryBody {
     data: Option<Bytes>,
-    /// Large uncompressed message payload emitted as its own data frame
+    /// Large message payload (post-compression, when negotiated) emitted as
+    /// its own data frame
     /// after `data` (which then carries only the 5-byte envelope header),
     /// so the payload is passed through by refcount instead of copied.
     payload: Option<Bytes>,
@@ -2124,7 +2126,7 @@ where
     );
 
     // Encode response into a gRPC envelope (5-byte header + payload). Large
-    // uncompressed payloads are chained (header segment + payload by
+    // payloads are chained (header segment + payload by
     // refcount) rather than copied into a contiguous buffer.
     let effective_policy = compression_policy.with_override(resp.compress);
     let min_chain = crate::envelope::MIN_CHAIN_SIZE;
@@ -3305,7 +3307,7 @@ pub mod axum_integration {
 mod tests {
     use super::*;
 
-    /// A payload at or above `STREAM_BATCH_THRESHOLD` must reach the body
+    /// A payload at or above `envelope::MIN_CHAIN_SIZE` must reach the body
     /// frames by refcount, not by copy: the emitted data frame references
     /// the handler's original allocation. Small envelopes (the 5-byte
     /// header) still batch into the framing buffer.
@@ -3313,7 +3315,7 @@ mod tests {
     async fn streaming_large_payload_is_chained_not_copied() {
         use futures::StreamExt as _;
 
-        let payload = Bytes::from(vec![0x42u8; STREAM_BATCH_THRESHOLD]);
+        let payload = Bytes::from(vec![0x42u8; crate::envelope::MIN_CHAIN_SIZE]);
         let original_ptr = payload.as_ptr();
         let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
@@ -3346,7 +3348,7 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    /// Payloads below the chaining threshold keep today's behavior: one
+    /// Payloads below the chaining threshold are emitted as one
     /// contiguous data frame containing header + payload.
     #[tokio::test]
     async fn streaming_small_payload_stays_contiguous() {
@@ -3376,7 +3378,7 @@ mod tests {
     async fn streaming_chained_frames_reassemble_to_same_wire_bytes() {
         use futures::StreamExt as _;
 
-        let large = Bytes::from(vec![0x5Au8; STREAM_BATCH_THRESHOLD + 7]);
+        let large = Bytes::from(vec![0x5Au8; crate::envelope::MIN_CHAIN_SIZE + 7]);
         let small = Bytes::from_static(b"tail");
         let items = [
             Ok::<_, ConnectError>(small.clone()),
