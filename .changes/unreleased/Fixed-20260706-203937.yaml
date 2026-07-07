@@ -1,0 +1,8 @@
+kind: Fixed
+body: |-
+  **Initial `BidiStream::message()` cancellation no longer breaks the receive side**.
+  Dropping the first receive while it is waiting for response headers or Connect
+  error-body parsing now leaves initialization pending for the next `message()`
+  call, while real transport, deadline, and protocol failures stay terminal and
+  sticky.
+time: 2026-07-06T20:39:37.361463737-04:00
