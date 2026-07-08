@@ -80,7 +80,7 @@ ship Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows
 (`.sig` + `.pem`), and a GitHub-native build provenance attestation.
 
 ```sh
-VERSION=v0.8.0
+VERSION=v0.8.1
 PLATFORM=linux-x86_64        # or darwin-aarch64, etc.
 BASE=https://github.com/connectrpc/connect-rust/releases/download/${VERSION}
 BIN=protoc-gen-connect-rust-${VERSION}-${PLATFORM}
@@ -115,9 +115,13 @@ install -m 0755 "${BIN}" /usr/local/bin/protoc-gen-connect-rust
 cargo install --locked connectrpc-codegen
 ```
 
-**3. Buf Schema Registry remote plugin (planned).** Once accepted upstream
-the plugin will be runnable as `remote: buf.build/connectrpc/connect-rust`
-in `buf.gen.yaml`, with no local install step.
+**3. Buf Schema Registry remote plugin.** The plugin is published on the
+Buf Schema Registry as
+[`buf.build/connectrpc/rust`](https://buf.build/connectrpc/rust), with
+versions tracking connect-rust releases. No local install of
+`protoc-gen-connect-rust` is needed: replace the
+`local: protoc-gen-connect-rust` entry below with
+`remote: buf.build/connectrpc/rust:v0.8.0`.
 
 ```yaml
 # buf.gen.yaml
