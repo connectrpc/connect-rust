@@ -2755,6 +2755,12 @@ where
 ///
 /// Errors that occur during the stream (e.g., in gRPC trailers or the
 /// END_STREAM envelope) are returned by [`ServerStream::message()`].
+///
+/// # Cancellation
+///
+/// Dropping the returned future or hitting its deadline drops the in-flight
+/// transport send with it, so a request that had not finished sending may
+/// never reach the server.
 pub async fn call_server_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
@@ -3433,9 +3439,11 @@ where
 /// # Cancellation
 ///
 /// Dropping the returned future (caller cancellation) or letting its deadline
-/// expire stops the in-flight transport send, even if the transport is still
-/// waiting for response headers — the background send does not outlive the
-/// abandoned call.
+/// expire promptly stops the in-flight transport send, even if the transport
+/// is still waiting for response headers — the background send task stops
+/// instead of outliving the call. As a consequence, a request that was still
+/// being sent when the call was abandoned may never reach the server; a
+/// caller that needs the request delivered must drive the call to completion.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
@@ -3508,11 +3516,10 @@ where
     let (mut resp_tx, resp_rx) =
         tokio::sync::oneshot::channel::<Result<Response<T::ResponseBody>, ConnectError>>();
     let _ = crate::spawn_detached(async move {
-        // If the caller's future is cancelled or the call deadline fires,
-        // `resp_rx` is dropped. Race the send against the receiver closing so
-        // that, the next time this task is polled, the closed branch wins and
-        // `response_fut` is dropped — stopping the transport work instead of
-        // leaving it running in a detached task.
+        // Race the send against the receiver closing (see the `resp_rx`
+        // ownership note above): once the caller stops waiting, the closed
+        // branch wins on this task's next poll and `response_fut` is dropped,
+        // stopping the transport work instead of leaving it running detached.
         let maybe_result = tokio::select! {
             result = response_fut => {
                 Some(result.map_err(|e| map_transport_send_error(e, "request failed")))
@@ -5741,8 +5748,9 @@ mod tests {
 
     // When the caller drops the `call_client_stream` future (cancellation)
     // while the transport is still waiting for response headers, the background
-    // send task must likewise stop polling the transport send. A deadline-only
-    // fix would leave this path leaking, so this is the load-bearing test.
+    // send task must likewise stop polling the transport send. Cancellation is
+    // a distinct path from deadline expiry — no deadline machinery fires here,
+    // so dropping the call future must stop the in-flight send on its own.
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn client_stream_cancellation_cancels_transport_send_task() {
@@ -5828,8 +5836,9 @@ mod tests {
             .expect("drop signal sender vanished without firing");
     }
 
-    // The abandonment fix must not disturb the success path: a well-formed
-    // Connect client-streaming response still decodes normally.
+    // Success path: with the send raced against caller abandonment in a
+    // background task, a well-formed Connect client-streaming response still
+    // decodes normally.
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn client_stream_transport_task_still_returns_response() {
@@ -5890,8 +5899,9 @@ mod tests {
         assert_eq!(response.view().value, "ok");
     }
 
-    // A transport send failure must still surface through the existing
-    // `map_transport_send_error(e, "request failed")` branch unchanged.
+    // A transport send failure surfaces through the
+    // `map_transport_send_error(e, "request failed")` branch even though the
+    // send runs in a background task raced against caller abandonment.
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn client_stream_transport_send_error_still_surfaces() {

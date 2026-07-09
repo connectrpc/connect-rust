@@ -3,7 +3,10 @@ body: |-
   **`call_client_stream` now stops its background transport send when the call
   is abandoned** ([#224]). Dropping the call future or hitting its deadline
   while the transport is still waiting for response headers no longer leaves the
-  detached send task polling the transport indefinitely.
+  detached send task polling the transport indefinitely. Note that abandonment
+  now cancels the underlying request: a request that was still being sent when
+  the call was abandoned may never reach the server, so a caller that needs
+  the request delivered must drive the call to completion.
 
   [#224]: https://github.com/connectrpc/connect-rust/issues/224
 time: 2026-07-09T05:10:15.451894063-04:00
