@@ -2386,15 +2386,20 @@ fn find_comment(source_info: &SourceCodeInfo, target_path: &[i32]) -> Option<Str
                 .as_ref()
                 .or(location.trailing_comments.as_ref())?;
 
-            // Trim each line; blank lines are dropped (protoc's convention
-            // uses a leading space we don't need here — `doc_attrs` adds
-            // its own uniform leading space for prettyplease rendering).
-            let cleaned: String = comment
+            // protoc strips the `//` marker but keeps the space that follows
+            // it; drop that one space per line while preserving deeper
+            // indentation (code blocks) and blank lines (paragraph breaks).
+            // `doc_attrs` adds its own uniform leading space for
+            // prettyplease rendering.
+            let normalized: String = comment
                 .lines()
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
+                .map(|line| line.strip_prefix(' ').unwrap_or(line).trim_end())
                 .collect::<Vec<_>>()
                 .join("\n");
+
+            // Escape markdown/HTML metacharacters so arbitrary proto
+            // comments can't break the consumer's rustdoc build.
+            let cleaned = crate::comments::sanitize_comment(normalized.trim_matches('\n'));
 
             if !cleaned.is_empty() {
                 return Some(cleaned);

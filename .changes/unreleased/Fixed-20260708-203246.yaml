@@ -8,5 +8,14 @@ body: |-
   has `SourceCodeInfo` stripped for the protoc and buf sources — reflection
   does not need it, and stripping keeps embedded descriptor bytes lean and
   proto comments out of shipped binaries (precompiled sets are still written
-  through unchanged).
+  through unchanged). Service and method comments are now sanitized for
+  rustdoc the same way buffa sanitizes message and field comments: markdown
+  and HTML metacharacters are escaped, bare URLs are autolinked, indented
+  blocks and code fences without a language annotation are rendered as
+  text, and unterminated fences are closed, so arbitrary proto comments
+  cannot break a consumer's `cargo doc` or be picked up as doctests.
+  Paragraph breaks and continuation-line indentation in service and method
+  comments are also preserved instead of being flattened.
+
+  [#222]: https://github.com/connectrpc/connect-rust/issues/222
 time: 2026-07-08T20:32:46.262831531-07:00

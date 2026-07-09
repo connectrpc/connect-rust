@@ -924,6 +924,12 @@ message Note {
   // DistinctiveFieldComment documents the text field.
   string text = 1;
 }
+
+// DistinctiveServiceComment: see [Note] and map<string, int32>.
+service NoteService {
+  // DistinctiveMethodComment: docs at http://example.com/notes here.
+  rpc GetNote(Note) returns (Note);
+}
 "#,
         )
         .unwrap();
@@ -946,6 +952,23 @@ message Note {
                 "expected proto comment `{marker}` as a doc comment in the \
                  generated Rust — was the descriptor built without \
                  --include_source_info?\n{generated}"
+            );
+        }
+
+        // Service and method comments flow through connectrpc-codegen's
+        // sanitizer: markdown/HTML metacharacters must be escaped and bare
+        // URLs autolinked so hostile proto comments can't break a
+        // consumer's rustdoc build.
+        let connect = std::fs::read_to_string(out.path().join("commented.__connect.rs"))
+            .expect("read commented.__connect.rs");
+        for expected in [
+            r"/// DistinctiveServiceComment: see \[Note\] and map\<string, int32\>.",
+            "/// DistinctiveMethodComment: docs at <http://example.com/notes> here.",
+        ] {
+            assert!(
+                connect.contains(expected),
+                "expected sanitized doc comment `{expected}` in generated \
+                 service code\n{connect}"
             );
         }
 
