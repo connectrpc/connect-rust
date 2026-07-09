@@ -1179,11 +1179,17 @@ where
             .await
     }
     /// Call the ClientStream RPC. Sends a request to /connectrpc.conformance.v1.ConformanceService/ClientStream.
+    ///
+    /// `requests` is an asynchronous stream; messages are sent as the
+    /// stream yields them. It must be `Send + 'static` (it backs the
+    /// request body), so yield owned messages or feed the call from a
+    /// channel-backed stream. For a collection that is already in
+    /// hand, wrap it with `::connectrpc::client::stream_iter(...)`.
     pub async fn client_stream(
         &self,
-        requests: impl IntoIterator<
+        requests: impl ::connectrpc::client::Stream<
             Item = crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
-        >,
+        > + Send + 'static,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
@@ -1201,11 +1207,17 @@ where
             .await
     }
     /// Call the ClientStream RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    ///
+    /// `requests` is an asynchronous stream; messages are sent as the
+    /// stream yields them. It must be `Send + 'static` (it backs the
+    /// request body), so yield owned messages or feed the call from a
+    /// channel-backed stream. For a collection that is already in
+    /// hand, wrap it with `::connectrpc::client::stream_iter(...)`.
     pub async fn client_stream_with_options(
         &self,
-        requests: impl IntoIterator<
+        requests: impl ::connectrpc::client::Stream<
             Item = crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
-        >,
+        > + Send + 'static,
         options: ::connectrpc::client::CallOptions,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<

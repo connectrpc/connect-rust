@@ -2242,9 +2242,19 @@ fn generate_client_method(
     let short_args: TokenStream; // args to the no-opts convenience method
     let opts_args: TokenStream; // args to the _with_options method
     let short_delegate_args: TokenStream; // how short delegates to opts
+    // Extra doc lines appended to both methods (client-stream input contract).
+    let mut extra_doc = quote! {};
 
     if client_streaming && !server_streaming {
         // Client-stream
+        extra_doc = quote! {
+            #[doc = ""]
+            #[doc = " `requests` is an asynchronous stream; messages are sent as the"]
+            #[doc = " stream yields them. It must be `Send + 'static` (it backs the"]
+            #[doc = " request body), so yield owned messages or feed the call from a"]
+            #[doc = " channel-backed stream. For a collection that is already in"]
+            #[doc = " hand, wrap it with `::connectrpc::client::stream_iter(...)`."]
+        };
         ret_ty = quote! {
             Result<
                 ::connectrpc::client::UnaryResponse<::buffa::view::OwnedView<#output_view_type<'static>>>,
@@ -2258,8 +2268,8 @@ fn generate_client_method(
                 requests, options,
             ).await
         };
-        short_args = quote! { requests: impl IntoIterator<Item = #input_type> };
-        opts_args = quote! { requests: impl IntoIterator<Item = #input_type>, options: ::connectrpc::client::CallOptions };
+        short_args = quote! { requests: impl ::connectrpc::client::Stream<Item = #input_type> + Send + 'static };
+        opts_args = quote! { requests: impl ::connectrpc::client::Stream<Item = #input_type> + Send + 'static, options: ::connectrpc::client::CallOptions };
         short_delegate_args = quote! { requests, ::connectrpc::client::CallOptions::default() };
     } else if client_streaming && server_streaming {
         // Bidi
@@ -2320,11 +2330,13 @@ fn generate_client_method(
 
     Ok(quote! {
         #[doc = #doc]
+        #extra_doc
         pub async fn #method_snake(&self, #short_args) -> #ret_ty {
             self.#method_with_opts(#short_delegate_args).await
         }
 
         #[doc = #doc_opts]
+        #extra_doc
         pub async fn #method_with_opts(&self, #opts_args) -> #ret_ty {
             #call_body
         }

@@ -1,0 +1,16 @@
+kind: Changed
+body: |-
+  **Breaking: client-streaming calls take an async `Stream` of requests** instead
+  of a synchronous iterator. `call_client_stream` and the generated client
+  methods accept `impl Stream<Item = Req> + Send + 'static`, so request
+  messages can be produced as they become available — without buffering the
+  upload or blocking a thread. The stream backs the HTTP request body
+  directly: the transport polls it as it is able to send, so backpressure is
+  HTTP/2 flow control and a server that ends the RPC mid-upload no longer
+  goes unnoticed while the stream is idle. The `Stream` trait and a
+  `stream_iter` adapter (`futures::stream::iter`) are re-exported from
+  `connectrpc::client`, so migrating a ready collection is
+  `client.sum(connectrpc::client::stream_iter(requests))` with no new
+  dependency. Because the stream backs the request body, it must be
+  `Send + 'static`: streams that borrow local data must be made owning.
+time: 2026-07-09T17:29:54.497133719Z

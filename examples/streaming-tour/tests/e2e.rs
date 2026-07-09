@@ -144,13 +144,10 @@ async fn server_stream_range() {
 async fn client_stream_sum() {
     let addr = start_server().await;
     let client = make_client(addr);
-    let messages: Vec<SumRequest> = [3, 5, 7, 9]
-        .iter()
-        .map(|&v| SumRequest {
-            value: Some(v),
-            ..Default::default()
-        })
-        .collect();
+    let messages = connectrpc::client::stream_iter([3, 5, 7, 9].map(|v| SumRequest {
+        value: Some(v),
+        ..Default::default()
+    }));
     let resp = client.sum(messages).await.unwrap();
     assert_eq!(resp.view().total, Some(24));
 }

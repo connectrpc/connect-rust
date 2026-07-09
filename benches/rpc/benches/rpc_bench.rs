@@ -216,7 +216,7 @@ fn bench_client_stream(c: &mut Criterion) {
         group.bench_function(BenchmarkId::from_parameter(protocol), |b| {
             b.to_async(&rt).iter(|| async {
                 client
-                    .client_stream(messages.clone())
+                    .client_stream(futures::stream::iter(messages.clone()))
                     .await
                     .expect("client_stream failed")
             });

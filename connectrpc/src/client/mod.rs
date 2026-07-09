@@ -118,6 +118,15 @@ use buffa::view::HasMessageView;
 use buffa::view::MessageView;
 use buffa::view::OwnedView;
 use buffa::view::ViewReborrow;
+/// Re-export of [`futures::Stream`] (the `futures` 0.3 / `futures-core` 0.3
+/// trait), the request-stream bound for client-streaming calls. Re-exported
+/// so generated code and callers can name the bound without a direct
+/// `futures` dependency.
+pub use futures::Stream;
+/// Re-export of [`futures::stream::iter`]: adapts a collection that is
+/// already in hand into a request stream for a client-streaming call,
+/// without a direct `futures` dependency.
+pub use futures::stream::iter as stream_iter;
 
 use crate::codec::CodecFormat;
 use crate::codec::content_type;
@@ -2955,7 +2964,7 @@ where
 
 /// A request body that pulls envelope-encoded frames from an mpsc channel.
 ///
-/// Used as the request body for bidirectional and client-streaming calls.
+/// Used as the request body for bidirectional streaming calls.
 /// [`BidiStream::send`] pushes encoded envelopes to the channel's sender half;
 /// dropping the sender (via [`BidiStream::close_send`]) closes the body,
 /// signalling EOF to the server.
@@ -2974,6 +2983,90 @@ impl Body for ChannelBody {
         self.rx
             .poll_recv(cx)
             .map(|opt| opt.map(|r| r.map(http_body::Frame::data)))
+    }
+}
+
+/// A request body that lazily encodes messages from the caller's stream
+/// into envelope frames as the transport polls for body data.
+///
+/// Used by [`call_client_stream`]: making the stream *be* the body hands
+/// upload liveness to the HTTP layer. The transport polls for the next
+/// frame only while it can send (backpressure is HTTP/2 flow control), a
+/// server that ends the RPC early makes the transport stop polling and
+/// drop the body, and a server that sends response headers early while
+/// still reading the upload keeps receiving frames — none of which needs a
+/// library-side pump loop.
+///
+/// The stream is held in a [`sync_wrapper::SyncWrapper`] so the body is
+/// `Sync` (as [`ClientBody`]'s boxing requires) without demanding `Sync`
+/// of the caller's stream — the wrapper only ever hands out `&mut` access.
+#[pin_project::pin_project]
+struct EncodingBody<S> {
+    #[pin]
+    stream: sync_wrapper::SyncWrapper<S>,
+    encoder: crate::envelope::EnvelopeEncoder,
+    codec_format: CodecFormat,
+    /// Mirror of an encode error also emitted through the body, letting the
+    /// call report the precise error instead of a transport-level failure.
+    error: std::sync::Arc<std::sync::Mutex<Option<ConnectError>>>,
+    /// Set on an encode error or stream exhaustion; the body then reports
+    /// end-of-stream without polling the (possibly non-fused) stream again.
+    done: bool,
+}
+
+impl<S, Req> Body for EncodingBody<S>
+where
+    S: Stream<Item = Req>,
+    Req: buffa::Message + crate::codec::JsonSerialize,
+{
+    type Data = Bytes;
+    type Error = ConnectError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, ConnectError>>> {
+        use std::task::Poll;
+
+        let this = self.project();
+        if *this.done {
+            return Poll::Ready(None);
+        }
+
+        let Some(request) = std::task::ready!(this.stream.get_pin_mut().poll_next(cx)) else {
+            // `Stream` gives no post-`None` guarantee, so never poll the
+            // (possibly non-fused) stream again.
+            *this.done = true;
+            return Poll::Ready(None);
+        };
+
+        let mut record_error = |err: &ConnectError| {
+            *this.done = true;
+            *this
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.clone());
+        };
+
+        let msg_bytes = match this.codec_format {
+            CodecFormat::Proto => request.encode_to_bytes(),
+            CodecFormat::Json => match encode_json(&request) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    record_error(&err);
+                    return Poll::Ready(Some(Err(err)));
+                }
+            },
+        };
+
+        let mut envelope_buf = BytesMut::new();
+        match tokio_util::codec::Encoder::encode(this.encoder, msg_bytes, &mut envelope_buf) {
+            Ok(()) => Poll::Ready(Some(Ok(http_body::Frame::data(envelope_buf.freeze())))),
+            Err(err) => {
+                record_error(&err);
+                Poll::Ready(Some(Err(err)))
+            }
+        }
     }
 }
 
@@ -3423,18 +3516,47 @@ where
 /// envelope-framed response with END_STREAM. Returns a [`UnaryResponse`] containing
 /// the decoded response message along with headers and trailers.
 ///
-/// The request body is streamed: each item from the iterator is encoded into
-/// an envelope and pushed to a bounded mpsc channel that backs the HTTP
-/// request body. The transport begins sending as soon as the first envelope
-/// is ready instead of waiting for the iterator to be fully drained, so peak
-/// memory stays around `channel_depth * envelope_size` rather than the full
-/// concatenated body.
+/// The request body IS the stream: each item yielded by `requests` is
+/// encoded into an envelope frame as the transport asks for the next chunk
+/// of body data. The transport begins sending as soon as the first message
+/// is available, backpressure is the HTTP layer's own flow control, and
+/// peak memory stays around one envelope rather than the full concatenated
+/// body.
+///
+/// `requests` is an asynchronous [`Stream`], so messages can be produced as
+/// they become available (paced by timers, read from sockets, forwarded from
+/// channels) without buffering the whole request up front. The stream must
+/// be `Send + 'static` because it backs the request body, which can outlive
+/// the call frame and move across threads — yield owned messages (no borrows
+/// of local data), or feed the call from a channel-backed stream. For a
+/// collection that is already in hand, wrap it with [`stream_iter`]:
+///
+/// ```rust,ignore
+/// let resp = call_client_stream(
+///     &transport, &config, "svc", "Method",
+///     connectrpc::client::stream_iter(vec![req1, req2]),
+///     CallOptions::default(),
+/// ).await?;
+/// ```
+///
+/// Because the transport owns the polling of `requests`, upload liveness
+/// follows HTTP semantics: a server that ends the RPC while `requests` is
+/// still pending (for example, rejecting the call partway through the
+/// upload) produces a response and the call returns without draining the
+/// stream, while a server that merely sends response headers early and
+/// keeps consuming the upload keeps receiving messages.
+///
+/// # Errors
+///
+/// Returns an error if a request message cannot be encoded, the transport
+/// fails, the whole-call deadline expires, the server responds with an
+/// error, or the response cannot be decoded.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
     service: &str,
     method: &str,
-    requests: impl IntoIterator<Item = Req>,
+    requests: impl Stream<Item = Req> + Send + 'static,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
@@ -3454,21 +3576,31 @@ where
         .parse()
         .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
 
-    // Channel-backed request body. Depth 32 matches `call_bidi_stream` and
-    // gives natural backpressure on HTTP/2 flow control.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ConnectError>>(32);
-    let body: ClientBody = ChannelBody { rx }.boxed();
-
     let compression_for_encoder = config.request_compression.as_ref().map(|enc| {
         (
             std::sync::Arc::new(config.compression.clone()),
             enc.as_str(),
         )
     });
-    let mut encoder = crate::envelope::EnvelopeEncoder::new(
+    let encoder = crate::envelope::EnvelopeEncoder::new(
         compression_for_encoder,
         config.compression_policy.with_override(options.compress),
     );
+
+    // The stream backs the request body directly: the transport polls it for
+    // the next frame as it is able to send. An encode failure is reported
+    // through the body (aborting the request) and stashed here so the call
+    // can surface the precise error instead of a generic transport failure.
+    let encode_error: std::sync::Arc<std::sync::Mutex<Option<ConnectError>>> =
+        std::sync::Arc::default();
+    let body: ClientBody = EncodingBody {
+        stream: sync_wrapper::SyncWrapper::new(requests),
+        encoder,
+        codec_format: config.codec_format,
+        error: encode_error.clone(),
+        done: false,
+    }
+    .boxed();
 
     // Compute deadline BEFORE sending, matching Go's ctx.Deadline() semantics
     let deadline = client_deadline(options.timeout, config.protocol);
@@ -3487,51 +3619,16 @@ where
         .body(body)
         .map_err(|e| ConnectError::internal(format!("failed to build request: {e}")))?;
 
-    // Drive the transport send concurrently with the iterator drain below.
-    // Without this, a transport whose send() future contains the actual I/O
-    // would not read from the channel until awaited, deadlocking once the
-    // channel filled. The response is bridged back via a oneshot so the
-    // awaitee is uniform across architectures.
-    let response_fut = transport.send(http_request);
-    let (resp_tx, resp_rx) =
-        tokio::sync::oneshot::channel::<Result<Response<T::ResponseBody>, ConnectError>>();
-    let _ = crate::spawn_detached(async move {
-        let result = response_fut
+    // Enforce the client-side deadline on send + parse. The transport polls
+    // the request body (and therefore the caller's stream) while this send
+    // future — or, for connection-driver transports, their background task —
+    // makes progress; there is no library-side pump that could hang on an
+    // idle stream or cut off an upload the server is still consuming.
+    let result = with_deadline(deadline, async {
+        let response = transport
+            .send(http_request)
             .await
-            .map_err(|e| map_transport_send_error(e, "request failed"));
-        let _ = resp_tx.send(result);
-    });
-
-    // Enforce client-side deadline on send + parse.
-    with_deadline(deadline, async {
-        // Drain the iterator, encoding each request and pushing its envelope
-        // into the channel. The iterator is synchronous, so the only awaits
-        // here are tx.send(...), which provides backpressure via the channel
-        // depth.
-        for request in requests {
-            let msg_bytes = match config.codec_format {
-                CodecFormat::Proto => request.encode_to_bytes(),
-                CodecFormat::Json => encode_json(&request)?,
-            };
-
-            let mut envelope_buf = BytesMut::new();
-            tokio_util::codec::Encoder::encode(&mut encoder, msg_bytes, &mut envelope_buf)?;
-
-            if tx.send(Ok(envelope_buf.freeze())).await.is_err() {
-                // Receiver dropped: the spawned send task has finished, either
-                // because the transport failed or the server responded before
-                // we finished sending. Stop draining and let the response
-                // task surface the actual error/result.
-                break;
-            }
-        }
-
-        drop(tx);
-
-        // Await the response now that the request body has been fully sent.
-        let response = resp_rx.await.map_err(|_| {
-            ConnectError::internal("transport send task dropped without producing a response")
-        })??;
+            .map_err(|e| map_transport_send_error(e, "request failed"))?;
 
         // For gRPC, the response is envelope-framed like a unary gRPC response
         // (single data envelope + trailers). Reuse parse_grpc_unary_response.
@@ -3544,7 +3641,20 @@ where
             }
         }
     })
-    .await
+    .await;
+
+    // An encode failure aborts the request at the transport level; surface
+    // the precise encode error instead of the generic transport failure —
+    // unconditionally, because a server's early response can race the abort
+    // and produce an `Ok` result for a truncated, encode-aborted upload.
+    if let Some(err) = encode_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        return Err(err);
+    }
+    result
 }
 
 /// Parse a Connect protocol client-streaming response.
@@ -5567,7 +5677,7 @@ mod tests {
             &config,
             "test.Service",
             "ClientStream",
-            [StringValue::from("hello")],
+            futures::stream::iter([StringValue::from("hello")]),
             CallOptions::default(),
         )
         .await

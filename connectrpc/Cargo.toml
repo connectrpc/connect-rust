@@ -28,6 +28,7 @@ tower = { workspace = true }
 tokio = { workspace = true, features = ["rt", "io-util", "sync", "time"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
+sync_wrapper = { workspace = true }
 async-trait = { workspace = true }
 
 # Protobuf.

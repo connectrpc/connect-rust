@@ -51,9 +51,10 @@ cargo test -p streaming-tour-example
   request type changes: unary takes `OwnedView<RequestView<'static>>`,
   client/bidi take a `Pin<Box<dyn Stream<Item = Result<OwnedView<...>>>>>`.
 - **`src/client.rs`** - generated-client invocation patterns. The
-  client-streaming `Sum` takes a `Vec<SumRequest>`; the bidi
-  `RunningSum` returns a stream you `.send()` to and `.message()` from
-  interleaved.
+  client-streaming `Sum` takes an async `Stream<Item = SumRequest>`
+  (a ready collection is adapted with `connectrpc::client::stream_iter`);
+  the bidi `RunningSum` returns a stream you `.send()` to and
+  `.message()` from interleaved.
 
 ## Where to go next
 

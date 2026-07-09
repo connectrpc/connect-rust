@@ -347,7 +347,10 @@ mod tests {
             })
             .collect();
 
-        let resp = client.client_stream(messages).await.unwrap();
+        let resp = client
+            .client_stream(futures::stream::iter(messages))
+            .await
+            .unwrap();
 
         let msg = resp.into_view();
         assert_eq!(msg.reborrow().sequence, 5);
@@ -360,7 +363,7 @@ mod tests {
         let client = make_client(addr);
 
         let resp = client
-            .client_stream(Vec::<EchoRequest>::new())
+            .client_stream(futures::stream::empty::<EchoRequest>())
             .await
             .unwrap();
 
@@ -371,8 +374,8 @@ mod tests {
 
     /// Regression: `call_client_stream` must stream the request body
     /// frame-by-frame instead of buffering the whole concatenated payload
-    /// into a single Frame. Each iterator item should produce its own body
-    /// frame (one envelope per channel push).
+    /// into a single Frame. Each stream item should produce its own body
+    /// frame (one envelope per message).
     #[tokio::test]
     async fn client_stream_request_body_is_streamed() {
         use bytes::Bytes;
@@ -430,9 +433,10 @@ mod tests {
             })
             .collect();
 
-        // Expected to fail with the forced transport error. call_client_stream
-        // awaits the oneshot internally, so frames are fully captured by return.
-        let _ = client.client_stream(messages).await;
+        // Expected to fail with the forced transport error. The transport's
+        // send future (which reads the whole body) completes before the call
+        // returns, so frames are fully captured by then.
+        let _ = client.client_stream(futures::stream::iter(messages)).await;
 
         let captured = frames.lock().unwrap().clone();
         assert_eq!(
@@ -448,6 +452,271 @@ mod tests {
                 "envelope frame too small ({size} bytes) — header alone is 5 bytes",
             );
         }
+    }
+
+    /// End-to-end: the client-stream request source is an async stream, so
+    /// messages produced *after* the call starts — here by a separate task
+    /// pacing itself with sleeps — are sent as they become available, and
+    /// the call completes once the stream ends.
+    #[tokio::test]
+    async fn client_stream_async_producer() {
+        let (addr, _server) = start_server().await;
+        let client = make_client(addr);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<EchoRequest>(1);
+        let producer = tokio::spawn(async move {
+            for i in 0..4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(EchoRequest {
+                    sequence: i,
+                    data: format!("async-{i}"),
+                    ..Default::default()
+                })
+                .await
+                .expect("request body should keep draining the channel");
+            }
+            // Dropping tx ends the stream, which ends the request body.
+        });
+
+        let resp = client
+            .client_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap();
+
+        let msg = resp.into_view();
+        assert_eq!(msg.reborrow().sequence, 4);
+        assert_eq!(msg.reborrow().data, "async-0,async-1,async-2,async-3");
+        producer.await.unwrap();
+    }
+
+    /// Regression: a transport whose response resolves *before* the request
+    /// stream is drained — a server sending response headers early while it
+    /// keeps consuming the upload is a legitimate HTTP/2 pattern — must NOT
+    /// cut the upload short. Every request message must still reach the
+    /// transport; only the request body being dropped ends the drain.
+    #[tokio::test]
+    async fn client_stream_early_response_headers_do_not_truncate_upload() {
+        use bytes::{BufMut, Bytes, BytesMut};
+        use connectrpc::client::{BoxFuture, ClientBody, ClientTransport};
+        use http::{Request, Response};
+        use http_body::Body;
+        use std::sync::Mutex;
+
+        /// Resolves with a complete, valid Connect client-stream response
+        /// immediately, while a spawned task keeps consuming the request
+        /// body until EOF, recording each frame.
+        #[derive(Clone)]
+        struct EarlyResponseTransport {
+            frames: Arc<Mutex<Vec<usize>>>,
+        }
+
+        impl ClientTransport for EarlyResponseTransport {
+            type ResponseBody = http_body_util::Full<Bytes>;
+            type Error = ConnectError;
+
+            fn send(
+                &self,
+                request: Request<ClientBody>,
+            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+                let frames = self.frames.clone();
+                // Keep the body alive and drain it in the background — the
+                // signal a real transport gives while the server is still
+                // reading the upload.
+                tokio::spawn(async move {
+                    let mut body = request.into_body();
+                    while let Some(frame) =
+                        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+                            .await
+                    {
+                        if let Ok(Ok(data)) = frame.map(http_body::Frame::into_data) {
+                            frames.lock().unwrap().push(data.len());
+                        }
+                    }
+                });
+
+                // Envelope-framed unary response + END_STREAM, ready at once.
+                let mut body = BytesMut::new();
+                let msg = buffa::Message::encode_to_vec(&EchoResponse {
+                    sequence: 42,
+                    ..Default::default()
+                });
+                body.put_u8(0);
+                body.put_u32(msg.len() as u32);
+                body.extend_from_slice(&msg);
+                body.put_u8(0x02); // END_STREAM
+                body.put_u32(2);
+                body.extend_from_slice(b"{}");
+                let response = Response::builder()
+                    .status(200)
+                    .header("content-type", "application/connect+proto")
+                    .body(http_body_util::Full::new(body.freeze()))
+                    .unwrap();
+                Box::pin(async move { Ok(response) })
+            }
+        }
+
+        let frames: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let transport = EarlyResponseTransport {
+            frames: frames.clone(),
+        };
+        let config = ClientConfig::new("http://localhost/".parse().unwrap());
+        let client = EchoServiceClient::new(transport, config);
+
+        // A paced producer: every item is momentarily unavailable, so a
+        // drain loop that (wrongly) stopped as soon as the response
+        // resolved would truncate the upload.
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel::<EchoRequest>(1);
+        tokio::spawn(async move {
+            for i in 0..5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if req_tx
+                    .send(EchoRequest {
+                        sequence: i,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let resp = client
+            .client_stream(tokio_stream::wrappers::ReceiverStream::new(req_rx))
+            .await
+            .unwrap();
+        assert_eq!(resp.view().sequence, 42);
+
+        // The consumer task races the call's return for the tail frames;
+        // give it a moment to observe body EOF before asserting.
+        for _ in 0..200 {
+            if frames.lock().unwrap().len() >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            5,
+            "all request messages must be sent even though the response resolved first",
+        );
+    }
+
+    /// Regression: an encode failure in the request body must surface as the
+    /// call's error even when the transport still produces a successful
+    /// response (the abort and an early server response can race). Without
+    /// the unconditional encode-error check, this call would return `Ok`
+    /// for a truncated, encode-aborted upload.
+    #[tokio::test]
+    async fn client_stream_encode_error_beats_ok_response() {
+        use bytes::{BufMut, Bytes, BytesMut};
+        use connectrpc::client::{BoxFuture, ClientBody, ClientTransport};
+        use http::{Request, Response};
+        use http_body::Body;
+
+        /// Reads the request body until EOF or the first body error, then
+        /// returns a complete, valid response regardless.
+        #[derive(Clone)]
+        struct SwallowingTransport;
+
+        impl ClientTransport for SwallowingTransport {
+            type ResponseBody = http_body_util::Full<Bytes>;
+            type Error = ConnectError;
+
+            fn send(
+                &self,
+                request: Request<ClientBody>,
+            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+                Box::pin(async move {
+                    let mut body = request.into_body();
+                    while let Some(frame) =
+                        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+                            .await
+                    {
+                        if frame.is_err() {
+                            break;
+                        }
+                    }
+
+                    let mut body = BytesMut::new();
+                    let msg = buffa::Message::encode_to_vec(&EchoResponse::default());
+                    body.put_u8(0);
+                    body.put_u32(msg.len() as u32);
+                    body.extend_from_slice(&msg);
+                    body.put_u8(0x02); // END_STREAM
+                    body.put_u32(2);
+                    body.extend_from_slice(b"{}");
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("content-type", "application/connect+proto")
+                        .body(http_body_util::Full::new(body.freeze()))
+                        .unwrap())
+                })
+            }
+        }
+
+        // An unregistered request compression makes envelope encoding fail
+        // (the message must exceed the compression min-size to be attempted).
+        let config =
+            ClientConfig::new("http://localhost/".parse().unwrap()).compress_requests("bogus");
+        let client = EchoServiceClient::new(SwallowingTransport, config);
+
+        let err = client
+            .client_stream(connectrpc::client::stream_iter([EchoRequest {
+                data: "x".repeat(8 * 1024),
+                ..Default::default()
+            }]))
+            .await
+            .expect_err("encode failure must surface despite the 200 response");
+        assert_eq!(err.code, connectrpc::ErrorCode::Unimplemented);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("unsupported compression"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Regression: a server that ends the RPC while the request stream is
+    /// still pending must surface its response instead of waiting for the
+    /// next request message. The transport owns the polling of the
+    /// stream-backed request body, so when the call ends it simply stops
+    /// polling; a library-side pump loop awaiting the next item would hang
+    /// this call forever (no timeout is set).
+    #[tokio::test]
+    async fn client_stream_early_server_response_unblocks_pending_stream() {
+        use bytes::Bytes;
+        use connectrpc::client::{BoxFuture, ClientBody, ClientTransport};
+        use http::{Request, Response};
+
+        /// Fails the call immediately, without consuming the request body —
+        /// the shape of a server rejecting the RPC mid-upload.
+        #[derive(Clone)]
+        struct ImmediateErrorTransport;
+
+        impl ClientTransport for ImmediateErrorTransport {
+            type ResponseBody = http_body_util::Empty<Bytes>;
+            type Error = ConnectError;
+
+            fn send(
+                &self,
+                _request: Request<ClientBody>,
+            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+                Box::pin(async { Err(ConnectError::unavailable("rejected mid-upload")) })
+            }
+        }
+
+        let config = ClientConfig::new("http://localhost/".parse().unwrap());
+        let client = EchoServiceClient::new(ImmediateErrorTransport, config);
+
+        let call = client.client_stream(futures::stream::pending::<EchoRequest>());
+        let err = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("call must return once the transport responds, not await the stream")
+            .expect_err("transport error must surface");
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
     }
 
     /// Tests bidi streaming at the server level by sending envelope-framed
@@ -573,7 +842,10 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let resp = client.client_stream(messages).await.unwrap();
+        let resp = client
+            .client_stream(futures::stream::iter(messages))
+            .await
+            .unwrap();
         assert_eq!(resp.view().sequence, 4);
 
         // NotFound — wrong path should produce Unimplemented, not panic.
@@ -1395,7 +1667,10 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let resp = client.client_stream(messages).await.unwrap();
+        let resp = client
+            .client_stream(futures::stream::iter(messages))
+            .await
+            .unwrap();
         assert_eq!(
             resp.headers().get("x-stream-intercepted").unwrap(),
             "/test.echo.v1.EchoService/ClientStream"
@@ -1490,7 +1765,7 @@ mod tests {
         // Client streaming: the response is unary-shaped over a streaming
         // wire, so the error surfaces from the call itself.
         let err = client
-            .client_stream(vec![EchoRequest::default()])
+            .client_stream(futures::stream::iter(vec![EchoRequest::default()]))
             .await
             .expect_err("expected deny");
         assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
