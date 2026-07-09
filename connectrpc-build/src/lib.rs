@@ -4,7 +4,11 @@
 //! build time. It shells out to `protoc` (or `buf`, or reads a precompiled
 //! `FileDescriptorSet`) to obtain descriptors, then runs
 //! [`connectrpc_codegen`] to emit buffa message types plus ConnectRPC
-//! service traits and clients into `$OUT_DIR`.
+//! service traits and clients into `$OUT_DIR`. Comments in the `.proto`
+//! source are carried into the generated Rust as doc comments, as long as
+//! the descriptors carry source info — the protoc and buf sources always
+//! do, but a precompiled set must be built with it (see
+//! [`Config::descriptor_set`]).
 //!
 //! # Example
 //!
@@ -268,7 +272,8 @@ impl Config {
     /// and `buf.yaml` configuration; [`Config::includes`] is ignored. When
     /// using buf, [`Config::files`] must contain proto-relative names as
     /// they appear in the buf module (e.g. `"my/service.proto"`), not
-    /// filesystem paths.
+    /// filesystem paths. buf includes source info by default, so proto
+    /// comments become generated doc comments, same as the protoc source.
     #[must_use]
     pub fn use_buf(mut self) -> Self {
         self.descriptor_source = DescriptorSource::Buf;
@@ -280,7 +285,9 @@ impl Config {
     ///
     /// Produce the file once with `protoc --descriptor_set_out=... --include_imports`
     /// or `buf build --as-file-descriptor-set -o ...`, then ship it with
-    /// your source.
+    /// your source. Add `--include_source_info` to the `protoc` invocation
+    /// if you want proto comments carried into the generated Rust docs
+    /// (buf includes source info by default).
     ///
     /// [`Config::files`] selects which files in the set to generate code for.
     /// **These must be the proto-relative names as they appear in the
@@ -318,6 +325,12 @@ impl Config {
     /// The inverse of [`Config::descriptor_set`], which *reads* a precompiled
     /// set; this *writes* the one connectrpc-build already computed, so build
     /// scripts no longer need a second `protoc --descriptor_set_out` pass.
+    ///
+    /// For the protoc and buf sources, `SourceCodeInfo` (proto comments and
+    /// spans) is stripped from the emitted set — reflection does not need it,
+    /// and stripping keeps the embedded bytes lean and proto comments out of
+    /// shipped binaries. A precompiled set is written through byte-for-byte;
+    /// use that source if you need the emitted set to carry source info.
     #[must_use]
     pub fn emit_descriptor_set(mut self, name: impl Into<String>) -> Self {
         self.emit_descriptor_set = Some(name.into());
@@ -398,7 +411,7 @@ impl Config {
                 (bytes, proto_relative_names(&self.files))
             }
         };
-        let fds = FileDescriptorSet::decode_from_slice(&descriptor_bytes)
+        let mut fds = FileDescriptorSet::decode_from_slice(&descriptor_bytes)
             .map_err(|e| anyhow!("failed to decode FileDescriptorSet: {e}"))?;
 
         // 3. Generate.
@@ -411,9 +424,9 @@ impl Config {
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("failed to create out_dir '{}'", out_dir.display()))?;
 
-        // Emit the parsed descriptor set for gRPC server reflection, if requested.
-        // `descriptor_bytes` already carries the full import closure for every
-        // descriptor source, so the written set is reflection-ready as-is.
+        // Emit the descriptor set for gRPC server reflection, if requested.
+        // The decoded set carries the full import closure for every
+        // descriptor source, so the written set is reflection-ready.
         if let Some(name) = &self.emit_descriptor_set {
             // `<out_dir>/<name>` is the documented contract; a separator or
             // absolute path would silently escape it via `Path::join`.
@@ -424,7 +437,22 @@ impl Config {
                 );
             }
             let target = out_dir.join(name);
-            write_if_changed(&target, &descriptor_bytes)
+            // For the sets this crate builds itself, strip `SourceCodeInfo`
+            // before writing: reflection never needs it, and passing it
+            // through would bloat the embedded bytes and leak proto comments
+            // into consumer binaries. A precompiled set is user-curated, so
+            // it is written through byte-for-byte. Codegen has already run,
+            // so mutating `fds` here is safe.
+            let emit_bytes = match &self.descriptor_source {
+                DescriptorSource::Protoc | DescriptorSource::Buf => {
+                    for file in &mut fds.file {
+                        file.source_code_info = Default::default();
+                    }
+                    fds.encode_to_vec()
+                }
+                DescriptorSource::Precompiled(_) => descriptor_bytes,
+            };
+            write_if_changed(&target, &emit_bytes)
                 .with_context(|| format!("failed to write descriptor set {}", target.display()))?;
         }
 
@@ -504,6 +532,9 @@ fn run_protoc(files: &[PathBuf], includes: &[PathBuf]) -> Result<Vec<u8>> {
 
     let mut cmd = Command::new(&protoc);
     cmd.arg("--include_imports");
+    // Without this, the descriptor set carries no `SourceCodeInfo` and proto
+    // comments never reach the generated Rust docs.
+    cmd.arg("--include_source_info");
     cmd.arg(format!("--descriptor_set_out={}", out_path.display()));
     for inc in includes {
         cmd.arg(format!("--proto_path={}", inc.display()));
@@ -873,6 +904,74 @@ mod tests {
             "default emission must not emit any cfg attr — external \
              consumers should not need to declare a `client` Cargo \
              feature unless they opt in. Got:\n{ungated}"
+        );
+    }
+
+    /// Protoc mode must pass `--include_source_info` so proto comments
+    /// survive into the generated Rust as doc comments (issue #222).
+    /// Unlike the fixture-driven tests above, this one requires `protoc`
+    /// on PATH — a documented prerequisite of the workspace test suite.
+    #[test]
+    fn protoc_mode_preserves_proto_comments() {
+        let proto_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proto_dir.path().join("commented.proto"),
+            r#"syntax = "proto3";
+package commented;
+
+// DistinctiveMessageComment documents the Note message.
+message Note {
+  // DistinctiveFieldComment documents the text field.
+  string text = 1;
+}
+"#,
+        )
+        .unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        Config::new()
+            .files(&[proto_dir.path().join("commented.proto")])
+            .includes(&[proto_dir.path()])
+            .out_dir(out.path())
+            .emit_rerun_directives(false)
+            .emit_descriptor_set("commented.bin")
+            .compile()
+            .expect("compile in protoc mode");
+
+        let generated =
+            std::fs::read_to_string(out.path().join("commented.rs")).expect("read commented.rs");
+        for marker in ["DistinctiveMessageComment", "DistinctiveFieldComment"] {
+            assert!(
+                generated.contains(&format!("/// {marker}")),
+                "expected proto comment `{marker}` as a doc comment in the \
+                 generated Rust — was the descriptor built without \
+                 --include_source_info?\n{generated}"
+            );
+        }
+
+        // The emitted reflection set must NOT carry the source info codegen
+        // consumed: reflection doesn't need it, and it would leak proto
+        // comments into consumer binaries. The rest of the descriptor
+        // content must survive the strip's decode→re-encode round trip.
+        let bytes = std::fs::read(out.path().join("commented.bin")).unwrap();
+        let emitted = FileDescriptorSet::decode_from_slice(&bytes).unwrap();
+        assert!(
+            emitted
+                .file
+                .iter()
+                .all(|f| f.source_code_info.as_option().is_none()),
+            "emitted descriptor set must have SourceCodeInfo stripped"
+        );
+        let file = emitted
+            .file
+            .iter()
+            .find(|f| f.name.as_deref() == Some("commented.proto"))
+            .expect("emitted set must retain commented.proto");
+        assert!(
+            file.message_type
+                .iter()
+                .any(|m| m.name.as_deref() == Some("Note")),
+            "emitted set must retain the Note message"
         );
     }
 
