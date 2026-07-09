@@ -1,0 +1,15 @@
+kind: Fixed
+body: |-
+  **Initial `BidiStream::message()` cancellation no longer breaks the receive side**.
+  Dropping the first receive while it is waiting for response headers or Connect
+  error-body parsing now leaves initialization pending for the next `message()`
+  call, while real transport, deadline, and protocol failures stay terminal and
+  sticky. Dropping the `BidiStream` (or failing the call at its deadline) now
+  aborts the in-flight initialization task instead of detaching it: a stalled
+  server can no longer pin an abandoned call's resources, and dropping the
+  stream cancels the call outright rather than flushing buffered request
+  messages in the background — callers that need the request delivered must
+  drive the call via `message()` before dropping. `message()` now requires
+  `B: 'static` and the view type to be `'static`, which every transport and
+  generated view type already satisfies.
+time: 2026-07-06T20:39:37.361463737-04:00

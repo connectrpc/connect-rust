@@ -887,7 +887,7 @@ mod tests {
     /// Regression test for the half-duplex deadlock on `SharedHttp2Connection`.
     ///
     /// Before the fix, `call_bidi_stream` stored the transport's `send()`
-    /// future unpolled in `RecvState::Pending`, so the HTTP request never
+    /// future unpolled in the receive state machine, so the HTTP request never
     /// initiated until the first `message()` call. `BidiStream::send()`
     /// would buffer into the 32-deep mpsc with nobody draining it, and the
     /// 33rd send would hang forever. After the fix, the send future is
