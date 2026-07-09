@@ -2993,7 +2993,8 @@ impl Body for ChannelBody {
 /// HEADERS, then constructs the [`ServerStream`]. Both pending operations stay
 /// in this state machine while awaited, so cancelling `message()` does not
 /// discard either the response task or a suspended construction step such as
-/// Connect error-body parsing.
+/// Connect error-body parsing. Dropping the whole [`BidiStream`] (or failing
+/// the call at its deadline) aborts the in-flight task instead.
 enum RecvState<B, RespView> {
     /// Request initiated in a spawned task; response HEADERS not yet
     /// received. Awaiting the handle yields the [`Response`] once hyper
@@ -3019,6 +3020,16 @@ enum RecvState<B, RespView> {
 /// HTTP/2. This type does not distinguish — it's the caller's responsibility to
 /// respect the protocol in use. On HTTP/1.1, calling `message()` before
 /// `close_send()` will block until the request body is complete.
+///
+/// # Cancellation
+///
+/// Dropping the `BidiStream` cancels the call: any in-flight initialization
+/// task is aborted, which resets the underlying transport stream. Request
+/// messages accepted by [`send()`](Self::send) but not yet transmitted may
+/// never reach the server — a caller that needs the request delivered must
+/// drive the call to completion via [`message()`](Self::message) before
+/// dropping. Cancelling an individual `message()` future is safe and
+/// resumable — see [`message()`](Self::message).
 ///
 /// # Example
 ///
@@ -3053,15 +3064,11 @@ pub struct BidiStream<B, Req, RespView> {
 // send-channel state, recv-state discriminant, and any receive error.
 impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let recv_state = match &self.recv {
-            RecvState::AwaitingHeaders(_) => "AwaitingHeaders",
-            RecvState::Constructing(_) => "Constructing",
-            RecvState::Ready(_) => "Ready",
-            RecvState::Failed(_) => "Failed",
-        };
-        let recv_error = match &self.recv {
-            RecvState::Failed(err) => Some(err),
-            _ => None,
+        let (recv_state, recv_error) = match &self.recv {
+            RecvState::AwaitingHeaders(_) => ("AwaitingHeaders", None),
+            RecvState::Constructing(_) => ("Constructing", None),
+            RecvState::Ready(_) => ("Ready", None),
+            RecvState::Failed(err) => ("Failed", Some(err)),
         };
         f.debug_struct("BidiStream")
             .field("send_closed", &self.tx.is_none())
@@ -3070,6 +3077,22 @@ impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
             .field("codec_format", &self.stream_config.codec_format)
             .field("recv_error", &recv_error)
             .finish_non_exhaustive()
+    }
+}
+
+// Dropping the stream aborts any in-flight initialization task. Without
+// this, a task left in `AwaitingHeaders` or `Constructing` would detach on
+// drop and — absent a call deadline — could be pinned indefinitely by a
+// server that stalls response HEADERS or a Connect error body without ever
+// ending the stream. Abandoning the stream abandons the RPC, so nothing can
+// consume the task's result anyway.
+impl<B, Req, RespView> Drop for BidiStream<B, Req, RespView> {
+    fn drop(&mut self) {
+        match &self.recv {
+            RecvState::AwaitingHeaders(task) => task.abort(),
+            RecvState::Constructing(task) => task.abort(),
+            RecvState::Ready(_) | RecvState::Failed(_) => {}
+        }
     }
 }
 
@@ -3170,14 +3193,23 @@ where
                     // is pending, so cancelling this `message()` future does
                     // not detach the task or lose its eventual response.
                     let response = match with_deadline(self.stream_config.deadline, async {
-                        task.await.map_err(|e| {
-                            ConnectError::internal(format!("transport send task panicked: {e}"))
+                        // Reborrow rather than move so `task` stays usable
+                        // for the abort in the failure arm below.
+                        (&mut *task).await.map_err(|e| {
+                            // JoinError's Display already distinguishes
+                            // panic from cancellation.
+                            ConnectError::internal(format!("transport send task failed: {e}"))
                         })?
                     })
                     .await
                     {
                         Ok(response) => response,
                         Err(e) => {
+                            // Deadline (or join) failure is terminal: abort
+                            // the response task rather than detaching it —
+                            // the RPC is dead, so nothing will ever consume
+                            // its result. No-op if the task already finished.
+                            task.abort();
                             self.recv = RecvState::Failed(e.clone());
                             return Err(e);
                         }
@@ -3218,7 +3250,7 @@ where
                     let result = match task.await {
                         Ok(result) => result,
                         Err(e) => Err(ConnectError::internal(format!(
-                            "response stream construction task panicked: {e}"
+                            "response stream construction task failed: {e}"
                         ))),
                     };
 
@@ -3237,7 +3269,8 @@ where
     }
 
     /// Response headers. `None` until the first [`message()`](Self::message)
-    /// call resolves them (i.e. until the response HEADERS frame arrives).
+    /// call completes response initialization (a cancelled first `message()`
+    /// can leave this `None` even after the HEADERS frame arrived).
     #[must_use]
     pub fn headers(&self) -> Option<&http::HeaderMap> {
         match &self.recv {
@@ -3261,7 +3294,10 @@ where
     /// decode/transport/deadline failure. [`message()`](Self::message)
     /// already returns this same error, so most callers never need this
     /// accessor; it exists for post-hoc inspection alongside
-    /// [`trailers()`](Self::trailers).
+    /// [`trailers()`](Self::trailers). Returns `None` while response
+    /// initialization is still in progress — including after a cancelled
+    /// first `message()` call whose retained initialization has since
+    /// failed; call `message()` again to surface that error.
     #[must_use]
     pub fn error(&self) -> Option<&ConnectError> {
         match &self.recv {
@@ -3354,9 +3390,10 @@ where
     // this avoids.
     //
     // Uses tokio::spawn directly (not spawn_detached) because
-    // RecvState::AwaitingHeaders needs JoinHandle<Result<...>>. If wasm32+client
-    // becomes supported, factor this into a spawn_with_result helper that
-    // bridges via oneshot on wasm.
+    // RecvState::AwaitingHeaders needs JoinHandle<Result<...>>. There is a
+    // second such site: `message()` spawns the RecvState::Constructing task.
+    // If wasm32+client becomes supported, factor both into a
+    // spawn_with_result helper that bridges via oneshot on wasm.
     let response_fut = transport.send(http_request);
     let response_task = tokio::spawn(async move {
         response_fut
@@ -4709,6 +4746,92 @@ mod tests {
         assert_eq!(again.code, ErrorCode::Unavailable);
         assert_eq!(again.message.as_deref(), Some("request failed: boom"));
         assert_eq!(stream.error().unwrap().code, ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn bidi_drop_aborts_headers_task() {
+        let (guard_tx, guard_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_never_tx, never_rx) =
+            tokio::sync::oneshot::channel::<Result<Response<Full<Bytes>>, ConnectError>>();
+        let response_task = tokio::spawn(async move {
+            let _guard = guard_tx;
+            never_rx.await.expect("test never resolves the response")
+        });
+        let stream = bidi_stream_with_response_task(response_task, None);
+        drop(stream);
+
+        // The abort drops the task and with it `_guard`, erroring the
+        // receiver. Without the abort the task stays parked and this times out.
+        tokio::time::timeout(Duration::from_secs(5), guard_rx)
+            .await
+            .expect("dropped BidiStream should abort the headers task")
+            .expect_err("guard sender should be dropped by the abort");
+    }
+
+    #[tokio::test]
+    async fn bidi_drop_aborts_pending_construction() {
+        use buffa_types::google::protobuf::StringValue;
+
+        let (body, body_polled, body_release) = GatedBody::new();
+        let (response_ready_tx, response_ready_rx) = tokio::sync::oneshot::channel();
+        let response_task = tokio::spawn(async move {
+            let response = connect_response(http::StatusCode::BAD_REQUEST, body);
+            let _ = response_ready_tx.send(());
+            Ok(response)
+        });
+        response_ready_rx
+            .await
+            .expect("response task should have prepared headers");
+        let mut stream = bidi_stream_with_response_task(response_task, None);
+
+        let mut first_message = Box::pin(stream.message::<StringValue>());
+        assert!(matches!(
+            futures::poll!(&mut first_message),
+            std::task::Poll::Pending
+        ));
+        body_polled
+            .await
+            .expect("Connect error body should be polled");
+        drop(first_message);
+        drop(stream);
+
+        // Aborting the construction task drops the gated response body; the
+        // release handle then holds the only reference to the shared state.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::sync::Arc::strong_count(&body_release.shared) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped BidiStream should abort construction and drop the body");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bidi_deadline_aborts_headers_task() {
+        use buffa_types::google::protobuf::StringValue;
+
+        let (guard_tx, guard_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_never_tx, never_rx) =
+            tokio::sync::oneshot::channel::<Result<Response<Full<Bytes>>, ConnectError>>();
+        let response_task = tokio::spawn(async move {
+            let _guard = guard_tx;
+            never_rx.await.expect("test never resolves the response")
+        });
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let mut stream = bidi_stream_with_response_task(response_task, Some(deadline));
+
+        let err = stream
+            .message::<StringValue>()
+            .await
+            .expect_err("deadline should fail receive initialization");
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+
+        // Failing the call at the deadline aborts (not detaches) the headers
+        // task, dropping `_guard`.
+        tokio::time::timeout(Duration::from_secs(5), guard_rx)
+            .await
+            .expect("deadline failure should abort the headers task")
+            .expect_err("guard sender should be dropped by the abort");
     }
 
     #[tokio::test]
