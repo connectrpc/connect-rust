@@ -119,14 +119,40 @@ use buffa::view::MessageView;
 use buffa::view::OwnedView;
 use buffa::view::ViewReborrow;
 /// Re-export of [`futures::Stream`] (the `futures` 0.3 / `futures-core` 0.3
-/// trait), the request-stream bound for client-streaming calls. Re-exported
-/// so generated code and callers can name the bound without a direct
-/// `futures` dependency.
+/// trait), which [`ClientRequestStream`] builds on. Re-exported so generic
+/// code can name the trait without a direct `futures` dependency.
 pub use futures::Stream;
 /// Re-export of [`futures::stream::iter`]: adapts a collection that is
 /// already in hand into a request stream for a client-streaming call,
 /// without a direct `futures` dependency.
 pub use futures::stream::iter as stream_iter;
+
+mod sealed {
+    pub trait Sealed {}
+    impl<S> Sealed for S where S: super::Stream + Send + 'static {}
+}
+
+/// The request-stream bound for client-streaming calls.
+///
+/// Implemented automatically for every `Stream<Item = Req> + Send + 'static`
+/// — it cannot (and never needs to) be implemented by hand. The trait exists
+/// so the compiler can point at the two usual fixes when the bound is not
+/// met: wrap a ready collection with [`stream_iter`], and make a borrowing
+/// stream yield owned messages (the stream backs the request body, which can
+/// outlive the call frame and move across threads — hence `Send + 'static`).
+///
+/// Not to be confused with the server-side
+/// [`dispatcher::RequestStream`](crate::dispatcher::RequestStream), a boxed
+/// stream of raw request bytes.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as the request stream of a client-streaming call",
+    label = "expected an async `Stream<Item = {Req}> + Send + 'static`",
+    note = "for a collection that is already in hand, wrap it with `connectrpc::client::stream_iter(...)`",
+    note = "the stream backs the request body, so it must be `Send + 'static`: yield owned messages (no borrows of local data) or feed the call from a channel-backed stream"
+)]
+pub trait ClientRequestStream<Req>: sealed::Sealed + Stream<Item = Req> + Send + 'static {}
+
+impl<S, Req> ClientRequestStream<Req> for S where S: Stream<Item = Req> + Send + 'static {}
 
 use crate::codec::CodecFormat;
 use crate::codec::content_type;
@@ -3525,10 +3551,11 @@ where
 ///
 /// `requests` is an asynchronous [`Stream`], so messages can be produced as
 /// they become available (paced by timers, read from sockets, forwarded from
-/// channels) without buffering the whole request up front. The stream must
-/// be `Send + 'static` because it backs the request body, which can outlive
-/// the call frame and move across threads — yield owned messages (no borrows
-/// of local data), or feed the call from a channel-backed stream. For a
+/// channels) without buffering the whole request up front. The
+/// [`ClientRequestStream`] bound additionally requires `Send + 'static`
+/// because the stream backs the request body, which can outlive the call
+/// frame and move across threads — yield owned messages (no borrows of
+/// local data), or feed the call from a channel-backed stream. For a
 /// collection that is already in hand, wrap it with [`stream_iter`]:
 ///
 /// ```rust,ignore
@@ -3556,7 +3583,7 @@ pub async fn call_client_stream<T, Req, RespView>(
     config: &ClientConfig,
     service: &str,
     method: &str,
-    requests: impl Stream<Item = Req> + Send + 'static,
+    requests: impl ClientRequestStream<Req>,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where

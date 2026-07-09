@@ -751,9 +751,10 @@ let resp = client
     .await?;
 
 // ...or feed the call from a live producer through a channel-backed
-// stream (add the `tokio-stream` crate for the wrapper). The stream backs
-// the request body, so it must be `Send + 'static`: yield owned messages
-// rather than borrows of local data.
+// stream (add the `tokio-stream` crate for the wrapper). The generated
+// bound, `ClientRequestStream<T>`, is `Stream<Item = T> + Send + 'static`:
+// the stream backs the request body, so yield owned messages rather than
+// borrows of local data.
 let (tx, rx) = tokio::sync::mpsc::channel(16);
 tokio::spawn(async move {
     while let Some(chunk) = source.recv().await {

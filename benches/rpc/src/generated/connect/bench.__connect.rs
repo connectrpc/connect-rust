@@ -934,16 +934,17 @@ where
     }
     /// Call the ClientStream RPC. Sends a request to /bench.v1.BenchService/ClientStream.
     ///
-    /// `requests` is an asynchronous stream; messages are sent as the
-    /// stream yields them. It must be `Send + 'static` (it backs the
-    /// request body), so yield owned messages or feed the call from a
+    /// `requests` is any `Stream<Item = ...> + Send + 'static` of
+    /// request messages (the `ClientRequestStream` bound); messages
+    /// are sent as the stream yields them. It backs the request
+    /// body, so yield owned messages or feed the call from a
     /// channel-backed stream. For a collection that is already in
     /// hand, wrap it with `::connectrpc::client::stream_iter(...)`.
     pub async fn client_stream(
         &self,
-        requests: impl ::connectrpc::client::Stream<
-            Item = crate::proto::bench::v1::BenchRequest,
-        > + Send + 'static,
+        requests: impl ::connectrpc::client::ClientRequestStream<
+            crate::proto::bench::v1::BenchRequest,
+        >,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
@@ -960,16 +961,17 @@ where
     }
     /// Call the ClientStream RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
     ///
-    /// `requests` is an asynchronous stream; messages are sent as the
-    /// stream yields them. It must be `Send + 'static` (it backs the
-    /// request body), so yield owned messages or feed the call from a
+    /// `requests` is any `Stream<Item = ...> + Send + 'static` of
+    /// request messages (the `ClientRequestStream` bound); messages
+    /// are sent as the stream yields them. It backs the request
+    /// body, so yield owned messages or feed the call from a
     /// channel-backed stream. For a collection that is already in
     /// hand, wrap it with `::connectrpc::client::stream_iter(...)`.
     pub async fn client_stream_with_options(
         &self,
-        requests: impl ::connectrpc::client::Stream<
-            Item = crate::proto::bench::v1::BenchRequest,
-        > + Send + 'static,
+        requests: impl ::connectrpc::client::ClientRequestStream<
+            crate::proto::bench::v1::BenchRequest,
+        >,
         options: ::connectrpc::client::CallOptions,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<

@@ -2249,9 +2249,10 @@ fn generate_client_method(
         // Client-stream
         extra_doc = quote! {
             #[doc = ""]
-            #[doc = " `requests` is an asynchronous stream; messages are sent as the"]
-            #[doc = " stream yields them. It must be `Send + 'static` (it backs the"]
-            #[doc = " request body), so yield owned messages or feed the call from a"]
+            #[doc = " `requests` is any `Stream<Item = ...> + Send + 'static` of"]
+            #[doc = " request messages (the `ClientRequestStream` bound); messages"]
+            #[doc = " are sent as the stream yields them. It backs the request"]
+            #[doc = " body, so yield owned messages or feed the call from a"]
             #[doc = " channel-backed stream. For a collection that is already in"]
             #[doc = " hand, wrap it with `::connectrpc::client::stream_iter(...)`."]
         };
@@ -2268,8 +2269,9 @@ fn generate_client_method(
                 requests, options,
             ).await
         };
-        short_args = quote! { requests: impl ::connectrpc::client::Stream<Item = #input_type> + Send + 'static };
-        opts_args = quote! { requests: impl ::connectrpc::client::Stream<Item = #input_type> + Send + 'static, options: ::connectrpc::client::CallOptions };
+        short_args =
+            quote! { requests: impl ::connectrpc::client::ClientRequestStream<#input_type> };
+        opts_args = quote! { requests: impl ::connectrpc::client::ClientRequestStream<#input_type>, options: ::connectrpc::client::CallOptions };
         short_delegate_args = quote! { requests, ::connectrpc::client::CallOptions::default() };
     } else if client_streaming && server_streaming {
         // Bidi
