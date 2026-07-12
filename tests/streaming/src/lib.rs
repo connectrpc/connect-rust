@@ -1214,6 +1214,131 @@ mod tests {
             .expect("half-duplex bidi deadlocked (send #33 never completed?)");
     }
 
+    /// Build a gRPC/h2 echo client — the transport shape that supports true
+    /// full duplex — for the `into_split` tests.
+    async fn split_test_client() -> (
+        EchoServiceClient<connectrpc::client::SharedHttp2Connection>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use connectrpc::Protocol;
+        use connectrpc::client::Http2Connection;
+
+        let (addr, server) = start_server_mono().await;
+        let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+        let conn = Http2Connection::connect_plaintext(uri.clone())
+            .await
+            .unwrap()
+            .shared(64);
+        let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
+        (EchoServiceClient::new(conn, config), server)
+    }
+
+    /// True full duplex through `into_split`: the reader runs in its own
+    /// task, and the sender does not send message N+1 until the reader has
+    /// received the echo of message N — a ping-pong that a single-task
+    /// interleaved send/message loop could also do, but here the halves are
+    /// owned by different tasks.
+    #[tokio::test]
+    async fn bidi_into_split_full_duplex_ping_pong() {
+        let (client, _server) = split_test_client().await;
+        let (mut send, mut recv) = client.bidi_stream().await.unwrap().into_split();
+
+        let (echo_tx, mut echo_rx) = tokio::sync::mpsc::channel::<i32>(1);
+        let reader = tokio::spawn(async move {
+            let mut echoes = Vec::new();
+            while let Some(resp) = recv.message().await.unwrap() {
+                echoes.push(resp.view().sequence);
+                if echo_tx.send(resp.view().sequence).await.is_err() {
+                    break;
+                }
+            }
+            (echoes, recv)
+        });
+
+        let test = async {
+            for i in 0..4 {
+                send.send(EchoRequest {
+                    sequence: i,
+                    data: format!("split-{i}"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+                // Wait for this message's echo before sending the next.
+                assert_eq!(echo_rx.recv().await, Some(i));
+            }
+            send.close_send();
+
+            let (echoes, recv) = reader.await.unwrap();
+            assert_eq!(echoes, vec![0, 1, 2, 3]);
+            assert!(recv.error().is_none());
+        };
+        tokio::time::timeout(Duration::from_secs(10), test)
+            .await
+            .expect("split full-duplex ping-pong deadlocked");
+    }
+
+    /// Dropping the send half (without `close_send`) ends the request body
+    /// cleanly: the reader sees the echoes already sent, then a clean end.
+    #[tokio::test]
+    async fn bidi_into_split_dropping_send_half_ends_stream_cleanly() {
+        let (client, _server) = split_test_client().await;
+        let (mut send, mut recv) = client.bidi_stream().await.unwrap().into_split();
+
+        let test = async {
+            for i in 0..2 {
+                send.send(EchoRequest {
+                    sequence: i,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            }
+            drop(send);
+
+            let mut count = 0;
+            while let Some(resp) = recv.message().await.unwrap() {
+                assert_eq!(resp.view().sequence, count);
+                count += 1;
+            }
+            assert_eq!(count, 2, "both echoes must arrive before the clean end");
+        };
+        tokio::time::timeout(Duration::from_secs(10), test)
+            .await
+            .expect("dropping the send half must end the stream, not hang it");
+    }
+
+    /// Dropping the receive half cancels the RPC; sends on the other half
+    /// then fail instead of blocking forever.
+    #[tokio::test]
+    async fn bidi_into_split_dropping_recv_half_fails_sends() {
+        let (client, _server) = split_test_client().await;
+        let (mut send, recv) = client.bidi_stream().await.unwrap().into_split();
+        drop(recv);
+
+        let test = async {
+            // The cancellation propagates through the transport
+            // asynchronously; keep sending until it surfaces.
+            for i in 0..1000 {
+                if let Err(err) = send
+                    .send(EchoRequest {
+                        sequence: i,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    assert_eq!(err.code, connectrpc::ErrorCode::Unavailable);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            panic!("sends kept succeeding after the receive half was dropped");
+        };
+        tokio::time::timeout(Duration::from_secs(10), test)
+            .await
+            .expect("send must fail after the receive half is dropped, not hang");
+    }
+
     // ========================================================================
     // TLS integration tests — dogfood HttpClient::with_tls and
     // Http2Connection::connect_tls against our own Server::with_tls.
