@@ -39,19 +39,16 @@ pub(crate) fn sanitize_comment(text: &str) -> String {
     let raw_lines: Vec<&str> = text.lines().collect();
     let mut lines: Vec<String> = Vec::with_capacity(raw_lines.len());
     let mut in_code_block = false;
-    let mut in_user_fence = false;
-    let mut user_fence_ticks = 0;
+    // The character and run length of the author's fence we are inside, if
+    // any — a closer must match both.
+    let mut open_fence: Option<(char, usize)> = None;
 
     for (idx, line) in raw_lines.iter().enumerate() {
-        if in_user_fence {
-            // Per CommonMark, only a run of at least the opener's tick
-            // count with no info string closes the fence; anything else
-            // (shorter runs, ```lang lines) is fence content.
-            if let Some((ticks, info)) = fence_marker(line)
-                && ticks >= user_fence_ticks
-                && info.trim().is_empty()
-            {
-                in_user_fence = false;
+        if let Some(open) = open_fence {
+            // Anything that does not close the fence (a shorter run, a
+            // ```lang line, the other fence character) is fence content.
+            if fence_marker(line).is_some_and(|f| f.closes(open)) {
+                open_fence = None;
             }
             lines.push((*line).to_string());
             continue;
@@ -79,12 +76,10 @@ pub(crate) fn sanitize_comment(text: &str) -> String {
             // Fall through: this line still needs classifying.
         }
 
-        if let Some((ticks, info)) = fence_marker(line) {
-            in_user_fence = true;
-            user_fence_ticks = ticks;
-            let indent = &line[..line.len() - line.trim_start().len()];
-            let ticks_str = "`".repeat(ticks);
-            lines.push(format!("{indent}{ticks_str}{}", fence_info(info)));
+        if let Some(fence) = fence_marker(line) {
+            open_fence = Some((fence.ch, fence.len));
+            let run = fence.ch.to_string().repeat(fence.len);
+            lines.push(format!("{}{run}{}", fence.indent, fence_info(fence.info)));
         } else if is_indented(line) {
             lines.push("```text".to_string());
             in_code_block = true;
@@ -97,11 +92,11 @@ pub(crate) fn sanitize_comment(text: &str) -> String {
     if in_code_block {
         lines.push("```".to_string());
     }
-    if in_user_fence {
+    if let Some((ch, len)) = open_fence {
         // An unterminated fence would swallow the rest of the doc block
         // (including any generator-authored text appended after the proto
-        // comment); close it with a matching-length fence.
-        lines.push("`".repeat(user_fence_ticks));
+        // comment); close it with a matching fence.
+        lines.push(ch.to_string().repeat(len));
     }
 
     lines.join("\n")
@@ -181,17 +176,57 @@ fn strip_indent(line: &str) -> String {
     }
 }
 
-/// If `line` is a fence marker (an optionally ≤3-space-indented run of 3+
-/// backticks), return the run length and the info string after it. Lines
-/// indented 4+ spaces are indented code, not fences (CommonMark).
-fn fence_marker(line: &str) -> Option<(usize, &str)> {
+/// A fenced-code-block marker line.
+struct Fence<'a> {
+    /// The 0–3 spaces before the run.
+    indent: &'a str,
+    /// The fence character: a backtick or a tilde.
+    ch: char,
+    /// How many of them the run has. A closer needs at least as many.
+    len: usize,
+    /// Whatever follows the run — the language, plus any rustdoc attributes.
+    info: &'a str,
+}
+
+impl Fence<'_> {
+    /// Whether this marker closes `open` — same character, a run at least as
+    /// long, and nothing but spaces or tabs after it (CommonMark).
+    fn closes(&self, open: (char, usize)) -> bool {
+        self.ch == open.0 && self.len >= open.1 && self.info.chars().all(|c| c == ' ' || c == '\t')
+    }
+}
+
+/// If `line` is a fence marker — an optionally ≤3-space-indented run of 3+
+/// backticks *or* tildes — describe it. rustdoc's markdown parser treats
+/// `~~~` exactly like ` ``` `, so both must be inerted.
+///
+/// Only spaces may precede the run, and only 3 of them: 4+ spaces or a tab
+/// make the line indented code, and any other leading whitespace (an NBSP,
+/// say) is prose. A backtick fence's info string may not itself contain a
+/// backtick. In each of those cases CommonMark says this is not a fence, so
+/// neither does this — misreading one as a fence would leave the *real*
+/// fence rustdoc sees unguarded.
+fn fence_marker(line: &str) -> Option<Fence<'_>> {
     if is_indented(line) {
         return None;
     }
-    let trimmed = line.trim_start();
-    let info = trimmed.trim_start_matches('`');
-    let ticks = trimmed.len() - info.len();
-    (ticks >= 3).then_some((ticks, info))
+    let indent_len = line.len() - line.trim_start_matches(' ').len();
+    let (indent, rest) = line.split_at(indent_len);
+    let ch = rest.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let info = rest.trim_start_matches(ch);
+    let len = rest.len() - info.len();
+    if len < 3 || (ch == '`' && info.contains('`')) {
+        return None;
+    }
+    Some(Fence {
+        indent,
+        ch,
+        len,
+        info,
+    })
 }
 
 /// Escape one prose line for rustdoc.
@@ -532,6 +567,64 @@ mod tests {
                 "info string: {info}"
             );
         }
+    }
+
+    #[test]
+    fn tilde_fences_are_inerted_too() {
+        // rustdoc's markdown parser treats ~~~ exactly like ``` — a tilde
+        // fence's body is compiled as a doctest just the same.
+        assert_eq!(
+            sanitize_comment("~~~rust\nlet x = 1;\n~~~"),
+            "~~~rust,ignore\nlet x = 1;\n~~~"
+        );
+        assert_eq!(
+            sanitize_comment("~~~\n{\"a\": 1}\n~~~"),
+            "~~~text\n{\"a\": 1}\n~~~"
+        );
+        // A tilde fence is not closed by a backtick run, and vice versa.
+        assert_eq!(sanitize_comment("~~~\nx\n```"), "~~~text\nx\n```\n~~~");
+    }
+
+    #[test]
+    fn exotic_leading_whitespace_is_not_a_fence() {
+        // Only spaces (0-3) may precede a fence marker. rustdoc reads an
+        // NBSP- or tab-prefixed run as prose, and so must we — otherwise we
+        // "close" a fence rustdoc never opened and leave the run it *does*
+        // treat as an opener (the trailing one here) unguarded.
+        for lead in ["\u{a0}", " \t"] {
+            let out = sanitize_comment(&format!("{lead}```\nlet x = 1;\n```"));
+            assert!(
+                out.starts_with(&format!("{lead}```\n")),
+                "opener-lookalike must stay prose: {out:?}"
+            );
+            assert!(
+                out.ends_with("```text\n```"),
+                "the run rustdoc treats as the real opener must be inerted \
+                 and closed: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closer_may_only_trail_spaces_or_tabs() {
+        // rustdoc allows only spaces/tabs after a closing run, so an
+        // NBSP-trailing run is content, and the fence stays open — and must
+        // therefore be force-closed.
+        let out = sanitize_comment("```\nx\n```\u{a0}");
+        assert!(
+            out.ends_with("\n```"),
+            "unclosed fence must be force-closed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn backtick_in_info_string_is_not_a_fence() {
+        // CommonMark: a backtick fence's info string may not contain a
+        // backtick, so rustdoc reads this line as prose, not an opener.
+        // Treating it as a fence would desync us from rustdoc and let the
+        // *next* ``` open an unannotated (Rust) block.
+        let out = sanitize_comment("```rust```\nx");
+        assert!(!out.contains("ignore"), "not treated as a fence: {out}");
     }
 
     #[test]
