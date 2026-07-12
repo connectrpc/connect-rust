@@ -24,8 +24,11 @@ bytes = { workspace = true }
 # Tower service abstraction (the foundation)
 tower = { workspace = true }
 
-# Async runtime (minimal features for core)
-tokio = { workspace = true, features = ["rt", "io-util", "sync", "time"] }
+# Async runtime (minimal features for core). `macros` is load-bearing for
+# `tokio::select!` in the `server` accept loop; it stays on the base
+# dependency because CI's `--all-targets` would hide its removal via
+# dev-dep unification while breaking downstream `server`-only builds.
+tokio = { workspace = true, features = ["rt", "io-util", "sync", "time", "macros"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
 sync_wrapper = { workspace = true }
@@ -128,10 +131,6 @@ server = [
     "dep:libc",
     "dep:tower-http",
     "tokio/net",
-    # The accept loop uses `tokio::select!`. Surfaced only when downstream
-    # consumers enable `server` without also enabling `tokio/macros`
-    # themselves; `--all-targets` (CI) hides it via dev-dep unification.
-    "tokio/macros",
 ]
 
 # HTTP client with connection pooling
