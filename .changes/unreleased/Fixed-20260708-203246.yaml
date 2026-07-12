@@ -11,9 +11,13 @@ body: |-
   through unchanged). Service and method comments are now sanitized for
   rustdoc the same way buffa sanitizes message and field comments: markdown
   and HTML metacharacters are escaped, bare URLs are autolinked, indented
-  blocks and code fences without a language annotation are rendered as
-  text, and unterminated fences are closed, so arbitrary proto comments
-  cannot break a consumer's `cargo doc` or be picked up as doctests.
+  blocks are rendered as text, and unterminated fences are closed, so
+  arbitrary proto comments cannot break a consumer's `cargo doc`. Code
+  fences in proto comments are also made inert — an unannotated fence
+  becomes `text` and any other gains `ignore` (keeping its language, so a
+  `rust` fence is still syntax-highlighted) — because rustdoc would
+  otherwise compile a fence's contents as a doctest in the consuming crate,
+  where a proto comment's example has no imports and names proto types.
   Paragraph breaks and continuation-line indentation in service and method
   comments are also preserved instead of being flattened.
 

@@ -7,12 +7,12 @@
 //! `text`, and markdown/HTML metacharacters in prose are escaped so
 //! arbitrary proto comments cannot break a consumer's `cargo doc`
 //! (intra-doc-link and HTML-tag lints) or inadvertently become doctests.
-//! Several deliberate divergences harden on buffa's behavior: fences
-//! without a language annotation default to `text` (rustdoc would
-//! otherwise compile their content as a Rust doctest), an unterminated
-//! fence is closed at the end of the comment, and fence open/close
-//! detection follows CommonMark (closers need matching tick counts and no
-//! info string; markers indented 4+ spaces are code, not fences). This
+//! Several deliberate divergences harden on buffa's behavior: every code
+//! fence is made inert so rustdoc can never compile comment content as a
+//! doctest (see [`fence_info`]), an unterminated fence is closed at the end
+//! of the comment, and fence open/close detection follows CommonMark
+//! (closers need matching tick counts and no info string; markers indented
+//! 4+ spaces are code, not fences). This
 //! module is transitional: if buffa exports an equivalently hardened
 //! sanitizer publicly, this fork should be deleted in favor of it.
 //! Proto cross-reference resolution
@@ -26,9 +26,10 @@
 /// no leading-space normalization — `doc_attrs` adds the uniform single
 /// space prettyplease needs. Handles, in priority order per line:
 ///
-/// - user-written ``` fences: content passes through unescaped; an opener
-///   with no language annotation gains `text`, and an unterminated fence
-///   is closed at the end of the comment;
+/// - user-written ``` fences: content passes through unescaped, while the
+///   opener's info string is rewritten by [`fence_info`] so rustdoc never
+///   compiles it; an unterminated fence is closed at the end of the
+///   comment;
 /// - indented blocks (4 spaces / tab): wrapped in a ```` ```text ````
 ///   fence and de-indented, so protoc-style examples render as code and
 ///   can never be run as doctests;
@@ -81,14 +82,9 @@ pub(crate) fn sanitize_comment(text: &str) -> String {
         if let Some((ticks, info)) = fence_marker(line) {
             in_user_fence = true;
             user_fence_ticks = ticks;
-            if info.trim().is_empty() {
-                // rustdoc treats a fence with no info string as a Rust
-                // doctest; default it to `text` so arbitrary comment
-                // content is never compiled by a consumer's `cargo test`.
-                lines.push(format!("{}text", line.trim_end()));
-            } else {
-                lines.push((*line).to_string());
-            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let ticks_str = "`".repeat(ticks);
+            lines.push(format!("{indent}{ticks_str}{}", fence_info(info)));
         } else if is_indented(line) {
             lines.push("```text".to_string());
             in_code_block = true;
@@ -109,6 +105,59 @@ pub(crate) fn sanitize_comment(text: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// The info string to emit for a fence opener, so that rustdoc never
+/// *compiles* the fence body. Proto comments are untrusted input: their
+/// examples have no imports, name proto types rather than Rust ones, and
+/// would be compiled — and run — by the consumer's `cargo test --doc`.
+///
+/// Deciding "is this Rust?" the way rustdoc does is a trap: an explicit
+/// `rust` keeps the block Rust even beside an unknown word
+/// (`rust,noplayground`), error-code tokens (`compile_fail,E0277`) and
+/// `{class=…}` attributes keep it Rust too, and the verdict is even
+/// order-dependent. So this does not classify at all — it makes every
+/// fence inert:
+///
+/// - `ignore-<target>` tokens are dropped. rustdoc reads them as a target
+///   *list* that replaces a plain `ignore`, so the block would still be
+///   compiled for every other target.
+/// - a bare `ignore` is then ensured. It is the only attribute that
+///   reliably stops compilation: `no_run` still type-checks,
+///   `should_panic` runs, and `compile_fail` merely inverts the verdict.
+///
+/// The author's language annotation is preserved, so a ` ```rust ` fence
+/// still gets Rust syntax highlighting as ` ```rust,ignore `. An `ignore`
+/// on a non-Rust fence is inert, and an unannotated fence becomes `text`
+/// rather than guessing a language — rustdoc highlights nothing but Rust,
+/// so identifying JSON or YAML would buy no rendering benefit.
+///
+/// (Every claim above was verified against rustdoc directly.)
+fn fence_info(info: &str) -> String {
+    let mut dropped_target_ignore = false;
+    let mut tokens: Vec<&str> = Vec::new();
+    for tok in info.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+        if tok.starts_with("ignore-") {
+            dropped_target_ignore = true;
+        } else {
+            tokens.push(tok);
+        }
+    }
+
+    if tokens.is_empty() {
+        // A fence annotated only with `ignore-<target>` was Rust, so keep
+        // it highlighted; an unannotated one is language-agnostic.
+        return if dropped_target_ignore {
+            "rust,ignore".to_string()
+        } else {
+            "text".to_string()
+        };
+    }
+
+    if !tokens.contains(&"ignore") {
+        tokens.push("ignore");
+    }
+    tokens.join(",")
 }
 
 /// An indented-code-block line: 4+ spaces or a tab (CommonMark).
@@ -411,8 +460,10 @@ mod tests {
 
     #[test]
     fn user_fences_pass_through() {
+        // Fence *content* is never escaped; only the info string gains the
+        // `ignore` that keeps rustdoc from compiling it.
         let input = "Example:\n```json\n{\"a\": [1]}\n```\ndone [x]";
-        let expected = "Example:\n```json\n{\"a\": [1]}\n```\ndone \\[x\\]";
+        let expected = "Example:\n```json,ignore\n{\"a\": [1]}\n```\ndone \\[x\\]";
         assert_eq!(sanitize_comment(input), expected);
     }
 
@@ -436,6 +487,70 @@ mod tests {
     }
 
     #[test]
+    fn rust_fence_is_marked_ignore_but_keeps_highlighting() {
+        // `rust,ignore` is still syntax-highlighted by rustdoc, but never
+        // compiled — a proto comment's Rust example has no imports and
+        // would fail in the consumer's `cargo test --doc`.
+        let input = "```rust\nlet x = Note::default();\n```";
+        assert_eq!(
+            sanitize_comment(input),
+            "```rust,ignore\nlet x = Note::default();\n```"
+        );
+    }
+
+    /// Every one of these still reaches rustdoc's compiler without an
+    /// `ignore`: `no_run` type-checks, `should_panic` runs, `compile_fail`
+    /// inverts the verdict, an error code or an mdBook-style word keeps the
+    /// block Rust, and `ignore-<target>` compiles on every other target —
+    /// even when a plain `ignore` sits beside it, because rustdoc lets the
+    /// target list replace it. All verified against rustdoc directly.
+    #[test]
+    fn every_fence_is_made_inert() {
+        let cases = [
+            ("rust", "rust,ignore"),
+            ("no_run", "no_run,ignore"),
+            ("should_panic", "should_panic,ignore"),
+            ("compile_fail", "compile_fail,ignore"),
+            ("compile_fail,E0277", "compile_fail,E0277,ignore"),
+            ("rust,noplayground", "rust,noplayground,ignore"),
+            ("edition2018", "edition2018,ignore"),
+            // `ignore-<target>` is dropped, not kept alongside `ignore`.
+            ("ignore-wasm32", "rust,ignore"),
+            ("rust,ignore-wasm32", "rust,ignore"),
+            ("ignore-wasm32,ignore", "ignore"),
+            // Non-Rust fences keep their language; the added `ignore` is
+            // inert for them, and uniformity beats classifying.
+            ("json", "json,ignore"),
+            ("proto", "proto,ignore"),
+            // Whitespace-separated info strings normalize to commas.
+            ("rust no_run", "rust,no_run,ignore"),
+        ];
+        for (info, expected) in cases {
+            assert_eq!(
+                sanitize_comment(&format!("```{info}\nbody\n```")),
+                format!("```{expected}\nbody\n```"),
+                "info string: {info}"
+            );
+        }
+    }
+
+    #[test]
+    fn already_ignored_fences_are_untouched() {
+        for info in ["rust,ignore", "ignore", "ignore,json"] {
+            let input = format!("```{info}\nbody\n```");
+            assert_eq!(sanitize_comment(&input), input, "info string: {info}");
+        }
+    }
+
+    #[test]
+    fn indented_fence_opener_keeps_indent() {
+        assert_eq!(
+            sanitize_comment("  ```rust\n  x\n  ```"),
+            "  ```rust,ignore\n  x\n  ```"
+        );
+    }
+
+    #[test]
     fn four_tick_fence_keeps_inner_three_tick_line() {
         let input = "````\n```\ncode\n````";
         assert_eq!(sanitize_comment(input), "````text\n```\ncode\n````");
@@ -443,8 +558,13 @@ mod tests {
 
     #[test]
     fn info_string_line_inside_fence_is_content() {
+        // The inner ```rust line is fence content, not a closer, so it is
+        // left alone; only the opener is rewritten.
         let input = "```json\n{}\n```rust\nx\n```";
-        assert_eq!(sanitize_comment(input), input);
+        assert_eq!(
+            sanitize_comment(input),
+            "```json,ignore\n{}\n```rust\nx\n```"
+        );
     }
 
     #[test]
