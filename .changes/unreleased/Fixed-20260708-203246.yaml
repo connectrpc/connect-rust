@@ -1,0 +1,25 @@
+kind: Fixed
+body: |-
+  `connectrpc-build` now passes `--include_source_info` to `protoc`, so proto
+  comments are carried into the generated Rust documentation ([#222]). Users of
+  `Config::descriptor_set` must add `--include_source_info` to their own
+  `protoc` invocation to get the same benefit; `buf`-built sets already
+  include source info. The set written by `Config::emit_descriptor_set` now
+  has `SourceCodeInfo` stripped for the protoc and buf sources — reflection
+  does not need it, and stripping keeps embedded descriptor bytes lean and
+  proto comments out of shipped binaries (precompiled sets are still written
+  through unchanged). Service and method comments are now sanitized for
+  rustdoc the same way buffa sanitizes message and field comments: markdown
+  and HTML metacharacters are escaped, bare URLs are autolinked, indented
+  blocks are rendered as text, and unterminated fences are closed, so
+  arbitrary proto comments cannot break a consumer's `cargo doc`. Code
+  fences in proto comments are also made inert — an unannotated fence
+  becomes `text` and any other gains `ignore` (keeping its language, so a
+  `rust` fence is still syntax-highlighted) — because rustdoc would
+  otherwise compile a fence's contents as a doctest in the consuming crate,
+  where a proto comment's example has no imports and names proto types.
+  Paragraph breaks and continuation-line indentation in service and method
+  comments are also preserved instead of being flattened.
+
+  [#222]: https://github.com/connectrpc/connect-rust/issues/222
+time: 2026-07-08T20:32:46.262831531-07:00

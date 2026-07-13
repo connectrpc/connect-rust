@@ -125,11 +125,13 @@ pub trait Health: Send + Sync + 'static {
     /// The server will immediately send back a message indicating the current
     /// serving status. It will then subsequently send a new message whenever
     /// the service's serving status changes.
+    ///
     /// If the requested service is unknown when the call is received, the
     /// server will send a message setting the serving status to SERVICE_UNKNOWN
     /// but will *not* terminate the call. If at some future point, the serving
     /// status of the service becomes known, the server will send a new message
     /// with the service's serving status.
+    ///
     /// If the call terminates with status UNIMPLEMENTED, then the client should
     /// assume this method is not supported and should not retry the call. If
     /// the call terminates with any other status (including OK), then the
