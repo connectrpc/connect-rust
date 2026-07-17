@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use buffa::Message;
 use buffa::view::{MessageView, ViewEncode};
 use bytes::Bytes;
+use bytes::BytesMut;
 use futures::Stream;
 use http::HeaderMap;
 use http::header::{HeaderName, HeaderValue};
@@ -504,6 +505,86 @@ pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> +
 /// parameters with this alias so signatures stay readable.
 pub type InboundStream<M> = ServiceStream<crate::StreamMessage<M>>;
 
+/// Encoded message bytes, either contiguous or split into reference-counted
+/// segments.
+///
+/// Concatenating [`segments`](Self::segments) always yields the message's wire
+/// bytes; how they are divided is an artifact of how the body was encoded and
+/// carries no protocol meaning. Envelope framing has never depended on HTTP
+/// frame boundaries, so a segmented body reaches the peer as the same message.
+///
+/// The single-buffer case is kept unboxed: a small message that was never
+/// worth segmenting costs no allocation to carry.
+#[derive(Debug, Clone)]
+pub enum EncodedBody {
+    /// One contiguous buffer — what a non-segmenting encode produces.
+    Contiguous(Bytes),
+    /// Several buffers, concatenating to the message's wire bytes.
+    Segmented(Vec<Bytes>),
+}
+
+impl EncodedBody {
+    /// Build from a rope's segments, collapsing the trivial cases so callers
+    /// never see a needless `Vec` for zero or one segment.
+    #[must_use]
+    pub fn from_segments(mut segments: Vec<Bytes>) -> Self {
+        match segments.len() {
+            0 => Self::Contiguous(Bytes::new()),
+            1 => Self::Contiguous(segments.pop().unwrap_or_default()),
+            _ => Self::Segmented(segments),
+        }
+    }
+
+    /// Total encoded length across all segments.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(b) => b.len(),
+            Self::Segmented(v) => v.iter().map(Bytes::len).sum(),
+        }
+    }
+
+    /// Whether the encoded message is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The segments in wire order.
+    #[must_use]
+    pub fn segments(&self) -> &[Bytes] {
+        match self {
+            Self::Contiguous(b) => std::slice::from_ref(b),
+            Self::Segmented(v) => v,
+        }
+    }
+
+    /// Flatten to a single contiguous buffer, copying only when segmented.
+    ///
+    /// This is the escape hatch for paths that genuinely need one buffer
+    /// (compression, JSON, base64) — it gives back exactly what a
+    /// non-segmenting encode would have produced.
+    #[must_use]
+    pub fn into_contiguous(self) -> Bytes {
+        match self {
+            Self::Contiguous(b) => b,
+            Self::Segmented(v) => {
+                let mut out = BytesMut::with_capacity(v.iter().map(Bytes::len).sum());
+                for segment in &v {
+                    out.extend_from_slice(segment);
+                }
+                out.freeze()
+            }
+        }
+    }
+}
+
+impl From<Bytes> for EncodedBody {
+    fn from(bytes: Bytes) -> Self {
+        Self::Contiguous(bytes)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encodable<M>
 // ---------------------------------------------------------------------------
@@ -536,6 +617,32 @@ pub type InboundStream<M> = ServiceStream<crate::StreamMessage<M>>;
 pub trait Encodable<M> {
     /// Encode `self` as wire bytes for `M` in the requested format.
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError>;
+
+    /// Encode `self` as wire bytes that may arrive in several reference-counted
+    /// segments rather than one contiguous buffer.
+    ///
+    /// Concatenating the segments yields exactly what [`encode`](Self::encode)
+    /// would have returned, so this is an optimization and never a wire-format
+    /// difference. A payload of at least `min_segment` bytes that the encoder
+    /// can hand over by reference count — a large `bytes::Bytes` field, or a
+    /// view field borrowed from the buffer the view was decoded from — becomes
+    /// its own segment instead of being copied into the output.
+    ///
+    /// The default implementation returns [`encode`](Self::encode)'s single
+    /// buffer, which is always correct; overriding it is worthwhile only for
+    /// bodies that can carry a large payload by reference.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`encode`](Self::encode).
+    fn encode_segments(
+        &self,
+        codec: CodecFormat,
+        min_segment: usize,
+    ) -> Result<EncodedBody, ConnectError> {
+        let _ = min_segment;
+        self.encode(codec).map(EncodedBody::from)
+    }
 }
 
 impl<M: Message + JsonSerialize> Encodable<M> for M {
@@ -543,6 +650,23 @@ impl<M: Message + JsonSerialize> Encodable<M> for M {
         match codec {
             CodecFormat::Proto => Ok(self.encode_to_bytes()),
             CodecFormat::Json => encode_json(self),
+        }
+    }
+
+    fn encode_segments(
+        &self,
+        codec: CodecFormat,
+        min_segment: usize,
+    ) -> Result<EncodedBody, ConnectError> {
+        match codec {
+            // JSON is serialized whole; there is nothing to hand over by
+            // reference, so it takes the contiguous path.
+            CodecFormat::Json => encode_json(self).map(EncodedBody::from),
+            CodecFormat::Proto => {
+                let mut rope = buffa::Rope::with_min_segment(min_segment);
+                buffa::Message::encode(self, &mut rope);
+                Ok(EncodedBody::from_segments(rope.into_segments()))
+            }
         }
     }
 }
@@ -928,6 +1052,63 @@ impl<B> Response<B> {
 mod tests {
     use super::*;
     use buffa_types::google::protobuf::StringValue;
+
+    /// The invariant the whole segmented path rests on: however the encoder
+    /// chose to divide the output, concatenating it must reproduce exactly
+    /// what the contiguous encode produced. A divergence here is a wire-format
+    /// bug, not a performance one.
+    #[test]
+    fn segments_concatenate_to_the_contiguous_encoding() {
+        let msg = StringValue::from("a message that round-trips");
+
+        for min_segment in [1usize, 8, 1024, usize::MAX] {
+            let segmented =
+                Encodable::<StringValue>::encode_segments(&msg, CodecFormat::Proto, min_segment)
+                    .expect("proto encode");
+            let contiguous =
+                Encodable::<StringValue>::encode(&msg, CodecFormat::Proto).expect("proto encode");
+
+            assert_eq!(
+                segmented.len(),
+                contiguous.len(),
+                "min_segment={min_segment}: length must match"
+            );
+            assert_eq!(
+                segmented.into_contiguous(),
+                contiguous,
+                "min_segment={min_segment}: bytes must match"
+            );
+        }
+    }
+
+    #[test]
+    fn json_encoding_stays_contiguous() {
+        // JSON is serialized whole, so there is nothing to hand over by
+        // reference and the segmented call must not pretend otherwise.
+        let msg = StringValue::from("json");
+        let body =
+            Encodable::<StringValue>::encode_segments(&msg, CodecFormat::Json, 1).expect("json");
+        assert!(matches!(body, EncodedBody::Contiguous(_)));
+    }
+
+    #[test]
+    fn encoded_body_collapses_trivial_segment_counts() {
+        assert!(matches!(
+            EncodedBody::from_segments(vec![]),
+            EncodedBody::Contiguous(b) if b.is_empty()
+        ));
+        assert!(matches!(
+            EncodedBody::from_segments(vec![Bytes::from_static(b"one")]),
+            EncodedBody::Contiguous(_)
+        ));
+        assert!(matches!(
+            EncodedBody::from_segments(vec![
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two")
+            ]),
+            EncodedBody::Segmented(_)
+        ));
+    }
 
     #[tokio::test]
     async fn response_stream_ok_shorthand() {
