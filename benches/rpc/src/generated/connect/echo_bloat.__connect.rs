@@ -38,6 +38,7 @@ pub const BLOAT_ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec:
 /// repeated strings, a string map, two singular sub-messages, and a
 /// repeated sub-message — the field-shape mix where view→view encode
 /// (zero string allocations) is expected to win biggest.
+///
 /// Target encoded size: ~2-3 KB.
 ///
 /// # Implementing handlers

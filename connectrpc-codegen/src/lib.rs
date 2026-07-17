@@ -37,6 +37,7 @@
 //! ```
 
 pub mod codegen;
+mod comments;
 pub mod plugin;
 
 pub use codegen::CodeGenConfig;
