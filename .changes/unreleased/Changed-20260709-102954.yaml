@@ -11,8 +11,11 @@ body: |-
   control and a server that ends the RPC mid-upload no longer goes
   unnoticed while the stream is idle. The `Stream` trait and a
   `stream_iter` adapter (`futures::stream::iter`) are re-exported from
-  `connectrpc::client`, so migrating a ready collection is
-  `client.sum(connectrpc::client::stream_iter(requests))` with no new
+  `connectrpc::client`, with `stream_iter` also at the crate root, so
+  migrating a ready collection is
+  `client.sum(connectrpc::stream_iter(requests))` with no new
   dependency. Because the stream backs the request body, it must be
   `Send + 'static`: streams that borrow local data must be made owning.
+  Note that dropping a client-streaming call now cancels it: messages the
+  stream had not yet yielded are never delivered.
 time: 2026-07-09T17:29:54.497133719Z

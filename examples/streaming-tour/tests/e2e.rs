@@ -144,7 +144,7 @@ async fn server_stream_range() {
 async fn client_stream_sum() {
     let addr = start_server().await;
     let client = make_client(addr);
-    let messages = connectrpc::client::stream_iter([3, 5, 7, 9].map(|v| SumRequest {
+    let messages = connectrpc::stream_iter([3, 5, 7, 9].map(|v| SumRequest {
         value: Some(v),
         ..Default::default()
     }));

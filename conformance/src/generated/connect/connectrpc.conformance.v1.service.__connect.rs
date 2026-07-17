@@ -1185,7 +1185,13 @@ where
     /// are sent as the stream yields them. It backs the request
     /// body, so yield owned messages or feed the call from a
     /// channel-backed stream. For a collection that is already in
-    /// hand, wrap it with `::connectrpc::client::stream_iter(...)`.
+    /// hand, wrap it with `::connectrpc::stream_iter(...)`.
+    ///
+    /// Dropping the returned future cancels the call: the request
+    /// body is dropped along with it, so messages the stream had
+    /// not yet yielded are never delivered. A caller that needs the
+    /// request delivered must drive the call to completion rather
+    /// than, say, wrapping it in a `timeout`.
     pub async fn client_stream(
         &self,
         requests: impl ::connectrpc::client::ClientRequestStream<
@@ -1214,7 +1220,13 @@ where
     /// are sent as the stream yields them. It backs the request
     /// body, so yield owned messages or feed the call from a
     /// channel-backed stream. For a collection that is already in
-    /// hand, wrap it with `::connectrpc::client::stream_iter(...)`.
+    /// hand, wrap it with `::connectrpc::stream_iter(...)`.
+    ///
+    /// Dropping the returned future cancels the call: the request
+    /// body is dropped along with it, so messages the stream had
+    /// not yet yielded are never delivered. A caller that needs the
+    /// request delivered must drive the call to completion rather
+    /// than, say, wrapping it in a `timeout`.
     pub async fn client_stream_with_options(
         &self,
         requests: impl ::connectrpc::client::ClientRequestStream<

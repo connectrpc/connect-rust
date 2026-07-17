@@ -2254,7 +2254,13 @@ fn generate_client_method(
             #[doc = " are sent as the stream yields them. It backs the request"]
             #[doc = " body, so yield owned messages or feed the call from a"]
             #[doc = " channel-backed stream. For a collection that is already in"]
-            #[doc = " hand, wrap it with `::connectrpc::client::stream_iter(...)`."]
+            #[doc = " hand, wrap it with `::connectrpc::stream_iter(...)`."]
+            #[doc = ""]
+            #[doc = " Dropping the returned future cancels the call: the request"]
+            #[doc = " body is dropped along with it, so messages the stream had"]
+            #[doc = " not yet yielded are never delivered. A caller that needs the"]
+            #[doc = " request delivered must drive the call to completion rather"]
+            #[doc = " than, say, wrapping it in a `timeout`."]
         };
         ret_ty = quote! {
             Result<

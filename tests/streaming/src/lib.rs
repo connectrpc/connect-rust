@@ -663,7 +663,7 @@ mod tests {
         let client = EchoServiceClient::new(SwallowingTransport, config);
 
         let err = client
-            .client_stream(connectrpc::client::stream_iter([EchoRequest {
+            .client_stream(connectrpc::stream_iter([EchoRequest {
                 data: "x".repeat(8 * 1024),
                 ..Default::default()
             }]))

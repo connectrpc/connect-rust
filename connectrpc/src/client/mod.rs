@@ -144,10 +144,22 @@ mod sealed {
 /// Not to be confused with the server-side
 /// [`dispatcher::RequestStream`](crate::dispatcher::RequestStream), a boxed
 /// stream of raw request bytes.
+///
+/// # Panics in `poll_next`
+///
+/// The stream backs the request body, so it is polled on the task driving
+/// the HTTP request rather than on the caller's. A panic in `poll_next`
+/// therefore does not propagate to the caller: it surfaces as a generic
+/// transport error, and where that driver task is shared between calls
+/// (such as [`SharedHttp2Connection`]) it can fault every RPC on that
+/// connection, not just this one. The stream yields `Req`, not a
+/// `Result`, so it has no channel for reporting its own failure: end the
+/// stream early instead of panicking, and surface the reason through your
+/// own application protocol.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be used as the request stream of a client-streaming call",
     label = "expected an async `Stream<Item = {Req}> + Send + 'static`",
-    note = "for a collection that is already in hand, wrap it with `connectrpc::client::stream_iter(...)`",
+    note = "for a collection that is already in hand, wrap it with `connectrpc::stream_iter(...)`",
     note = "the stream backs the request body, so it must be `Send + 'static`: yield owned messages (no borrows of local data) or feed the call from a channel-backed stream"
 )]
 pub trait ClientRequestStream<Req>: sealed::Sealed + Stream<Item = Req> + Send + 'static {}
@@ -3567,7 +3579,7 @@ where
 /// ```rust,ignore
 /// let resp = call_client_stream(
 ///     &transport, &config, "svc", "Method",
-///     connectrpc::client::stream_iter(vec![req1, req2]),
+///     connectrpc::stream_iter(vec![req1, req2]),
 ///     CallOptions::default(),
 /// ).await?;
 /// ```
@@ -3692,6 +3704,12 @@ where
     // the precise encode error instead of the generic transport failure —
     // unconditionally, because a server's early response can race the abort
     // and produce an `Ok` result for a truncated, encode-aborted upload.
+    //
+    // The race runs the other way too, and that direction is left alone on
+    // purpose: with the body driven in the background, an encode failure can
+    // land after this check and is then never read, so the call reports the
+    // server's `Ok`. That is the intended outcome — the server had already
+    // produced a complete response, so the truncated tail did not affect it.
     if let Some(err) = encode_error
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

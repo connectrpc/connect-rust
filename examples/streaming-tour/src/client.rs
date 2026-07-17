@@ -55,7 +55,7 @@ async fn main() -> Result<(), BoxError> {
     // with `stream_iter` (a live producer would pass a channel-backed
     // stream instead).
     let inputs = [3, 5, 7, 9];
-    let messages = connectrpc::client::stream_iter(inputs.map(|v| SumRequest {
+    let messages = connectrpc::stream_iter(inputs.map(|v| SumRequest {
         value: Some(v),
         ..Default::default()
     }));

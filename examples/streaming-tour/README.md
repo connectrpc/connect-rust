@@ -52,7 +52,7 @@ cargo test -p streaming-tour-example
   client/bidi take a `Pin<Box<dyn Stream<Item = Result<OwnedView<...>>>>>`.
 - **`src/client.rs`** - generated-client invocation patterns. The
   client-streaming `Sum` takes an async `Stream<Item = SumRequest>`
-  (a ready collection is adapted with `connectrpc::client::stream_iter`);
+  (a ready collection is adapted with `connectrpc::stream_iter`);
   the bidi `RunningSum` returns a stream you `.send()` to and
   `.message()` from interleaved.
 
