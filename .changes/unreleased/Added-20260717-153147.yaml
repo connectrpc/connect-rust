@@ -1,0 +1,11 @@
+kind: Added
+body: |-
+  **`protoc-gen-connect-rust` now advertises proto edition 2024** as its
+  maximum supported edition ([#229]). Previously `protoc` refused to run the
+  generator against an `edition = "2024"` file at all. Generated stubs are
+  unchanged: the features edition 2024 introduced, `enforce_naming_style`
+  and `default_symbol_visibility`, are enforced by `protoc` while compiling
+  and do not affect the service descriptors the generator reads.
+
+  [#229]: https://github.com/connectrpc/connect-rust/issues/229
+time: 2026-07-17T15:31:47.376852992-07:00

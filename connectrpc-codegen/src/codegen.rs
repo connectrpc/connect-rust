@@ -18,6 +18,7 @@ use quote::format_ident;
 use quote::quote;
 
 use buffa_codegen::generated::descriptor::DescriptorProto;
+use buffa_codegen::generated::descriptor::Edition;
 use buffa_codegen::generated::descriptor::FileDescriptorProto;
 use buffa_codegen::generated::descriptor::MethodDescriptorProto;
 use buffa_codegen::generated::descriptor::ServiceDescriptorProto;
@@ -695,8 +696,8 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
 
     Ok(CodeGeneratorResponse {
         supported_features: Some(feature_flags()),
-        minimum_edition: Some(EDITION_2023),
-        maximum_edition: Some(EDITION_2023),
+        minimum_edition: Some(Edition::EDITION_2023 as i32),
+        maximum_edition: Some(Edition::EDITION_2024 as i32),
         file: files,
         ..Default::default()
     })
@@ -709,10 +710,6 @@ fn feature_flags() -> u64 {
     const FEATURE_SUPPORTS_EDITIONS: u64 = 2;
     FEATURE_PROTO3_OPTIONAL | FEATURE_SUPPORTS_EDITIONS
 }
-
-/// Edition 2023 numeric value. buffa-codegen handles proto2/proto3/edition-2023;
-/// we declare 2023 as both min and max.
-const EDITION_2023: i32 = 1000;
 
 /// Format a TokenStream into a Rust source string via prettyplease.
 fn format_token_stream(tokens: &TokenStream) -> Result<String> {
@@ -4814,5 +4811,16 @@ mod tests {
 
         let chat = render(&consts[3]);
         assert!(chat.contains("StreamType::BidiStream"), "{chat}");
+    }
+
+    #[test]
+    fn declares_edition_2024_support() {
+        // protoc refuses to run a generator against a file whose edition
+        // falls outside the advertised range, so this declaration is the
+        // whole of edition support for a service generator.
+        let response = generate(&CodeGeneratorRequest::default())
+            .expect("an empty request still yields a response carrying the edition range");
+        assert_eq!(response.minimum_edition, Some(Edition::EDITION_2023 as i32));
+        assert_eq!(response.maximum_edition, Some(Edition::EDITION_2024 as i32));
     }
 }
