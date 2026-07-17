@@ -62,8 +62,8 @@ impl<M: HasMessageView> StreamMessage<M> {
     ///
     /// Encodes `message` to wire bytes and decodes it back into the retained
     /// zero-copy view, as the dispatcher does for a received item — but
-    /// without the wire-facing recursion and unknown-field limits, since the
-    /// input is trusted local data:
+    /// without the wire-facing recursion, unknown-field, and element-memory
+    /// limits, since the input is trusted local data:
     ///
     /// ```rust,ignore
     /// let item = StreamMessage::from_message(&EchoRequest {
@@ -75,20 +75,26 @@ impl<M: HasMessageView> StreamMessage<M> {
     ///
     /// # Panics
     ///
-    /// Panics if the encoded message exceeds the protobuf 2 GiB size limit
-    /// — nothing larger is decodable protobuf on any path.
+    /// Panics while encoding if `message` exceeds the protobuf 2 GiB size
+    /// limit — nothing larger is encodable or decodable protobuf on any
+    /// path. The decode below cannot fail: it reads back bytes just encoded
+    /// here, with every wire-facing limit lifted.
     #[must_use]
     pub fn from_message(message: &M) -> Self {
         let bytes = Bytes::from(buffa::Message::encode_to_vec(message));
         // The input is trusted local data, so decode without the wire-facing
-        // recursion and unknown-field limits: a just-encoded message can
-        // legitimately exceed either (both are enforced only at decode), and
-        // failing on it here would betray the constructor's purpose. The
-        // protobuf 2 GiB size limit stays — nothing larger is decodable
-        // protobuf on any path.
+        // recursion, unknown-field, and element-memory limits: a just-encoded
+        // message can legitimately exceed any of them (all three are enforced
+        // only at decode), and failing on it here would betray the
+        // constructor's purpose. The element-memory budget in particular is an
+        // amplification defence against a small payload materializing a huge
+        // one, which cannot apply to bytes this process just encoded from a
+        // message it already holds. The protobuf 2 GiB size limit stays —
+        // nothing larger is decodable protobuf on any path.
         let opts = buffa::DecodeOptions::new()
             .with_recursion_limit(u32::MAX)
-            .with_unknown_field_limit(usize::MAX);
+            .with_unknown_field_limit(usize::MAX)
+            .with_element_memory_limit(usize::MAX);
         Self::from_owned_view(
             OwnedView::decode_with_options(bytes, &opts)
                 .expect("a just-encoded message always decodes"),
@@ -109,17 +115,12 @@ impl<M: HasMessageView> StreamMessage<M> {
     /// `bytes` fields are sliced zero-copy out of the retained buffer where
     /// possible; string and repeated fields are allocated.
     ///
-    /// Infallible: an [`OwnedView`] can only be built by buffa's wire
-    /// decoder, and buffa (≥ 0.8.1) charges every unknown-field record
-    /// against the decode-time allowance, so a view that decoded
-    /// successfully re-materializes within that same allowance, and known
-    /// fields were already validated at decode.
+    /// Infallible: [`OwnedView::to_owned_message`] cannot fail, because an
+    /// `OwnedView` can only come from buffa's wire decoder and conversion
+    /// replays under the budget the decode already charged.
     #[must_use]
     pub fn to_owned_message(&self) -> M {
-        self.inner
-            .as_ref()
-            .to_owned_message()
-            .expect("wire-decoded view always converts (buffa >= 0.8.1)")
+        self.inner.as_ref().to_owned_message()
     }
 
     /// The message's protobuf wire bytes.
@@ -209,6 +210,35 @@ mod tests {
             .encode_to_vec(),
         );
         StreamMessage::from_owned_view(OwnedView::decode(bytes).expect("decode"))
+    }
+
+    #[test]
+    fn from_message_accepts_more_elements_than_the_wire_budget_allows() {
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        // Enough elements to exceed buffa's 32 MiB element-memory default.
+        // Element footprint is what that budget charges, not element
+        // contents, so this stays small on the wire — a single large payload
+        // would not trip it however big it got.
+        let n = 800_000;
+        let list = ListValue {
+            values: (0..n).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+
+        // Control: the same bytes must be over the default budget, or this
+        // test would keep passing while no longer exercising the over-budget
+        // path — buffa retuning the default or the per-element charge is
+        // exactly the change that should fail here rather than go unnoticed.
+        let encoded = buffa::Message::encode_to_vec(&list);
+        assert!(
+            ListValue::decode_from_slice(&encoded).is_err(),
+            "{n} elements no longer exceed the default element-memory budget; \
+             raise it so this test still covers what it claims to"
+        );
+
+        let msg = StreamMessage::from_message(&list);
+        assert_eq!(msg.view().values.len(), n);
     }
 
     #[test]

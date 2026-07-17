@@ -1,0 +1,22 @@
+kind: Changed
+body: |-
+  **Updated to buffa 0.9, which requires regenerating your generated code.**
+  The floor is hard rather than a preference: buffa 0.9 widens its size
+  arithmetic to `u64`, so code emitted by a 0.8.x codegen no longer compiles
+  against the 0.9 runtime. Regenerate through `connectrpc-build`,
+  `buffa-build`, or your `buf generate` pipeline after upgrading. The
+  `extern_path` targets a generated crate points at must likewise be buffa
+  0.9 output.
+
+  One behaviour change is worth knowing before you upgrade: buffa 0.9
+  applies a decode-time element-memory budget, 32 MiB by default, bounding
+  the footprint a decode may materialize in repeated, map, string and bytes
+  elements. It is an amplification defence, and it charges element footprint
+  rather than element contents — so a large payload does not trip it however
+  big it grows, but a message carrying very many small elements can, and
+  such a message is now rejected where buffa 0.8 accepted it.
+
+  `StreamMessage::to_owned_message` and `UnaryResponse::into_owned_parts`
+  ride on buffa's now-infallible `OwnedView::to_owned_message`. Neither
+  signature changes.
+time: 2026-07-17T16:37:30.155635226-07:00

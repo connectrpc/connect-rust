@@ -19,7 +19,7 @@ publish = false
 path = "stub.rs"
 
 [dependencies]
-buffa = { version = "0.8.1", features = ["json"] }
+buffa = { version = "0.9", features = ["json"] }
 connectrpc = { version = "0.8.0", default-features = false, features = ["server", "client"] }
 futures = "0.3"
 http-body = "1"
