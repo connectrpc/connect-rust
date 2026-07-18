@@ -271,6 +271,7 @@ pub use handler::view_streaming_handler_fn;
 pub use request::HasMessageView;
 pub use request::ServiceRequest;
 pub use response::Encodable;
+pub use response::EncodedBody;
 pub use response::EncodedResponse;
 pub use response::InboundStream;
 pub use response::MaybeBorrowed;

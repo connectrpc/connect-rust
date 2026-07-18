@@ -1323,10 +1323,14 @@ impl<D: Dispatcher> ConnectRpcService<D> {
 pub struct GrpcUnaryBody {
     data: Option<Bytes>,
     /// Large message payload (post-compression, when negotiated) emitted as
-    /// its own data frame
-    /// after `data` (which then carries only the 5-byte envelope header),
-    /// so the payload is passed through by refcount instead of copied.
-    payload: Option<Bytes>,
+    /// its own data frame after `data` (which then carries only the 5-byte
+    /// envelope header), so the payload is passed through by refcount
+    /// instead of copied.
+    ///
+    /// More than one when the encoder handed back several segments — a view
+    /// re-encode captures each large borrowed field separately rather than
+    /// gathering them, so they stay separate all the way to the socket.
+    payload: std::collections::VecDeque<Bytes>,
     trailers: Option<GrpcUnaryTrailers>,
 }
 
@@ -1349,7 +1353,7 @@ impl Body for GrpcUnaryBody {
         let me = self.get_mut();
         if let Some(data) = me.data.take() {
             Poll::Ready(Some(Ok(Frame::data(data))))
-        } else if let Some(payload) = me.payload.take() {
+        } else if let Some(payload) = me.payload.pop_front() {
             Poll::Ready(Some(Ok(Frame::data(payload))))
         } else if let Some(trailers) = me.trailers.take() {
             match trailers {
@@ -1890,17 +1894,23 @@ where
 
     // Compress response body if negotiated, respecting the compression policy
     let effective_policy = compression_policy.with_override(resp.compress);
+    // Connect unary puts the message straight in the HTTP body with no
+    // envelope, so there is no frame boundary to hang a segment on — and
+    // compression needs one contiguous input regardless. Flattening is a
+    // no-op unless the encoder segmented.
+    let body_len = resp.body.len();
+    let resp_body = resp.body.into_contiguous();
     let (final_body, content_encoding) = if let Some(encoding) = response_encoding {
-        if !effective_policy.should_compress(resp.body.len()) {
-            (resp.body, None)
-        } else {
-            match compression.compress(encoding, &resp.body) {
+        if effective_policy.should_compress(body_len) {
+            match compression.compress(encoding, &resp_body) {
                 Ok(compressed) => (compressed, Some(encoding)),
-                Err(_) => (resp.body, None), // Fall back to uncompressed
+                Err(_) => (resp_body, None), // Fall back to uncompressed
             }
+        } else {
+            (resp_body, None)
         }
     } else {
-        (resp.body, None)
+        (resp_body, None)
     };
 
     // Build response with the same content type as the request
@@ -1990,13 +2000,13 @@ where
         }
         let body = GrpcUnaryBody {
             data: None,
-            payload: None,
+            payload: std::collections::VecDeque::new(),
             trailers: Some(trailers),
         };
         response.body(body).unwrap_or_else(|_| {
             Response::new(GrpcUnaryBody {
                 data: None,
-                payload: None,
+                payload: std::collections::VecDeque::new(),
                 trailers: None,
             })
         })
@@ -2133,12 +2143,21 @@ where
     let (encoded_data, chained_payload) = if let Some(encoding) = response_encoding
         && effective_policy.should_compress(resp.body.len())
     {
-        match compression.compress(encoding, &resp.body) {
-            Ok(compressed) => Envelope::compressed(compressed).encode_parts(min_chain),
-            Err(_) => Envelope::data(resp.body).encode_parts(min_chain),
+        // Compression needs one contiguous input and produces one contiguous
+        // output, so any segmentation the encoder managed ends here. That is
+        // the right trade: the compressor was going to read every byte anyway.
+        let flat = resp.body.into_contiguous();
+        match compression.compress(encoding, &flat) {
+            Ok(compressed) => {
+                let (head, payload) = Envelope::compressed(compressed).encode_parts(min_chain);
+                (head, payload.into_iter().collect())
+            }
+            Err(_) => {
+                Envelope::encode_body_parts(crate::envelope::flags::DATA, flat.into(), min_chain)
+            }
         }
     } else {
-        Envelope::data(resp.body).encode_parts(min_chain)
+        Envelope::encode_body_parts(crate::envelope::flags::DATA, resp.body, min_chain)
     };
 
     // Build gRPC trailers
@@ -2173,7 +2192,7 @@ where
 
     let body = GrpcUnaryBody {
         data: Some(encoded_data),
-        payload: chained_payload,
+        payload: chained_payload.into(),
         trailers: Some(trailers),
     };
 
@@ -2434,8 +2453,13 @@ where
             );
             match with_request_deadline(deadline, fut).await {
                 // Wrap single response in a one-item stream
-                Ok(r) => r.map_body(|bytes| -> BoxStream<Result<Bytes, ConnectError>> {
-                    Box::pin(futures::stream::once(async move { Ok(bytes) }))
+                // The streaming machinery carries contiguous message bytes,
+                // and re-enveloping happens per item downstream, so a
+                // client-streaming response flattens here.
+                Ok(r) => r.map_body(|body| -> BoxStream<Result<Bytes, ConnectError>> {
+                    Box::pin(futures::stream::once(
+                        async move { Ok(body.into_contiguous()) },
+                    ))
                 }),
                 Err(e) => return streaming_error_response(&e, protocol, codec_format),
             }
@@ -2617,7 +2641,9 @@ where
 
     let stream_compression = response_encoding.map(|encoding| (compression, encoding));
     let response_stream: BoxStream<Result<Bytes, ConnectError>> =
-        Box::pin(futures::stream::once(async { Ok(resp.body) }));
+        Box::pin(futures::stream::once(async {
+            Ok(resp.body.into_contiguous())
+        }));
     let effective_policy = compression_policy.with_override(resp.compress);
     let body = StreamingResponseBody::new(
         response_stream,
@@ -3456,7 +3482,7 @@ mod tests {
             Envelope::data(payload.clone()).encode_parts(crate::envelope::MIN_CHAIN_SIZE);
         let mut body = GrpcUnaryBody {
             data: Some(head.clone()),
-            payload: chained,
+            payload: chained.into_iter().collect(),
             trailers: Some(GrpcUnaryTrailers::Http2(http::HeaderMap::new())),
         };
 

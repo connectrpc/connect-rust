@@ -1,0 +1,8 @@
+kind: Changed
+body: |-
+    Response bodies can now reach the socket in several reference-counted segments instead of one contiguous buffer. When a handler returns an `OwnedView`, its large borrowed fields are handed to the HTTP body by reference count rather than copied into the encode buffer — the encode then costs the same whatever the payload weighs (measured 1.49us to 421ns at 16 KiB per field, 252us to 421ns at 1 MiB). The wire bytes are unchanged; only the HTTP frame boundaries differ, which gRPC and Connect envelope framing has never depended on.
+
+    Owned-message responses are deliberately unaffected: their fields are `String` and `Vec<u8>`, which cannot be handed over by reference, so segmenting them would only add cost. Small messages are unaffected too — below the framing threshold the encoder stays contiguous.
+
+    `EncodedResponse` is now `Response<EncodedBody>` rather than `Response<Bytes>`. This is a breaking change for code implementing the `Dispatcher` trait directly or handling `EncodedResponse` values: construct with `.into()` from `Bytes`, and call `.into_contiguous()` where a single buffer is needed. Interceptors are unaffected — `UnaryResponse` still carries a contiguous `Payload`.
+time: 2026-07-17T17:36:21.338084808-07:00

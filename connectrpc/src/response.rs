@@ -1079,7 +1079,7 @@ impl<M: Message + JsonSerialize> Encodable<M> for PreEncoded<M> {
 /// This is what the [`Dispatcher`](crate::Dispatcher) returns to the
 /// protocol layer — encoding happens inside the dispatcher so the body
 /// type stays generic across the trait boundary.
-pub type EncodedResponse = Response<Bytes>;
+pub type EncodedResponse = Response<EncodedBody>;
 
 impl<B> Response<B> {
     /// Encode the body to bytes via [`Encodable<M>`], preserving
@@ -1089,9 +1089,14 @@ impl<B> Response<B> {
     where
         B: Encodable<M>,
     {
-        let bytes = self.body.encode(codec)?;
+        // Bodies that can hand a large payload over by reference count say so
+        // here; everything else takes the default and returns the same single
+        // buffer it always did.
+        let body = self
+            .body
+            .encode_segments(codec, crate::envelope::MIN_CHAIN_SIZE)?;
         Ok(Response {
-            body: bytes,
+            body,
             headers: self.headers,
             trailers: self.trailers,
             compress: self.compress,
@@ -1317,7 +1322,9 @@ mod tests {
         let enc = r.encode::<StringValue>(CodecFormat::Proto).unwrap();
         assert_eq!(enc.headers.get("x-a").unwrap(), "1");
         assert_eq!(
-            StringValue::decode_from_slice(&enc.body).unwrap().value,
+            StringValue::decode_from_slice(&enc.body.into_contiguous())
+                .unwrap()
+                .value,
             "hi"
         );
     }

@@ -119,6 +119,48 @@ impl Envelope {
         (head.freeze(), Some(self.data))
     }
 
+    /// Frame an already-encoded body, keeping any segments it arrived in.
+    ///
+    /// The generalization of [`encode_parts`](Self::encode_parts) from one
+    /// payload to several. A body that the encoder split — because it could
+    /// hand a large field over by reference count rather than copy it — stays
+    /// split all the way to the socket, one body frame per segment, instead of
+    /// being flattened back into a single buffer here and undoing the saving.
+    ///
+    /// The envelope header still declares the total length across every
+    /// segment, so the framing on the wire is byte-for-byte what a contiguous
+    /// encode would have produced. Envelope framing has never depended on
+    /// HTTP frame boundaries.
+    ///
+    /// A body below `min_chain` is written into the head buffer as before: a
+    /// segment that small would be copied into the framing buffer downstream
+    /// regardless, so splitting it buys nothing and costs a frame.
+    pub(crate) fn encode_body_parts(
+        flags: u8,
+        body: crate::response::EncodedBody,
+        min_chain: usize,
+    ) -> (Bytes, Vec<Bytes>) {
+        let total = body.len();
+        if total < min_chain {
+            let mut buf = BytesMut::with_capacity(HEADER_SIZE + total);
+            write_envelope_header(flags, total, &mut buf)
+                .expect("envelope payload exceeds u32::MAX");
+            for segment in body.segments() {
+                buf.extend_from_slice(segment);
+            }
+            return (buf.freeze(), Vec::new());
+        }
+
+        let mut head = BytesMut::with_capacity(HEADER_SIZE);
+        write_envelope_header(flags, total, &mut head).expect("envelope payload exceeds u32::MAX");
+
+        let segments = match body {
+            crate::response::EncodedBody::Contiguous(bytes) => vec![bytes],
+            crate::response::EncodedBody::Segmented(segments) => segments,
+        };
+        (head.freeze(), segments)
+    }
+
     /// Decode an envelope from bytes.
     ///
     /// Returns `Ok(Some(envelope))` if a complete envelope was decoded,
