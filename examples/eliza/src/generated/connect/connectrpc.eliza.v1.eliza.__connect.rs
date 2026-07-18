@@ -48,13 +48,11 @@ for ::buffa::view::OwnedView<
     fn encode_segments(
         &self,
         codec: ::connectrpc::CodecFormat,
-        min_segment: usize,
     ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body_segments(
             self.reborrow(),
             self.bytes(),
             codec,
-            min_segment,
         )
     }
 }
@@ -84,13 +82,11 @@ for ::buffa::view::OwnedView<
     fn encode_segments(
         &self,
         codec: ::connectrpc::CodecFormat,
-        min_segment: usize,
     ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body_segments(
             self.reborrow(),
             self.bytes(),
             codec,
-            min_segment,
         )
     }
 }
@@ -120,13 +116,11 @@ for ::buffa::view::OwnedView<
     fn encode_segments(
         &self,
         codec: ::connectrpc::CodecFormat,
-        min_segment: usize,
     ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body_segments(
             self.reborrow(),
             self.bytes(),
             codec,
-            min_segment,
         )
     }
 }

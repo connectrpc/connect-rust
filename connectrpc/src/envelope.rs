@@ -97,35 +97,12 @@ impl Envelope {
         buf.freeze()
     }
 
-    /// Encode this envelope as a head segment plus an optionally chained
-    /// payload.
-    ///
-    /// Payloads of at least `min_chain` bytes return `(header, Some(payload))`
-    /// — the 5-byte header alone, with the payload passed through by refcount
-    /// for the caller to emit as its own body frame. Smaller payloads return
-    /// the full contiguous encoding and `None`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the payload exceeds `u32::MAX` bytes, like
-    /// [`encode`](Self::encode).
-    pub(crate) fn encode_parts(self, min_chain: usize) -> (Bytes, Option<Bytes>) {
-        if self.data.len() < min_chain {
-            return (self.encode(), None);
-        }
-        let mut head = BytesMut::with_capacity(HEADER_SIZE);
-        write_envelope_header(self.flags, self.data.len(), &mut head)
-            .expect("envelope payload exceeds u32::MAX");
-        (head.freeze(), Some(self.data))
-    }
-
     /// Frame an already-encoded body, keeping any segments it arrived in.
     ///
-    /// The generalization of [`encode_parts`](Self::encode_parts) from one
-    /// payload to several. A body that the encoder split — because it could
-    /// hand a large field over by reference count rather than copy it — stays
-    /// split all the way to the socket, one body frame per segment, instead of
-    /// being flattened back into a single buffer here and undoing the saving.
+    /// A body that the encoder split — because it could hand a large field
+    /// over by reference count rather than copy it — stays split all the way
+    /// to the socket, one body frame per segment, instead of being flattened
+    /// back into a single buffer here and undoing the saving.
     ///
     /// The envelope header still declares the total length across every
     /// segment, so the framing on the wire is byte-for-byte what a contiguous
@@ -382,10 +359,11 @@ impl EnvelopeEncoder {
     /// Smaller payloads are written contiguously into `dst` and `None` is
     /// returned.
     ///
-    /// This is the single implementation of the envelope-encode policy —
-    /// the [`Encoder`](tokio_util::codec::Encoder) impl delegates here with
-    /// `min_chain = usize::MAX` (never chain) — so the compression decision
-    /// and the chaining decision cannot drift apart.
+    /// The [`Encoder`](tokio_util::codec::Encoder) impl delegates here with
+    /// `min_chain = usize::MAX` (never chain), so the compression decision and
+    /// the chaining decision cannot drift apart on the streaming path.
+    /// Unary responses take [`Envelope::encode_body_parts`], which applies the
+    /// same threshold to an already-encoded body.
     ///
     /// gRPC/Connect envelope framing is independent of HTTP-level frame
     /// boundaries, so splitting the header and payload across body frames
@@ -464,12 +442,14 @@ mod tests {
     // ── Envelope tests ──────────────────────────────────────────────
 
     #[test]
-    fn encode_parts_chains_large_payload_by_refcount() {
+    fn encode_body_parts_chains_large_payload_by_refcount() {
         let payload = Bytes::from(vec![7u8; 64]);
         let ptr = payload.as_ptr();
-        let (head, chained) = Envelope::data(payload.clone()).encode_parts(64);
+        let (head, chained) = Envelope::encode_body_parts(flags::DATA, payload.clone().into(), 64);
         assert_eq!(head.len(), HEADER_SIZE);
-        let chained = chained.expect("payload at threshold must chain");
+        let [chained] = &chained[..] else {
+            panic!("payload at threshold must chain as one segment");
+        };
         assert!(std::ptr::eq(chained.as_ptr(), ptr), "must not copy");
 
         // Reassembled bytes are identical to the contiguous encoding.
@@ -519,11 +499,76 @@ mod tests {
     }
 
     #[test]
-    fn encode_parts_small_payload_stays_contiguous() {
+    fn encode_body_parts_small_payload_stays_contiguous() {
         let payload = Bytes::from_static(b"tiny");
-        let (head, chained) = Envelope::data(payload.clone()).encode_parts(64);
-        assert!(chained.is_none());
+        let (head, chained) = Envelope::encode_body_parts(flags::DATA, payload.clone().into(), 64);
+        assert!(chained.is_empty());
         assert_eq!(head, Envelope::data(payload).encode());
+    }
+
+    /// The property every branch has to hold: the header declares the total
+    /// length across all segments, and concatenating what is emitted equals
+    /// the contiguous envelope. A header that disagreed with the bytes after
+    /// it would desynchronize the peer's framing rather than fail locally, so
+    /// each branch is pinned rather than left to the conformance suite.
+    #[test]
+    fn encode_body_parts_declares_the_length_it_emits() {
+        use crate::response::EncodedBody;
+
+        let cases: Vec<(&str, EncodedBody)> = vec![
+            ("empty", EncodedBody::Contiguous(Bytes::new())),
+            (
+                "sub-threshold contiguous",
+                EncodedBody::Contiguous(Bytes::from_static(b"small")),
+            ),
+            (
+                "sub-threshold segmented",
+                EncodedBody::Segmented(vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]),
+            ),
+            (
+                "over-threshold contiguous",
+                EncodedBody::Contiguous(Bytes::from(vec![9u8; 128])),
+            ),
+            (
+                "over-threshold two segments",
+                EncodedBody::Segmented(vec![
+                    Bytes::from(vec![1u8; 64]),
+                    Bytes::from(vec![2u8; 64]),
+                ]),
+            ),
+            (
+                "over-threshold many segments",
+                EncodedBody::Segmented((0..5).map(|i| Bytes::from(vec![i as u8; 40])).collect()),
+            ),
+        ];
+
+        for (name, body) in cases {
+            let total = body.len();
+            let expected = Envelope::data(body.clone().into_contiguous()).encode();
+
+            let (head, segments) = Envelope::encode_body_parts(flags::DATA, body, 64);
+
+            let declared = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            assert_eq!(declared, total, "{name}: header must declare the total");
+
+            let emitted: usize =
+                head.len() - HEADER_SIZE + segments.iter().map(Bytes::len).sum::<usize>();
+            assert_eq!(
+                emitted, total,
+                "{name}: emitted payload bytes must match the declared length"
+            );
+
+            let mut reassembled = BytesMut::from(&head[..]);
+            for segment in &segments {
+                assert!(!segment.is_empty(), "{name}: no empty segments");
+                reassembled.put_slice(segment);
+            }
+            assert_eq!(
+                reassembled.freeze(),
+                expected,
+                "{name}: must reassemble to the contiguous envelope"
+            );
+        }
     }
 
     #[test]

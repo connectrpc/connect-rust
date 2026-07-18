@@ -1,17 +1,23 @@
-//! Does encoding a response view through a rope actually pay?
+//! What encoding a response view through a rope costs, across payload sizes.
 //!
-//! The response path copies twice today: once when the message is encoded
-//! into a contiguous buffer, and once when that buffer is written into the
-//! envelope framing buffer. buffa 0.9's `Rope` removes the first copy for
-//! payloads it can hand over by reference count — for a *view*, that means
-//! any large field borrowed from the buffer the view was decoded from,
-//! which needs no codegen configuration and so is available to every user.
+//! Encoding a message into one contiguous buffer copies every field into it.
+//! A view's fields are slices into the buffer the view was decoded from, so a
+//! rope backed by that buffer can take a large field by reference instead,
+//! which is what `encode_view_body_segments` does on the response path.
 //!
-//! Threading segments from the encoder out to the socket is a breaking
-//! change to connect-rust's dispatcher boundary, so this measures the
-//! ceiling first: the encode step alone, contiguous versus rope, across
-//! payload sizes. Everything below the segment threshold should be a wash;
-//! the question is how the curve behaves above it.
+//! The arms isolate where the cost goes:
+//!
+//! - `contiguous` — the copy-everything baseline.
+//! - `rope_backed` — the rope with the view's own buffer, so captures engage.
+//! - `encode_view_segments` — the production entry point, including its size
+//!   gate, which is what makes the small sizes match the baseline.
+//! - `owned_contiguous` — an owned message, whose `String` fields cannot be
+//!   captured; this is why owned bodies are left on the contiguous path.
+//! - `rope_unbacked` — a rope with no buffer to capture from. Separates the
+//!   rope's own cost from the saving the capture produces.
+//!
+//! Above the segment threshold the encode is payload-independent: only the
+//! framing is still being written.
 
 use buffa::view::MessageView;
 use buffa::{Rope, ViewEncode};
@@ -42,11 +48,9 @@ fn encoded_message(each: usize) -> Bytes {
 fn bench_view_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("view_encode");
 
-    // Straddle the 16 KiB segment threshold in both directions. At 256 B and
-    // 1 KiB neither the fields nor the whole message reach it, so those rows
-    // should sit at parity with the contiguous path rather than paying for a
-    // rope that cannot capture anything. From 16 KiB up every field is
-    // capturable and the encode should go flat.
+    // Straddle the 16 KiB segment threshold in both directions: at 256 B and
+    // 1 KiB neither the fields nor the whole message reach it, from 16 KiB up
+    // every field clears it.
     for each in [256usize, 1024, 16 * 1024, 256 * 1024, 1024 * 1024] {
         let buffer = encoded_message(each);
         let view = FewLargeStringsView::decode_view(&buffer).expect("decode view");
@@ -68,16 +72,16 @@ fn bench_view_encode(c: &mut Criterion) {
             });
         });
 
-        // What connect-rust actually calls, so the size gate is included:
-        // below one segment it must fall back to contiguous rather than pay
-        // for a rope that cannot capture anything.
+        // The production entry point, so the size gate is included. Below one
+        // segment it falls back to contiguous rather than pay for a rope that
+        // cannot capture anything.
         group.bench_with_input(
             BenchmarkId::new("encode_view_segments", each),
             &view,
             |b, view| {
                 b.iter(|| {
                     std::hint::black_box(
-                        connectrpc::__codegen::encode_view_body_segments(
+                        connectrpc::__codegen::encode_view_body_with_min_segment(
                             view,
                             &buffer,
                             CodecFormat::Proto,
@@ -107,9 +111,8 @@ fn bench_view_encode(c: &mut Criterion) {
             },
         );
 
-        // Control: a rope with no backing buffer cannot capture anything, so
-        // it should track the contiguous path. This separates "the rope is
-        // cheap" from "the capture is what pays".
+        // Control: a rope with no backing buffer has nothing to capture, so
+        // this arm shows the rope's own cost with the saving removed.
         group.bench_with_input(BenchmarkId::new("rope_unbacked", each), &view, |b, view| {
             b.iter(|| {
                 let mut rope = Rope::new();

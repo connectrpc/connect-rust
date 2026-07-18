@@ -1314,10 +1314,10 @@ impl<D: Dispatcher> ConnectRpcService<D> {
 
 /// A lightweight body for gRPC unary responses.
 ///
-/// Yields two or three frames: one data frame carrying the gRPC envelope
-/// (or, for large chained responses, just its 5-byte header followed by a
-/// second data frame with the payload by refcount), then one trailers frame
-/// (for gRPC) or a final data frame (for gRPC-Web trailer encoding).
+/// Yields one data frame carrying the gRPC envelope — or, for a large
+/// response, just its 5-byte header followed by one data frame per payload
+/// segment, each passed through by refcount — then one trailers frame (for
+/// gRPC) or a final data frame (for gRPC-Web trailer encoding).
 /// This avoids the overhead of `Pin<Box<dyn Stream>>` + `stream::unfold` +
 /// `EnvelopeEncoder` for the common unary case.
 pub struct GrpcUnaryBody {
@@ -1894,10 +1894,14 @@ where
 
     // Compress response body if negotiated, respecting the compression policy
     let effective_policy = compression_policy.with_override(resp.compress);
-    // Connect unary puts the message straight in the HTTP body with no
-    // envelope, so there is no frame boundary to hang a segment on — and
-    // compression needs one contiguous input regardless. Flattening is a
-    // no-op unless the encoder segmented.
+    // Connect unary flattens. Compression needs one contiguous input, and the
+    // uncompressed case would need `Full<Bytes>` replaced with a multi-frame
+    // body to carry segments — Connect puts the message straight in the HTTP
+    // body, so nothing here splits it for us the way an envelope does. That is
+    // a body-type change rather than an impossibility, and it is worth doing:
+    // Connect is the primary protocol, so the segmented encode currently
+    // reaches only gRPC and gRPC-Web unary. Flattening is a no-op unless the
+    // encoder segmented.
     let body_len = resp.body.len();
     let resp_body = resp.body.into_contiguous();
     let (final_body, content_encoding) = if let Some(encoding) = response_encoding {
@@ -2148,10 +2152,11 @@ where
         // the right trade: the compressor was going to read every byte anyway.
         let flat = resp.body.into_contiguous();
         match compression.compress(encoding, &flat) {
-            Ok(compressed) => {
-                let (head, payload) = Envelope::compressed(compressed).encode_parts(min_chain);
-                (head, payload.into_iter().collect())
-            }
+            Ok(compressed) => Envelope::encode_body_parts(
+                crate::envelope::flags::COMPRESSED,
+                compressed.into(),
+                min_chain,
+            ),
             Err(_) => {
                 Envelope::encode_body_parts(crate::envelope::flags::DATA, flat.into(), min_chain)
             }
@@ -3478,11 +3483,14 @@ mod tests {
 
         let payload = Bytes::from(vec![0x33u8; crate::envelope::MIN_CHAIN_SIZE]);
         let ptr = payload.as_ptr();
-        let (head, chained) =
-            Envelope::data(payload.clone()).encode_parts(crate::envelope::MIN_CHAIN_SIZE);
+        let (head, chained) = Envelope::encode_body_parts(
+            crate::envelope::flags::DATA,
+            payload.clone().into(),
+            crate::envelope::MIN_CHAIN_SIZE,
+        );
         let mut body = GrpcUnaryBody {
             data: Some(head.clone()),
-            payload: chained.into_iter().collect(),
+            payload: chained.into(),
             trailers: Some(GrpcUnaryTrailers::Http2(http::HeaderMap::new())),
         };
 

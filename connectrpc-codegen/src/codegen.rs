@@ -1210,18 +1210,13 @@ fn encodable_impl_pair(
             /// its large fields can be handed to the response body by
             /// reference count instead of copied. The bare view impl above
             /// cannot do this: it has borrows but no buffer to name.
-            fn encode_segments(
-                &self,
-                codec: ::connectrpc::CodecFormat,
-                min_segment: usize,
-            )
+            fn encode_segments(&self, codec: ::connectrpc::CodecFormat)
                 -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError>
             {
                 ::connectrpc::__codegen::encode_view_body_segments(
                     self.reborrow(),
                     self.bytes(),
                     codec,
-                    min_segment,
                 )
             }
         }
