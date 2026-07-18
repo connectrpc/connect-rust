@@ -1,0 +1,4 @@
+kind: Changed
+body: |-
+    Large response messages are no longer copied into the framing buffer on the server. Uncompressed (and compressed) payloads of at least 16 KiB are emitted as their own HTTP body data frame by reference count, so encoding a streaming or gRPC unary response costs one payload copy instead of two. Envelope wire bytes are unchanged — only HTTP-level frame boundaries differ (the 5-byte envelope header may arrive in a separate frame from its payload, which the protocol has always permitted).
+time: 2026-07-06T15:50:26.107887272Z

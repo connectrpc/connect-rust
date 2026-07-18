@@ -943,6 +943,13 @@ struct BatchingEnvelopeStream {
     finalizer: StreamFinalizer,
     /// Finalizer frame staged for the next poll (when buf was non-empty at end).
     pending_final: Option<Frame<Bytes>>,
+    /// Large payload (post-compression, when negotiated) staged for the next
+    /// poll: emitted as its
+    /// own data frame (refcount clone) right after the header flush, instead
+    /// of being copied into `buf`. See [`EnvelopeEncoder::encode_chained`].
+    ///
+    /// [`EnvelopeEncoder::encode_chained`]: crate::envelope::EnvelopeEncoder::encode_chained
+    pending_payload: Option<Bytes>,
     /// Fused-done flag.
     done: bool,
 }
@@ -962,6 +969,7 @@ impl BatchingEnvelopeStream {
             trailers,
             finalizer,
             pending_final: None,
+            pending_payload: None,
             done: false,
         }
     }
@@ -977,10 +985,15 @@ impl Stream for BatchingEnvelopeStream {
     type Item = Result<Frame<Bytes>, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        use tokio_util::codec::Encoder;
-
         if self.done {
             return Poll::Ready(None);
+        }
+
+        // Staged large payload from a prior poll — its envelope header was
+        // already flushed, so this must precede everything else (including
+        // a staged finalizer).
+        if let Some(payload) = self.pending_payload.take() {
+            return Poll::Ready(Some(Ok(Frame::data(payload))));
         }
 
         // Staged finalizer from a prior poll (buf was non-empty at stream end).
@@ -1031,22 +1044,36 @@ impl Stream for BatchingEnvelopeStream {
                 }
                 Poll::Ready(Some(Ok(data))) => {
                     let me = &mut *self;
-                    if let Err(err) = me.encoder.encode(data, &mut me.buf) {
-                        // Envelope encoding/compression failed mid-stream.
-                        // The buffer may contain prior successfully-encoded
-                        // envelopes — don't drop them.
-                        tracing::debug!(
-                            error = %err,
-                            "streaming response: envelope encoding failed"
-                        );
-                        let final_frame = self.finalizer.error(&err, &self.trailers);
-                        if self.buf.is_empty() {
-                            self.done = true;
-                            return Poll::Ready(Some(Ok(final_frame)));
-                        } else {
-                            self.pending_final = Some(final_frame);
+                    match me.encoder.encode_chained(
+                        data,
+                        &mut me.buf,
+                        crate::envelope::MIN_CHAIN_SIZE,
+                    ) {
+                        Err(err) => {
+                            // Envelope encoding/compression failed mid-stream.
+                            // The buffer may contain prior successfully-encoded
+                            // envelopes — don't drop them.
+                            tracing::debug!(
+                                error = %err,
+                                "streaming response: envelope encoding failed"
+                            );
+                            let final_frame = self.finalizer.error(&err, &self.trailers);
+                            if self.buf.is_empty() {
+                                self.done = true;
+                                return Poll::Ready(Some(Ok(final_frame)));
+                            } else {
+                                self.pending_final = Some(final_frame);
+                                return Poll::Ready(Some(Ok(self.flush_buf())));
+                            }
+                        }
+                        Ok(Some(payload)) => {
+                            // Large payload: `buf` now ends with
+                            // its 5-byte envelope header. Flush the buffer and
+                            // stage the payload as the next frame, unmoved.
+                            self.pending_payload = Some(payload);
                             return Poll::Ready(Some(Ok(self.flush_buf())));
                         }
+                        Ok(None) => {}
                     }
                     if self.buf.len() >= STREAM_BATCH_THRESHOLD {
                         return Poll::Ready(Some(Ok(self.flush_buf())));
@@ -1287,12 +1314,19 @@ impl<D: Dispatcher> ConnectRpcService<D> {
 
 /// A lightweight body for gRPC unary responses.
 ///
-/// Yields exactly two frames: one data frame (the gRPC envelope) and one
-/// trailers frame (for gRPC) or a second data frame (for gRPC-Web trailer encoding).
+/// Yields two or three frames: one data frame carrying the gRPC envelope
+/// (or, for large chained responses, just its 5-byte header followed by a
+/// second data frame with the payload by refcount), then one trailers frame
+/// (for gRPC) or a final data frame (for gRPC-Web trailer encoding).
 /// This avoids the overhead of `Pin<Box<dyn Stream>>` + `stream::unfold` +
 /// `EnvelopeEncoder` for the common unary case.
 pub struct GrpcUnaryBody {
     data: Option<Bytes>,
+    /// Large message payload (post-compression, when negotiated) emitted as
+    /// its own data frame
+    /// after `data` (which then carries only the 5-byte envelope header),
+    /// so the payload is passed through by refcount instead of copied.
+    payload: Option<Bytes>,
     trailers: Option<GrpcUnaryTrailers>,
 }
 
@@ -1315,6 +1349,8 @@ impl Body for GrpcUnaryBody {
         let me = self.get_mut();
         if let Some(data) = me.data.take() {
             Poll::Ready(Some(Ok(Frame::data(data))))
+        } else if let Some(payload) = me.payload.take() {
+            Poll::Ready(Some(Ok(Frame::data(payload))))
         } else if let Some(trailers) = me.trailers.take() {
             match trailers {
                 GrpcUnaryTrailers::Http2(map) => Poll::Ready(Some(Ok(Frame::trailers(map)))),
@@ -1954,11 +1990,13 @@ where
         }
         let body = GrpcUnaryBody {
             data: None,
+            payload: None,
             trailers: Some(trailers),
         };
         response.body(body).unwrap_or_else(|_| {
             Response::new(GrpcUnaryBody {
                 data: None,
+                payload: None,
                 trailers: None,
             })
         })
@@ -2087,17 +2125,20 @@ where
         metadata.streaming_encoding.as_deref(),
     );
 
-    // Encode response into a gRPC envelope (5-byte header + payload)
+    // Encode response into a gRPC envelope (5-byte header + payload). Large
+    // payloads are chained (header segment + payload by
+    // refcount) rather than copied into a contiguous buffer.
     let effective_policy = compression_policy.with_override(resp.compress);
-    let encoded_data = if let Some(encoding) = response_encoding
+    let min_chain = crate::envelope::MIN_CHAIN_SIZE;
+    let (encoded_data, chained_payload) = if let Some(encoding) = response_encoding
         && effective_policy.should_compress(resp.body.len())
     {
         match compression.compress(encoding, &resp.body) {
-            Ok(compressed) => Envelope::compressed(compressed).encode(),
-            Err(_) => Envelope::data(resp.body).encode(),
+            Ok(compressed) => Envelope::compressed(compressed).encode_parts(min_chain),
+            Err(_) => Envelope::data(resp.body).encode_parts(min_chain),
         }
     } else {
-        Envelope::data(resp.body).encode()
+        Envelope::data(resp.body).encode_parts(min_chain)
     };
 
     // Build gRPC trailers
@@ -2132,6 +2173,7 @@ where
 
     let body = GrpcUnaryBody {
         data: Some(encoded_data),
+        payload: chained_payload,
         trailers: Some(trailers),
     };
 
@@ -3264,6 +3306,169 @@ pub mod axum_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A payload at or above `envelope::MIN_CHAIN_SIZE` must reach the body
+    /// frames by refcount, not by copy: the emitted data frame references
+    /// the handler's original allocation. Small envelopes (the 5-byte
+    /// header) still batch into the framing buffer.
+    #[tokio::test]
+    async fn streaming_large_payload_is_chained_not_copied() {
+        use futures::StreamExt as _;
+
+        let payload = Bytes::from(vec![0x42u8; crate::envelope::MIN_CHAIN_SIZE]);
+        let original_ptr = payload.as_ptr();
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        // Frame 1: the 5-byte envelope header (batched buffer flush).
+        let head = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(head.len(), crate::envelope::HEADER_SIZE);
+        assert_eq!(head[0], crate::envelope::flags::DATA);
+        assert_eq!(
+            u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize,
+            payload.len()
+        );
+
+        // Frame 2: the payload, by refcount — same allocation, no copy.
+        let data = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(data.len(), payload.len());
+        assert!(
+            std::ptr::eq(data.as_ptr(), original_ptr),
+            "payload frame must reference the original allocation"
+        );
+
+        // Frame 3: gRPC trailers.
+        let trailers = stream.next().await.unwrap().unwrap();
+        assert!(trailers.is_trailers());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Payloads below the chaining threshold are emitted as one
+    /// contiguous data frame containing header + payload.
+    #[tokio::test]
+    async fn streaming_small_payload_stays_contiguous() {
+        use futures::StreamExt as _;
+
+        let payload = Bytes::from_static(b"small");
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let frame = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(frame.len(), crate::envelope::HEADER_SIZE + payload.len());
+        assert_eq!(&frame[crate::envelope::HEADER_SIZE..], &payload[..]);
+
+        let trailers = stream.next().await.unwrap().unwrap();
+        assert!(trailers.is_trailers());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// The chained split must be invisible to an envelope decoder: bytes
+    /// reassembled from the frames decode identically to the contiguous path.
+    #[tokio::test]
+    async fn streaming_chained_frames_reassemble_to_same_wire_bytes() {
+        use futures::StreamExt as _;
+
+        let large = Bytes::from(vec![0x5Au8; crate::envelope::MIN_CHAIN_SIZE + 7]);
+        let small = Bytes::from_static(b"tail");
+        let items = [
+            Ok::<_, ConnectError>(small.clone()),
+            Ok(large.clone()),
+            Ok(small.clone()),
+        ];
+        let source = futures::stream::iter(items).boxed();
+        let mut stream = std::pin::pin!(create_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let mut wire = bytes::BytesMut::new();
+        while let Some(frame) = stream.next().await {
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                wire.extend_from_slice(&data);
+            }
+        }
+
+        // Decode all envelopes back out and compare to the source messages.
+        let mut decoded = Vec::new();
+        while let Some(env) = Envelope::decode(&mut wire).unwrap() {
+            decoded.push(env);
+        }
+        assert_eq!(decoded.len(), 4, "3 data envelopes + 1 end-stream");
+        assert_eq!(decoded[0].data, small);
+        assert_eq!(decoded[1].data, large);
+        assert_eq!(decoded[2].data, small);
+        assert!(decoded[3].is_end_stream());
+    }
+
+    /// A source error right after a chained payload must still emit the
+    /// staged payload before the error finalizer: header frame, payload
+    /// frame, then trailers.
+    #[tokio::test]
+    async fn streaming_error_after_chained_payload_preserves_order() {
+        use futures::StreamExt as _;
+
+        let large = Bytes::from(vec![0x77u8; crate::envelope::MIN_CHAIN_SIZE]);
+        let items = [
+            Ok::<_, ConnectError>(large.clone()),
+            Err(ConnectError::internal("boom")),
+        ];
+        let source = futures::stream::iter(items).boxed();
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let head = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(head.len(), crate::envelope::HEADER_SIZE);
+        let payload = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(payload, large);
+        let trailers = stream.next().await.unwrap().unwrap();
+        let map = trailers.into_trailers().unwrap();
+        assert_eq!(map.get("grpc-status").unwrap(), "13", "internal = 13");
+        assert!(stream.next().await.is_none());
+    }
+
+    /// GrpcUnaryBody with a chained payload yields header, payload, then
+    /// trailers, in that order; the payload frame is the original
+    /// allocation.
+    #[tokio::test]
+    async fn grpc_unary_body_chained_frame_order() {
+        use http_body_util::BodyExt as _;
+
+        let payload = Bytes::from(vec![0x33u8; crate::envelope::MIN_CHAIN_SIZE]);
+        let ptr = payload.as_ptr();
+        let (head, chained) =
+            Envelope::data(payload.clone()).encode_parts(crate::envelope::MIN_CHAIN_SIZE);
+        let mut body = GrpcUnaryBody {
+            data: Some(head.clone()),
+            payload: chained,
+            trailers: Some(GrpcUnaryTrailers::Http2(http::HeaderMap::new())),
+        };
+
+        let f1 = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(f1, head);
+        assert_eq!(f1.len(), crate::envelope::HEADER_SIZE);
+        let f2 = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert!(std::ptr::eq(f2.as_ptr(), ptr), "payload must not be copied");
+        let f3 = body.frame().await.unwrap().unwrap();
+        assert!(f3.is_trailers());
+        assert!(body.frame().await.is_none());
+    }
 
     #[test]
     fn test_service_creation() {
