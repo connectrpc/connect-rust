@@ -72,5 +72,9 @@ harness = false
 name = "filter_handler"
 harness = false
 
+[[bench]]
+name = "view_rope_encode"
+harness = false
+
 [lints]
 workspace = true

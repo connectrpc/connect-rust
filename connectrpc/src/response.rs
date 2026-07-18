@@ -653,22 +653,14 @@ impl<M: Message + JsonSerialize> Encodable<M> for M {
         }
     }
 
-    fn encode_segments(
-        &self,
-        codec: CodecFormat,
-        min_segment: usize,
-    ) -> Result<EncodedBody, ConnectError> {
-        match codec {
-            // JSON is serialized whole; there is nothing to hand over by
-            // reference, so it takes the contiguous path.
-            CodecFormat::Json => encode_json(self).map(EncodedBody::from),
-            CodecFormat::Proto => {
-                let mut rope = buffa::Rope::with_min_segment(min_segment);
-                buffa::Message::encode(self, &mut rope);
-                Ok(EncodedBody::from_segments(rope.into_segments()))
-            }
-        }
-    }
+    // Deliberately does not override `encode_segments`. An owned message
+    // holds its `string` and `bytes` fields as `String` / `Vec<u8>` under the
+    // default codegen mapping, and neither can be handed over by reference
+    // count — so a rope here captures nothing and only adds its own cost.
+    // Measured on a four-field message (benches/rpc `view_encode`), routing
+    // owned messages through a rope cost 30.6µs -> 43.5µs at 256 KiB and
+    // 136ns -> 317ns at 1 KiB. The win lives on the view path, which borrows
+    // its fields out of a buffer a rope can capture from.
 }
 
 /// Encode a view body via [`ViewEncode`] for [`CodecFormat::Proto`], or
@@ -691,6 +683,65 @@ pub fn encode_view_body<'a, V: ViewEncode<'a>>(
         CodecFormat::Json => Err(ConnectError::unimplemented(
             "view-body responses do not support the JSON codec; return the owned message type for JSON-serving handlers",
         )),
+    }
+}
+
+/// Encode a view body, capturing its large borrowed fields by reference count
+/// instead of copying them.
+///
+/// This is where buffa 0.9's rope actually pays. A view's fields are slices
+/// into the buffer it was decoded from, so a rope told about that buffer can
+/// take a large field by reference — the encode then costs the same whatever
+/// the payload weighs. Measured on a four-string message
+/// (benches/rpc `view_encode`): 1.49µs -> 421ns at 16 KiB per field, and
+/// 252µs -> 421ns at 1 MiB, flat because only the framing is being written.
+///
+/// The same measurement is why `backing` is not optional in spirit: a rope
+/// with no buffer to capture from captures nothing and runs *slower* than a
+/// contiguous encode, so callers that cannot supply the view's own buffer
+/// should stay on [`encode_view_body`].
+///
+/// Pass `envelope::MIN_CHAIN_SIZE` as `min_segment` unless there is a reason
+/// not to. A segment below that is copied into the framing buffer anyway, so
+/// producing one spends the rope's overhead without saving a copy — and at
+/// 4 KiB the pathology is measurable: a four-field message clears the gate
+/// while no individual field does, so nothing is captured and the encode goes
+/// 141ns -> 365ns. Matching the framing threshold also makes every segment
+/// the encoder emits map to exactly one frame the body writes.
+///
+/// # Errors
+///
+/// [`ErrorCode::Unimplemented`](crate::ErrorCode::Unimplemented) for
+/// [`CodecFormat::Json`], as [`encode_view_body`].
+#[doc(hidden)]
+pub fn encode_view_body_segments<'a, V: ViewEncode<'a>>(
+    view: &V,
+    backing: &Bytes,
+    codec: CodecFormat,
+    min_segment: usize,
+) -> Result<EncodedBody, ConnectError> {
+    match codec {
+        CodecFormat::Json => Err(ConnectError::unimplemented(
+            "view-body responses do not support the JSON codec; return the owned message type for JSON-serving handlers",
+        )),
+        CodecFormat::Proto => {
+            let mut cache = buffa::SizeCache::new();
+            let size = buffa::checked_encode_size(view.compute_size(&mut cache)).map_err(|_| {
+                ConnectError::internal("response message exceeds the 2 GiB protobuf size limit")
+            })?;
+
+            // Below one segment nothing can be captured, so the rope would be
+            // pure overhead — see the note above.
+            if (size as usize) < min_segment {
+                let mut buf = BytesMut::with_capacity(size as usize);
+                view.write_to(&mut cache, &mut buf);
+                return Ok(EncodedBody::Contiguous(buf.freeze()));
+            }
+
+            let mut rope = buffa::Rope::with_min_segment(min_segment).with_backing(backing.clone());
+            view.write_to(&mut cache, &mut rope);
+            Ok(EncodedBody::from_segments(rope.into_segments()))
+        }
     }
 }
 
@@ -1051,22 +1102,27 @@ impl<B> Response<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa_types::google::protobuf::__buffa::view::StringValueView;
     use buffa_types::google::protobuf::StringValue;
 
     /// The invariant the whole segmented path rests on: however the encoder
     /// chose to divide the output, concatenating it must reproduce exactly
     /// what the contiguous encode produced. A divergence here is a wire-format
     /// bug, not a performance one.
+    ///
+    /// Swept across thresholds because each one divides the output
+    /// differently — 1 makes almost every write its own segment, `usize::MAX`
+    /// never segments at all, and the interesting cases sit between.
     #[test]
-    fn segments_concatenate_to_the_contiguous_encoding() {
-        let msg = StringValue::from("a message that round-trips");
+    fn view_segments_concatenate_to_the_contiguous_encoding() {
+        let buffer = encoded_string_value(&"m".repeat(64 * 1024));
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+        let contiguous = encode_view_body(&view, CodecFormat::Proto).expect("proto encode");
 
-        for min_segment in [1usize, 8, 1024, usize::MAX] {
+        for min_segment in [1usize, 8, 4096, 64 * 1024, usize::MAX] {
             let segmented =
-                Encodable::<StringValue>::encode_segments(&msg, CodecFormat::Proto, min_segment)
+                encode_view_body_segments(&view, &buffer, CodecFormat::Proto, min_segment)
                     .expect("proto encode");
-            let contiguous =
-                Encodable::<StringValue>::encode(&msg, CodecFormat::Proto).expect("proto encode");
 
             assert_eq!(
                 segmented.len(),
@@ -1079,6 +1135,81 @@ mod tests {
                 "min_segment={min_segment}: bytes must match"
             );
         }
+    }
+
+    /// Wire bytes for a `StringValue`, to decode a borrowing view from.
+    fn encoded_string_value(value: &str) -> Bytes {
+        Bytes::from(buffa::Message::encode_to_vec(&StringValue::from(value)))
+    }
+
+    #[test]
+    fn small_views_skip_the_rope() {
+        // A rope costs more than it saves on a message too small to contain a
+        // capturable field, so the gate must send those down the contiguous
+        // path. Pinning it because the regression would be invisible: the
+        // bytes stay correct and only the encode gets slower.
+        let buffer = encoded_string_value("small");
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+
+        let body = encode_view_body_segments(
+            &view,
+            &buffer,
+            CodecFormat::Proto,
+            crate::envelope::MIN_CHAIN_SIZE,
+        )
+        .expect("proto encode");
+        assert!(
+            matches!(body, EncodedBody::Contiguous(_)),
+            "a message under one segment must not pay for a rope"
+        );
+    }
+
+    #[test]
+    fn large_view_fields_are_captured_as_segments() {
+        // The whole point of the exercise: a field larger than one segment,
+        // borrowed from the buffer the rope is backed by, is handed over by
+        // reference instead of copied. If this stops splitting, the encode has
+        // silently gone back to copying the payload.
+        let buffer = encoded_string_value(&"x".repeat(64 * 1024));
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+
+        let body = encode_view_body_segments(
+            &view,
+            &buffer,
+            CodecFormat::Proto,
+            crate::envelope::MIN_CHAIN_SIZE,
+        )
+        .expect("proto encode");
+        assert!(
+            matches!(body, EncodedBody::Segmented(_)),
+            "a 64 KiB borrowed field must be captured, not copied"
+        );
+        assert_eq!(
+            body.into_contiguous(),
+            encode_view_body(&view, CodecFormat::Proto).expect("proto encode"),
+            "segmented output must equal what the contiguous encoder produced"
+        );
+    }
+
+    #[test]
+    fn view_segments_without_backing_are_still_correct() {
+        // A rope pointed at the wrong buffer captures nothing, which costs
+        // speed but must never cost correctness.
+        let buffer = encoded_string_value(&"y".repeat(64 * 1024));
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+        let unrelated = Bytes::from_static(b"not the buffer this view came from");
+
+        let body = encode_view_body_segments(
+            &view,
+            &unrelated,
+            CodecFormat::Proto,
+            crate::envelope::MIN_CHAIN_SIZE,
+        )
+        .expect("proto encode");
+        assert_eq!(
+            body.into_contiguous(),
+            encode_view_body(&view, CodecFormat::Proto).expect("proto encode")
+        );
     }
 
     #[test]

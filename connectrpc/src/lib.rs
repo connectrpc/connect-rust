@@ -286,6 +286,7 @@ pub use stream_message::StreamMessage;
 #[doc(hidden)]
 pub mod __codegen {
     pub use crate::response::encode_view_body;
+    pub use crate::response::encode_view_body_segments;
 }
 
 // Error types
