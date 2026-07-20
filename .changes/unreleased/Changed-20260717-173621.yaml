@@ -1,0 +1,26 @@
+kind: Changed
+body: |-
+  **A gRPC or gRPC-Web unary response whose body is an `OwnedView` no longer
+  copies its large fields when encoding.** A view's fields are slices into the
+  buffer it was decoded from, so they are handed to the HTTP body by reference
+  count and reach the socket as their own data frames. Past the framing
+  threshold the encode stops growing with the payload, because only the
+  framing is still being written.
+
+  Encoding stays contiguous where segmenting would not pay: responses below
+  the framing threshold, owned-message responses (their `String` and `Vec<u8>`
+  fields cannot be handed over by reference), a response much smaller than the
+  request it borrows from (capturing would keep the whole request buffer alive
+  while the response flushes), Connect-protocol unary, streaming, and any call
+  passing through an interceptor, since an interceptor may replace the body and
+  so needs it whole.
+
+  **Breaking, for custom dispatch only.** `EncodedResponse` is now
+  `Response<EncodedBody>` rather than `Response<Bytes>`. If you implement the
+  `Dispatcher` trait, or construct or consume `EncodedResponse` values, build
+  one with `Bytes::into()` and recover a single buffer with
+  `EncodedBody::into_contiguous()`. Interceptors are unaffected —
+  `UnaryResponse` still carries a contiguous `Payload`, because an interceptor
+  may replace the whole body — note that this also means a call with an
+  interceptor configured takes the contiguous path.
+time: 2026-07-17T17:36:21.338084808-07:00

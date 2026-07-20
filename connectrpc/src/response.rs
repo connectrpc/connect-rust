@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use buffa::Message;
 use buffa::view::{MessageView, ViewEncode};
 use bytes::Bytes;
+use bytes::BytesMut;
 use futures::Stream;
 use http::HeaderMap;
 use http::header::{HeaderName, HeaderValue};
@@ -504,6 +505,86 @@ pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> +
 /// parameters with this alias so signatures stay readable.
 pub type InboundStream<M> = ServiceStream<crate::StreamMessage<M>>;
 
+/// Encoded message bytes, either contiguous or split into reference-counted
+/// segments.
+///
+/// Concatenating [`segments`](Self::segments) always yields the message's wire
+/// bytes; how they are divided is an artifact of how the body was encoded and
+/// carries no protocol meaning. Envelope framing has never depended on HTTP
+/// frame boundaries, so a segmented body reaches the peer as the same message.
+///
+/// The single-buffer case is kept unboxed: a small message that was never
+/// worth segmenting costs no allocation to carry.
+#[derive(Debug, Clone)]
+pub enum EncodedBody {
+    /// One contiguous buffer — what a non-segmenting encode produces.
+    Contiguous(Bytes),
+    /// Several buffers, concatenating to the message's wire bytes.
+    Segmented(Vec<Bytes>),
+}
+
+impl EncodedBody {
+    /// Build from a rope's segments, collapsing the trivial cases so callers
+    /// never see a needless `Vec` for zero or one segment.
+    #[must_use]
+    pub fn from_segments(mut segments: Vec<Bytes>) -> Self {
+        match segments.len() {
+            0 => Self::Contiguous(Bytes::new()),
+            1 => Self::Contiguous(segments.pop().unwrap_or_default()),
+            _ => Self::Segmented(segments),
+        }
+    }
+
+    /// Total encoded length across all segments.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(b) => b.len(),
+            Self::Segmented(v) => v.iter().map(Bytes::len).sum(),
+        }
+    }
+
+    /// Whether the encoded message is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The segments in wire order.
+    #[must_use]
+    pub fn segments(&self) -> &[Bytes] {
+        match self {
+            Self::Contiguous(b) => std::slice::from_ref(b),
+            Self::Segmented(v) => v,
+        }
+    }
+
+    /// Flatten to a single contiguous buffer, copying only when segmented.
+    ///
+    /// This is the escape hatch for paths that genuinely need one buffer
+    /// (compression, JSON, base64) — it gives back exactly what a
+    /// non-segmenting encode would have produced.
+    #[must_use]
+    pub fn into_contiguous(self) -> Bytes {
+        match self {
+            Self::Contiguous(b) => b,
+            Self::Segmented(v) => {
+                let mut out = BytesMut::with_capacity(v.iter().map(Bytes::len).sum());
+                for segment in &v {
+                    out.extend_from_slice(segment);
+                }
+                out.freeze()
+            }
+        }
+    }
+}
+
+impl From<Bytes> for EncodedBody {
+    fn from(bytes: Bytes) -> Self {
+        Self::Contiguous(bytes)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encodable<M>
 // ---------------------------------------------------------------------------
@@ -536,6 +617,37 @@ pub type InboundStream<M> = ServiceStream<crate::StreamMessage<M>>;
 pub trait Encodable<M> {
     /// Encode `self` as wire bytes for `M` in the requested format.
     fn encode(&self, codec: CodecFormat) -> Result<Bytes, ConnectError>;
+
+    /// Encode `self` as wire bytes that may arrive in several reference-counted
+    /// segments rather than one contiguous buffer.
+    ///
+    /// Concatenating the segments yields exactly what [`encode`](Self::encode)
+    /// would have returned, so this is an optimization and never a wire-format
+    /// difference. A payload the encoder can hand over by reference count — a
+    /// large `bytes::Bytes` field, or a view field borrowed from the buffer the
+    /// view was decoded from — becomes its own segment instead of being copied
+    /// into the output.
+    ///
+    /// The default implementation returns [`encode`](Self::encode)'s single
+    /// buffer, which is always correct. Overriding it is worthwhile only for a
+    /// body that can carry a large payload by reference; a body whose fields
+    /// are `String` or `Vec<u8>` has nothing to hand over, and segmenting it
+    /// would add the rope's cost for no saving.
+    ///
+    /// How large a payload has to be before it earns its own segment is the
+    /// framing layer's decision, not the implementation's — anything smaller
+    /// is copied into the framing buffer downstream regardless, so a smaller
+    /// threshold spends effort without saving a copy. Implementations that
+    /// need to encode a view should call
+    /// [`__codegen::encode_view_body_segments`](crate::__codegen::encode_view_body_segments),
+    /// which applies that threshold for them.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`encode`](Self::encode).
+    fn encode_segments(&self, codec: CodecFormat) -> Result<EncodedBody, ConnectError> {
+        self.encode(codec).map(EncodedBody::from)
+    }
 }
 
 impl<M: Message + JsonSerialize> Encodable<M> for M {
@@ -545,6 +657,13 @@ impl<M: Message + JsonSerialize> Encodable<M> for M {
             CodecFormat::Json => encode_json(self),
         }
     }
+
+    // Deliberately does not override `encode_segments`. An owned message
+    // holds its `string` and `bytes` fields as `String` / `Vec<u8>` under the
+    // default codegen mapping, and neither can be handed over by reference
+    // count, so a rope here would capture nothing and only add its own cost.
+    // The win lives on the view path, which borrows its fields out of a
+    // buffer a rope can capture from.
 }
 
 /// Encode a view body via [`ViewEncode`] for [`CodecFormat::Proto`], or
@@ -563,10 +682,155 @@ pub fn encode_view_body<'a, V: ViewEncode<'a>>(
     codec: CodecFormat,
 ) -> Result<Bytes, ConnectError> {
     match codec {
-        CodecFormat::Proto => Ok(view.encode_to_bytes()),
+        // Not `encode_to_bytes`, which panics past the 2 GiB protobuf limit:
+        // an oversized response is a request-shaped input reaching a server,
+        // and the segmented sibling already reports it as an error. The work
+        // is the same either way — `encode_to_bytes` runs these two passes
+        // internally.
+        CodecFormat::Proto => {
+            let mut cache = buffa::SizeCache::new();
+            let size = checked_response_size(view.compute_size(&mut cache))?;
+            let mut buf = BytesMut::with_capacity(size);
+            view.write_to(&mut cache, &mut buf);
+            Ok(buf.freeze())
+        }
         CodecFormat::Json => Err(ConnectError::unimplemented(
             "view-body responses do not support the JSON codec; return the owned message type for JSON-serving handlers",
         )),
+    }
+}
+
+/// Whether a response of `size` bytes should be encoded through a rope, given
+/// that its captures would alias a `backing` buffer of `backing_len` bytes.
+///
+/// Two ways a rope loses. A response below one segment has nothing large
+/// enough to capture, so the rope is pure overhead. And a small response
+/// derived from a large request would capture slices of that request's buffer,
+/// keeping the whole allocation alive until the response finishes flushing —
+/// a handler that answers a 64 MiB upload with a 32 KiB summary would hold
+/// 64 MiB per in-flight response where it used to hold 32 KiB. Copying is
+/// cheaper than that. When the response is at least half the buffer it borrows from,
+/// the buffer was going to stay alive anyway and the capture is free.
+fn worth_segmenting(size: usize, backing_len: usize, min_segment: usize) -> bool {
+    size >= min_segment && size.saturating_mul(2) >= backing_len
+}
+
+/// Merge segments below `min_segment` into their neighbour.
+///
+/// A rope flushes its pending tail before each capture, so a view with several
+/// large fields yields alternating tag/length fragments and captured payloads.
+/// Emitted as-is those fragments become their own HTTP data frames, each a
+/// handful of bytes behind a 9-byte HTTP/2 frame header. Merging them costs a
+/// copy proportional to the fragment, not the payload.
+fn coalesce_small(segments: Vec<Bytes>, min_segment: usize) -> Vec<Bytes> {
+    if segments.len() < 2 {
+        return segments;
+    }
+    let mut out: Vec<Bytes> = Vec::with_capacity(segments.len());
+    let mut pending = BytesMut::new();
+    for segment in segments {
+        if segment.len() >= min_segment {
+            if !pending.is_empty() {
+                out.push(std::mem::take(&mut pending).freeze());
+            }
+            out.push(segment);
+        } else {
+            pending.extend_from_slice(&segment);
+        }
+    }
+    if !pending.is_empty() {
+        out.push(pending.freeze());
+    }
+    out
+}
+
+/// Reject a response larger than protobuf can encode, as an error rather than
+/// a panic — this runs on a server, where the size is a function of what a
+/// caller asked for.
+fn checked_response_size(size: u32) -> Result<usize, ConnectError> {
+    buffa::checked_encode_size(size)
+        .map(|size| size as usize)
+        .map_err(|_| {
+            ConnectError::internal("response message exceeds the 2 GiB protobuf size limit")
+        })
+}
+
+/// Encode a view body, capturing its large borrowed fields by reference count
+/// instead of copying them.
+///
+/// This is where buffa 0.9's rope pays. A view's fields are slices into the
+/// buffer it was decoded from, so a rope told about that buffer can take a
+/// large field by reference, and the encode then costs the same whatever the
+/// payload weighs. The `view_rope_encode` benchmark in `benches/rpc` measures the
+/// curve; above the threshold the encode goes flat, because only the framing
+/// is still being written.
+///
+/// `backing` must be the buffer this view was decoded from. A rope pointed
+/// anywhere else captures nothing and is slower than a contiguous encode — it
+/// still produces correct bytes, so the cost of getting this wrong is silent.
+/// A caller with no buffer to give should use [`encode_view_body`].
+///
+/// The threshold below which a payload is not worth its own segment is the
+/// framing layer's, applied here so callers cannot pick a worse one: anything
+/// smaller is copied into the framing buffer downstream regardless, and a
+/// message can clear a smaller gate while none of its individual fields do,
+/// which spends the rope's cost and captures nothing. Matching the framing
+/// threshold also makes every segment map to exactly one body frame.
+///
+/// # Errors
+///
+/// [`ErrorCode::Unimplemented`](crate::ErrorCode::Unimplemented) for
+/// [`CodecFormat::Json`], as [`encode_view_body`].
+#[doc(hidden)]
+pub fn encode_view_body_segments<'a, V: ViewEncode<'a>>(
+    view: &V,
+    backing: &Bytes,
+    codec: CodecFormat,
+) -> Result<EncodedBody, ConnectError> {
+    encode_view_body_with_min_segment(view, backing, codec, crate::envelope::MIN_CHAIN_SIZE)
+}
+
+/// [`encode_view_body_segments`] with the segment threshold spelled out, so
+/// tests and benchmarks can sweep it. Production callers take the framing
+/// layer's threshold via [`encode_view_body_segments`].
+///
+/// # Errors
+///
+/// As [`encode_view_body_segments`].
+#[doc(hidden)]
+pub fn encode_view_body_with_min_segment<'a, V: ViewEncode<'a>>(
+    view: &V,
+    backing: &Bytes,
+    codec: CodecFormat,
+    min_segment: usize,
+) -> Result<EncodedBody, ConnectError> {
+    match codec {
+        CodecFormat::Json => Err(ConnectError::unimplemented(
+            "view-body responses do not support the JSON codec; return the owned message type for JSON-serving handlers",
+        )),
+        CodecFormat::Proto => {
+            let mut cache = buffa::SizeCache::new();
+            let size = checked_response_size(view.compute_size(&mut cache))?;
+
+            if !worth_segmenting(size, backing.len(), min_segment) {
+                let mut buf = BytesMut::with_capacity(size);
+                view.write_to(&mut cache, &mut buf);
+                return Ok(EncodedBody::Contiguous(buf.freeze()));
+            }
+
+            // Known cost: a rope's tail starts empty and grows by doubling,
+            // and every field too small to capture lands in it. A message that
+            // clears the gate while none of its fields do therefore copies
+            // itself roughly twice over instead of once into a sized buffer.
+            // buffa 0.9 exposes no way to pre-size the tail; until it does,
+            // that shape pays for a rope that captures nothing.
+            let mut rope = buffa::Rope::with_min_segment(min_segment).with_backing(backing.clone());
+            view.write_to(&mut cache, &mut rope);
+            Ok(EncodedBody::from_segments(coalesce_small(
+                rope.into_segments(),
+                min_segment,
+            )))
+        }
     }
 }
 
@@ -626,6 +890,18 @@ where
         match self {
             Self::Owned(m) => m.encode(codec),
             Self::Borrowed(v) => v.encode(codec),
+        }
+    }
+
+    /// Forwards to the wrapped body rather than taking the contiguous
+    /// default. `Borrowed` is the arm handlers reach for to avoid copying, so
+    /// it is exactly the arm that must not lose the segmented encode by being
+    /// wrapped — the wrapper would otherwise quietly undo the reason it was
+    /// chosen.
+    fn encode_segments(&self, codec: CodecFormat) -> Result<EncodedBody, ConnectError> {
+        match self {
+            Self::Owned(m) => m.encode_segments(codec),
+            Self::Borrowed(v) => v.encode_segments(codec),
         }
     }
 }
@@ -904,7 +1180,7 @@ impl<M: Message + JsonSerialize> Encodable<M> for PreEncoded<M> {
 /// This is what the [`Dispatcher`](crate::Dispatcher) returns to the
 /// protocol layer — encoding happens inside the dispatcher so the body
 /// type stays generic across the trait boundary.
-pub type EncodedResponse = Response<Bytes>;
+pub type EncodedResponse = Response<EncodedBody>;
 
 impl<B> Response<B> {
     /// Encode the body to bytes via [`Encodable<M>`], preserving
@@ -914,9 +1190,12 @@ impl<B> Response<B> {
     where
         B: Encodable<M>,
     {
-        let bytes = self.body.encode(codec)?;
+        // Bodies that can hand a large payload over by reference count say so
+        // here; everything else takes the default and returns the same single
+        // buffer it always did.
+        let body = self.body.encode_segments(codec)?;
         Ok(Response {
-            body: bytes,
+            body,
             headers: self.headers,
             trailers: self.trailers,
             compress: self.compress,
@@ -927,7 +1206,178 @@ impl<B> Response<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa_types::google::protobuf::__buffa::view::StringValueView;
     use buffa_types::google::protobuf::StringValue;
+
+    /// The invariant the whole segmented path rests on: however the encoder
+    /// chose to divide the output, concatenating it must reproduce exactly
+    /// what the contiguous encode produced. A divergence here is a wire-format
+    /// bug, not a performance one.
+    ///
+    /// Swept across thresholds because each one divides the output
+    /// differently — 1 makes almost every write its own segment, `usize::MAX`
+    /// never segments at all, and the interesting cases sit between.
+    #[test]
+    fn view_segments_concatenate_to_the_contiguous_encoding() {
+        let buffer = encoded_string_value(&"m".repeat(64 * 1024));
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+        let contiguous = encode_view_body(&view, CodecFormat::Proto).expect("proto encode");
+
+        for min_segment in [1usize, 8, 4096, 64 * 1024, usize::MAX] {
+            let segmented =
+                encode_view_body_with_min_segment(&view, &buffer, CodecFormat::Proto, min_segment)
+                    .expect("proto encode");
+
+            assert_eq!(
+                segmented.len(),
+                contiguous.len(),
+                "min_segment={min_segment}: length must match"
+            );
+            assert_eq!(
+                segmented.into_contiguous(),
+                contiguous,
+                "min_segment={min_segment}: bytes must match"
+            );
+        }
+    }
+
+    /// Wire bytes for a `StringValue`, to decode a borrowing view from.
+    fn encoded_string_value(value: &str) -> Bytes {
+        Bytes::from(buffa::Message::encode_to_vec(&StringValue::from(value)))
+    }
+
+    #[test]
+    fn small_views_skip_the_rope() {
+        // A rope costs more than it saves on a message too small to contain a
+        // capturable field, so the gate must send those down the contiguous
+        // path. Pinning it because the regression would be invisible: the
+        // bytes stay correct and only the encode gets slower.
+        let buffer = encoded_string_value("small");
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+
+        let body =
+            encode_view_body_segments(&view, &buffer, CodecFormat::Proto).expect("proto encode");
+        assert!(
+            matches!(body, EncodedBody::Contiguous(_)),
+            "a message under one segment must not pay for a rope"
+        );
+    }
+
+    #[test]
+    fn large_view_fields_are_captured_as_segments() {
+        // The whole point of the exercise: a field larger than one segment,
+        // borrowed from the buffer the rope is backed by, is handed over by
+        // reference instead of copied. If this stops splitting, the encode has
+        // silently gone back to copying the payload.
+        let buffer = encoded_string_value(&"x".repeat(64 * 1024));
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+
+        let body =
+            encode_view_body_segments(&view, &buffer, CodecFormat::Proto).expect("proto encode");
+        assert!(
+            matches!(body, EncodedBody::Segmented(_)),
+            "a 64 KiB borrowed field must be captured, not copied"
+        );
+        assert_eq!(
+            body.into_contiguous(),
+            encode_view_body(&view, CodecFormat::Proto).expect("proto encode"),
+            "segmented output must equal what the contiguous encoder produced"
+        );
+    }
+
+    #[test]
+    fn a_small_response_does_not_pin_a_large_request_buffer() {
+        // Capturing means the response's segments alias the request's buffer,
+        // which keeps the whole allocation alive until the response finishes
+        // flushing. For a summary of a large upload that trades a copy for
+        // holding orders of magnitude more memory per in-flight response, so
+        // the encoder copies instead.
+        let big_request = 4 * 1024 * 1024;
+        let small_response = 64 * 1024;
+        assert!(
+            !worth_segmenting(small_response, big_request, 16 * 1024),
+            "a response this much smaller than its request must not capture"
+        );
+
+        // Returning most of what arrived is the case capture is for: the
+        // buffer stays alive regardless, so aliasing it costs nothing.
+        assert!(worth_segmenting(64 * 1024, 66 * 1024, 16 * 1024));
+
+        // Still gated on the segment threshold.
+        assert!(!worth_segmenting(1024, 1024, 16 * 1024));
+    }
+
+    #[test]
+    fn tiny_segments_are_merged_into_their_neighbours() {
+        // A rope flushes its tail before each capture, so a multi-field view
+        // yields alternating small tag/length fragments and large payloads.
+        // Left alone each fragment becomes its own HTTP frame, a few bytes
+        // behind a 9-byte frame header.
+        let big = Bytes::from(vec![1u8; 32 * 1024]);
+        let segments = vec![
+            Bytes::from_static(b"ab"),
+            big.clone(),
+            Bytes::from_static(b"cd"),
+            big.clone(),
+            Bytes::from_static(b"ef"),
+        ];
+        let merged = coalesce_small(segments, 16 * 1024);
+
+        assert_eq!(merged.len(), 5, "large payloads stay their own segments");
+        let total: usize = merged.iter().map(Bytes::len).sum();
+        assert_eq!(total, 2 + 32 * 1024 + 2 + 32 * 1024 + 2);
+
+        // The large payloads must still be the original allocations, not
+        // copies — merging the fragments must not gather the payloads too.
+        assert!(std::ptr::eq(merged[1].as_ptr(), big.as_ptr()));
+        assert!(std::ptr::eq(merged[3].as_ptr(), big.as_ptr()));
+    }
+
+    #[test]
+    fn view_segments_without_backing_are_still_correct() {
+        // A rope pointed at the wrong buffer captures nothing, which costs
+        // speed but must never cost correctness.
+        let buffer = encoded_string_value(&"y".repeat(64 * 1024));
+        let view = StringValueView::decode_view(&buffer).expect("decode view");
+        let unrelated = Bytes::from_static(b"not the buffer this view came from");
+
+        let body =
+            encode_view_body_segments(&view, &unrelated, CodecFormat::Proto).expect("proto encode");
+        assert_eq!(
+            body.into_contiguous(),
+            encode_view_body(&view, CodecFormat::Proto).expect("proto encode")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "json")]
+    fn json_encoding_stays_contiguous() {
+        // JSON is serialized whole, so there is nothing to hand over by
+        // reference and the segmented call must not pretend otherwise.
+        let msg = StringValue::from("json");
+        let body =
+            Encodable::<StringValue>::encode_segments(&msg, CodecFormat::Json).expect("json");
+        assert!(matches!(body, EncodedBody::Contiguous(_)));
+    }
+
+    #[test]
+    fn encoded_body_collapses_trivial_segment_counts() {
+        assert!(matches!(
+            EncodedBody::from_segments(vec![]),
+            EncodedBody::Contiguous(b) if b.is_empty()
+        ));
+        assert!(matches!(
+            EncodedBody::from_segments(vec![Bytes::from_static(b"one")]),
+            EncodedBody::Contiguous(_)
+        ));
+        assert!(matches!(
+            EncodedBody::from_segments(vec![
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two")
+            ]),
+            EncodedBody::Segmented(_)
+        ));
+    }
 
     #[tokio::test]
     async fn response_stream_ok_shorthand() {
@@ -1005,7 +1455,9 @@ mod tests {
         let enc = r.encode::<StringValue>(CodecFormat::Proto).unwrap();
         assert_eq!(enc.headers.get("x-a").unwrap(), "1");
         assert_eq!(
-            StringValue::decode_from_slice(&enc.body).unwrap().value,
+            StringValue::decode_from_slice(&enc.body.into_contiguous())
+                .unwrap()
+                .value,
             "hi"
         );
     }

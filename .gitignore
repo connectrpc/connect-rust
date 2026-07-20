@@ -24,3 +24,8 @@ benches/rpc-go/fortune-connect-go
 
 # Tool downloads (changie, etc.) — see Taskfile install-* tasks
 .local/
+
+# Raw output from benchmark harnesses that write into the working tree.
+# These carry host details from whatever machine produced them and are not
+# reproducible artifacts worth tracking.
+metal-bench-results/

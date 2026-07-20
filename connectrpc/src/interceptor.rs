@@ -343,7 +343,11 @@ impl UnaryResponse {
     /// Build a `UnaryResponse` from an encoded handler response.
     pub fn from_encoded(resp: EncodedResponse, format: CodecFormat) -> Self {
         Response {
-            body: Payload::new(resp.body, format),
+            // Interceptors inspect and replace whole message bodies, so the
+            // payload has to be contiguous here. Flattening is a no-op unless
+            // the encoder segmented, and an interceptor is the one consumer
+            // that cannot work with segments.
+            body: Payload::new(resp.body.into_contiguous(), format),
             headers: resp.headers,
             trailers: resp.trailers,
             compress: resp.compress,
@@ -358,7 +362,7 @@ impl UnaryResponse {
     /// [`Payload::set_message`] fails to re-encode.
     pub fn into_encoded(self) -> Result<EncodedResponse, ConnectError> {
         Ok(Response {
-            body: self.body.encoded()?,
+            body: self.body.encoded()?.into(),
             headers: self.headers,
             trailers: self.trailers,
             compress: self.compress,
@@ -721,7 +725,7 @@ pub(crate) async fn call_client_streaming_intercepted<D: crate::Dispatcher>(
         }
     };
     Ok(Response {
-        body,
+        body: body.into(),
         headers,
         trailers,
         compress,
@@ -814,9 +818,9 @@ impl<D: crate::Dispatcher> StreamTerminal for ClientStreamingTerminal<'_, D> {
         // Wrap the single response in a 1-item outbound stream so the
         // chain has a uniform type. `call_client_streaming_intercepted`
         // pulls it back out for the dispatch path.
-        Ok(resp.map_body(move |bytes| -> PayloadStream {
+        Ok(resp.map_body(move |body| -> PayloadStream {
             Box::pin(futures::stream::once(async move {
-                Ok(Payload::new(bytes, format))
+                Ok(Payload::new(body.into_contiguous(), format))
             }))
         }))
     }
@@ -858,7 +862,7 @@ impl<D: crate::Dispatcher> StreamTerminal for BidiStreamingTerminal<'_, D> {
 /// let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(MyInterceptor)];
 /// let resp = connectrpc::interceptor::run_chain(&chain, my_req, |req| async move {
 ///     // assert what the handler would see
-///     Ok(UnaryResponse::from_encoded(EncodedResponse::new(Bytes::new()), CodecFormat::Proto))
+///     Ok(UnaryResponse::from_encoded(EncodedResponse::new(Bytes::new().into()), CodecFormat::Proto))
 /// })
 /// .await?;
 /// ```
@@ -968,7 +972,7 @@ mod tests {
                 value: self.respond_with.into(),
                 ..Default::default()
             })?;
-            let mut resp = EncodedResponse::new(body);
+            let mut resp = EncodedResponse::new(body.into());
             resp.headers.insert("x-in-len", in_len.parse().unwrap());
             Ok(UnaryResponse::from_encoded(resp, CodecFormat::Proto))
         }
@@ -1201,7 +1205,7 @@ mod tests {
         // Exercise the public test helper that downstream crates use.
         let resp = run_chain(&chain, req(), |_| async {
             Ok(UnaryResponse::from_encoded(
-                EncodedResponse::new(Bytes::new()),
+                EncodedResponse::new(Bytes::new().into()),
                 CodecFormat::Proto,
             ))
         })
@@ -1220,7 +1224,7 @@ mod tests {
         impl Interceptor for Passthrough {}
         let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(Passthrough)];
         let resp = run_chain(&chain, req(), |_| async {
-            let mut r = EncodedResponse::new(Bytes::from_static(b"x"));
+            let mut r = EncodedResponse::new(Bytes::from_static(b"x").into());
             r.headers.insert("x-h", "1".parse().unwrap());
             r.trailers.insert("x-t", "2".parse().unwrap());
             r.compress = Some(true);
@@ -1232,7 +1236,7 @@ mod tests {
         assert_eq!(encoded.headers.get("x-h").unwrap(), "1");
         assert_eq!(encoded.trailers.get("x-t").unwrap(), "2");
         assert_eq!(encoded.compress, Some(true));
-        assert_eq!(&*encoded.body, b"x");
+        assert_eq!(&*encoded.body.into_contiguous(), b"x");
     }
 
     #[tokio::test]
@@ -1256,7 +1260,7 @@ mod tests {
                 request: Payload,
                 _: CodecFormat,
             ) -> crate::dispatcher::UnaryResult {
-                Box::pin(async move { Ok(EncodedResponse::new(request.encoded()?)) })
+                Box::pin(async move { Ok(EncodedResponse::new(request.encoded()?.into())) })
             }
             fn call_server_streaming(
                 &self,
@@ -1298,7 +1302,10 @@ mod tests {
         .await
         .unwrap();
         // Same backing storage — no copy through Payload.
-        assert!(std::ptr::eq(resp.body.as_ptr(), body.as_ptr()));
+        assert!(std::ptr::eq(
+            resp.body.into_contiguous().as_ptr(),
+            body.as_ptr()
+        ));
     }
 
     /// `DispatchTerminal` hands the `Payload` — not raw bytes — to the
@@ -1333,7 +1340,7 @@ mod tests {
                 Box::pin(async move {
                     let m: StringValue = request.take_message()?;
                     *captured.lock().unwrap() = Some(m.value);
-                    Ok(EncodedResponse::new(Bytes::new()))
+                    Ok(EncodedResponse::new(Bytes::new().into()))
                 })
             }
             fn call_server_streaming(
@@ -1761,7 +1768,7 @@ mod tests {
                 while let Some(item) = requests.next().await {
                     total += item?.len();
                 }
-                Ok(EncodedResponse::new(Bytes::from(total.to_string())))
+                Ok(EncodedResponse::new(Bytes::from(total.to_string()).into()))
             })
         }
         fn call_bidi_streaming(
@@ -1822,7 +1829,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(&*resp.body, b"4");
+        assert_eq!(&*resp.body.into_contiguous(), b"4");
 
         // Bidi-streaming.
         let body = Bytes::from_static(b"z");
@@ -1998,7 +2005,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(&*resp.body, b"5");
+        assert_eq!(&*resp.body.into_contiguous(), b"5");
 
         // Bidi: 2-item inbound → echo dispatcher returns it as outbound.
         let inbound: RequestStream = Box::pin(futures::stream::iter(vec![

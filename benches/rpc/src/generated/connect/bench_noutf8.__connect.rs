@@ -25,6 +25,20 @@ for ::buffa::view::OwnedView<
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
 }
 /// Full service name for this service.
 pub const LOG_INGEST_SERVICE_SERVICE_NAME: &str = "bench.noutf8.v1.LogIngestService";

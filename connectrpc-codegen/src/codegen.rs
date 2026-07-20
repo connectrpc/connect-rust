@@ -1205,6 +1205,20 @@ fn encodable_impl_pair(
             {
                 ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
             }
+
+            /// An `OwnedView` still holds the buffer it was decoded from, so
+            /// its large fields can be handed to the response body by
+            /// reference count instead of copied. The bare view impl above
+            /// cannot do this: it has borrows but no buffer to name.
+            fn encode_segments(&self, codec: ::connectrpc::CodecFormat)
+                -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError>
+            {
+                ::connectrpc::__codegen::encode_view_body_segments(
+                    self.reborrow(),
+                    self.bytes(),
+                    codec,
+                )
+            }
         }
     }))
 }
@@ -4354,11 +4368,13 @@ mod tests {
             .iter()
             .find(|f| f.name == "ping.__connect.rs")
             .expect("service companion");
-        // Count impl bodies (one `encode_view_body` call each) rather than
-        // `impl ::connectrpc::Encodable<` — that string also appears in the
-        // trait method's return-position bound.
+        // Count impl bodies rather than `impl ::connectrpc::Encodable<` —
+        // that string also appears in the trait method's return-position
+        // bound. Match `encode_view_body(` with the paren so the
+        // `encode_view_body_segments` override on the OwnedView impl is not
+        // counted as a second body.
         assert_eq!(
-            companion.content.matches("encode_view_body").count(),
+            companion.content.matches("encode_view_body(").count(),
             4,
             "exactly one impl pair per message (PingReq + PingResp), \
              no E0119 duplicates: {}",
@@ -4452,7 +4468,7 @@ mod tests {
         assert_eq!(pkg_mod.kind, GeneratedFileKind::PackageMod);
         assert_eq!(pkg_mod.name, "common.v1.rs");
         assert_eq!(
-            pkg_mod.content.matches("encode_view_body").count(),
+            pkg_mod.content.matches("encode_view_body(").count(),
             2,
             "impl pair inlined into the package file: {}",
             pkg_mod.content
@@ -4496,7 +4512,7 @@ mod tests {
             .find(|f| f.kind == GeneratedFileKind::PackageMod && f.package == "common.v1")
             .expect("PackageMod for common.v1");
         assert_eq!(
-            pkg_mod.content.matches("encode_view_body").count(),
+            pkg_mod.content.matches("encode_view_body(").count(),
             2,
             "impl pair inlined into the package file: {}",
             pkg_mod.content
