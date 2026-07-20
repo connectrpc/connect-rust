@@ -851,6 +851,7 @@ pub struct ClientConfig {
     pub(crate) compression_policy: CompressionPolicy,
     pub(crate) default_timeout: Option<Duration>,
     pub(crate) default_max_message_size: Option<usize>,
+    pub(crate) default_element_memory_limit: Option<usize>,
     pub(crate) default_headers: http::HeaderMap,
 }
 
@@ -868,6 +869,7 @@ impl ClientConfig {
             compression_policy: CompressionPolicy::default(),
             default_timeout: None,
             default_max_message_size: None,
+            default_element_memory_limit: None,
             default_headers: http::HeaderMap::new(),
         }
     }
@@ -957,11 +959,45 @@ impl ClientConfig {
 
     /// Set a default maximum decompressed response message size.
     ///
+    /// This bounds decompressed bytes, not element footprint. A response of
+    /// very many small elements can sit inside this limit and still exhaust
+    /// memory; that is what
+    /// [`Self::with_default_element_memory_limit`] defends against, and
+    /// raising this one will not help with it.
+    ///
     /// Read via [`Self::default_max_message_size`]. Per-call
     /// [`CallOptions::with_max_message_size`] overrides this.
     #[must_use]
     pub fn with_default_max_message_size(mut self, size: usize) -> Self {
         self.default_max_message_size = Some(size);
+        self
+    }
+
+    /// Set a default budget for the memory a response decode may commit to
+    /// repeated, map, string and bytes elements.
+    ///
+    /// Distinct from [`Self::with_default_max_message_size`], which bounds
+    /// decompressed bytes: this bounds the in-memory footprint those bytes
+    /// ask for. A response of very many small elements can be well inside
+    /// the size limit and still expand by orders of magnitude, which is the
+    /// amplification this defends against. Unset means buffa's 32 MiB
+    /// default; raise it for a server that legitimately returns such
+    /// responses.
+    ///
+    ///
+    /// Set on both codecs, but it defends less on JSON. A JSON response is
+    /// parsed by `serde_json` into an owned message first, and that parse is
+    /// bounded only by `max_message_size` — the amplification has already
+    /// happened by the time the budget is checked on the view decode. On
+    /// JSON the budget therefore bounds the second materialization and makes
+    /// the knob behave the same way it does on proto; it is not an
+    /// equivalent defence.
+    ///
+    /// Read via [`Self::default_element_memory_limit`]. Per-call
+    /// [`CallOptions::with_element_memory_limit`] overrides this.
+    #[must_use]
+    pub fn with_default_element_memory_limit(mut self, bytes: usize) -> Self {
+        self.default_element_memory_limit = Some(bytes);
         self
     }
 
@@ -1054,6 +1090,14 @@ impl ClientConfig {
         self.default_max_message_size
     }
 
+    /// The default response element-memory budget, if set.
+    ///
+    /// Set via [`Self::with_default_element_memory_limit`]. Per-call
+    /// [`CallOptions::with_element_memory_limit`] overrides this when set.
+    pub fn default_element_memory_limit(&self) -> Option<usize> {
+        self.default_element_memory_limit
+    }
+
     /// The headers applied to every request through this config.
     ///
     /// Useful for auth tokens, user-agent, tracing context.
@@ -1093,6 +1137,7 @@ pub struct CallOptions {
     pub(crate) headers: http::HeaderMap,
     pub(crate) timeout: Option<Duration>,
     pub(crate) max_message_size: Option<usize>,
+    pub(crate) element_memory_limit: Option<usize>,
     pub(crate) compress: Option<bool>,
 }
 
@@ -1166,10 +1211,37 @@ impl CallOptions {
 
     /// Set the maximum decompressed message size in bytes.
     ///
+    /// This bounds decompressed bytes, not element footprint. A response of
+    /// very many small elements can sit inside this limit and still exhaust
+    /// memory; that is what
+    /// [`Self::with_element_memory_limit`] defends against, and raising this
+    /// one will not help with it.
+    ///
     /// Read via [`Self::max_message_size`].
     #[must_use]
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = Some(size);
+        self
+    }
+
+    /// Set the budget for the memory this call's response decode may commit
+    /// to repeated, map, string and bytes elements.
+    ///
+    /// Overrides [`ClientConfig::with_default_element_memory_limit`]; see
+    /// there for how this differs from the message-size limit.
+    ///
+    /// Set on both codecs, but it defends less on JSON. A JSON response is
+    /// parsed by `serde_json` into an owned message first, and that parse is
+    /// bounded only by `max_message_size` — the amplification has already
+    /// happened by the time the budget is checked on the view decode. On
+    /// JSON the budget therefore bounds the second materialization and makes
+    /// the knob behave the same way it does on proto; it is not an
+    /// equivalent defence.
+    ///
+    /// Read via [`Self::element_memory_limit`].
+    #[must_use]
+    pub fn with_element_memory_limit(mut self, bytes: usize) -> Self {
+        self.element_memory_limit = Some(bytes);
         self
     }
 
@@ -1213,6 +1285,25 @@ impl CallOptions {
         self.max_message_size
     }
 
+    /// The response element-memory budget for this call.
+    ///
+    /// When unset the decode uses buffa's 32 MiB default. Exceeding it fails
+    /// the call rather than truncating.
+    ///
+    /// Set via [`Self::with_element_memory_limit`].
+    pub fn element_memory_limit(&self) -> Option<usize> {
+        self.element_memory_limit
+    }
+
+    /// The buffa decode options this call's response decode uses.
+    pub(crate) fn decode_options(&self) -> buffa::DecodeOptions {
+        let options = buffa::DecodeOptions::new();
+        match self.element_memory_limit {
+            Some(bytes) => options.with_element_memory_limit(bytes),
+            None => options,
+        }
+    }
+
     /// The per-call compression override. `Some(true)` forces compression,
     /// `Some(false)` disables it, `None` defers to the policy.
     ///
@@ -1235,6 +1326,9 @@ fn effective_options(config: &ClientConfig, options: CallOptions) -> CallOptions
     CallOptions {
         timeout: options.timeout.or(config.default_timeout),
         max_message_size: options.max_message_size.or(config.default_max_message_size),
+        element_memory_limit: options
+            .element_memory_limit
+            .or(config.default_element_memory_limit),
         compress: options.compress,
         headers: merge_headers(&config.default_headers, options.headers),
     }
@@ -1489,6 +1583,32 @@ where
     }
 }
 
+/// Report a failed response decode.
+///
+/// Exceeding the element-memory budget is the one decode failure the caller
+/// can act on — the response is well-formed, just larger than this client
+/// agreed to materialize — so it says which knob to raise. Every other
+/// variant keeps the bare message, because naming a limit there would send
+/// someone chasing a setting that cannot help. `DecodeError` is
+/// `#[non_exhaustive]`, hence the catch-all arm.
+fn decode_response_error(e: buffa::DecodeError) -> ConnectError {
+    match e {
+        // `ResourceExhausted`, not `internal`, and deliberately: this is the
+        // same class as the `max_message_size` overflow above it, which
+        // already uses that code. `internal` reads as "the client broke" and
+        // would route a raise-and-retry caller into an on-call page.
+        buffa::DecodeError::ElementMemoryLimitExceeded => ConnectError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "failed to decode response: {e}; if this server is trusted, raise \
+                 CallOptions::with_element_memory_limit or \
+                 ClientConfig::with_default_element_memory_limit"
+            ),
+        ),
+        _ => ConnectError::internal(format!("failed to decode response: {e}")),
+    }
+}
+
 /// Decode a response message as an `OwnedView` from bytes.
 ///
 /// For proto-encoded responses, this is a true zero-copy decode — the view borrows
@@ -1496,24 +1616,42 @@ where
 /// deserialized to an owned message, then re-encoded to proto bytes and decoded as
 /// a view. This JSON round-trip adds overhead relative to owned-type decoding, but
 /// is negligible compared to JSON parsing itself.
+///
+/// `options` carries the caller's decode limits, and bounds the protobuf
+/// decode on both paths — the JSON arm re-encodes and decodes under the same
+/// limits rather than taking buffa's defaults. The `serde_json` parse that
+/// precedes it is bounded by `max_message_size` alone.
 fn decode_response_view<RespView>(
     data: Bytes,
     format: CodecFormat,
+    options: &buffa::DecodeOptions,
 ) -> Result<OwnedView<RespView>, ConnectError>
 where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     match format {
-        CodecFormat::Proto => OwnedView::<RespView>::decode(data)
-            .map_err(|e| ConnectError::internal(format!("failed to decode response: {e}"))),
+        CodecFormat::Proto => {
+            OwnedView::<RespView>::decode_with_options(data, options).map_err(decode_response_error)
+        }
         #[cfg(feature = "json")]
         CodecFormat::Json => {
             let owned: RespView::Owned = serde_json::from_slice(&data).map_err(|e| {
                 ConnectError::internal(format!("failed to decode JSON response: {e}"))
             })?;
-            OwnedView::<RespView>::from_owned(&owned)
-                .map_err(|e| ConnectError::internal(format!("failed to re-encode for view: {e}")))
+            // This is `OwnedView::from_owned` inlined so the decode half can
+            // take the caller's limits — `from_owned` uses buffa's defaults,
+            // which made the knob a silent no-op for JSON clients. The
+            // round-trip itself is not new: a view has to borrow from proto
+            // bytes, and serde hands us an owned message.
+            //
+            // `try_encode_to_vec`, not `encode_to_vec`: the latter panics
+            // past 2 GiB, and this size is chosen by the peer.
+            let bytes = Bytes::from(buffa::Message::try_encode_to_vec(&owned).map_err(|e| {
+                ConnectError::internal(format!("failed to re-encode for view: {e}"))
+            })?);
+            OwnedView::<RespView>::decode_with_options(bytes, options)
+                .map_err(decode_response_error)
         }
         #[cfg(not(feature = "json"))]
         CodecFormat::Json => Err(ConnectError::unimplemented(
@@ -1999,7 +2137,8 @@ where
         ));
     }
 
-    let message = decode_response_view::<RespView>(body, config.codec_format)?;
+    let message =
+        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options())?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -2220,7 +2359,8 @@ where
         ));
     }
 
-    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+    let message =
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options())?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -2361,6 +2501,7 @@ pub struct ServerStream<B, RespView> {
     codec_format: CodecFormat,
     protocol: Protocol,
     max_message_size: Option<usize>,
+    element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
     /// The terminal record; `Some` once the stream has ended, by any cause.
     end: Option<StreamEnd>,
@@ -2369,6 +2510,17 @@ pub struct ServerStream<B, RespView> {
     /// from a stream that produced data and was then cut off.
     saw_body_data: bool,
     _phantom: PhantomData<RespView>,
+}
+
+impl<B, RespView> ServerStream<B, RespView> {
+    /// The buffa decode options this stream's per-message decode uses.
+    fn decode_options(&self) -> buffa::DecodeOptions {
+        let options = buffa::DecodeOptions::new();
+        match self.element_memory_limit {
+            Some(bytes) => options.with_element_memory_limit(bytes),
+            None => options,
+        }
+    }
 }
 
 // Manual impl: the body type `B` (typically `hyper::body::Incoming`) isn't
@@ -2546,7 +2698,11 @@ where
                         .into());
                     }
 
-                    let msg = decode_response_view::<RespView>(data, self.codec_format)?;
+                    let msg = decode_response_view::<RespView>(
+                        data,
+                        self.codec_format,
+                        &self.decode_options(),
+                    )?;
                     return Ok(msg);
                 }
                 None => match self.poll_body().await? {
@@ -2881,6 +3037,7 @@ where
             &config.compression,
             config.codec_format,
             options.max_message_size,
+            options.element_memory_limit,
             deadline,
         )
         .await
@@ -2904,6 +3061,7 @@ async fn make_server_stream<B, RespView>(
     compression: &CompressionRegistry,
     codec_format: CodecFormat,
     max_message_size: Option<usize>,
+    element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
 ) -> Result<ServerStream<B, RespView>, ConnectError>
 where
@@ -2981,6 +3139,7 @@ where
         .map(|s| s.to_owned());
 
     Ok(ServerStream {
+        element_memory_limit,
         headers: response_headers,
         body: response.into_body(),
         buf: BytesMut::new(),
@@ -3284,6 +3443,7 @@ struct StreamConfig {
     codec_format: CodecFormat,
     compression: CompressionRegistry,
     max_message_size: Option<usize>,
+    element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
 }
 
@@ -3410,6 +3570,7 @@ where
                     let codec_format = self.stream_config.codec_format;
                     let compression = self.stream_config.compression.clone();
                     let max_message_size = self.stream_config.max_message_size;
+                    let element_memory_limit = self.stream_config.element_memory_limit;
                     let deadline = self.stream_config.deadline;
 
                     let construct_task = tokio::spawn(async move {
@@ -3424,6 +3585,7 @@ where
                                 &compression,
                                 codec_format,
                                 max_message_size,
+                                element_memory_limit,
                                 deadline,
                             ),
                         )
@@ -3712,6 +3874,7 @@ where
                 codec_format: config.codec_format,
                 compression: config.compression.clone(),
                 max_message_size: options.max_message_size,
+                element_memory_limit: options.element_memory_limit,
                 deadline,
             },
         },
@@ -3980,7 +4143,8 @@ where
         max_msg_size,
         &resp_headers,
     )?;
-    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+    let message =
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options())?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -4510,8 +4674,12 @@ mod tests {
         // the deleted fallible `into_owned` used, so the wire-visible
         // behavior for an over-limit response is pinned here.
         let body = crate::request::tests::unknown_field_overflow_body();
-        let err =
-            decode_response_view::<StringValueView<'static>>(body, CodecFormat::Proto).unwrap_err();
+        let err = decode_response_view::<StringValueView<'static>>(
+            body,
+            CodecFormat::Proto,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
     }
 
@@ -4841,6 +5009,7 @@ mod tests {
             recv: BidiRecvHalf {
                 recv: RecvState::AwaitingHeaders(response_task),
                 stream_config: StreamConfig {
+                    element_memory_limit: None,
                     protocol: Protocol::Connect,
                     codec_format: CodecFormat::Proto,
                     compression: CompressionRegistry::new(),
@@ -5190,6 +5359,53 @@ mod tests {
             .expect_err("guard sender should be dropped by the abort");
     }
 
+    /// The streaming path carries its own copy of the budget, so a
+    /// construction site that forgot to populate it would leave streamed
+    /// messages decoding under buffa's default while the unary tests stayed
+    /// green. Drive a real over-budget envelope through `ServerStream` to
+    /// pin that the field is actually consulted.
+    #[tokio::test]
+    async fn server_stream_per_message_decode_honours_the_element_budget() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::ListValueView;
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        let list = ListValue {
+            values: (0..800_000).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let envelope = Envelope::data(list.encode_to_bytes()).encode();
+
+        let make = |element_memory_limit| ServerStream::<_, ListValueView<'static>> {
+            element_memory_limit,
+            headers: http::HeaderMap::new(),
+            body: Full::new(envelope.clone()),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(64 * 1024 * 1024),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = make(None)
+            .message()
+            .await
+            .expect_err("a streamed message must be rejected at buffa's default budget");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+
+        let msg = make(Some(usize::MAX))
+            .message()
+            .await
+            .expect("raising the stream's budget must admit the same envelope")
+            .expect("the envelope carries a data frame");
+        assert_eq!(msg.view().values.len(), 800_000);
+    }
+
     #[tokio::test]
     async fn connect_server_stream_truncated_after_data_errors() {
         use buffa::Message;
@@ -5198,6 +5414,7 @@ mod tests {
 
         let body = Full::new(Envelope::data(StringValue::from("hello").encode_to_bytes()).encode());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -5248,6 +5465,7 @@ mod tests {
 
         let body = Full::new(Bytes::new());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -5301,6 +5519,7 @@ mod tests {
             .encode(),
         );
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body: Full::new(body.freeze()),
             buf: BytesMut::new(),
@@ -5368,6 +5587,7 @@ mod tests {
         headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers,
             body: Full::new(body.freeze()),
             buf: BytesMut::new(),
@@ -5435,6 +5655,7 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -5492,6 +5713,7 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -5519,6 +5741,7 @@ mod tests {
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body: Full::new(Bytes::new()),
             buf: BytesMut::new(),
@@ -5564,6 +5787,7 @@ mod tests {
         headers.insert("grpc-status", "0".parse().unwrap());
         let body = Full::new(Envelope::data(StringValue::from("hello").encode_to_bytes()).encode());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers,
             body,
             buf: BytesMut::new(),
@@ -5603,6 +5827,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("grpc-status", "0".parse().unwrap());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers,
             body: Full::new(Bytes::new()),
             buf: BytesMut::new(),
@@ -5639,6 +5864,7 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -5703,6 +5929,7 @@ mod tests {
         let body = StreamBody::new(frames);
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -5757,6 +5984,7 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
             buf: BytesMut::new(),
@@ -6933,6 +7161,95 @@ mod tests {
         assert_eq!(unary_request_content_type(&config), "application/json");
     }
 
+    /// The knob has to be load-bearing in both directions: the same bytes
+    /// rejected under the default budget and accepted once it is raised.
+    /// A one-sided assertion would pass even if the limit were never read.
+    #[test]
+    fn response_element_memory_limit_is_load_bearing() {
+        use buffa_types::google::protobuf::__buffa::view::ListValueView;
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        // Element footprint is charged, not contents, so this is small on
+        // the wire and large decoded.
+        let list = ListValue {
+            values: (0..800_000).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
+
+        let defaults = CallOptions::default();
+        let err = decode_response_view::<ListValueView<'static>>(
+            encoded.clone(),
+            CodecFormat::Proto,
+            &defaults.decode_options(),
+        )
+        .unwrap_err();
+        // Assert the SETTER names: an earlier version of this hint cited the
+        // getters, which do not raise anything.
+        let message = err.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("CallOptions::with_element_memory_limit")
+                && message.contains("ClientConfig::with_default_element_memory_limit"),
+            "an over-budget response must name the setters that fix it, got {message:?}"
+        );
+
+        let raised = CallOptions::default().with_element_memory_limit(usize::MAX);
+        let view = decode_response_view::<ListValueView<'static>>(
+            encoded,
+            CodecFormat::Proto,
+            &raised.decode_options(),
+        )
+        .expect("raising the budget must admit the same bytes");
+        assert_eq!(view.reborrow().values.len(), 800_000);
+    }
+
+    /// A response that is merely malformed must not point at a limit — that
+    /// would send someone chasing a setting that cannot help.
+    #[test]
+    fn a_malformed_response_does_not_name_a_limit() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let err = decode_response_view::<StringValueView<'static>>(
+            Bytes::from_static(&[0xFF, 0xFF, 0xFF]),
+            CodecFormat::Proto,
+            &CallOptions::default().decode_options(),
+        )
+        .unwrap_err();
+        assert!(
+            !err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("element_memory_limit"),
+            "got {:?}",
+            err.message
+        );
+    }
+
+    /// Per-call wins over the config default, and the config default applies
+    /// when the call says nothing — the same precedence `max_message_size`
+    /// already has.
+    #[test]
+    fn element_memory_limit_precedence_matches_max_message_size() {
+        let config = ClientConfig::new("http://example.com".parse().unwrap())
+            .with_default_element_memory_limit(1024);
+
+        let inherited = effective_options(&config, CallOptions::default());
+        assert_eq!(inherited.element_memory_limit(), Some(1024));
+
+        let overridden = effective_options(
+            &config,
+            CallOptions::default().with_element_memory_limit(4096),
+        );
+        assert_eq!(overridden.element_memory_limit(), Some(4096));
+
+        let unset = ClientConfig::new("http://example.com".parse().unwrap());
+        assert_eq!(
+            effective_options(&unset, CallOptions::default()).element_memory_limit(),
+            None,
+            "unset must stay unset so the decode uses buffa's default"
+        );
+    }
+
     #[cfg(not(feature = "json"))]
     #[test]
     fn decode_response_view_json_is_unimplemented_without_feature() {
@@ -6946,13 +7263,21 @@ mod tests {
         let err = decode_response_view::<StringValueView>(
             Bytes::from_static(b"\"x\""),
             CodecFormat::Json,
+            &buffa::DecodeOptions::new(),
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unimplemented);
 
         // Proto decoding still works.
         let bytes = StringValue::from("ok").encode_to_bytes();
-        assert!(decode_response_view::<StringValueView>(bytes, CodecFormat::Proto).is_ok());
+        assert!(
+            decode_response_view::<StringValueView>(
+                bytes,
+                CodecFormat::Proto,
+                &buffa::DecodeOptions::new()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

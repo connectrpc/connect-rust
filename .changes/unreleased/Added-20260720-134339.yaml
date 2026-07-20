@@ -23,8 +23,23 @@ body: |-
   client-streaming and bidi, on both the generated dispatch and hand-registered
   handlers, view-based and owned-message alike. A rejection now names the limit
   to raise, since it is the one decode failure an operator can fix without the
-  peer changing anything. Clients still decode *responses* under buffa's
-  defaults; that knob is a follow-up.
+  peer changing anything.
+
+  **Clients get the same control over responses.** A client decoding a
+  response of very many small elements hit the same 32 MiB wall with no
+  override. `ClientConfig::with_default_element_memory_limit` sets a default
+  and `CallOptions::with_element_memory_limit` overrides it per call, the same
+  config-default/per-call pair `max_message_size` already uses, and it covers
+  unary, server-streaming, client-streaming and bidi responses. It is set on
+  both codecs, but defends less on JSON: `serde_json` materializes the owned
+  message before the budget is consulted, so there the budget bounds the
+  view decode rather than the parse.
+
+  An over-budget response is `resource_exhausted`, matching the neighbouring
+  `max_message_size` overflow rather than reporting a limit as an internal
+  error, and it names the setter that raises it. Neither knob is a breaking
+  change: both types are already `#[non_exhaustive]`, and leaving them unset
+  keeps buffa's default.
 
   **Breaking, for generated code only.** `decode_borrowed_request_view` and
   `decode_message_request_stream` now take the decode limits, and `Limits` is
