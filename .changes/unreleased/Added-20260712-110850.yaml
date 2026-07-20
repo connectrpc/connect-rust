@@ -1,0 +1,10 @@
+kind: Added
+body: |-
+  **`BidiStream::into_split`** splits a bidirectional stream into
+  independently owned `BidiSendHalf` and `BidiRecvHalf`, so the two sides
+  can be driven from separate tasks (true full duplex). The split is a plain
+  move of the stream's two sides — no locking is added. Dropping the send
+  half (or calling `close_send`) ends the request body cleanly while the
+  RPC continues; dropping the receive half cancels the RPC, matching the
+  behavior of dropping a whole `BidiStream`.
+time: 2026-07-12T18:08:50.214607301Z

@@ -325,6 +325,8 @@ pub use interceptor::streaming_interceptor;
 pub use interceptor::unary_interceptor;
 
 // Client response and stream handles (what generated client methods return)
+pub use client::BidiRecvHalf;
+pub use client::BidiSendHalf;
 pub use client::BidiStream;
 pub use client::ServerStream;
 pub use client::UnaryResponse;

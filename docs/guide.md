@@ -774,6 +774,24 @@ if let Some(reply) = bidi.message().await? {
     println!("{}", reply.view().total.unwrap_or_default());
 }
 bidi.close_send();
+
+// For true full duplex, split the bidi stream into independently owned
+// halves and drive them from separate tasks. Response-dependent sends
+// require an HTTP/2 transport (on HTTP/1.1 no response arrives until the
+// upload completes). Dropping the send half ends the upload cleanly;
+// dropping the receive half cancels the RPC.
+let (mut send, mut recv) = client.running_sum().await?.into_split();
+let reader = tokio::spawn(async move {
+    while let Some(reply) = recv.message().await? {
+        println!("{}", reply.view().total.unwrap_or_default());
+    }
+    Ok::<_, connectrpc::ConnectError>(())
+});
+for req in requests {
+    send.send(req).await?;
+}
+send.close_send();
+reader.await.expect("reader task")?;
 ```
 
 `?` on `message()` is the complete error handling: `Ok(None)` means the

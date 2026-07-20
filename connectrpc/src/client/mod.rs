@@ -3003,8 +3003,8 @@ where
 /// A request body that pulls envelope-encoded frames from an mpsc channel.
 ///
 /// Used as the request body for bidirectional streaming calls.
-/// [`BidiStream::send`] pushes encoded envelopes to the channel's sender half;
-/// dropping the sender (via [`BidiStream::close_send`]) closes the body,
+/// [`BidiSendHalf::send`] pushes encoded envelopes to the channel's sender;
+/// dropping the sender (via [`BidiSendHalf::close_send`]) closes the body,
 /// signalling EOF to the server.
 struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, ConnectError>>,
@@ -3108,7 +3108,7 @@ where
     }
 }
 
-/// State machine for the receive side of a [`BidiStream`].
+/// State machine for [`BidiRecvHalf`], the receive side of a [`BidiStream`].
 ///
 /// The transport send is spawned so the HTTP request makes progress
 /// immediately (connect, handshake, start streaming the request body from
@@ -3124,8 +3124,9 @@ where
 /// HEADERS, then constructs the [`ServerStream`]. Both pending operations stay
 /// in this state machine while awaited, so cancelling `message()` does not
 /// discard either the response task or a suspended construction step such as
-/// Connect error-body parsing. Dropping the whole [`BidiStream`] (or failing
-/// the call at its deadline) aborts the in-flight task instead.
+/// Connect error-body parsing. Dropping the [`BidiRecvHalf`] that owns this
+/// state (or failing the call at its deadline) aborts the in-flight task
+/// instead.
 enum RecvState<B, RespView> {
     /// Request initiated in a spawned task; response HEADERS not yet
     /// received. Awaiting the handle yields the [`Response`] once hyper
@@ -3152,6 +3153,9 @@ enum RecvState<B, RespView> {
 /// respect the protocol in use. On HTTP/1.1, calling `message()` before
 /// `close_send()` will block until the request body is complete.
 ///
+/// To drive the two sides from separate tasks, split the stream into
+/// independently owned halves with [`into_split()`](Self::into_split).
+///
 /// # Cancellation
 ///
 /// Dropping the `BidiStream` cancels the call: any in-flight initialization
@@ -3176,24 +3180,69 @@ enum RecvState<B, RespView> {
 /// }
 /// ```
 pub struct BidiStream<B, Req, RespView> {
-    // Send side
+    // Field order is load-bearing for drop: `send` drops first (clean
+    // request-body EOF), then `recv`'s Drop aborts any in-flight
+    // initialization task. The glue between the two field drops is
+    // synchronous, so the spawned task cannot advance in between — the
+    // abort still catches anything the old whole-struct Drop would have.
+    send: BidiSendHalf<Req>,
+    recv: BidiRecvHalf<B, RespView>,
+}
+
+// Manual impl: delegate to the halves, which carry the useful state.
+impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BidiStream")
+            .field("send", &self.send)
+            .field("recv", &self.recv)
+            .finish()
+    }
+}
+
+/// The send half of a [`BidiStream`], returned by
+/// [`BidiStream::into_split`].
+///
+/// Owns the request side of the RPC: [`send()`](Self::send) and
+/// [`close_send()`](Self::close_send). Dropping the half without calling
+/// `close_send` closes the send side the same way (the request body ends
+/// cleanly); the RPC itself stays alive as long as the [`BidiRecvHalf`]
+/// does. The halves cannot be recombined into a [`BidiStream`].
+pub struct BidiSendHalf<Req> {
     tx: Option<tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>>,
     encoder: crate::envelope::EnvelopeEncoder,
     codec_format: CodecFormat,
+    /// Copy of the whole-call deadline; checked before each send.
+    deadline: Option<std::time::Instant>,
+    _req: PhantomData<Req>,
+}
 
-    // Receive side — state machine: AwaitingHeaders -> Constructing -> Ready or Failed
+impl<Req> std::fmt::Debug for BidiSendHalf<Req> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BidiSendHalf")
+            .field("send_closed", &self.tx.is_none())
+            .field("codec_format", &self.codec_format)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The receive half of a [`BidiStream`], returned by
+/// [`BidiStream::into_split`].
+///
+/// Owns the response side of the RPC: [`message()`](Self::message) plus the
+/// [`headers()`](Self::headers), [`trailers()`](Self::trailers), and
+/// [`error()`](Self::error) accessors. Dropping this half cancels the RPC
+/// (any in-flight initialization task is aborted and the transport stream
+/// is reset), after which sends on the [`BidiSendHalf`] fail. The halves
+/// cannot be recombined into a [`BidiStream`].
+pub struct BidiRecvHalf<B, RespView> {
+    // State machine: AwaitingHeaders -> Constructing -> Ready or Failed
     recv: RecvState<B, RespView>,
     /// Config snapshot for constructing ServerStream when headers arrive.
     /// Captured by value (not &) because the stream outlives call_bidi_stream.
     stream_config: StreamConfig,
-
-    _req: PhantomData<Req>,
 }
 
-// Manual impl: the body type inside `ServerStream` typically isn't `Debug`,
-// and the JoinHandle's inner type wouldn't format usefully anyway. Print
-// send-channel state, recv-state discriminant, and any receive error.
-impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
+impl<B, RespView> std::fmt::Debug for BidiRecvHalf<B, RespView> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (recv_state, recv_error) = match &self.recv {
             RecvState::AwaitingHeaders(_) => ("AwaitingHeaders", None),
@@ -3201,8 +3250,7 @@ impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
             RecvState::Ready(_) => ("Ready", None),
             RecvState::Failed(err) => ("Failed", Some(err)),
         };
-        f.debug_struct("BidiStream")
-            .field("send_closed", &self.tx.is_none())
+        f.debug_struct("BidiRecvHalf")
             .field("recv_state", &recv_state)
             .field("protocol", &self.stream_config.protocol)
             .field("codec_format", &self.stream_config.codec_format)
@@ -3211,13 +3259,14 @@ impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
     }
 }
 
-// Dropping the stream aborts any in-flight initialization task. Without
-// this, a task left in `AwaitingHeaders` or `Constructing` would detach on
-// drop and — absent a call deadline — could be pinned indefinitely by a
-// server that stalls response HEADERS or a Connect error body without ever
-// ending the stream. Abandoning the stream abandons the RPC, so nothing can
-// consume the task's result anyway.
-impl<B, Req, RespView> Drop for BidiStream<B, Req, RespView> {
+// Dropping the receive half aborts any in-flight initialization task.
+// Without this, a task left in `AwaitingHeaders` or `Constructing` would
+// detach on drop and — absent a call deadline — could be pinned indefinitely
+// by a server that stalls response HEADERS or a Connect error body without
+// ever ending the stream. Abandoning the receive half abandons the RPC, so
+// nothing can consume the task's result anyway. (This also covers dropping
+// a whole `BidiStream`, which contains this half.)
+impl<B, RespView> Drop for BidiRecvHalf<B, RespView> {
     fn drop(&mut self) {
         match &self.recv {
             RecvState::AwaitingHeaders(task) => task.abort(),
@@ -3238,24 +3287,24 @@ struct StreamConfig {
     deadline: Option<std::time::Instant>,
 }
 
-impl<B, Req, RespView> BidiStream<B, Req, RespView>
+impl<Req> BidiSendHalf<Req>
 where
-    B: Body<Data = Bytes> + Send + Unpin,
-    B::Error: std::fmt::Display,
     Req: buffa::Message + crate::codec::JsonSerialize,
-    RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     /// Send a request message.
     ///
+    /// # Errors
+    ///
     /// Returns an error if [`close_send`](Self::close_send) was already
     /// called, if the whole-call deadline has passed, or if the server has
-    /// closed the stream (the receiver half was dropped). In the latter
-    /// case, call [`message()`](Self::message) to retrieve the server's error.
+    /// closed the stream. In the latter case, receive on the other half —
+    /// [`BidiRecvHalf::message()`] — to retrieve the server's error. (The
+    /// same error is returned when the [`BidiRecvHalf`] was dropped, which
+    /// cancels the RPC.)
     pub async fn send(&mut self, msg: Req) -> Result<(), ConnectError> {
         // Check the whole-call deadline before each send, matching
         // connect-go's ctx.Err() check in duplexHTTPCall.Send().
-        if let Some(d) = self.stream_config.deadline
+        if let Some(d) = self.deadline
             && std::time::Instant::now() >= d
         {
             return Err(ConnectError::deadline_exceeded(
@@ -3288,11 +3337,20 @@ where
     /// Close the send side of the stream. Idempotent.
     ///
     /// After this, only receiving is possible. For half-duplex use
-    /// (HTTP/1.1), this must be called before [`message()`](Self::message).
+    /// (HTTP/1.1), this must be called before receiving. Dropping the half
+    /// has the same effect.
     pub fn close_send(&mut self) {
         self.tx = None; // drop sender → channel closes → body signals EOF
     }
+}
 
+impl<B, RespView> BidiRecvHalf<B, RespView>
+where
+    B: Body<Data = Bytes> + Send + Unpin,
+    B::Error: std::fmt::Display,
+    RespView: MessageView<'static> + Send,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
+{
     /// Receive the next response message.
     ///
     /// The first call awaits response headers (lazily, so full-duplex
@@ -3301,6 +3359,8 @@ where
     /// If this future is dropped while response initialization is still pending,
     /// the initialization remains in the stream and the next `message()` call
     /// resumes it. Actual initialization failures remain terminal and sticky.
+    ///
+    /// # Errors
     ///
     /// Returns `Ok(None)` only when the server finished **cleanly**; a
     /// server error carried in the termination metadata is returned as
@@ -3439,6 +3499,111 @@ where
     }
 }
 
+impl<B, Req, RespView> BidiStream<B, Req, RespView> {
+    /// Split the stream into independently owned send and receive halves,
+    /// so the two sides can be driven from separate tasks (full duplex).
+    ///
+    /// Interleaved, response-dependent use — receiving an answer before
+    /// sending the next message — requires an HTTP/2 transport, exactly as
+    /// with an unsplit stream: on HTTP/1.1 no response arrives until the
+    /// request body is complete, so a task waiting on the other half's
+    /// progress deadlocks. Prefer moving each half into its own spawned
+    /// task (as below) over storing them in named struct fields — the
+    /// halves' full type parameters include the transport body type, which
+    /// task-local inference names for you.
+    ///
+    /// The halves are plain moves of the stream's two sides — no locking is
+    /// added — and there is no way to reassemble them. Semantics carried by
+    /// each half:
+    ///
+    /// - Dropping the [`BidiSendHalf`] (or calling
+    ///   [`close_send()`](BidiSendHalf::close_send)) ends the request body
+    ///   cleanly; the RPC continues until the receive half finishes.
+    /// - Dropping the [`BidiRecvHalf`] cancels the RPC — as when dropping a
+    ///   whole `BidiStream` — after which sends on the other half fail.
+    /// - When [`send()`](BidiSendHalf::send) fails because the server closed
+    ///   the stream, the server's error is retrieved from the *receive* half
+    ///   via [`message()`](BidiRecvHalf::message).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (mut send, mut recv) = stream.into_split();
+    /// let reader = tokio::spawn(async move {
+    ///     while let Some(msg) = recv.message().await? {
+    ///         println!("got: {msg:?}");
+    ///     }
+    ///     Ok::<_, connectrpc::ConnectError>(())
+    /// });
+    /// for req in requests {
+    ///     send.send(req).await?;
+    /// }
+    /// send.close_send();
+    /// reader.await.expect("reader task")?;
+    /// ```
+    #[must_use]
+    pub fn into_split(self) -> (BidiSendHalf<Req>, BidiRecvHalf<B, RespView>) {
+        (self.send, self.recv)
+    }
+}
+
+impl<B, Req, RespView> BidiStream<B, Req, RespView>
+where
+    B: Body<Data = Bytes> + Send + Unpin,
+    B::Error: std::fmt::Display,
+    Req: buffa::Message + crate::codec::JsonSerialize,
+    RespView: MessageView<'static> + Send,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
+{
+    /// Send a request message.
+    ///
+    /// # Errors
+    ///
+    /// See [`BidiSendHalf::send`] for the error contract.
+    pub async fn send(&mut self, msg: Req) -> Result<(), ConnectError> {
+        self.send.send(msg).await
+    }
+
+    /// Close the send side of the stream. Idempotent.
+    /// See [`BidiSendHalf::close_send`].
+    pub fn close_send(&mut self) {
+        self.send.close_send();
+    }
+
+    /// Receive the next response message.
+    ///
+    /// # Errors
+    ///
+    /// See [`BidiRecvHalf::message`] for the full contract.
+    pub async fn message<M>(&mut self) -> Result<Option<crate::StreamMessage<M>>, ConnectError>
+    where
+        B: 'static,
+        RespView: MessageView<'static, Owned = M> + 'static,
+        M: HasMessageView<View<'static> = RespView>,
+    {
+        self.recv.message().await
+    }
+
+    /// Response headers. See [`BidiRecvHalf::headers`].
+    #[must_use]
+    pub fn headers(&self) -> Option<&http::HeaderMap> {
+        self.recv.headers()
+    }
+
+    /// Trailing metadata. See [`BidiRecvHalf::trailers`].
+    #[must_use]
+    pub fn trailers(&self) -> Option<&http::HeaderMap> {
+        self.recv.trailers()
+    }
+
+    /// Terminal error that ended the stream, if any.
+    /// See [`BidiRecvHalf::error`].
+    #[must_use]
+    pub fn error(&self) -> Option<&ConnectError> {
+        self.recv.error()
+    }
+}
+
 /// Make a bidirectional-streaming RPC call.
 ///
 /// Opens a stream to the server and returns a [`BidiStream`] handle for
@@ -3533,18 +3698,23 @@ where
     });
 
     Ok(BidiStream {
-        tx: Some(tx),
-        encoder,
-        codec_format: config.codec_format,
-        recv: RecvState::AwaitingHeaders(response_task),
-        stream_config: StreamConfig {
-            protocol: config.protocol,
+        send: BidiSendHalf {
+            tx: Some(tx),
+            encoder,
             codec_format: config.codec_format,
-            compression: config.compression.clone(),
-            max_message_size: options.max_message_size,
             deadline,
+            _req: PhantomData,
         },
-        _req: PhantomData,
+        recv: BidiRecvHalf {
+            recv: RecvState::AwaitingHeaders(response_task),
+            stream_config: StreamConfig {
+                protocol: config.protocol,
+                codec_format: config.codec_format,
+                compression: config.compression.clone(),
+                max_message_size: options.max_message_size,
+                deadline,
+            },
+        },
     })
 }
 
@@ -4603,6 +4773,8 @@ mod tests {
         // is typically `hyper::body::Incoming` which isn't Debug).
         assert_debug::<ServerStream<http_body_util::Empty<Bytes>, ()>>();
         assert_debug::<BidiStream<http_body_util::Empty<Bytes>, (), ()>>();
+        assert_debug::<BidiSendHalf<()>>();
+        assert_debug::<BidiRecvHalf<http_body_util::Empty<Bytes>, ()>>();
 
         // Transports — manual impls that print mode/connection state.
         #[cfg(feature = "client")]
@@ -4620,6 +4792,18 @@ mod tests {
         assert_send::<TestBidi>();
         assert_sync::<TestBidi>();
         assert_unpin::<TestBidi>();
+
+        // The halves are moved into separate spawned tasks, so their auto
+        // traits are individually load-bearing, not just via containment.
+        type TestSend = BidiSendHalf<()>;
+        type TestRecv = BidiRecvHalf<http_body_util::Empty<Bytes>, ()>;
+
+        assert_send::<TestSend>();
+        assert_sync::<TestSend>();
+        assert_unpin::<TestSend>();
+        assert_send::<TestRecv>();
+        assert_sync::<TestRecv>();
+        assert_unpin::<TestRecv>();
     }
 
     fn connect_success_body(message: &str) -> Bytes {
@@ -4647,18 +4831,23 @@ mod tests {
         buffa_types::google::protobuf::__buffa::view::StringValueView<'static>,
     > {
         BidiStream {
-            tx: None,
-            encoder: crate::envelope::EnvelopeEncoder::uncompressed(),
-            codec_format: CodecFormat::Proto,
-            recv: RecvState::AwaitingHeaders(response_task),
-            stream_config: StreamConfig {
-                protocol: Protocol::Connect,
+            send: BidiSendHalf {
+                tx: None,
+                encoder: crate::envelope::EnvelopeEncoder::uncompressed(),
                 codec_format: CodecFormat::Proto,
-                compression: CompressionRegistry::new(),
-                max_message_size: Some(1024),
                 deadline,
+                _req: PhantomData,
             },
-            _req: PhantomData,
+            recv: BidiRecvHalf {
+                recv: RecvState::AwaitingHeaders(response_task),
+                stream_config: StreamConfig {
+                    protocol: Protocol::Connect,
+                    codec_format: CodecFormat::Proto,
+                    compression: CompressionRegistry::new(),
+                    max_message_size: Some(1024),
+                    deadline,
+                },
+            },
         }
     }
 
