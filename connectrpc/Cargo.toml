@@ -45,9 +45,9 @@ async-trait = { workspace = true }
 # explicitly for the same reason: it is in buffa's default set (validated
 # string decoding on the hot path), and `default-features = false` would
 # silently drop it. Keep the version in sync with the
-# `[workspace.dependencies]` `buffa` entry (which documents the 0.8.1 floor —
-# infallible owned conversion needs per-record unknown-field accounting).
-buffa = { version = "0.8.1", default-features = false, features = ["std", "fast-utf8"] }
+# `[workspace.dependencies]` `buffa` entry, which documents why the floor is
+# where it is.
+buffa = { version = "0.9", default-features = false, features = ["std", "fast-utf8"] }
 
 # Serialization. Non-optional even in proto-only builds: the Connect error and
 # streaming end-of-stream wire frames are always JSON regardless of the message

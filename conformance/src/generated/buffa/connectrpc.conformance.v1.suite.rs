@@ -186,21 +186,23 @@ impl ::buffa::MessageName for TestSuite {
 impl ::buffa::Message for TestSuite {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if !self.name.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.name) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
         {
             let val = self.mode.to_i32();
             if val != 0 {
-                size += 1u32 + ::buffa::types::int32_encoded_len(val) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
         for v in &self.test_cases {
@@ -208,70 +210,66 @@ impl ::buffa::Message for TestSuite {
             let inner_size = v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
         if !self.relevant_protocols.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_protocols
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
-            size
-                += 1u32 + ::buffa::encoding::varint_len(payload as u64) as u32 + payload;
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
         if !self.relevant_http_versions.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_http_versions
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
-            size
-                += 1u32 + ::buffa::encoding::varint_len(payload as u64) as u32 + payload;
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
         if !self.relevant_codecs.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_codecs
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
-            size
-                += 1u32 + ::buffa::encoding::varint_len(payload as u64) as u32 + payload;
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
         if !self.relevant_compressions.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_compressions
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
-            size
-                += 1u32 + ::buffa::encoding::varint_len(payload as u64) as u32 + payload;
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
         {
             let val = self.connect_version_mode.to_i32();
             if val != 0 {
-                size += 1u32 + ::buffa::types::int32_encoded_len(val) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
         if self.relies_on_tls {
-            size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         if self.relies_on_tls_client_certs {
-            size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         if self.relies_on_connect_get {
-            size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         if self.relies_on_message_receive_limit {
-            size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -285,48 +283,52 @@ impl ::buffa::Message for TestSuite {
             }
         }
         for v in &self.test_cases {
-            ::buffa::types::put_len_delimited_header(3u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             v.write_to(__cache, buf);
         }
         if !self.relevant_protocols.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_protocols
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
             ::buffa::types::put_len_delimited_header(4u32, payload, buf);
             for v in &self.relevant_protocols {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
             }
         }
         if !self.relevant_http_versions.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_http_versions
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
             ::buffa::types::put_len_delimited_header(5u32, payload, buf);
             for v in &self.relevant_http_versions {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
             }
         }
         if !self.relevant_codecs.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_codecs
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
             ::buffa::types::put_len_delimited_header(6u32, payload, buf);
             for v in &self.relevant_codecs {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
             }
         }
         if !self.relevant_compressions.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .relevant_compressions
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
             ::buffa::types::put_len_delimited_header(7u32, payload, buf);
             for v in &self.relevant_compressions {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
@@ -387,6 +389,9 @@ impl ::buffa::Message for TestSuite {
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
                 ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
                 self.test_cases.push(elem);
             }
@@ -406,7 +411,7 @@ impl ::buffa::Message for TestSuite {
                         self.relevant_protocols
                             .push(
                                 ::buffa::EnumValue::from(
-                                    ::buffa::types::decode_int32(&mut limited)?,
+                                    ::buffa::types::decode_int32_packed(&mut limited)?,
                                 ),
                             );
                     }
@@ -444,7 +449,7 @@ impl ::buffa::Message for TestSuite {
                         self.relevant_http_versions
                             .push(
                                 ::buffa::EnumValue::from(
-                                    ::buffa::types::decode_int32(&mut limited)?,
+                                    ::buffa::types::decode_int32_packed(&mut limited)?,
                                 ),
                             );
                     }
@@ -482,7 +487,7 @@ impl ::buffa::Message for TestSuite {
                         self.relevant_codecs
                             .push(
                                 ::buffa::EnumValue::from(
-                                    ::buffa::types::decode_int32(&mut limited)?,
+                                    ::buffa::types::decode_int32_packed(&mut limited)?,
                                 ),
                             );
                     }
@@ -520,7 +525,7 @@ impl ::buffa::Message for TestSuite {
                         self.relevant_compressions
                             .push(
                                 ::buffa::EnumValue::from(
-                                    ::buffa::types::decode_int32(&mut limited)?,
+                                    ::buffa::types::decode_int32_packed(&mut limited)?,
                                 ),
                             );
                     }
@@ -975,7 +980,10 @@ pub struct TestCase {
         rename = "request",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub request: ::buffa::MessageField<ClientCompatRequest>,
+    pub request: ::buffa::MessageField<
+        ClientCompatRequest,
+        ::buffa::Inline<ClientCompatRequest>,
+    >,
     /// To support extremely large messages, as well as very precisely-sized
     /// messages, without having to encode them fully or perfectly in YAML
     /// test cases, this value can be specified. When non-empty, this value
@@ -1022,7 +1030,10 @@ pub struct TestCase {
         alias = "expected_response",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub expected_response: ::buffa::MessageField<ClientResponseResult>,
+    pub expected_response: ::buffa::MessageField<
+        ClientResponseResult,
+        ::buffa::Inline<ClientResponseResult>,
+    >,
     /// When expected_response indicates that an error is expected, in some cases, the
     /// actual error code returned may be flexible. In that case, this field provides
     /// other acceptable error codes, in addition to the one indicated in the
@@ -1068,75 +1079,88 @@ impl ::buffa::MessageName for TestCase {
 impl ::buffa::Message for TestCase {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.request.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.request.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
         for v in &self.expand_requests {
             let __slot = __cache.reserve();
             let inner_size = v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
         if self.expected_response.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.expected_response.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
         if !self.other_allowed_error_codes.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .other_allowed_error_codes
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
-            size
-                += 1u32 + ::buffa::encoding::varint_len(payload as u64) as u32 + payload;
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if self.request.is_set() {
-            ::buffa::types::put_len_delimited_header(1u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.request.write_to(__cache, buf);
         }
         for v in &self.expand_requests {
-            ::buffa::types::put_len_delimited_header(2u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             v.write_to(__cache, buf);
         }
         if self.expected_response.is_set() {
-            ::buffa::types::put_len_delimited_header(3u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.expected_response.write_to(__cache, buf);
         }
         if !self.other_allowed_error_codes.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .other_allowed_error_codes
                 .iter()
-                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u32)
-                .sum::<u32>();
+                .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
+                .sum::<u64>();
             ::buffa::types::put_len_delimited_header(4u32, payload, buf);
             for v in &self.other_allowed_error_codes {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
@@ -1172,6 +1196,9 @@ impl ::buffa::Message for TestCase {
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
                 ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
                 self.expand_requests.push(elem);
             }
@@ -1202,7 +1229,7 @@ impl ::buffa::Message for TestCase {
                         self.other_allowed_error_codes
                             .push(
                                 ::buffa::EnumValue::from(
-                                    ::buffa::types::decode_int32(&mut limited)?,
+                                    ::buffa::types::decode_int32_packed(&mut limited)?,
                                 ),
                             );
                     }
@@ -1325,24 +1352,26 @@ pub mod test_case {
     impl ::buffa::Message for ExpandedSize {
         /// Returns the total encoded size in bytes.
         ///
-        /// The result is a `u32`; the protobuf specification requires all
-        /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-        /// compliant message will never overflow this type.
+        /// Accumulates in `u64` (which cannot overflow for in-memory
+        /// data) and saturates to `u32` at return, so a message whose
+        /// encoded size exceeds the 2 GiB protobuf limit yields a value
+        /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+        /// points reject, never a silently wrapped size.
         #[allow(clippy::let_and_return)]
         fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
             #[allow(unused_imports)]
             use ::buffa::Enumeration as _;
-            let mut size = 0u32;
+            let mut size = 0u64;
             if let Some(v) = self.size_relative_to_limit {
-                size += 1u32 + ::buffa::types::int32_encoded_len(v) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(v) as u64;
             }
-            size += self.__buffa_unknown_fields.encoded_len() as u32;
-            size
+            size += self.__buffa_unknown_fields.encoded_len() as u64;
+            ::buffa::saturate_size(size)
         }
         fn write_to(
             &self,
             _cache: &mut ::buffa::SizeCache,
-            buf: &mut impl ::buffa::bytes::BufMut,
+            buf: &mut impl ::buffa::EncodeSink,
         ) {
             #[allow(unused_imports)]
             use ::buffa::Enumeration as _;

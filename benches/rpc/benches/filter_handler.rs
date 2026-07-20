@@ -31,7 +31,7 @@ const BATCH: usize = 100;
 /// Decode → always to_owned + scrub-if-needed → encode owned.
 fn codec_owned(req_bytes: &bytes::Bytes) -> bytes::Bytes {
     let req = OwnedRecordView::decode(req_bytes.clone()).unwrap();
-    let mut owned = req.to_owned_message().unwrap();
+    let mut owned = req.to_owned_message();
     if has_sensitive(req.reborrow()) {
         scrub(&mut owned);
     }
@@ -45,7 +45,7 @@ fn codec_view(req_bytes: &bytes::Bytes) -> bytes::Bytes {
     if !has_sensitive(req.reborrow()) {
         return req.reborrow().encode_to_bytes();
     }
-    let mut owned = req.to_owned_message().unwrap();
+    let mut owned = req.to_owned_message();
     scrub(&mut owned);
     owned.encode_to_bytes()
 }

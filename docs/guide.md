@@ -44,8 +44,8 @@ complete dependency block for a typical (JSON-capable) service:
 ```toml
 [dependencies]
 connectrpc = "0.8"
-buffa = { version = "0.8.1", features = ["json"] }
-buffa-types = { version = "0.8", features = ["json"] }
+buffa = { version = "0.9", features = ["json"] }
+buffa-types = { version = "0.9", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -369,7 +369,7 @@ borrowed from the dispatcher-owned body, so the response (and anything
 moved into `tokio::spawn`) cannot borrow from it - call
 `.to_owned_message()` to get the owned struct when you need one. The
 conversion is infallible: buffa charges every unknown-field record
-against the decode-time allowance (since 0.8.1), so a request that
+against the decode-time allowance, so a request that
 decoded successfully always re-materializes.
 
 ### `RequestContext` and `Response`

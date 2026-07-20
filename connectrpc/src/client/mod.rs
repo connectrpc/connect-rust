@@ -1409,18 +1409,12 @@ where
     /// for callers that also need the response's header and trailer
     /// metadata.
     ///
-    /// Infallible: an [`OwnedView`] body can only be built by buffa's wire
-    /// decoder, and buffa (≥ 0.8.1) charges every unknown-field record
-    /// against the decode-time allowance, so a view that decoded
-    /// successfully re-materializes within that same allowance, and known
-    /// fields were already validated at decode.
+    /// Infallible: [`OwnedView::to_owned_message`] cannot fail, because an
+    /// `OwnedView` can only come from buffa's wire decoder and conversion
+    /// replays under the budget the decode already charged.
     #[must_use]
     pub fn into_owned_parts(self) -> (http::HeaderMap, V::Owned, http::HeaderMap) {
-        let owned = self
-            .body
-            .to_owned_message()
-            .expect("wire-decoded view always converts (buffa >= 0.8.1)");
-        (self.headers, owned, self.trailers)
+        (self.headers, self.body.to_owned_message(), self.trailers)
     }
 }
 

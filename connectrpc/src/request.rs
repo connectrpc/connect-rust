@@ -91,7 +91,7 @@ impl<'a, Req: HasMessageView> ServiceRequest<'a, Req> {
     /// possible; string and repeated fields are allocated. Use this for data
     /// that must outlive the handler call.
     ///
-    /// Infallible for dispatcher-built requests: buffa (≥ 0.8.1) charges
+    /// Infallible for dispatcher-built requests: buffa charges
     /// every unknown-field record against the decode-time allowance, so any
     /// view the dispatcher decoded successfully re-materializes within that
     /// same allowance, and known fields were already validated at decode.
@@ -105,7 +105,7 @@ impl<'a, Req: HasMessageView> ServiceRequest<'a, Req> {
     pub fn to_owned_message(&self) -> Req {
         self.view
             .to_owned_from_source(Some(self.body))
-            .expect("wire-decoded view always converts (buffa >= 0.8.1)")
+            .expect("wire-decoded view always converts")
     }
 
     /// The request body as protobuf wire bytes.

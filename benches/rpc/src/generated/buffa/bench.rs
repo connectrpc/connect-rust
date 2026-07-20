@@ -192,24 +192,26 @@ impl ::buffa::MessageName for EchoRequest {
 impl ::buffa::Message for EchoRequest {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if !self.message.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.message) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.message) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -314,24 +316,26 @@ impl ::buffa::MessageName for EchoResponse {
 impl ::buffa::Message for EchoResponse {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if !self.message.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.message) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.message) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -423,7 +427,7 @@ pub struct BenchRequest {
         rename = "payload",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub payload: ::buffa::MessageField<Payload>,
+    pub payload: ::buffa::MessageField<Payload, ::buffa::Inline<Payload>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -453,32 +457,34 @@ impl ::buffa::MessageName for BenchRequest {
 impl ::buffa::Message for BenchRequest {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.response_count != 0i32 {
-            size += 1u32 + ::buffa::types::int32_encoded_len(self.response_count) as u32;
+            size += 1u64 + ::buffa::types::int32_encoded_len(self.response_count) as u64;
         }
         if self.payload.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.payload.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -486,7 +492,11 @@ impl ::buffa::Message for BenchRequest {
             ::buffa::types::put_int32_field(1u32, self.response_count, buf);
         }
         if self.payload.is_set() {
-            ::buffa::types::put_len_delimited_header(2u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.payload.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -571,7 +581,7 @@ pub struct BenchResponse {
         rename = "payload",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub payload: ::buffa::MessageField<Payload>,
+    pub payload: ::buffa::MessageField<Payload, ::buffa::Inline<Payload>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -598,34 +608,40 @@ impl ::buffa::MessageName for BenchResponse {
 impl ::buffa::Message for BenchResponse {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.payload.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.payload.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if self.payload.is_set() {
-            ::buffa::types::put_len_delimited_header(1u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.payload.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -792,7 +808,7 @@ pub struct Payload {
         rename = "metadata",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub metadata: ::buffa::MessageField<Metadata>,
+    pub metadata: ::buffa::MessageField<Metadata, ::buffa::Inline<Metadata>>,
     /// Repeated scalars — packed encoding in proto
     ///
     /// Field 13: `scores`
@@ -865,49 +881,51 @@ impl ::buffa::MessageName for Payload {
 impl ::buffa::Message for Payload {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.id != 0i32 {
-            size += 1u32 + ::buffa::types::int32_encoded_len(self.id) as u32;
+            size += 1u64 + ::buffa::types::int32_encoded_len(self.id) as u64;
         }
         if self.timestamp_nanos != 0i64 {
             size
-                += 1u32 + ::buffa::types::int64_encoded_len(self.timestamp_nanos) as u32;
+                += 1u64 + ::buffa::types::int64_encoded_len(self.timestamp_nanos) as u64;
         }
         if self.latitude.to_bits() != 0u64 {
-            size += 1u32 + ::buffa::types::FIXED64_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
         }
         if self.longitude.to_bits() != 0u64 {
-            size += 1u32 + ::buffa::types::FIXED64_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
         }
         if self.active {
-            size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         if self.trace_id != 0u64 {
-            size += 1u32 + ::buffa::types::FIXED64_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
         }
         if !self.name.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.name) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
         if !self.description.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.description) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.description) as u64;
         }
         if !self.region.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.region) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.region) as u64;
         }
         if !self.data.is_empty() {
-            size += 1u32 + ::buffa::types::bytes_encoded_len(&self.data) as u32;
+            size += 1u64 + ::buffa::types::bytes_encoded_len(&self.data) as u64;
         }
         {
             let val = self.status.to_i32();
             if val != 0 {
-                size += 1u32 + ::buffa::types::int32_encoded_len(val) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
         if self.metadata.is_set() {
@@ -915,34 +933,33 @@ impl ::buffa::Message for Payload {
             let inner_size = self.metadata.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
         if !self.scores.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .scores
                 .iter()
-                .map(|&v| ::buffa::types::int32_encoded_len(v) as u32)
-                .sum::<u32>();
-            size
-                += 1u32 + ::buffa::encoding::varint_len(payload as u64) as u32 + payload;
+                .map(|&v| ::buffa::types::int32_encoded_len(v) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
         for v in &self.tags {
-            size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         size
             += ::buffa::map_codec::field_len::<
                 ::buffa::map_codec::Str,
                 ::buffa::map_codec::Str,
                 _,
-            >(&self.attributes, 1u32);
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+            >(&self.attributes, 1u64);
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -974,7 +991,7 @@ impl ::buffa::Message for Payload {
             ::buffa::types::put_string_field(9u32, &self.region, buf);
         }
         if !self.data.is_empty() {
-            ::buffa::types::put_bytes_field(10u32, &self.data, buf);
+            ::buffa::types::put_shared_bytes_field(10u32, &self.data, buf);
         }
         {
             let val = self.status.to_i32();
@@ -983,15 +1000,19 @@ impl ::buffa::Message for Payload {
             }
         }
         if self.metadata.is_set() {
-            ::buffa::types::put_len_delimited_header(12u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                12u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.metadata.write_to(__cache, buf);
         }
         if !self.scores.is_empty() {
-            let payload: u32 = self
+            let payload: u64 = self
                 .scores
                 .iter()
-                .map(|&v| ::buffa::types::int32_encoded_len(v) as u32)
-                .sum::<u32>();
+                .map(|&v| ::buffa::types::int32_encoded_len(v) as u64)
+                .sum::<u64>();
             ::buffa::types::put_len_delimited_header(13u32, payload, buf);
             for &v in &self.scores {
                 ::buffa::types::encode_int32(v, buf);
@@ -1118,14 +1139,24 @@ impl ::buffa::Message for Payload {
                             ::buffa::DecodeError::UnexpectedEof,
                         );
                     }
-                    self.scores.reserve(len);
-                    let mut limited = buf.take(len);
-                    while limited.has_remaining() {
-                        self.scores.push(::buffa::types::decode_int32(&mut limited)?);
-                    }
-                    let leftover = limited.remaining();
-                    if leftover > 0 {
-                        limited.advance(leftover);
+                    if buf.chunk().len() >= len {
+                        ::buffa::types::extend_packed_int32(
+                            &buf.chunk()[..len],
+                            &mut self.scores,
+                            len,
+                        )?;
+                        buf.advance(len);
+                    } else {
+                        self.scores.reserve(len);
+                        let mut limited = buf.take(len);
+                        while limited.has_remaining() {
+                            self.scores
+                                .push(::buffa::types::decode_int32_packed(&mut limited)?);
+                        }
+                        let leftover = limited.remaining();
+                        if leftover > 0 {
+                            limited.advance(leftover);
+                        }
                     }
                 } else if tag.wire_type() == ::buffa::encoding::WireType::Varint {
                     self.scores.push(::buffa::types::decode_int32(buf)?);
@@ -1143,7 +1174,11 @@ impl ::buffa::Message for Payload {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                self.tags.push(::buffa::types::decode_string(buf)?);
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.tags.push(__elem);
             }
             15u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -1280,36 +1315,38 @@ impl ::buffa::MessageName for Metadata {
 impl ::buffa::Message for Metadata {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if !self.request_id.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.request_id) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.request_id) as u64;
         }
         if !self.user_agent.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.user_agent) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.user_agent) as u64;
         }
         if self.created_at != 0i64 {
-            size += 1u32 + ::buffa::types::int64_encoded_len(self.created_at) as u32;
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.created_at) as u64;
         }
         size
             += ::buffa::map_codec::field_len::<
                 ::buffa::map_codec::Str,
                 ::buffa::map_codec::Str,
                 _,
-            >(&self.headers, 1u32);
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+            >(&self.headers, 1u64);
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -1457,34 +1494,40 @@ impl ::buffa::MessageName for LogRequest {
 impl ::buffa::Message for LogRequest {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         for v in &self.records {
             let __slot = __cache.reserve();
             let inner_size = v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         for v in &self.records {
-            ::buffa::types::put_len_delimited_header(1u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -1506,6 +1549,9 @@ impl ::buffa::Message for LogRequest {
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
                 ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
                 self.records.push(elem);
             }
@@ -1587,24 +1633,26 @@ impl ::buffa::MessageName for LogResponse {
 impl ::buffa::Message for LogResponse {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.count != 0i32 {
-            size += 1u32 + ::buffa::types::int32_encoded_len(self.count) as u32;
+            size += 1u64 + ::buffa::types::int32_encoded_len(self.count) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -1745,7 +1793,7 @@ pub struct LogRecord {
         rename = "source",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub source: ::buffa::MessageField<LogSource>,
+    pub source: ::buffa::MessageField<LogSource, ::buffa::Inline<LogSource>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1782,60 +1830,62 @@ impl ::buffa::MessageName for LogRecord {
 impl ::buffa::Message for LogRecord {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.timestamp_nanos != 0i64 {
             size
-                += 1u32 + ::buffa::types::int64_encoded_len(self.timestamp_nanos) as u32;
+                += 1u64 + ::buffa::types::int64_encoded_len(self.timestamp_nanos) as u64;
         }
         if !self.service_name.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.service_name) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.service_name) as u64;
         }
         if !self.instance_id.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.instance_id) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.instance_id) as u64;
         }
         {
             let val = self.severity.to_i32();
             if val != 0 {
-                size += 1u32 + ::buffa::types::int32_encoded_len(val) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
         if !self.message.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.message) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.message) as u64;
         }
         size
             += ::buffa::map_codec::field_len::<
                 ::buffa::map_codec::Str,
                 ::buffa::map_codec::Str,
                 _,
-            >(&self.labels, 1u32);
+            >(&self.labels, 1u64);
         if !self.trace_id.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.trace_id) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.trace_id) as u64;
         }
         if !self.span_id.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.span_id) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.span_id) as u64;
         }
         if self.source.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.source.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -1869,7 +1919,11 @@ impl ::buffa::Message for LogRecord {
             ::buffa::types::put_string_field(8u32, &self.span_id, buf);
         }
         if self.source.is_set() {
-            ::buffa::types::put_len_delimited_header(9u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                9u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.source.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -2228,30 +2282,32 @@ impl ::buffa::MessageName for LogSource {
 impl ::buffa::Message for LogSource {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if !self.file.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.file) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.file) as u64;
         }
         if self.line != 0i32 {
-            size += 1u32 + ::buffa::types::int32_encoded_len(self.line) as u32;
+            size += 1u64 + ::buffa::types::int32_encoded_len(self.line) as u64;
         }
         if !self.function.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.function) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.function) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -2416,37 +2472,39 @@ impl ::buffa::MessageName for LogIngestResponse {
 impl ::buffa::Message for LogIngestResponse {
     /// Returns the total encoded size in bytes.
     ///
-    /// The result is a `u32`; the protobuf specification requires all
-    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
-    /// compliant message will never overflow this type.
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if self.count != 0i32 {
-            size += 1u32 + ::buffa::types::int32_encoded_len(self.count) as u32;
+            size += 1u64 + ::buffa::types::int32_encoded_len(self.count) as u64;
         }
         if self.total_message_bytes != 0i64 {
             size
-                += 1u32
-                    + ::buffa::types::int64_encoded_len(self.total_message_bytes) as u32;
+                += 1u64
+                    + ::buffa::types::int64_encoded_len(self.total_message_bytes) as u64;
         }
         if self.total_label_bytes != 0i64 {
             size
-                += 1u32
-                    + ::buffa::types::int64_encoded_len(self.total_label_bytes) as u32;
+                += 1u64
+                    + ::buffa::types::int64_encoded_len(self.total_label_bytes) as u64;
         }
         if self.max_severity != 0i32 {
-            size += 1u32 + ::buffa::types::int32_encoded_len(self.max_severity) as u32;
+            size += 1u64 + ::buffa::types::int32_encoded_len(self.max_severity) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;

@@ -29,21 +29,21 @@ futures = "0.3"
 pin-project = "1"
 async-trait = "0.1"
 
-# Protobuf. The 0.8 floor matches the regen baseline for the checked-in
-# generated code: 0.8.0 moves the view decode tag loop into `MessageView`,
-# introduces the pluggable owned-type traits (`from_wire`, `ProtoList`,
-# `ProtoBox`, `MapStorage`), and is the baseline the checked-in generated
-# directories were last regenerated against.
+# Protobuf. The 0.9 floor matches the regen baseline for the checked-in
+# generated code, and is a hard floor rather than a preference: 0.9.0 widens
+# `types::put_len_delimited_header` and the `map_codec::field_len`
+# accumulator to `u64`, so code emitted by a 0.8.x codegen does not compile
+# against a 0.9 runtime. Regenerate whenever this moves.
 # (connectrpc-build also sources the generated `mod.rs` `#[allow(...)]` list
-# from `buffa_codegen::ALLOW_LINTS`, present since 0.5.1.)
+# from `buffa_codegen::ALLOW_LINTS`.)
 # NOTE: the `connectrpc` crate pins `buffa` directly (not `workspace = true`)
 # so its `json` cargo feature can gate `buffa/json` for proto-only builds —
 # keep that floor aligned with this one when bumping.
-buffa = { version = "0.8.1", features = ["json"] }
-buffa-types = { version = "0.8", features = ["json"] }
-buffa-codegen = { version = "0.8" }
+buffa = { version = "0.9", features = ["json"] }
+buffa-types = { version = "0.9", features = ["json"] }
+buffa-codegen = { version = "0.9" }
 # `reflect` is needed for `DescriptorPool`, which backs connectrpc-reflection.
-buffa-descriptor = { version = "0.8", features = ["reflect"] }
+buffa-descriptor = { version = "0.9", features = ["reflect"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

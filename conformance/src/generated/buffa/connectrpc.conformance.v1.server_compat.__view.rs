@@ -94,6 +94,7 @@ impl<'a> ::buffa::MessageView<'a> for ServerCompatRequestView<'a> {
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
     }
+    #[inline]
     fn merge_view_field(
         &mut self,
         tag: ::buffa::encoding::Tag,
@@ -203,6 +204,7 @@ impl<'a> ::buffa::MessageView<'a> for ServerCompatRequestView<'a> {
                 Some(v) => {
                     ::buffa::MessageField::<
                         super::super::TLSCreds,
+                        ::buffa::Inline<super::super::TLSCreds>,
                     >::some(v.to_owned_from_source(__buffa_src)?)
                 }
                 None => ::buffa::MessageField::none(),
@@ -217,49 +219,49 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerCompatRequestView<'a> {
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         {
             let val = self.protocol.to_i32();
             if val != 0 {
-                size += 1u32 + ::buffa::types::int32_encoded_len(val) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
         {
             let val = self.http_version.to_i32();
             if val != 0 {
-                size += 1u32 + ::buffa::types::int32_encoded_len(val) as u32;
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
         if self.use_tls {
-            size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         if !self.client_tls_cert.is_empty() {
             size
-                += 1u32
-                    + ::buffa::types::bytes_encoded_len(&self.client_tls_cert) as u32;
+                += 1u64
+                    + ::buffa::types::bytes_encoded_len(&self.client_tls_cert) as u64;
         }
         if self.message_receive_limit != 0u32 {
             size
-                += 1u32
+                += 1u64
                     + ::buffa::types::uint32_encoded_len(self.message_receive_limit)
-                        as u32;
+                        as u64;
         }
         if self.server_creds.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.server_creds.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
-                    + inner_size;
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
     fn write_to(
         &self,
         __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -279,13 +281,17 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerCompatRequestView<'a> {
             ::buffa::types::put_bool_field(4u32, self.use_tls, buf);
         }
         if !self.client_tls_cert.is_empty() {
-            ::buffa::types::put_bytes_field(5u32, &self.client_tls_cert, buf);
+            ::buffa::types::put_shared_bytes_field(5u32, &self.client_tls_cert, buf);
         }
         if self.message_receive_limit != 0u32 {
             ::buffa::types::put_uint32_field(6u32, self.message_receive_limit, buf);
         }
         if self.server_creds.is_set() {
-            ::buffa::types::put_len_delimited_header(7u32, __cache.consume_next(), buf);
+            ::buffa::types::put_len_delimited_header(
+                7u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
             self.server_creds.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -395,7 +401,9 @@ impl ServerCompatRequestOwnedView {
     ///
     /// # Errors
     ///
-    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
     /// somehow invalid (should not happen for well-formed messages).
     pub fn from_owned(
         msg: &super::super::ServerCompatRequest,
@@ -411,16 +419,13 @@ impl ServerCompatRequestOwnedView {
     }
     /// Convert to the owned message type.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if re-materializing preserved unknown fields
-    /// fails (e.g. the unknown-field limit is exceeded).
-    pub fn to_owned_message(
-        &self,
-    ) -> ::core::result::Result<
-        super::super::ServerCompatRequest,
-        ::buffa::DecodeError,
-    > {
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ServerCompatRequest {
         self.0.to_owned_message()
     }
     /// The underlying bytes buffer.
@@ -578,6 +583,7 @@ impl<'a> ::buffa::MessageView<'a> for ServerCompatResponseView<'a> {
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
     }
+    #[inline]
     fn merge_view_field(
         &mut self,
         tag: ::buffa::encoding::Tag,
@@ -652,24 +658,24 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerCompatResponseView<'a> {
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        let mut size = 0u32;
+        let mut size = 0u64;
         if !self.host.is_empty() {
-            size += 1u32 + ::buffa::types::string_encoded_len(&self.host) as u32;
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.host) as u64;
         }
         if self.port != 0u32 {
-            size += 1u32 + ::buffa::types::uint32_encoded_len(self.port) as u32;
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.port) as u64;
         }
         if !self.pem_cert.is_empty() {
-            size += 1u32 + ::buffa::types::bytes_encoded_len(&self.pem_cert) as u32;
+            size += 1u64 + ::buffa::types::bytes_encoded_len(&self.pem_cert) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u32;
-        size
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
     fn write_to(
         &self,
         _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::bytes::BufMut,
+        buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
@@ -680,7 +686,7 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerCompatResponseView<'a> {
             ::buffa::types::put_uint32_field(2u32, self.port, buf);
         }
         if !self.pem_cert.is_empty() {
-            ::buffa::types::put_bytes_field(3u32, &self.pem_cert, buf);
+            ::buffa::types::put_shared_bytes_field(3u32, &self.pem_cert, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -775,7 +781,9 @@ impl ServerCompatResponseOwnedView {
     ///
     /// # Errors
     ///
-    /// Returns [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
     /// somehow invalid (should not happen for well-formed messages).
     pub fn from_owned(
         msg: &super::super::ServerCompatResponse,
@@ -791,16 +799,13 @@ impl ServerCompatResponseOwnedView {
     }
     /// Convert to the owned message type.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if re-materializing preserved unknown fields
-    /// fails (e.g. the unknown-field limit is exceeded).
-    pub fn to_owned_message(
-        &self,
-    ) -> ::core::result::Result<
-        super::super::ServerCompatResponse,
-        ::buffa::DecodeError,
-    > {
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ServerCompatResponse {
         self.0.to_owned_message()
     }
     /// The underlying bytes buffer.

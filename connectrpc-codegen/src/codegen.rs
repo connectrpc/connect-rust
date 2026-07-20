@@ -60,11 +60,11 @@ pub struct Options {
     /// [`generate_files`] (the unified `super::`-relative path).
     ///
     /// Every `extern_path` target must be buffa-generated code from
-    /// buffa ≥ 0.8.0 with views enabled (and, if the crate feature-gates
+    /// buffa ≥ 0.9.0 with views enabled (and, if the crate feature-gates
     /// its generated impls, with that feature turned on): the service
     /// stubs rely on the `buffa::HasMessageView` impls and `FooOwnedView`
     /// wrappers emitted alongside each message, the same way they rely on
-    /// the JSON/`Serialize` impls. `buffa-types` 0.8+ satisfies this for
+    /// the JSON/`Serialize` impls. `buffa-types` 0.9+ satisfies this for
     /// the well-known types. A crate generated without them fails to
     /// compile against the stubs (missing `HasMessageView` impl).
     pub buffa: CodeGenConfig,
@@ -540,9 +540,9 @@ pub fn generate_services(
 ///   `extern_path=.=<path>` is the catch-all (equivalent to `buffa_module`).
 ///   At least one catch-all mapping is required so every type resolves.
 ///   Every mapped path must point at buffa-generated code from
-///   buffa ≥ 0.8.0 with views enabled — the stubs use the
+///   buffa ≥ 0.9.0 with views enabled — the stubs use the
 ///   `buffa::HasMessageView` impls and owned-view wrappers generated with
-///   each message (`buffa-types` 0.8+ qualifies for the well-known types).
+///   each message (`buffa-types` 0.9+ qualifies for the well-known types).
 /// - `file_per_package` — emit one `<dotted.pkg>.rs` per proto package
 ///   instead of the per-proto split + stitcher. Set `protoc-gen-buffa`'s
 ///   own `file_per_package` option to the same value — the BSR/`tonic`
@@ -976,7 +976,7 @@ fn alias_collides(batch: &BatchState, current_package: &str, proto_fqn: &str) ->
 /// input type, including ones mapped via `extern_path`: the backing
 /// `buffa::HasMessageView` impl is emitted by buffa's codegen in the crate
 /// that owns the type (`extern_path` targets are required to be generated
-/// with buffa ≥ 0.8.0 and views enabled).
+/// with buffa ≥ 0.9.0 and views enabled).
 fn router_stream_items_tokens(
     resolver: &TypeResolver<'_>,
     method: &MethodDescriptorProto,
@@ -1356,7 +1356,7 @@ fn generate_service(
          `StreamMessage<M>` implements `Encodable<M>`.\n\n\
          Request types resolved through `extern_path` (e.g. well-known types\n\
          from another crate) use the same wrappers; the crate that owns the\n\
-         type must be generated with buffa ≥ 0.8.0 and views enabled so the\n\
+         type must be generated with buffa ≥ 0.9.0 and views enabled so the\n\
          backing `HasMessageView` impl exists.\n\n\
          The `impl Encodable<Out>` return bound accepts the owned `Out`, the\n\
          generated `OutView<'_>` / `OwnedOutView`,\n\
@@ -2717,7 +2717,7 @@ mod tests {
         );
         // `.google.protobuf.Empty` resolves through the default extern_path to
         // `::buffa_types::…`. extern_path targets are required to be
-        // buffa ≥ 0.8.0 generated code with views enabled, so the unary input
+        // buffa ≥ 0.9.0 generated code with views enabled, so the unary input
         // uses the same `ServiceRequest<'_, Req>` form as local types — the
         // backing `buffa::HasMessageView` impl ships with buffa-types.
         assert!(
