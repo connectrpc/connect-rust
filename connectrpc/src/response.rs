@@ -715,14 +715,23 @@ fn worth_segmenting(size: usize, backing_len: usize, min_segment: usize) -> bool
     size >= min_segment && size.saturating_mul(2) >= backing_len
 }
 
-/// Merge segments below `min_segment` into their neighbour.
+/// Merge each *run* of consecutive sub-`min_segment` segments into one.
 ///
 /// A rope flushes its pending tail before each capture, so a view with several
 /// large fields yields alternating tag/length fragments and captured payloads.
 /// Emitted as-is those fragments become their own HTTP data frames, each a
-/// handful of bytes behind a 9-byte HTTP/2 frame header. Merging them costs a
-/// copy proportional to the fragment, not the payload.
-fn coalesce_small(segments: Vec<Bytes>, min_segment: usize) -> Vec<Bytes> {
+/// handful of bytes behind a 9-byte HTTP/2 frame header. Merging a run costs a
+/// copy proportional to the fragments, not the payload.
+///
+/// An isolated fragment therefore stays its own segment: it has no small
+/// neighbour to join, and folding it into an adjacent capture would mean
+/// allocating and copying that capture, which is the one cost this whole path
+/// exists to avoid. It is still re-copied into a run of its own — a handful of
+/// bytes — so what survives untouched is the capture, not the fragment. The
+/// alternating shape above thus keeps one 9-byte frame header per captured
+/// field, a fixed price per field paid to leave the payloads themselves
+/// un-copied.
+fn coalesce_small_runs(segments: Vec<Bytes>, min_segment: usize) -> Vec<Bytes> {
     if segments.len() < 2 {
         return segments;
     }
@@ -826,7 +835,7 @@ pub fn encode_view_body_with_min_segment<'a, V: ViewEncode<'a>>(
             // that shape pays for a rope that captures nothing.
             let mut rope = buffa::Rope::with_min_segment(min_segment).with_backing(backing.clone());
             view.write_to(&mut cache, &mut rope);
-            Ok(EncodedBody::from_segments(coalesce_small(
+            Ok(EncodedBody::from_segments(coalesce_small_runs(
                 rope.into_segments(),
                 min_segment,
             )))
@@ -1308,11 +1317,12 @@ mod tests {
     }
 
     #[test]
-    fn tiny_segments_are_merged_into_their_neighbours() {
+    fn isolated_fragments_stay_their_own_segments() {
         // A rope flushes its tail before each capture, so a multi-field view
         // yields alternating small tag/length fragments and large payloads.
-        // Left alone each fragment becomes its own HTTP frame, a few bytes
-        // behind a 9-byte frame header.
+        // Each fragment's only neighbours are captures, and folding it into
+        // one would mean copying that capture — the cost this path exists to
+        // avoid — so it stays its own small frame.
         let big = Bytes::from(vec![1u8; 32 * 1024]);
         let segments = vec![
             Bytes::from_static(b"ab"),
@@ -1321,16 +1331,42 @@ mod tests {
             big.clone(),
             Bytes::from_static(b"ef"),
         ];
-        let merged = coalesce_small(segments, 16 * 1024);
+        let merged = coalesce_small_runs(segments, 16 * 1024);
 
-        assert_eq!(merged.len(), 5, "large payloads stay their own segments");
+        assert_eq!(
+            merged.len(),
+            5,
+            "nothing merges: no fragment is adjacent to another"
+        );
         let total: usize = merged.iter().map(Bytes::len).sum();
         assert_eq!(total, 2 + 32 * 1024 + 2 + 32 * 1024 + 2);
 
-        // The large payloads must still be the original allocations, not
-        // copies — merging the fragments must not gather the payloads too.
+        // The large payloads must still be the original allocations. This is
+        // the property the non-merging buys.
         assert!(std::ptr::eq(merged[1].as_ptr(), big.as_ptr()));
         assert!(std::ptr::eq(merged[3].as_ptr(), big.as_ptr()));
+    }
+
+    #[test]
+    fn consecutive_fragments_merge_into_one_segment() {
+        // The case the function does handle: a run of adjacent sub-threshold
+        // fragments collapses to a single segment, so a rope tail that came
+        // out in pieces costs one frame rather than one per piece.
+        let big = Bytes::from(vec![1u8; 32 * 1024]);
+        let segments = vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from_static(b"cd"),
+            Bytes::from_static(b"ef"),
+            big.clone(),
+        ];
+        let merged = coalesce_small_runs(segments, 16 * 1024);
+
+        assert_eq!(merged.len(), 2, "the three fragments become one segment");
+        assert_eq!(&merged[0][..], b"abcdef");
+        assert!(
+            std::ptr::eq(merged[1].as_ptr(), big.as_ptr()),
+            "merging a run must not copy the capture that follows it"
+        );
     }
 
     #[test]
