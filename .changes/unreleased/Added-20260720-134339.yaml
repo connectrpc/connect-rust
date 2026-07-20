@@ -1,0 +1,35 @@
+kind: Added
+body: |-
+  **The decode-time element-memory budget is now configurable.** buffa 0.9
+  introduced a 32 MiB budget on the memory a single decode may commit to
+  repeated, map, string and bytes *elements* — an amplification defence,
+  charged on element footprint rather than on contents, so a few bytes on the
+  wire cannot ask the decoder to materialize a very large number of small
+  elements. A single large payload is unaffected however big it grows.
+
+  Until now that budget applied to every received message with no way to
+  change it, so a legitimate message carrying very many small elements that
+  0.8 accepted would be rejected with no recourse. Servers set it through the
+  existing `Limits`:
+
+  ```rust
+  ConnectRpcService::new(dispatcher)
+      .with_limits(Limits::default().element_memory_limit(128 * 1024 * 1024))
+  ```
+
+  `Limits::unlimited()` lifts it along with the other limits.
+
+  It applies to every server receive path — unary, server-streaming,
+  client-streaming and bidi, on both the generated dispatch and hand-registered
+  handlers, view-based and owned-message alike. A rejection now names the limit
+  to raise, since it is the one decode failure an operator can fix without the
+  peer changing anything. Clients still decode *responses* under buffa's
+  defaults; that knob is a follow-up.
+
+  **Breaking, for generated code only.** `decode_borrowed_request_view` and
+  `decode_message_request_stream` now take the decode limits, and `Limits` is
+  `#[non_exhaustive]` so further limits can be added without another break.
+  Both functions are `#[doc(hidden)]` and called only from generated dispatch,
+  so regenerating with the matching `protoc-gen-connect-rust` is the whole
+  migration — which 0.9.0 already requires for buffa 0.9.
+time: 2026-07-20T13:43:39.897161068-07:00

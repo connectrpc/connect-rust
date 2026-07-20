@@ -270,6 +270,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::filter::v1::Record,

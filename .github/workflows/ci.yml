@@ -204,7 +204,9 @@ jobs:
             conformance/src/generated \
             examples/eliza/src/generated \
             examples/multiservice/src/generated \
-            benches/rpc/src/generated; then
+            benches/rpc/src/generated \
+            connectrpc-health/src/generated \
+            connectrpc-reflection/src/generated; then
             echo "::error::Checked-in generated code is stale. Run 'task generate:all' and commit the diff."
             exit 1
           fi

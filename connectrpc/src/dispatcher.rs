@@ -416,17 +416,24 @@ pub mod codegen {
     /// Used by generated `call_client_streaming` and `call_bidi_streaming`
     /// arms; the per-item decode is the same normalize-then-decode used on
     /// the unary paths.
+    ///
+    /// Takes the limits by value because the returned stream outlives the
+    /// caller's frame; generated arms pass `ctx.decode_options().clone()`
+    /// before `ctx` is moved into the handler call.
     pub fn decode_message_request_stream<M>(
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
+        options: buffa::DecodeOptions,
     ) -> crate::ServiceStream<crate::StreamMessage<M>>
     where
         M: crate::HasMessageView + JsonDeserialize + 'static,
         M::View<'static>: 'static,
     {
         Box::pin(requests.map(move |r| {
-            r.and_then(|raw| crate::handler::decode_request_view::<M::View<'static>>(raw, format))
-                .map(crate::StreamMessage::from_owned_view)
+            r.and_then(|raw| {
+                crate::handler::decode_request_view::<M::View<'static>>(raw, format, &options)
+            })
+            .map(crate::StreamMessage::from_owned_view)
         }))
     }
 }

@@ -131,7 +131,7 @@ and the three client suites.
 
 ## Checked-In Generated Code
 
-Five directories contain checked-in `buf generate` output and **must be
+Six directories contain checked-in `buf generate` output and **must be
 regenerated** whenever `connectrpc-codegen` output changes (or the buffa
 dependency is bumped):
 
@@ -140,6 +140,7 @@ dependency is bumped):
 - `examples/multiservice/src/generated/`
 - `benches/rpc/src/generated/`
 - `connectrpc-health/src/generated/`
+- `connectrpc-reflection/src/generated/`
 
 Regenerate all of them with:
 

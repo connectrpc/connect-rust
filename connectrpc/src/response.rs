@@ -62,6 +62,11 @@ pub struct RequestContext {
     pub(crate) protocol: Option<crate::Protocol>,
     /// The procedure path the client requested, with a leading slash.
     pub(crate) path: Option<String>,
+    /// Decode limits for this request's message, from the service's
+    /// [`Limits`](crate::Limits). Default when the context was built outside
+    /// the service (a hand-rolled test, a tower layer), which is why this is
+    /// the service's value rather than a global.
+    pub(crate) decode_options: buffa::DecodeOptions,
 }
 
 impl RequestContext {
@@ -74,7 +79,23 @@ impl RequestContext {
             spec: None,
             protocol: None,
             path: None,
+            decode_options: buffa::DecodeOptions::new(),
         }
+    }
+
+    /// Set the decode limits applied to this request's message.
+    #[doc(hidden)] // set by the service from its configured `Limits`
+    #[must_use]
+    pub fn with_decode_options(mut self, options: buffa::DecodeOptions) -> Self {
+        self.decode_options = options;
+        self
+    }
+
+    /// The decode limits applied to this request's message.
+    #[doc(hidden)] // read by generated dispatch
+    #[must_use]
+    pub fn decode_options(&self) -> &buffa::DecodeOptions {
+        &self.decode_options
     }
 
     /// Set the request deadline (absolute `Instant`).

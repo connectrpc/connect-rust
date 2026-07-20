@@ -603,6 +603,7 @@ for WellKnownTypesServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
@@ -624,6 +625,7 @@ for WellKnownTypesServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
@@ -645,6 +647,7 @@ for WellKnownTypesServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
@@ -666,6 +669,7 @@ for WellKnownTypesServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         ::buffa_types::google::protobuf::Empty,

@@ -266,6 +266,7 @@ impl<T: BloatEchoService> ::connectrpc::Dispatcher for BloatEchoServiceServer<T>
                     >(request.encoded()?, format)?;
                     let req: crate::proto::bench::v1::__buffa::view::BloatEchoView<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BloatEcho,

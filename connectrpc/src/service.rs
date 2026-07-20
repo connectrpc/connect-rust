@@ -455,7 +455,21 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// incrementally from the body stream — the full body is never buffered.
 /// In that case `max_request_body_size` does not apply, and
 /// `max_message_size` is the primary per-message protection.
+///
+/// `element_memory_limit` is the odd one out, and the distinction from
+/// `max_message_size` is the one worth getting right: `max_message_size`
+/// bounds *decompressed bytes on the wire*, while `element_memory_limit`
+/// bounds the *in-memory footprint of the element count* those bytes ask
+/// for. A repeated field of empty messages costs two bytes each encoded and
+/// a whole struct each decoded, so a body comfortably inside
+/// `max_message_size` can still expand by orders of magnitude. Raising one
+/// does not raise the other.
+///
+/// These are **server** limits, applied to received requests. A client
+/// decoding responses currently uses buffa's defaults, with no equivalent
+/// override.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Limits {
     /// Maximum size of the request body on the wire (before decompression).
     ///
@@ -476,6 +490,22 @@ pub struct Limits {
     ///
     /// Default: 4 MB.
     pub max_message_size: usize,
+
+    /// Maximum memory a single decode may commit to repeated, map, string
+    /// and bytes *elements*.
+    ///
+    /// This is an amplification defence, and it is charged on element
+    /// footprint rather than on contents: a few bytes on the wire can ask
+    /// the decoder to materialize a very large number of small elements,
+    /// each with its own allocation overhead, while staying well under
+    /// `max_message_size`. A single large payload is unaffected however big
+    /// it grows, because its contents are not charged.
+    ///
+    /// Raise it for a trusted peer that legitimately sends messages with
+    /// very many small elements; lower it to tighten the defence.
+    ///
+    /// Default: 32 MiB (buffa's `DEFAULT_ELEMENT_MEMORY_LIMIT`).
+    pub element_memory_limit: usize,
 }
 
 impl Default for Limits {
@@ -483,6 +513,7 @@ impl Default for Limits {
         Self {
             max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            element_memory_limit: buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
         }
     }
 }
@@ -495,6 +526,7 @@ impl Limits {
         Self {
             max_request_body_size: usize::MAX,
             max_message_size: usize::MAX,
+            element_memory_limit: usize::MAX,
         }
     }
 
@@ -517,6 +549,24 @@ impl Limits {
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
+    }
+
+    /// Set the maximum memory a single decode may commit to repeated, map,
+    /// string and bytes elements.
+    ///
+    /// See [`Limits`] for what this charges and why it is separate from
+    /// `max_message_size`.
+    #[must_use]
+    pub fn element_memory_limit(mut self, bytes: usize) -> Self {
+        self.element_memory_limit = bytes;
+        self
+    }
+
+    /// The buffa decode options these limits imply.
+    #[doc(hidden)] // read by generated dispatch via `RequestContext`
+    #[must_use]
+    pub fn decode_options(&self) -> buffa::DecodeOptions {
+        buffa::DecodeOptions::new().with_element_memory_limit(self.element_memory_limit)
     }
 }
 
@@ -1151,6 +1201,9 @@ fn create_grpc_web_envelope_stream(
 /// By default, the service applies security limits to prevent DoS attacks:
 /// - Request body: 4 MB (on-wire, before decompression)
 /// - Message size: 4 MB (after decompression, applied uniformly)
+/// - Element memory: 32 MiB per decode (the footprint of repeated, map,
+///   string and bytes elements, which a small body can inflate — see
+///   [`Limits`])
 ///
 /// These can be configured using [`with_limits`](Self::with_limits):
 ///
@@ -1877,7 +1930,8 @@ where
         // The leading slash was stripped for the Dispatcher::lookup key;
         // restore it so RequestContext::path() matches http::Uri::path()
         // and Spec::procedure.
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
     let resp: EncodedResponse = with_request_deadline(
@@ -2111,7 +2165,8 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with the same deadline used while receiving the body.
     let resp = match with_request_deadline(
@@ -2426,7 +2481,8 @@ where
         .with_extensions(extensions)
         .with_spec(method_desc.and_then(|d| d.spec))
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
     // For gRPC unary handlers, we wrap the single response in a one-item stream.
@@ -2569,7 +2625,8 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler. On error paths, the reader task is left running
     // (detached) so it can finish draining the request body — aborting it
@@ -2975,7 +3032,8 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with timeout if configured
     let handler_result = if let Some(timeout) = metadata.timeout {

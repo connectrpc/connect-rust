@@ -683,6 +683,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BenchRequest,
@@ -702,6 +703,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
@@ -721,6 +723,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
@@ -755,6 +758,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BenchRequest,
@@ -790,7 +794,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                 Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
-                    >(requests, format);
+                    >(requests, format, ctx.decode_options().clone());
                     svc.client_stream(ctx, req_stream)
                         .await?
                         .encode::<crate::proto::bench::v1::BenchResponse>(format)
@@ -816,7 +820,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                 Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
-                    >(requests, format);
+                    >(requests, format, ctx.decode_options().clone());
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
                     Ok(
                         resp
@@ -1404,6 +1408,7 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::EchoRequest,
@@ -1808,6 +1813,7 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,

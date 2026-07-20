@@ -2176,10 +2176,9 @@ mod tests {
         use crate::service::Limits;
         use crate::{CompressionPolicy, CompressionRegistry};
 
-        let limits = Limits {
-            max_request_body_size: 1024,
-            max_message_size: 512,
-        };
+        let limits = Limits::default()
+            .max_request_body_size(1024)
+            .max_message_size(512);
         let server = Server::new(Router::new())
             .with_limits(limits.clone())
             .with_compression(CompressionRegistry::default())
