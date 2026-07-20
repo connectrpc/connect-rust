@@ -28,8 +28,8 @@ use buffa::view::{MessageView, OwnedView};
 use bytes::Bytes;
 
 use crate::codec::{
-    CodecFormat, JsonDeserialize, JsonSerialize, decode_json, decode_proto, encode_json,
-    encode_proto,
+    CodecFormat, JsonDeserialize, JsonSerialize, decode_json, decode_proto_with_options,
+    encode_json, encode_proto,
 };
 use crate::error::ConnectError;
 
@@ -131,6 +131,7 @@ pub struct Payload {
     format: CodecFormat,
     decoded: OnceLock<Box<dyn AnyMessage>>,
     replaced: Option<Box<dyn AnyMessage>>,
+    decode_options: buffa::DecodeOptions,
 }
 
 impl Payload {
@@ -142,7 +143,26 @@ impl Payload {
             format,
             decoded: OnceLock::new(),
             replaced: None,
+            decode_options: buffa::DecodeOptions::new(),
         }
+    }
+
+    /// Attach the decode limits a typed accessor should honour.
+    ///
+    /// The server sets this from its [`Limits`](crate::Limits); a payload
+    /// built anywhere else decodes under buffa's defaults.
+    #[doc(hidden)] // set by the service from its configured `Limits`
+    #[must_use]
+    pub fn with_decode_options(mut self, options: buffa::DecodeOptions) -> Self {
+        self.decode_options = options;
+        self
+    }
+
+    /// The decode limits this payload's typed accessors honour.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn decode_options(&self) -> &buffa::DecodeOptions {
+        &self.decode_options
     }
 
     /// The original wire bytes the peer sent, **ignoring** any
@@ -196,7 +216,7 @@ impl Payload {
         // the other caller gets the wrong-type error below.
         if self.decoded.get().is_none() {
             let m: M = match self.format {
-                CodecFormat::Proto => decode_proto(&self.bytes)?,
+                CodecFormat::Proto => decode_proto_with_options(&self.bytes, &self.decode_options)?,
                 CodecFormat::Json => decode_json(&self.bytes)?,
             };
             let _ = self.decoded.set(Box::new(m));
@@ -278,7 +298,7 @@ impl Payload {
             });
         }
         match self.format {
-            CodecFormat::Proto => decode_proto(&self.bytes),
+            CodecFormat::Proto => decode_proto_with_options(&self.bytes, &self.decode_options),
             CodecFormat::Json => decode_json(&self.bytes),
         }
     }
@@ -461,10 +481,10 @@ mod tests {
         assert_eq!(v.reborrow().value, "after");
         // encoded() re-encodes for the original format.
         let encoded = p.encoded().unwrap();
-        let rt: StringValue = decode_proto(&encoded).unwrap();
+        let rt: StringValue = crate::codec::decode_proto(&encoded).unwrap();
         assert_eq!(rt.value, "after");
         // bytes() is unchanged.
-        let orig: StringValue = decode_proto(p.bytes()).unwrap();
+        let orig: StringValue = crate::codec::decode_proto(p.bytes()).unwrap();
         assert_eq!(orig.value, "before");
     }
 

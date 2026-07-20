@@ -285,6 +285,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::greet::v1::GreetRequest,

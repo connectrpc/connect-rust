@@ -324,10 +324,8 @@ impl UnaryRequest {
     /// Build a `UnaryRequest` from a dispatch context and wire-encoded
     /// body. Used by the dispatch path and by test fixtures.
     pub fn new(ctx: RequestContext, body: Bytes, format: CodecFormat) -> Self {
-        Self {
-            ctx,
-            payload: Payload::new(body, format),
-        }
+        let payload = Payload::new(body, format).with_decode_options(ctx.decode_options().clone());
+        Self { ctx, payload }
     }
 }
 
@@ -913,9 +911,8 @@ pub(crate) async fn call_unary_intercepted<D: crate::Dispatcher>(
     format: CodecFormat,
 ) -> Result<EncodedResponse, ConnectError> {
     if interceptors.is_empty() {
-        return dispatcher
-            .call_unary(path, ctx, Payload::new(body, format), format)
-            .await;
+        let payload = Payload::new(body, format).with_decode_options(ctx.decode_options().clone());
+        return dispatcher.call_unary(path, ctx, payload, format).await;
     }
     let terminal = DispatchTerminal {
         dispatcher,

@@ -96,9 +96,22 @@ pub fn encode_proto<M: Message>(message: &M) -> Result<Bytes, ConnectError> {
     Ok(message.encode_to_bytes())
 }
 
-/// Decode bytes into a protobuf message.
+/// Decode bytes into a protobuf message under buffa's default limits.
 pub fn decode_proto<M: Message>(data: &[u8]) -> Result<M, ConnectError> {
-    M::decode_from_slice(data)
+    decode_proto_with_options(data, &buffa::DecodeOptions::new())
+}
+
+/// Decode bytes into a protobuf message under explicit decode limits.
+///
+/// The server passes the limits from its [`Limits`](crate::Limits); see
+/// [`Payload::decode_options`](crate::Payload::decode_options) for how they
+/// reach an owned-message handler.
+pub fn decode_proto_with_options<M: Message>(
+    data: &[u8],
+    options: &buffa::DecodeOptions,
+) -> Result<M, ConnectError> {
+    options
+        .decode_from_slice(data)
         .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto: {e}")))
 }
 

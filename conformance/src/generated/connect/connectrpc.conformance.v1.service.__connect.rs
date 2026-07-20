@@ -960,6 +960,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::UnaryRequest,
@@ -981,6 +982,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::UnimplementedRequest,
@@ -1002,6 +1004,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::IdempotentUnaryRequest,
@@ -1039,6 +1042,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
@@ -1075,7 +1079,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                 Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
-                    >(requests, format);
+                    >(requests, format, ctx.decode_options().clone());
                     svc.client_stream(ctx, req_stream)
                         .await?
                         .encode::<
@@ -1104,7 +1108,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                 Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
-                    >(requests, format);
+                    >(requests, format, ctx.decode_options().clone());
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
                     Ok(
                         resp

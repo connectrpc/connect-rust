@@ -39,15 +39,36 @@ use crate::response::{
     Encodable, EncodedResponse, RequestContext, Response, ServiceResult, ServiceStream,
 };
 
+/// Report a failed request decode as `invalid_argument`.
+///
+/// Exceeding the element-memory budget is the one decode failure a server
+/// operator can fix without the peer changing anything, so it says which
+/// limit to raise. Every other variant is a malformed request, where naming
+/// a limit would misdirect. `DecodeError` is `#[non_exhaustive]`, hence the
+/// catch-all arm.
+fn decode_request_error(e: &buffa::DecodeError) -> ConnectError {
+    match e {
+        buffa::DecodeError::ElementMemoryLimitExceeded => ConnectError::invalid_argument(format!(
+            "failed to decode proto request: {e}; if this peer is trusted, \
+             raise Limits::element_memory_limit"
+        )),
+        _ => ConnectError::invalid_argument(format!("failed to decode proto request: {e}")),
+    }
+}
+
 /// Decode a request message from bytes using the specified codec format.
-pub(crate) fn decode_request<Req>(request: &Bytes, format: CodecFormat) -> Result<Req, ConnectError>
+pub(crate) fn decode_request<Req>(
+    request: &Bytes,
+    format: CodecFormat,
+    options: &buffa::DecodeOptions,
+) -> Result<Req, ConnectError>
 where
     Req: Message + JsonDeserialize,
 {
     match format {
-        CodecFormat::Proto => Req::decode_from_slice(&request[..]).map_err(|e| {
-            ConnectError::invalid_argument(format!("failed to decode proto request: {e}"))
-        }),
+        CodecFormat::Proto => options
+            .decode_from_slice(&request[..])
+            .map_err(|e| decode_request_error(&e)),
         CodecFormat::Json => decode_json(&request[..]),
     }
 }
@@ -398,7 +419,7 @@ where
     ) -> StreamingHandlerResult {
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            let req: Req = decode_request(&request, format)?;
+            let req: Req = decode_request(&request, format, ctx.decode_options())?;
             let resp = handler.call(ctx, req).await?;
             Ok(resp.map_body(|s| encode_body_stream(s, format)))
         })
@@ -511,9 +532,13 @@ where
         use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            let request_stream: ServiceStream<Req> = Box::pin(
-                requests.map(move |result| result.and_then(|raw| decode_request(&raw, format))),
-            );
+            // The stream outlives this frame, so it owns its limits rather
+            // than borrowing them from `ctx`, which is moved into the call.
+            let options = ctx.decode_options().clone();
+            let request_stream: ServiceStream<Req> =
+                Box::pin(requests.map(move |result| {
+                    result.and_then(|raw| decode_request(&raw, format, &options))
+                }));
             handler
                 .call(ctx, request_stream)
                 .await?
@@ -636,9 +661,13 @@ where
         use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            let request_stream: ServiceStream<Req> = Box::pin(
-                requests.map(move |result| result.and_then(|raw| decode_request(&raw, format))),
-            );
+            // The stream outlives this frame, so it owns its limits rather
+            // than borrowing them from `ctx`, which is moved into the call.
+            let options = ctx.decode_options().clone();
+            let request_stream: ServiceStream<Req> =
+                Box::pin(requests.map(move |result| {
+                    result.and_then(|raw| decode_request(&raw, format, &options))
+                }));
             let resp = handler.call(ctx, request_stream).await?;
             Ok(resp.map_body(|s| encode_body_stream(s, format)))
         })
@@ -658,14 +687,14 @@ where
 pub(crate) fn decode_request_view<ReqView>(
     request: Bytes,
     format: CodecFormat,
+    options: &buffa::DecodeOptions,
 ) -> Result<OwnedView<ReqView>, ConnectError>
 where
     ReqView: MessageView<'static> + Send,
     ReqView::Owned: Message + JsonDeserialize,
 {
     let body = request_proto_bytes::<ReqView::Owned>(request, format)?;
-    OwnedView::<ReqView>::decode(body)
-        .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto request: {e}")))
+    OwnedView::<ReqView>::decode_with_options(body, options).map_err(|e| decode_request_error(&e))
 }
 
 /// Normalize a request body to protobuf wire bytes.
@@ -703,17 +732,25 @@ where
 /// so the view's borrows are tied to the call frame rather than promoted to
 /// a synthetic `'static`.
 ///
+/// `options` carries the service's configured decode limits; see
+/// [`Limits`](crate::Limits).
+///
 /// # Errors
 ///
-/// Returns `ConnectError::invalid_argument` if the bytes are not a valid
+/// Returns `ConnectError::invalid_argument` if the bytes exceed one of
+/// `options`' limits, or if the bytes are not a valid
 /// encoding of the request message.
 #[doc(hidden)] // exposed only for dispatcher::codegen (generated code)
-pub fn decode_borrowed_request_view<'a, ReqView>(body: &'a [u8]) -> Result<ReqView, ConnectError>
+pub fn decode_borrowed_request_view<'a, ReqView>(
+    body: &'a [u8],
+    options: &buffa::DecodeOptions,
+) -> Result<ReqView, ConnectError>
 where
     ReqView: MessageView<'a>,
 {
-    ReqView::decode_view(body)
-        .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto request: {e}")))
+    options
+        .decode_view(body)
+        .map_err(|e| decode_request_error(&e))
 }
 
 /// Trait for unary RPC handlers using zero-copy request views.
@@ -822,7 +859,8 @@ where
             // here. `encoded()` is the wire bytes — a cheap `Bytes` clone
             // unless an interceptor replaced the body, in which case it
             // re-encodes the replacement.
-            let req = decode_request_view::<ReqView>(request.encoded()?, format)?;
+            let req =
+                decode_request_view::<ReqView>(request.encoded()?, format, ctx.decode_options())?;
             handler.call(ctx, req, format).await
         })
     }
@@ -938,7 +976,7 @@ where
     ) -> StreamingHandlerResult {
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            let req = decode_request_view::<ReqView>(request, format)?;
+            let req = decode_request_view::<ReqView>(request, format, ctx.decode_options())?;
             let resp = handler.call(ctx, req).await?;
             Ok(resp.map_body(|s| encode_body_stream(s, format)))
         })
@@ -1047,9 +1085,12 @@ where
         use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
+            // The stream outlives this frame, so it owns its limits rather
+            // than borrowing them from `ctx`, which is moved into the call.
+            let options = ctx.decode_options().clone();
             let request_stream: ServiceStream<OwnedView<ReqView>> =
                 Box::pin(requests.map(move |result| {
-                    result.and_then(|raw| decode_request_view::<ReqView>(raw, format))
+                    result.and_then(|raw| decode_request_view::<ReqView>(raw, format, &options))
                 }));
             handler.call(ctx, request_stream, format).await
         })
@@ -1167,9 +1208,12 @@ where
         use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
+            // The stream outlives this frame, so it owns its limits rather
+            // than borrowing them from `ctx`, which is moved into the call.
+            let options = ctx.decode_options().clone();
             let request_stream: ServiceStream<OwnedView<ReqView>> =
                 Box::pin(requests.map(move |result| {
-                    result.and_then(|raw| decode_request_view::<ReqView>(raw, format))
+                    result.and_then(|raw| decode_request_view::<ReqView>(raw, format, &options))
                 }));
             let resp = handler.call(ctx, request_stream).await?;
             Ok(resp.map_body(|s| encode_body_stream(s, format)))
@@ -1187,7 +1231,8 @@ mod tests {
     fn test_decode_request_proto() {
         let msg = StringValue::from("hello");
         let encoded = Bytes::from(msg.encode_to_vec());
-        let decoded: StringValue = decode_request(&encoded, CodecFormat::Proto).unwrap();
+        let decoded: StringValue =
+            decode_request(&encoded, CodecFormat::Proto, &buffa::DecodeOptions::new()).unwrap();
         assert_eq!(decoded.value, "hello");
     }
 
@@ -1195,14 +1240,20 @@ mod tests {
     #[test]
     fn test_decode_request_json() {
         let encoded = Bytes::from_static(b"\"world\"");
-        let decoded: StringValue = decode_request(&encoded, CodecFormat::Json).unwrap();
+        let decoded: StringValue =
+            decode_request(&encoded, CodecFormat::Json, &buffa::DecodeOptions::new()).unwrap();
         assert_eq!(decoded.value, "world");
     }
 
     #[test]
     fn test_decode_request_proto_invalid() {
         let garbage = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
-        let err = decode_request::<StringValue>(&garbage, CodecFormat::Proto).unwrap_err();
+        let err = decode_request::<StringValue>(
+            &garbage,
+            CodecFormat::Proto,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
@@ -1210,7 +1261,12 @@ mod tests {
     #[test]
     fn test_decode_request_json_invalid() {
         let garbage = Bytes::from_static(b"not json");
-        let err = decode_request::<StringValue>(&garbage, CodecFormat::Json).unwrap_err();
+        let err = decode_request::<StringValue>(
+            &garbage,
+            CodecFormat::Json,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
@@ -1221,8 +1277,12 @@ mod tests {
         // classified like any other malformed request, before any handler
         // (and its owned conversion) runs.
         let body = crate::request::tests::unknown_field_overflow_body();
-        let err =
-            decode_request_view::<StringValueView<'static>>(body, CodecFormat::Proto).unwrap_err();
+        let err = decode_request_view::<StringValueView<'static>>(
+            body,
+            CodecFormat::Proto,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
@@ -1230,7 +1290,12 @@ mod tests {
     fn test_decode_request_view_proto() {
         let msg = StringValue::from("view-test");
         let encoded = Bytes::from(msg.encode_to_vec());
-        let view = decode_request_view::<StringValueView>(encoded, CodecFormat::Proto).unwrap();
+        let view = decode_request_view::<StringValueView>(
+            encoded,
+            CodecFormat::Proto,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap();
         assert_eq!(view.reborrow().value, "view-test");
     }
 
@@ -1238,7 +1303,12 @@ mod tests {
     #[test]
     fn test_decode_request_view_json() {
         let encoded = Bytes::from_static(b"\"json-view\"");
-        let view = decode_request_view::<StringValueView>(encoded, CodecFormat::Json).unwrap();
+        let view = decode_request_view::<StringValueView>(
+            encoded,
+            CodecFormat::Json,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap();
         assert_eq!(view.reborrow().value, "json-view");
     }
 
@@ -1251,7 +1321,9 @@ mod tests {
     #[test]
     fn decode_request_json_is_unimplemented_without_feature() {
         let body = Bytes::from_static(b"\"world\"");
-        let err = decode_request::<StringValue>(&body, CodecFormat::Json).unwrap_err();
+        let err =
+            decode_request::<StringValue>(&body, CodecFormat::Json, &buffa::DecodeOptions::new())
+                .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Unimplemented);
     }
 
@@ -1259,14 +1331,24 @@ mod tests {
     #[test]
     fn decode_request_view_json_is_unimplemented_without_feature() {
         let body = Bytes::from_static(b"\"world\"");
-        let err = decode_request_view::<StringValueView>(body, CodecFormat::Json).unwrap_err();
+        let err = decode_request_view::<StringValueView>(
+            body,
+            CodecFormat::Json,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Unimplemented);
     }
 
     #[test]
     fn test_decode_request_view_proto_invalid() {
         let garbage = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
-        let err = decode_request_view::<StringValueView>(garbage, CodecFormat::Proto).unwrap_err();
+        let err = decode_request_view::<StringValueView>(
+            garbage,
+            CodecFormat::Proto,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
@@ -1378,5 +1460,138 @@ mod tests {
             )]))
         });
         assert_handler::<_, StringValue, StringValue, PreEncoded<StringValue>>(&pre);
+    }
+
+    /// Owned-message handlers decode through `Payload`/`decode_request`
+    /// rather than the view helpers, and that path silently used buffa's
+    /// defaults until the limits were threaded onto `Payload` too. Both
+    /// owned entry points are pinned here.
+    #[test]
+    fn owned_message_decoding_honours_the_configured_limit() {
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        let list = ListValue {
+            values: (0..800_000).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
+        let raised = crate::Limits::default().element_memory_limit(usize::MAX);
+
+        // `decode_request`, used by the owned-message streaming wrappers.
+        assert!(
+            decode_request::<ListValue>(
+                &encoded,
+                CodecFormat::Proto,
+                &crate::Limits::default().decode_options()
+            )
+            .is_err(),
+            "the default budget must still reject"
+        );
+        let decoded: ListValue =
+            decode_request(&encoded, CodecFormat::Proto, &raised.decode_options())
+                .expect("raised budget must admit");
+        assert_eq!(decoded.values.len(), 800_000);
+
+        // `Payload::take_message`, used by the owned-message unary wrapper.
+        let payload = crate::Payload::new(encoded.clone(), CodecFormat::Proto);
+        assert!(
+            payload.take_message::<ListValue>().is_err(),
+            "a payload with no limits attached decodes under buffa defaults"
+        );
+        let payload = crate::Payload::new(encoded, CodecFormat::Proto)
+            .with_decode_options(raised.decode_options());
+        let decoded: ListValue = payload
+            .take_message()
+            .expect("a payload carrying raised limits must admit");
+        assert_eq!(decoded.values.len(), 800_000);
+    }
+
+    /// The budget rejection names the limit to raise, since it is the one
+    /// decode failure an operator can fix without the peer changing.
+    #[test]
+    fn an_over_budget_decode_says_which_limit_to_raise() {
+        use buffa_types::google::protobuf::__buffa::view::ListValueView;
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        let list = ListValue {
+            values: (0..800_000).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
+        let err = decode_borrowed_request_view::<ListValueView<'_>>(
+            &encoded,
+            &crate::Limits::default().decode_options(),
+        )
+        .expect_err("over budget");
+        let message = err.message.unwrap_or_default();
+        assert!(
+            message.contains("element_memory_limit"),
+            "the budget rejection must name the knob, got {message:?}"
+        );
+
+        // A malformed request must NOT suggest raising a limit — that would
+        // send an operator chasing a setting that cannot help.
+        let garbage = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+        let err = decode_borrowed_request_view::<ListValueView<'_>>(
+            &garbage,
+            &crate::Limits::default().decode_options(),
+        )
+        .expect_err("malformed");
+        let message = err.message.unwrap_or_default();
+        assert!(
+            !message.contains("element_memory_limit"),
+            "a malformed request must not point at a limit, got {message:?}"
+        );
+    }
+
+    /// The element-memory budget is a *configured* limit, not a constant:
+    /// the same bytes must be rejected at the default and accepted once the
+    /// service raises it. Without the second half, wiring the knob to
+    /// nothing would still pass.
+    #[test]
+    fn element_memory_limit_is_taken_from_the_configured_limits() {
+        use buffa_types::google::protobuf::__buffa::view::ListValueView;
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        // Element footprint is what the budget charges, not element
+        // contents, so this stays small on the wire.
+        let n = 800_000;
+        let list = ListValue {
+            values: (0..n).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
+
+        let defaults = crate::Limits::default();
+        let err =
+            decode_borrowed_request_view::<ListValueView<'_>>(&encoded, &defaults.decode_options())
+                .expect_err("800k elements must exceed the 32 MiB default");
+        assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
+
+        let raised = crate::Limits::default().element_memory_limit(usize::MAX);
+        let view =
+            decode_borrowed_request_view::<ListValueView<'_>>(&encoded, &raised.decode_options())
+                .expect("raising the limit must admit the same bytes");
+        assert_eq!(view.values.len(), n);
+    }
+
+    /// `unlimited()` must lift the decode budget too — a caller who asks for
+    /// no restrictions and still gets a 32 MiB element ceiling has been
+    /// silently ignored.
+    #[test]
+    fn unlimited_limits_lift_the_element_budget() {
+        assert_eq!(crate::Limits::unlimited().element_memory_limit, usize::MAX);
+    }
+
+    /// A context built outside the service carries buffa's defaults rather
+    /// than no limits at all.
+    #[test]
+    fn a_bare_request_context_decodes_under_buffa_defaults() {
+        let ctx = RequestContext::new(http::HeaderMap::new());
+        let listing = format!("{:?}", ctx.decode_options());
+        assert!(
+            listing.contains(&buffa::DEFAULT_ELEMENT_MEMORY_LIMIT.to_string()),
+            "expected buffa's default element-memory budget, got {listing}"
+        );
     }
 }

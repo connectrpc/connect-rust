@@ -276,6 +276,7 @@ impl<T: MathService> ::connectrpc::Dispatcher for MathServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::math::v1::AddRequest,

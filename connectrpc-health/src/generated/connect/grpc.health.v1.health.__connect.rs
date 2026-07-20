@@ -352,6 +352,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,
@@ -388,6 +389,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,

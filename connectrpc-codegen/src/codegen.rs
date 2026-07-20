@@ -1886,7 +1886,7 @@ fn generate_service_server(
         let stream_decode = {
             let input_fqn = m.input_type.as_deref().unwrap_or("");
             let input_owned = resolver.rust_type(input_fqn, package)?;
-            quote! { ::connectrpc::dispatcher::codegen::decode_message_request_stream::<#input_owned>(requests, format) }
+            quote! { ::connectrpc::dispatcher::codegen::decode_message_request_stream::<#input_owned>(requests, format, ctx.decode_options().clone()) }
         };
 
         if cs && ss {
@@ -1927,7 +1927,7 @@ fn generate_service_server(
                         // The normalized body is owned by this future; the handler
                         // borrows from it until it returns the response stream.
                         let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request, format)?;
-                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body)?;
+                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body, ctx.decode_options())?;
                         #call_handler
                         Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
@@ -1952,7 +1952,7 @@ fn generate_service_server(
                         // The normalized body is owned by this future; the handler
                         // borrows from it for the duration of the call.
                         let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request.encoded()?, format)?;
-                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body)?;
+                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body, ctx.decode_options())?;
                         #call_handler
                     })
                 }
