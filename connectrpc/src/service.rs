@@ -1897,11 +1897,9 @@ where
     // Connect unary flattens. Compression needs one contiguous input, and the
     // uncompressed case would need `Full<Bytes>` replaced with a multi-frame
     // body to carry segments — Connect puts the message straight in the HTTP
-    // body, so nothing here splits it for us the way an envelope does. That is
-    // a body-type change rather than an impossibility, and it is worth doing:
-    // Connect is the primary protocol, so the segmented encode currently
-    // reaches only gRPC and gRPC-Web unary. Flattening is a no-op unless the
-    // encoder segmented.
+    // body, so nothing here splits it for us the way an envelope does. The
+    // segmented encode therefore reaches only gRPC and gRPC-Web unary.
+    // Flattening is a no-op unless the encoder segmented.
     let body_len = resp.body.len();
     let resp_body = resp.body.into_contiguous();
     let (final_body, content_encoding) = if let Some(encoding) = response_encoding {

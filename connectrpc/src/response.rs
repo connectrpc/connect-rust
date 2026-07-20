@@ -709,7 +709,7 @@ pub fn encode_view_body<'a, V: ViewEncode<'a>>(
 /// keeping the whole allocation alive until the response finishes flushing —
 /// a handler that answers a 64 MiB upload with a 32 KiB summary would hold
 /// 64 MiB per in-flight response where it used to hold 32 KiB. Copying is
-/// cheaper than that. When the response is most of the buffer it borrows from,
+/// cheaper than that. When the response is at least half the buffer it borrows from,
 /// the buffer was going to stay alive anyway and the capture is free.
 fn worth_segmenting(size: usize, backing_len: usize, min_segment: usize) -> bool {
     size >= min_segment && size.saturating_mul(2) >= backing_len
@@ -761,7 +761,7 @@ fn checked_response_size(size: u32) -> Result<usize, ConnectError> {
 /// This is where buffa 0.9's rope pays. A view's fields are slices into the
 /// buffer it was decoded from, so a rope told about that buffer can take a
 /// large field by reference, and the encode then costs the same whatever the
-/// payload weighs. The `view_encode` benchmark in `benches/rpc` measures the
+/// payload weighs. The `view_rope_encode` benchmark in `benches/rpc` measures the
 /// curve; above the threshold the encode goes flat, because only the framing
 /// is still being written.
 ///
@@ -1350,6 +1350,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "json")]
     fn json_encoding_stays_contiguous() {
         // JSON is serialized whole, so there is nothing to hand over by
         // reference and the segmented call must not pretend otherwise.

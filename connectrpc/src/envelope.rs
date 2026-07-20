@@ -454,7 +454,7 @@ mod tests {
 
         // Reassembled bytes are identical to the contiguous encoding.
         let mut reassembled = BytesMut::from(&head[..]);
-        reassembled.put_slice(&chained);
+        reassembled.put_slice(chained);
         assert_eq!(
             reassembled.freeze(),
             Envelope::data(payload).encode(),

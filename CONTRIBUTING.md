@@ -185,6 +185,10 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
 - **MSRV** — `cargo check` on the minimum toolchain, read from `rust-version`
   in the workspace `Cargo.toml` so the declaration and the check cannot drift
 - **Examples** — builds and runs the example crates
-- **Minimal features** — `cargo check -p connectrpc --no-default-features`
+- **Minimal features** — `cargo check` *and* `cargo test`, both
+  `-p connectrpc --no-default-features`. Because the tests run, a test that
+  needs `json`, `gzip`, `zstd` or `streaming` must be
+  `#[cfg(feature = "...")]`-gated or it fails here while passing the
+  default-feature suite
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
 - **Conformance (server)** / **Conformance (client)** — full suites
