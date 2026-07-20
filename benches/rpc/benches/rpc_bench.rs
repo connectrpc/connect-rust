@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pprof::criterion::{Output, PProfProfiler};
 
 use connectrpc::client::{HttpClient, full_body};
@@ -216,10 +216,70 @@ fn bench_client_stream(c: &mut Criterion) {
         group.bench_function(BenchmarkId::from_parameter(protocol), |b| {
             b.to_async(&rt).iter(|| async {
                 client
-                    .client_stream(messages.clone())
+                    .client_stream(futures::stream::iter(messages.clone()))
                     .await
                     .expect("client_stream failed")
             });
+        });
+    }
+    group.finish();
+}
+
+/// Sustained client-streaming: enough messages per call that the per-message
+/// path (stream poll, encode, frame emission) dominates call setup/teardown.
+fn bench_client_stream_many_small(c: &mut Criterion) {
+    const MANY: i32 = 1000;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (addr, _handle) = rt.block_on(start_server());
+
+    let mut group = c.benchmark_group("client_stream_many_small");
+    group.throughput(Throughput::Elements(MANY as u64));
+    group.sample_size(30);
+    let messages: Vec<BenchRequest> = (0..MANY).map(|_| small_request()).collect();
+    for protocol in PROTOCOLS {
+        let client = make_client(addr, protocol, CodecFormat::Proto);
+        group.bench_function(BenchmarkId::from_parameter(protocol), |b| {
+            // iter_batched keeps the 1000-message clone out of the timing.
+            b.to_async(&rt).iter_batched(
+                || messages.clone(),
+                |msgs| async {
+                    client
+                        .client_stream(futures::stream::iter(msgs))
+                        .await
+                        .expect("client_stream failed")
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Large-message client-streaming: per-message encode/copy cost is
+/// significant relative to the wire, so where the encode runs matters.
+fn bench_client_stream_large(c: &mut Criterion) {
+    const LARGE_COUNT: i32 = 10;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (addr, _handle) = rt.block_on(start_server());
+
+    let mut group = c.benchmark_group("client_stream_large");
+    group.throughput(Throughput::Elements(LARGE_COUNT as u64));
+    group.sample_size(20);
+    let messages: Vec<BenchRequest> = (0..LARGE_COUNT).map(|_| large_request()).collect();
+    for protocol in PROTOCOLS {
+        let client = make_client(addr, protocol, CodecFormat::Proto);
+        group.bench_function(BenchmarkId::from_parameter(protocol), |b| {
+            // iter_batched keeps the 10 MiB clone out of the timing.
+            b.to_async(&rt).iter_batched(
+                || messages.clone(),
+                |msgs| async {
+                    client
+                        .client_stream(futures::stream::iter(msgs))
+                        .await
+                        .expect("client_stream failed")
+                },
+                BatchSize::LargeInput,
+            );
         });
     }
     group.finish();
@@ -292,6 +352,8 @@ criterion_group! {
         bench_unary_large,
         bench_server_stream,
         bench_client_stream,
+        bench_client_stream_many_small,
+        bench_client_stream_large,
         bench_bidi_stream,
 }
 criterion_main!(benches);

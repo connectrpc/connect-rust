@@ -329,6 +329,10 @@ pub use client::BidiStream;
 pub use client::ServerStream;
 pub use client::UnaryResponse;
 
+// Request-side adapter for client-streaming calls. Re-exported at the root
+// because adapting a ready collection is the common call site.
+pub use client::stream_iter;
+
 // ============================================================================
 // Codec exports
 // ============================================================================

@@ -25,12 +25,13 @@ bytes = { workspace = true }
 tower = { workspace = true }
 
 # Async runtime (minimal features for core). `macros` is load-bearing for
-# `tokio::select!` in both the always-compiled client-stream path and the
-# `server` accept loop; CI's `--all-targets` would hide its removal via
+# `tokio::select!` in the `server` accept loop; it stays on the base
+# dependency because CI's `--all-targets` would hide its removal via
 # dev-dep unification while breaking downstream `server`-only builds.
 tokio = { workspace = true, features = ["rt", "io-util", "sync", "time", "macros"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
+sync_wrapper = { workspace = true }
 async-trait = { workspace = true }
 
 # Protobuf.

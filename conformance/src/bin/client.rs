@@ -1039,7 +1039,12 @@ async fn do_client_stream_call(
     // Make the call
     let call_future = async {
         let resp = call_client_stream::<_, ClientStreamRequest, ClientStreamResponseView<'static>>(
-            &transport, &config, service, method, requests, options,
+            &transport,
+            &config,
+            service,
+            method,
+            futures::stream::iter(requests),
+            options,
         )
         .await?;
         let (headers, message, trailers) = resp.into_owned_parts();

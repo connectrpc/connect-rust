@@ -2239,9 +2239,26 @@ fn generate_client_method(
     let short_args: TokenStream; // args to the no-opts convenience method
     let opts_args: TokenStream; // args to the _with_options method
     let short_delegate_args: TokenStream; // how short delegates to opts
+    // Extra doc lines appended to both methods (client-stream input contract).
+    let mut extra_doc = quote! {};
 
     if client_streaming && !server_streaming {
         // Client-stream
+        extra_doc = quote! {
+            #[doc = ""]
+            #[doc = " `requests` is any `Stream<Item = ...> + Send + 'static` of"]
+            #[doc = " request messages (the `ClientRequestStream` bound); messages"]
+            #[doc = " are sent as the stream yields them. It backs the request"]
+            #[doc = " body, so yield owned messages or feed the call from a"]
+            #[doc = " channel-backed stream. For a collection that is already in"]
+            #[doc = " hand, wrap it with `::connectrpc::stream_iter(...)`."]
+            #[doc = ""]
+            #[doc = " Dropping the returned future cancels the call: the request"]
+            #[doc = " body is dropped along with it, so messages the stream had"]
+            #[doc = " not yet yielded are never delivered. A caller that needs the"]
+            #[doc = " request delivered must drive the call to completion rather"]
+            #[doc = " than, say, wrapping it in a `timeout`."]
+        };
         ret_ty = quote! {
             Result<
                 ::connectrpc::client::UnaryResponse<::buffa::view::OwnedView<#output_view_type<'static>>>,
@@ -2255,8 +2272,9 @@ fn generate_client_method(
                 requests, options,
             ).await
         };
-        short_args = quote! { requests: impl IntoIterator<Item = #input_type> };
-        opts_args = quote! { requests: impl IntoIterator<Item = #input_type>, options: ::connectrpc::client::CallOptions };
+        short_args =
+            quote! { requests: impl ::connectrpc::client::ClientRequestStream<#input_type> };
+        opts_args = quote! { requests: impl ::connectrpc::client::ClientRequestStream<#input_type>, options: ::connectrpc::client::CallOptions };
         short_delegate_args = quote! { requests, ::connectrpc::client::CallOptions::default() };
     } else if client_streaming && server_streaming {
         // Bidi
@@ -2317,11 +2335,13 @@ fn generate_client_method(
 
     Ok(quote! {
         #[doc = #doc]
+        #extra_doc
         pub async fn #method_snake(&self, #short_args) -> #ret_ty {
             self.#method_with_opts(#short_delegate_args).await
         }
 
         #[doc = #doc_opts]
+        #extra_doc
         pub async fn #method_with_opts(&self, #opts_args) -> #ret_ty {
             #call_body
         }

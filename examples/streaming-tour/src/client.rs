@@ -51,14 +51,14 @@ async fn main() -> Result<(), BoxError> {
     println!("]");
 
     // --- Client streaming ---
+    // `sum` takes an async stream of requests; adapt the in-hand array
+    // with `stream_iter` (a live producer would pass a channel-backed
+    // stream instead).
     let inputs = [3, 5, 7, 9];
-    let messages: Vec<SumRequest> = inputs
-        .iter()
-        .map(|&v| SumRequest {
-            value: Some(v),
-            ..Default::default()
-        })
-        .collect();
+    let messages = connectrpc::stream_iter(inputs.map(|v| SumRequest {
+        value: Some(v),
+        ..Default::default()
+    }));
     let resp = client.sum(messages).await?;
     println!(
         "Sum({inputs:?}) -> {}",

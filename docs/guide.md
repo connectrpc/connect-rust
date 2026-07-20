@@ -742,8 +742,30 @@ while let Some(msg) = stream.message().await? {
     println!("{}", msg.view().value.unwrap_or_default());
 }
 
-// Client streaming - takes a Vec
-let resp = client.sum(vec![req1, req2, req3]).await?;
+// Client streaming - takes an async `Stream` of requests, so messages
+// can be produced as they become available without buffering the whole
+// upload. A ready collection is adapted with `stream_iter` (a re-export
+// of `futures::stream::iter`, so no direct `futures` dependency needed):
+let resp = client
+    .sum(connectrpc::stream_iter(vec![req1, req2, req3]))
+    .await?;
+
+// ...or feed the call from a live producer through a channel-backed
+// stream (add the `tokio-stream` crate for the wrapper). The generated
+// bound, `ClientRequestStream<T>`, is `Stream<Item = T> + Send + 'static`:
+// the stream backs the request body, so yield owned messages rather than
+// borrows of local data.
+let (tx, rx) = tokio::sync::mpsc::channel(16);
+tokio::spawn(async move {
+    while let Some(chunk) = source.recv().await {
+        if tx.send(request_for(chunk)).await.is_err() {
+            break; // call ended — stop producing
+        }
+    }
+});
+let resp = client
+    .sum(tokio_stream::wrappers::ReceiverStream::new(rx))
+    .await?;
 
 // Bidi - received items are `StreamMessage`s too
 let mut bidi = client.running_sum().await?;
@@ -759,6 +781,12 @@ server finished cleanly, and a terminal RPC error — including a
 gRPC/gRPC-Web stream that ends without a usable `grpc-status` — comes
 back as `Err`, sticky across calls. The `error()` and `trailers()`
 accessors remain available afterwards for post-hoc inspection.
+
+Dropping a client-streaming call cancels it: the request body is dropped
+with the future, so messages the stream had not yet yielded never reach
+the server. Wrapping such a call in a `timeout` therefore abandons the
+upload rather than truncating it cleanly — drive the call to completion
+whenever the request must be delivered.
 
 Both `streaming-tour/src/client.rs` and the eliza example show these
 patterns end-to-end.

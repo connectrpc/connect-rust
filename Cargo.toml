@@ -27,6 +27,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 futures = "0.3"
 pin-project = "1"
+sync_wrapper = "1"
 async-trait = "0.1"
 
 # Protobuf. The 0.9 floor matches the regen baseline for the checked-in
