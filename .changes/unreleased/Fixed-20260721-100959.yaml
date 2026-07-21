@@ -1,0 +1,20 @@
+kind: Fixed
+body: |-
+  **A Connect or gRPC call whose deadline expires now reports
+  `deadline_exceeded` when the transport fails first.** A server enforcing the
+  same deadline aborts the RPC independently, so its RST_STREAM can arrive
+  before the client's own timer fires. The in-flight body read then failed
+  first and the call reported `internal`, attributing to the client what was
+  really a timeout the caller asked for. Which code you got came down to timer
+  coarseness and scheduler delay, so the same call could report either one run
+  to run.
+
+  Transport errors surfacing after the deadline has elapsed are now classified
+  as `deadline_exceeded`, the rule the missing-`grpc-status` path already
+  applied and which both now share. The transport cause is kept in the
+  message, so a
+  genuine transport fault that merely happened after the deadline is still
+  diagnosable, and a failure before the deadline is still `internal`. [#210]
+
+  [#210]: https://github.com/connectrpc/connect-rust/issues/210
+time: 2026-07-21T10:09:59.192206315-07:00
