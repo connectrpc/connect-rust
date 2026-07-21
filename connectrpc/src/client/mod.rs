@@ -1381,6 +1381,48 @@ where
     }
 }
 
+/// Has the call's deadline passed?
+///
+/// The single definition of "past the deadline" for classifying errors that
+/// surface around a timeout. `with_deadline` decides when to *stop* waiting;
+/// this decides how to *describe* a failure that arrived on its own, which
+/// several paths need and which must agree between them.
+/// Note for tests: this reads the real clock, while `with_deadline` runs on
+/// tokio's. Under `#[tokio::test(start_paused = true)]` virtual time advances
+/// and this does not, so a paused-time test that delivers a body *error* and
+/// expects the timeout classification will not get it. Use real time for
+/// those; paused time is fine when the timer is what you are exercising.
+fn deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|d| std::time::Instant::now() >= d)
+}
+
+/// Classify a transport error that surfaced while reading a response body.
+///
+/// A server enforcing the same deadline aborts the RPC independently, so its
+/// RST_STREAM can beat the local timer: the body read fails first and the
+/// call reports a transport fault for what is really a timeout. Which of the
+/// two wins is down to timer coarseness and scheduler delay, so the same call
+/// can report either code run to run.
+///
+/// The missing-`grpc-status` path a few hundred lines below already resolves
+/// this by deadline rather than by arrival order; this applies the same rule
+/// to the body-read sites, and both now share [`deadline_elapsed`] so they
+/// cannot disagree.
+///
+/// `internal` is the wrong answer here because it attributes the failure to
+/// this client when the cause was a timeout the caller asked for.
+fn classify_body_read_error(
+    context: &str,
+    error: &dyn std::fmt::Display,
+    deadline: Option<std::time::Instant>,
+) -> ConnectError {
+    if deadline_elapsed(deadline) {
+        ConnectError::deadline_exceeded(format!("{context} after the deadline elapsed: {error}"))
+    } else {
+        ConnectError::internal(format!("{context}: {error}"))
+    }
+}
+
 /// Response from a unary RPC call.
 ///
 /// Contains the decoded response message along with response headers and
@@ -1628,7 +1670,9 @@ where
             .map_err(|e| map_transport_send_error(e, "request failed"))?;
 
         match config.protocol {
-            Protocol::Connect => parse_connect_unary_response(response, config, &options).await,
+            Protocol::Connect => {
+                parse_connect_unary_response(response, config, &options, deadline).await
+            }
             Protocol::Grpc | Protocol::GrpcWeb => {
                 parse_grpc_unary_response(response, config, &options, deadline).await
             }
@@ -1774,7 +1818,7 @@ where
             .map_err(|e| map_transport_send_error(e, "GET request failed"))?;
 
         // Response format is identical to POST unary Connect.
-        parse_connect_unary_response(response, config, &options).await
+        parse_connect_unary_response(response, config, &options, deadline).await
     })
     .await
 }
@@ -1845,6 +1889,7 @@ async fn parse_connect_unary_response<B, RespView>(
     response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
+    deadline: Option<std::time::Instant>,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
@@ -1876,7 +1921,7 @@ where
             .max_message_size
             .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-        let body = collect_body_bounded(response.into_body(), max_err_body_size)
+        let body = collect_body_bounded(response.into_body(), max_err_body_size, deadline)
             .await
             .map_err(|mut e| {
                 e.set_response_headers(headers.clone());
@@ -1977,7 +2022,7 @@ where
         .max_message_size
         .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-    let body = collect_body_bounded(response.into_body(), max_message_size).await?;
+    let body = collect_body_bounded(response.into_body(), max_message_size, deadline).await?;
 
     let body = if let Some(encoding) = response_encoding {
         config
@@ -2096,9 +2141,11 @@ where
                 }
             }
             Some(Err(e)) => {
-                return Err(ConnectError::internal(format!(
-                    "failed to read response body: {e}"
-                )));
+                return Err(classify_body_read_error(
+                    "failed to read response body",
+                    &e,
+                    deadline,
+                ));
             }
             None => break,
         }
@@ -2191,8 +2238,9 @@ where
     // spec: RST_STREAM CANCEL is upgraded to DeadlineExceeded when the deadline
     // has elapsed (matching grpc-go and connect-go behavior).
     if effective_trailers.get("grpc-status").is_none() {
-        let is_deadline_exceeded = deadline.is_some_and(|d| std::time::Instant::now() >= d);
-        let mut err = if is_deadline_exceeded {
+        let mut err = if deadline_elapsed(deadline) {
+            // Terser than the body-read path's message on purpose: there is
+            // no transport error here to carry, only a missing trailer.
             ConnectError::deadline_exceeded("request timeout")
         } else {
             ConnectError::internal("gRPC response missing grpc-status trailer")
@@ -2624,10 +2672,7 @@ where
                     || (trailers_only && has_status(&self.headers))
                 {
                     Ok(())
-                } else if self
-                    .deadline
-                    .is_some_and(|d| std::time::Instant::now() >= d)
-                {
+                } else if deadline_elapsed(self.deadline) {
                     Err(ConnectError::deadline_exceeded("request timeout"))
                 } else if trailers.is_some() {
                     Err(ConnectError::new(
@@ -2725,9 +2770,11 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    return Err(ConnectError::internal(format!(
-                        "error reading response body: {e}"
-                    )));
+                    return Err(classify_body_read_error(
+                        "failed to read response body",
+                        &e,
+                        deadline,
+                    ));
                 }
             }
         }
@@ -2934,7 +2981,8 @@ where
             let stream_max_err_size =
                 max_message_size.unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-            let body = collect_body_bounded(response.into_body(), stream_max_err_size).await?;
+            let body =
+                collect_body_bounded(response.into_body(), stream_max_err_size, deadline).await?;
 
             // Decompress if the server set Content-Encoding. On failure,
             // fall through to the generic HTTP-status error below.
@@ -3858,7 +3906,7 @@ where
                 parse_grpc_unary_response(response, config, &options, deadline).await
             }
             Protocol::Connect => {
-                parse_connect_client_stream_response(response, config, &options).await
+                parse_connect_client_stream_response(response, config, &options, deadline).await
             }
         }
     })
@@ -3889,6 +3937,7 @@ async fn parse_connect_client_stream_response<B, RespView>(
     response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
+    deadline: Option<std::time::Instant>,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
@@ -3910,7 +3959,7 @@ where
             .max_message_size
             .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-        let body = collect_body_bounded(response.into_body(), max_err_size).await?;
+        let body = collect_body_bounded(response.into_body(), max_err_size, deadline).await?;
 
         // Decompress if the server set Content-Encoding. On failure,
         // fall through to the generic HTTP-status error below.
@@ -3971,7 +4020,7 @@ where
     let body_limit = max_msg_size
         .saturating_add(2 * crate::envelope::HEADER_SIZE)
         .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
-    let body = collect_body_bounded(response.into_body(), body_limit).await?;
+    let body = collect_body_bounded(response.into_body(), body_limit, deadline).await?;
 
     let (data, trailers) = parse_connect_client_stream_envelopes(
         body,
@@ -4362,8 +4411,19 @@ fn parse_grpc_error_from_trailers(trailers: &http::HeaderMap) -> Option<ConnectE
 
 /// Collect an HTTP response body into `Bytes`, enforcing a size limit.
 ///
-/// Returns `ResourceExhausted` if the accumulated data exceeds `max_size`.
-async fn collect_body_bounded<B>(body: B, max_size: usize) -> Result<Bytes, ConnectError>
+/// `deadline` is the call's absolute deadline, used only to classify a
+/// transport failure — see [`classify_body_read_error`]. Pass `None` for a
+/// call without one; this function does not enforce the deadline, which
+/// [`with_deadline`] does around the whole read.
+///
+/// Returns `ResourceExhausted` if the accumulated data exceeds `max_size`,
+/// `DeadlineExceeded` if the body fails after the deadline has passed, and
+/// `Internal` if it fails before.
+async fn collect_body_bounded<B>(
+    body: B,
+    max_size: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<Bytes, ConnectError>
 where
     B: Body<Data = Bytes>,
     B::Error: std::fmt::Display,
@@ -4387,9 +4447,11 @@ where
                 }
             }
             Some(Err(e)) => {
-                return Err(ConnectError::internal(format!(
-                    "failed to read response body: {e}",
-                )));
+                return Err(classify_body_read_error(
+                    "failed to read response body",
+                    &e,
+                    deadline,
+                ));
             }
             None => break,
         }
@@ -7166,28 +7228,28 @@ mod tests {
     #[tokio::test]
     async fn collect_body_bounded_within_limit() {
         let body = Full::new(Bytes::from_static(b"hello"));
-        let got = collect_body_bounded(body, 10).await.unwrap();
+        let got = collect_body_bounded(body, 10, None).await.unwrap();
         assert_eq!(&got[..], b"hello");
     }
 
     #[tokio::test]
     async fn collect_body_bounded_at_exact_limit() {
         let body = Full::new(Bytes::from_static(b"hello"));
-        let got = collect_body_bounded(body, 5).await.unwrap();
+        let got = collect_body_bounded(body, 5, None).await.unwrap();
         assert_eq!(&got[..], b"hello");
     }
 
     #[tokio::test]
     async fn collect_body_bounded_exceeds_limit() {
         let body = Full::new(Bytes::from_static(b"hello world"));
-        let err = collect_body_bounded(body, 5).await.unwrap_err();
+        let err = collect_body_bounded(body, 5, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
     }
 
     #[tokio::test]
     async fn collect_body_bounded_empty() {
         let body = Full::new(Bytes::new());
-        let got = collect_body_bounded(body, 0).await.unwrap();
+        let got = collect_body_bounded(body, 0, None).await.unwrap();
         assert!(got.is_empty());
     }
 
@@ -7200,7 +7262,7 @@ mod tests {
         tx.send(Ok(Bytes::from_static(b"ccc"))).await.unwrap();
         drop(tx);
         // limit 7: first two frames (6 bytes) fit, third (3 more → 9) exceeds
-        let err = collect_body_bounded(body, 7).await.unwrap_err();
+        let err = collect_body_bounded(body, 7, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
     }
 
@@ -7211,7 +7273,7 @@ mod tests {
         tx.send(Ok(Bytes::from_static(b"foo"))).await.unwrap();
         tx.send(Ok(Bytes::from_static(b"bar"))).await.unwrap();
         drop(tx);
-        let got = collect_body_bounded(body, 10).await.unwrap();
+        let got = collect_body_bounded(body, 10, None).await.unwrap();
         assert_eq!(&got[..], b"foobar");
     }
 
@@ -7221,8 +7283,73 @@ mod tests {
         let body = ChannelBody { rx };
         tx.send(Err(ConnectError::internal("io"))).await.unwrap();
         drop(tx);
-        let err = collect_body_bounded(body, 1024).await.unwrap_err();
+        let err = collect_body_bounded(body, 1024, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    /// The race this fixes: a server enforcing the same deadline aborts the
+    /// stream, and its RST_STREAM can arrive before the local timer fires.
+    /// The body read then fails first, and the caller sees a transport fault
+    /// for what is really a timeout.
+    #[tokio::test]
+    async fn a_body_error_after_the_deadline_is_deadline_exceeded() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        tx.send(Err(ConnectError::internal("io"))).await.unwrap();
+        drop(tx);
+
+        let elapsed = std::time::Instant::now() - Duration::from_millis(1);
+        let err = collect_body_bounded(body, 1024, Some(elapsed))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+        // The transport cause survives the reclassification: a genuine
+        // transport fault that merely happened after the deadline is still
+        // diagnosable.
+        assert!(
+            err.message.as_deref().unwrap_or_default().contains("io"),
+            "got {:?}",
+            err.message
+        );
+    }
+
+    /// The other half, and the reason this is a deadline check rather than a
+    /// blanket remap: with the deadline still in the future the same failure
+    /// is a real transport error and must stay `internal`.
+    #[tokio::test]
+    async fn a_body_error_before_the_deadline_stays_internal() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        tx.send(Err(ConnectError::internal("io"))).await.unwrap();
+        drop(tx);
+
+        let future = std::time::Instant::now() + Duration::from_secs(60);
+        let err = collect_body_bounded(body, 1024, Some(future))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    /// A call with no deadline can never be past one, and must not pick up
+    /// the timeout wording either — `collect_body_bounded_propagates_body_error`
+    /// already covers the code, so this covers the message.
+    #[tokio::test]
+    async fn a_body_error_without_a_deadline_is_not_described_as_a_timeout() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        tx.send(Err(ConnectError::internal("io"))).await.unwrap();
+        drop(tx);
+
+        let err = collect_body_bounded(body, 1024, None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            !err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deadline"),
+            "got {:?}",
+            err.message
+        );
     }
 
     #[test]
