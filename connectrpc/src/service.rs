@@ -465,9 +465,10 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// `max_message_size` can still expand by orders of magnitude. Raising one
 /// does not raise the other.
 ///
-/// These are **server** limits, applied to received requests. A client
-/// decoding responses currently uses buffa's defaults, with no equivalent
-/// override.
+/// These are **server** limits, applied to received requests. The client
+/// side has its own equivalents for received *responses*:
+/// [`ClientConfig::with_default_element_memory_limit`](crate::client::ClientConfig::with_default_element_memory_limit)
+/// and [`CallOptions::with_element_memory_limit`](crate::client::CallOptions::with_element_memory_limit).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Limits {
