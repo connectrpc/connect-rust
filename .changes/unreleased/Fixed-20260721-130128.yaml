@@ -1,0 +1,22 @@
+kind: Fixed
+body: |-
+  **Code generation handles large schemas.** buffa 0.9's element-memory budget
+  is charged per element on struct size rather than on encoded bytes, and
+  descriptor structs are wide, so the 32 MiB default rejected descriptor sets
+  that are entirely legitimate — ordinary schemas of a few hundred `.proto`
+  files, not pathological ones.
+
+  `protoc-gen-connect-rust` and `connectrpc-build` decode the compiler's own
+  output, which is not the untrusted input that budget defends against, so both
+  now decode under buffa 0.9.1's 1 GiB tooling budget. Both honour the same
+  overrides buffa's own plugins do — the `element_memory_limit=` plugin option
+  and the `BUFFA_ELEMENT_MEMORY_LIMIT` environment variable — so one setting
+  raises every plugin in a `buf generate` run rather than needing a
+  connect-specific twin. See "Very large schemas" in the guide.
+
+  Descriptor sets supplied at *runtime* stay bounded, because a reflection
+  service may be fed descriptors by a peer rather than by its own build. An
+  over-budget set there now reports the new `ReflectionError::ElementBudget`,
+  which says the bytes are well-formed and the schema is simply large, rather
+  than a decode failure that reads like corruption.
+time: 2026-07-21T13:01:28.404442539-07:00

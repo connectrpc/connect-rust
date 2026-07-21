@@ -33,8 +33,26 @@ use buffa_descriptor::{DescriptorPool, PoolError};
 #[non_exhaustive]
 pub enum ReflectionError {
     /// The bytes did not decode as a `FileDescriptorSet`.
+    ///
+    /// Exceeding the element-memory budget is reported separately as
+    /// [`ElementBudget`](Self::ElementBudget), because there the bytes are
+    /// fine; this variant is every other wire-level failure.
     #[error("failed to decode FileDescriptorSet: {0}")]
-    Decode(#[from] buffa::DecodeError),
+    Decode(buffa::DecodeError),
+    /// The descriptor set was well-formed but exceeded the decode's
+    /// element-memory budget.
+    ///
+    /// Split apart from [`Decode`](Self::Decode) because the remedy is
+    /// different: the bytes are fine, and a reflection service is normally
+    /// handed its own server's descriptors, which are trusted. The remedy is
+    /// a smaller set — strip `source_code_info`, or narrow it to the files
+    /// this server reflects.
+    #[error(
+        "FileDescriptorSet exceeds the decode element-memory budget; the bytes \
+         are well-formed, the schema is simply large. Strip source_code_info \
+         or reduce the set to the files this server reflects."
+    )]
+    ElementBudget,
     /// The decoded descriptors did not link into a valid pool (dangling
     /// type reference, duplicate symbol, malformed map entry, ...).
     #[error("invalid descriptor set: {0}")]
@@ -71,6 +89,21 @@ pub enum ReflectionError {
     /// the reflector from bytes.
     #[error("cannot add to a descriptor pool with outstanding references")]
     SharedPool,
+}
+
+/// Written out rather than derived with `#[from]`, so that the budget/corrupt
+/// split cannot be bypassed. A derived conversion sends every
+/// [`buffa::DecodeError`] to [`Decode`](ReflectionError::Decode), so the next
+/// decode path added here — reached with `?`, which compiles fine — would
+/// report an over-budget set as corruption again, silently undoing the reason
+/// [`ElementBudget`](ReflectionError::ElementBudget) exists.
+impl From<buffa::DecodeError> for ReflectionError {
+    fn from(e: buffa::DecodeError) -> Self {
+        match e {
+            buffa::DecodeError::ElementMemoryLimitExceeded => Self::ElementBudget,
+            other => Self::Decode(other),
+        }
+    }
 }
 
 /// The answer to a single reflection query, protocol-version agnostic.
@@ -147,7 +180,9 @@ impl Reflector {
     ///
     /// Returns [`ReflectionError`] when the bytes do not decode as a
     /// `FileDescriptorSet`, the descriptors do not link, or a contained
-    /// file has no name.
+    /// file has no name. A set too large for the decode's element-memory
+    /// budget reports [`ElementBudget`](ReflectionError::ElementBudget)
+    /// rather than a decode failure.
     pub fn from_descriptor_set_bytes(bytes: &[u8]) -> Result<Self, ReflectionError> {
         let mut reflector = Self {
             pool: Arc::new(DescriptorPool::default()),
@@ -211,9 +246,11 @@ impl Reflector {
     ///
     /// # Errors
     ///
-    /// Returns [`ReflectionError`] when the bytes do not decode or link,
-    /// a contained file has no name, or any other reference to the
-    /// backing pool exists ([`ReflectionError::SharedPool`]) — which is
+    /// Returns [`ReflectionError`] when the bytes do not decode or link
+    /// (including [`ElementBudget`](ReflectionError::ElementBudget) for a set
+    /// over the decode's element-memory budget), a contained file has no
+    /// name, or any other reference to the backing pool exists
+    /// ([`ReflectionError::SharedPool`]) — which is
     /// always the case for reflectors built with
     /// [`from_descriptor_pool`](Self::from_descriptor_pool) from a
     /// long-lived pool. On error the reflector should be discarded: the
@@ -446,8 +483,10 @@ fn self_descriptors() -> &'static SelfDescriptors {
         // crate's tests, so a failure here is a build defect, not input.
         let bytes = crate::FILE_DESCRIPTOR_SET;
         let raw_files = split_descriptor_set(bytes).expect("embedded descriptor set is framed");
-        let set =
-            FileDescriptorSet::decode_from_slice(bytes).expect("embedded descriptor set decodes");
+        // This crate's own descriptors, nothing user-controlled, and far
+        // below any budget — so the default limits stay.
+        let set = FileDescriptorSet::decode_from_slice(bytes)
+            .expect("this crate's embedded descriptor set decodes");
         let response_bytes = set
             .file
             .iter()
@@ -817,6 +856,48 @@ mod tests {
             .add_descriptor_set_bytes(&FileDescriptorSet::default().encode_to_vec())
             .unwrap_err();
         assert!(matches!(err, ReflectionError::SharedPool));
+    }
+
+    /// The runtime path deliberately stays bounded, so an oversized set must
+    /// reach the caller as `ElementBudget` — the variant that says the bytes
+    /// are fine — and not as a decode failure that reads like corruption.
+    #[test]
+    fn an_oversized_set_reports_the_element_budget_not_a_decode_failure() {
+        // Charged per element on struct size, so many small files exceed the
+        // budget while staying small on the wire. The count is derived rather
+        // than written as a literal: the charge tracks
+        // `size_of::<FileDescriptorProto>()`, so a literal silently stops
+        // exceeding the budget whenever that struct shrinks, and the test
+        // would then assert a rejection that no longer happens. Same
+        // derivation as `connectrpc::test_budget` and connectrpc-build's
+        // `over_default_budget_set`, repeated because a `#[cfg(test)]` helper
+        // cannot cross a crate boundary; that module carries the full
+        // rationale.
+        let per_element = std::mem::size_of::<FileDescriptorProto>();
+        let n = (buffa::DEFAULT_ELEMENT_MEMORY_LIMIT / per_element) * 5 / 4;
+        let set = FileDescriptorSet {
+            file: (0..n)
+                .map(|i| FileDescriptorProto {
+                    name: Some(format!("f{i}.proto")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let bytes = buffa::Message::encode_to_vec(&set);
+
+        let err = Reflector::from_descriptor_set_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(err, ReflectionError::ElementBudget),
+            "expected ElementBudget, got {err:?}"
+        );
+        // The message has to say the schema is large, not that the bytes are
+        // bad — that distinction is the whole reason the variant exists.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("well-formed"),
+            "message should absolve the bytes, got {rendered:?}"
+        );
     }
 
     #[test]

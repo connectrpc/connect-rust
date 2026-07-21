@@ -411,8 +411,15 @@ impl Config {
                 (bytes, proto_relative_names(&self.files))
             }
         };
-        let mut fds = FileDescriptorSet::decode_from_slice(&descriptor_bytes)
-            .map_err(|e| anyhow!("failed to decode FileDescriptorSet: {e}"))?;
+        // 2. Decode the descriptor set.
+        //
+        // The compiler's own output — protoc or buf that this build script just
+        // ran, or a descriptor set the build points at — so buffa's tooling
+        // bound applies rather than its untrusted-input default.
+        let decode_options = buffa_codegen::tooling_decode_options().map_err(|e| anyhow!("{e}"))?;
+        let mut fds = decode_options
+            .decode_from_slice::<FileDescriptorSet>(&descriptor_bytes)
+            .map_err(|e| descriptor_decode_error(&e, decode_options.element_memory_limit()))?;
 
         // 3. Generate.
         let generated = codegen::generate_files(&fds.file, &files_to_generate, &self.options)?;
@@ -484,6 +491,16 @@ impl Config {
         if !self.emit_rerun_directives {
             return Ok(());
         }
+        // The decode above reads this, so it is a build input like any source
+        // file. Emitting any `rerun-if` directive narrows cargo to exactly the
+        // triggers listed, so without this a build that succeeded with the
+        // variable set is not re-run when it changes or is unset — the stale
+        // output is reused and the setting looks inert. Only the failing
+        // direction self-heals, because a failed build script always re-runs.
+        println!(
+            "cargo:rerun-if-env-changed={}",
+            buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV
+        );
         match &self.descriptor_source {
             DescriptorSource::Precompiled(p) => {
                 println!("cargo:rerun-if-changed={}", p.display());
@@ -507,6 +524,27 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Describe a descriptor-set decode failure for a build script.
+///
+/// buffa composes the base text, including the budget actually in force. For
+/// an over-budget set it also names two remedies, and only one of them is
+/// reachable from here — a build script has no plugin parameter string — so
+/// this says which, and points at the connectrpc guide rather than buffa's.
+fn descriptor_decode_error(e: &buffa::DecodeError, limit: usize) -> anyhow::Error {
+    let base = buffa_codegen::decode_failure("FileDescriptorSet", e, limit);
+    if matches!(e, buffa::DecodeError::ElementMemoryLimitExceeded) {
+        anyhow!(
+            "{base}\nOf those two, only the {env} environment variable applies to a \
+             build script, which has no plugin parameter string. See \"Very large \
+             schemas\" in the connectrpc guide: \
+             https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md",
+            env = buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV,
+        )
+    } else {
+        anyhow!(base)
     }
 }
 
@@ -1391,5 +1429,95 @@ service NoteService {
 
         write_if_changed(&path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// Build a descriptor set that overruns buffa's default element-memory
+    /// budget. The budget charges `size_of::<FileDescriptorProto>()` per
+    /// element rather than encoded bytes, so many tiny files trip it while
+    /// staying small on the wire — which is exactly why descriptor sets hit it
+    /// at a few megabytes. Derived from the live size, because a literal count
+    /// stops overrunning the budget the moment that struct shrinks — see
+    /// `connectrpc::test_budget` for the full rationale and the buffa 0.9.1
+    /// change that proved it.
+    fn over_default_budget_set() -> Vec<u8> {
+        use buffa_codegen::generated::descriptor::FileDescriptorProto;
+
+        let per_element = std::mem::size_of::<FileDescriptorProto>();
+        let n = (buffa::DEFAULT_ELEMENT_MEMORY_LIMIT / per_element) * 5 / 4;
+        let set = FileDescriptorSet {
+            file: (0..n)
+                .map(|i| FileDescriptorProto {
+                    name: Some(format!("f{i}.proto")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        buffa::Message::encode_to_vec(&set)
+    }
+
+    /// The regression this crate's decode path exists to prevent: a build's
+    /// own descriptors must decode even when they exceed the bound sized for
+    /// untrusted wire input.
+    ///
+    /// The first assertion is the control. Without it the second would pass
+    /// whether or not the tooling options do anything at all.
+    #[test]
+    fn the_tooling_options_decode_a_set_the_untrusted_default_rejects() {
+        let bytes = over_default_budget_set();
+
+        assert!(
+            matches!(
+                FileDescriptorSet::decode_from_slice(&bytes),
+                Err(buffa::DecodeError::ElementMemoryLimitExceeded)
+            ),
+            "fixture no longer exceeds the default budget ({} encoded bytes); \
+             it must, or the assertion below proves nothing",
+            bytes.len()
+        );
+
+        let opts = buffa_codegen::tooling_decode_options().expect("no override set");
+        opts.decode_from_slice::<FileDescriptorSet>(&bytes)
+            .expect("a build's own descriptors must decode under the tooling budget");
+    }
+
+    /// An over-budget failure has to correct buffa's hint, which offers a
+    /// plugin option that cannot be set from a build script.
+    #[test]
+    fn an_over_budget_decode_names_only_the_remedy_a_build_script_has() {
+        let rendered = descriptor_decode_error(
+            &buffa::DecodeError::ElementMemoryLimitExceeded,
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+        )
+        .to_string();
+
+        assert!(
+            rendered.contains(buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV),
+            "must name the variable that works here: {rendered}"
+        );
+        assert!(
+            rendered.contains("build script"),
+            "must say why the plugin option does not apply: {rendered}"
+        );
+        assert!(
+            rendered.contains("connectrpc/connect-rust"),
+            "must point at our guide, not buffa's: {rendered}"
+        );
+    }
+
+    /// A malformed set must not be dressed up as a budget problem — that
+    /// would send someone raising a limit that cannot help.
+    #[test]
+    fn a_malformed_set_is_not_reported_as_a_budget_problem() {
+        let rendered = descriptor_decode_error(
+            &buffa::DecodeError::UnexpectedEof,
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+        )
+        .to_string();
+
+        assert!(
+            !rendered.contains(buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV),
+            "a truncated set must not point at the budget: {rendered}"
+        );
     }
 }

@@ -586,6 +586,14 @@ pub fn generate_services(
 ///   foreign crate via `extern_path` are still skipped.
 ///   `encodable_impls=outputs` is the explicit default. See
 ///   [`Options::encodable_impls`].
+/// - `element_memory_limit=<bytes|unlimited>` — raises the element-memory
+///   budget used to decode the request, for schemas too large for the
+///   default (see "Very large schemas" in the guide). Accepted and ignored
+///   here: it governs the decode that produced the `CodeGeneratorRequest`,
+///   so `buffa_codegen::decode_request` has already read and applied it by
+///   scanning the wire. A caller who decodes the request itself and then
+///   calls this function must apply the option on that decode; passing it
+///   here alone does nothing.
 ///
 /// # Client-side cfg gate
 ///
@@ -661,6 +669,14 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                          `all_messages` or `outputs`"
                     ),
                 }
+            } else if opt
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == buffa_codegen::ELEMENT_MEMORY_LIMIT_OPT)
+            {
+                // Consumed before this point, by the scan `decode_request` runs
+                // to size the decode that produced `request`. Reaching the
+                // unknown-option arm would reject it from the one caller who
+                // needs it: whoever's schema was too large to decode.
             } else {
                 match opt {
                     "file_per_package" => options.buffa.file_per_package = true,
@@ -673,9 +689,11 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                             "unknown plugin option: {opt:?}. Supported: \
                              buffa_module=<rust_path>, extern_path=<proto>=<rust>, \
                              encodable_impls=<all_messages|outputs>, \
+                             {mem}=<bytes|unlimited>, \
                              file_per_package, strict_utf8_mapping, no_json, \
                              no_register_fn, gate_client_feature, \
-                             gate_client_feature=<name>"
+                             gate_client_feature=<name>",
+                            mem = buffa_codegen::ELEMENT_MEMORY_LIMIT_OPT
                         ));
                     }
                 }
@@ -4638,6 +4656,28 @@ mod tests {
             msg.contains("unknown plugin option"),
             "error should say the option is unknown: {msg}"
         );
+    }
+
+    /// `element_memory_limit` is read off the wire before the request is
+    /// decoded, so by the time options are parsed it is a leftover. Rejecting
+    /// it would fail the build of the only person who ever sets it — someone
+    /// whose schema was too large to decode without it.
+    #[test]
+    fn plugin_accepts_the_element_memory_limit_option_it_consumed_pre_decode() {
+        for value in ["unlimited", "max", "2147483648"] {
+            let request = CodeGeneratorRequest {
+                parameter: Some(format!(
+                    "buffa_module=crate::proto,{}={value}",
+                    buffa_codegen::ELEMENT_MEMORY_LIMIT_OPT
+                )),
+                file_to_generate: vec![],
+                proto_file: vec![],
+                ..Default::default()
+            };
+            generate(&request).unwrap_or_else(|e| {
+                panic!("element_memory_limit={value} must not reach the unknown-option arm: {e}")
+            });
+        }
     }
 
     #[test]

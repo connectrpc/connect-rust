@@ -54,8 +54,16 @@ fn main() -> Result<()> {
         .read_to_end(&mut input)
         .context("failed to read from stdin")?;
 
-    let request = CodeGeneratorRequest::decode_from_slice(&input)
-        .context("failed to decode CodeGeneratorRequest")?;
+    // buffa's plugins decode the identical request in the same `buf generate`
+    // run, so the bound, the overrides that raise it and the message naming
+    // them all come from there rather than from a connect-specific twin.
+    //
+    // The two overrides differ in reach, which the guide spells out: the
+    // environment variable covers every plugin in the run, while `opt:` is
+    // per-plugin, so setting the option on one plugin does nothing for this
+    // one.
+    let request: CodeGeneratorRequest =
+        buffa_codegen::decode_request(&input).map_err(|e| anyhow::anyhow!(e))?;
 
     // Process the request
     let response = codegen::generate(&request)?;

@@ -333,6 +333,70 @@ pub mod proto;
 The underlying difference (`OUT_DIR` vs a known source path) is honest
 and visible, but the call-site shape is parallel.
 
+### Very large schemas
+
+Generation reads a descriptor set, and buffa bounds how much memory a
+decode may commit to repeated elements. That bound is an amplification
+defence sized for untrusted wire input, and it is charged on each
+element's struct size rather than on its encoded bytes — so descriptor
+sets, whose structs are wide, reach it while still looking small on the
+wire. The tooling paths — this plugin and `connectrpc-build` — therefore
+decode under buffa's much higher tooling bound of 1 GiB. It stays finite,
+so a truncated or corrupt set still fails with an error instead of
+exhausting memory.
+
+If you do exceed it, generation stops with a message naming the budget in
+force and both ways to raise it. Both accept a byte count or `unlimited`,
+and they differ in reach.
+
+**The environment variable covers the whole run**, which is normally what
+you want:
+
+```sh
+BUFFA_ELEMENT_MEMORY_LIMIT=4294967296 buf generate
+BUFFA_ELEMENT_MEMORY_LIMIT=4294967296 cargo build
+```
+
+`buf generate` hands the identical request to every plugin in the run, so
+a schema big enough to need raising needs it for `protoc-gen-buffa` and
+`protoc-gen-connect-rust` alike. The variable is buffa's rather than a
+connect-specific twin precisely so that one setting serves both. It is
+also the only override that reaches `connectrpc-build`, since a build
+script has no plugin parameter string.
+
+**The plugin option is per-plugin.** `buf` gives each plugin its own `opt`
+list, so this raises the bound for `protoc-gen-connect-rust` and nothing
+else — every other plugin in the run needs its own entry:
+
+```yaml
+plugins:
+  - local: protoc-gen-buffa
+    out: src/generated
+    opt:
+      - element_memory_limit=4294967296
+  - local: protoc-gen-connect-rust
+    out: src/generated
+    opt:
+      - element_memory_limit=4294967296
+```
+
+Prefer a byte count to `unlimited`. `unlimited` removes the ceiling
+entirely, so a truncated or corrupt descriptor set stops failing with an
+error and starts exhausting memory instead — on CI that reads as a flaky
+runner rather than a bad input. A generous number keeps the diagnostic.
+
+This bound governs *generation* only, and nothing here reaches a running
+server. A descriptor set handed to a `Reflector` decodes on buffa's
+untrusted-input default with no override: reflection descriptors can come
+from a peer rather than your own build, so the defence stays on. A set
+over that budget reports `ReflectionError::ElementBudget`, and the remedy
+is a smaller set — strip `source_code_info`, or narrow it to the files
+that server reflects.
+
+Request decoding is a different budget again, configured per service
+through `Limits::element_memory_limit`. None of the three read each
+other, so raising the build-time bound has no effect on either.
+
 ## Implementing servers
 
 A service is a Rust trait generated from your `.proto` file. The
