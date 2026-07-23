@@ -40,7 +40,7 @@ use http::Request;
 use http::Response;
 use http::Uri;
 
-use super::{BoxFuture, ClientBody, ClientTransport};
+use super::{BoxFuture, ClientBody, ClientTransport, unavailable_from_transport_error};
 use crate::error::ConnectError;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -105,10 +105,10 @@ fn unix_connector(
         let path = path.clone();
         async move {
             let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
-                ConnectError::unavailable(format!(
-                    "unix socket connect to {} failed: {e}",
-                    path.display()
-                ))
+                unavailable_from_transport_error(
+                    format_args!("unix socket connect to {} failed", path.display()),
+                    e,
+                )
             })?;
             Ok(hyper_util::rt::TokioIo::new(stream))
         }
@@ -910,7 +910,7 @@ impl Http2ConnectionBuilder {
 async fn drive_connect(conn: &mut Http2Connection, ctx: &str) -> Result<(), ConnectError> {
     std::future::poll_fn(|cx| conn.inner.poll_ready(cx))
         .await
-        .map_err(|e| ConnectError::unavailable(format!("{ctx}: {e}")))
+        .map_err(|e| unavailable_from_transport_error(ctx, e))
 }
 
 impl tower::Service<Request<ClientBody>> for Http2Connection {
@@ -1003,7 +1003,7 @@ impl ClientTransport for SharedHttp2Connection {
         Box::pin(async move {
             svc.oneshot(request)
                 .await
-                .map_err(|e| ConnectError::unavailable(format!("h2 send failed: {e}")))
+                .map_err(|e| unavailable_from_transport_error("h2 send failed", e))
         })
     }
 }
@@ -1150,9 +1150,7 @@ impl tower::Service<Uri> for MakeSendRequest {
                     let tcp = io.into_inner();
                     let connector = tokio_rustls::TlsConnector::from(tls);
                     let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-                        BoxError::from(ConnectError::unavailable(format!(
-                            "TLS handshake failed: {e}"
-                        )))
+                        BoxError::from(unavailable_from_transport_error("TLS handshake failed", e))
                     })?;
 
                     // Verify ALPN negotiated h2. A server that doesn't speak h2
@@ -1208,9 +1206,10 @@ where
     match timeout {
         Some(dur) => match tokio::time::timeout(dur, fut).await {
             Ok(res) => res.map_err(Into::into),
-            Err(_) => Err(ConnectError::unavailable(format!(
-                "connection establishment did not complete within {dur:?}"
-            ))
+            Err(elapsed) => Err(unavailable_from_transport_error(
+                format_args!("connection establishment did not complete within {dur:?}"),
+                elapsed,
+            )
             .into()),
         },
         None => fut.await.map_err(Into::into),
@@ -1370,8 +1369,13 @@ mod tests {
     #[tokio::test]
     async fn connect_plaintext_to_nonexistent_fails() {
         // Port 1 should not have a listener.
-        let err = Http2Connection::connect_plaintext("http://127.0.0.1:1".parse().unwrap()).await;
-        assert!(err.is_err(), "expected connect to port 1 to fail");
+        let err = Http2Connection::connect_plaintext("http://127.0.0.1:1".parse().unwrap())
+            .await
+            .expect_err("expected connect to port 1 to fail");
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "eager-connect failure must retain its cause as source(): {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1468,6 +1472,74 @@ mod tests {
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn connect_tls_handshake_failure_preserves_source() {
+        // A listener that accepts the TCP connection and immediately closes
+        // it, before any TLS bytes are exchanged — the client's handshake
+        // fails fast on the resulting EOF, without needing a timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let uri: Uri = format!("https://{addr}").parse().unwrap();
+        let err = Http2Connection::connect_tls(uri, tls_config)
+            .await
+            .expect_err("handshake against a closed connection must fail");
+
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("TLS handshake failed"),
+            "expected a TLS-handshake-failure message, got: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "TLS handshake failure must retain its cause as source(): {err:?}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_send_after_deferred_connect_failure_preserves_source() {
+        // A lazy connection defers its first connect failure to call() (see
+        // Reconnect::poll_ready) — that deferred-error path is exactly what
+        // SharedHttp2Connection::send goes through for a shared connection
+        // that never manages to connect.
+        let conn = Http2Connection::lazy_plaintext("http://127.0.0.1:1".parse().unwrap());
+        let shared = conn.shared(1);
+
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("http://127.0.0.1:1/")
+            .body(crate::client::full_body(bytes::Bytes::new()))
+            .unwrap();
+
+        let err = ClientTransport::send(&shared, request)
+            .await
+            .expect_err("send over a connection that can never connect must fail");
+        assert!(
+            err.message.as_deref().unwrap().contains("h2 send failed"),
+            "unexpected message: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "h2-send failure must retain its cause as source(): {err:?}"
+        );
+    }
+
     #[test]
     fn lazy_with_connector_starts_idle() {
         let conn = Http2Connection::lazy_with_connector(
@@ -1521,6 +1593,10 @@ mod tests {
         assert!(
             err.message.as_deref().unwrap().contains(path),
             "error should include socket path, got: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "unix-connect failure must retain its cause as source(): {err:?}"
         );
     }
 
@@ -1652,6 +1728,10 @@ mod tests {
             "expected a handshake-timeout message, got: {err:?}"
         );
         assert!(
+            std::error::Error::source(&err).is_some(),
+            "establishment-timeout failure must retain its cause as source(): {err:?}"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
             "establishment_timeout(150ms) should fire within ~2s, took {elapsed:?}"
         );
@@ -1704,6 +1784,10 @@ mod tests {
             "expected a handshake-timeout message, got: {err:?}"
         );
         assert!(
+            std::error::Error::source(&err).is_some(),
+            "establishment-timeout failure must retain its cause as source(): {err:?}"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
             "establishment_timeout(150ms) should fire within ~2s, took {elapsed:?}"
         );
@@ -1737,6 +1821,10 @@ mod tests {
                 .unwrap()
                 .contains("establishment did not complete"),
             "expected a handshake-timeout message, got: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "establishment-timeout failure must retain its cause as source(): {err:?}"
         );
         assert!(
             elapsed < Duration::from_secs(2),
