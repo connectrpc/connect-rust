@@ -1660,6 +1660,19 @@ For more structured errors, attach `ErrorDetail` entries (which carry
 typed protobuf messages) before returning. These flow through to
 clients in the standard Connect error-detail wire format.
 
+To keep an underlying error's cause available for logging without
+sending it to the client, attach it with `.with_source(err)`; it's
+surfaced through `Error::source()` but never serialized. Transport
+failures on the client (DNS, connection refused/reset, TLS handshake,
+timeout) populate this automatically, so `err.source()` reveals the
+original transport error even though `err.to_string()` only shows the
+Connect-level message. `source()` is local-only: it's set only by code
+that calls `.with_source(..)` in this process, so a `ConnectError`
+decoded from a server's response — including one an interceptor
+constructs from RPC status metadata — always has `source() == None`,
+even when its `message` is populated. Only locally-originated errors
+(client transport failures, `From<std::io::Error>`) carry a source.
+
 ## Compression
 
 The runtime ships with gzip, zstd, and identity by default. Servers

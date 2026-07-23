@@ -3,6 +3,8 @@
 //! This module provides error types that conform to the ConnectRPC protocol
 //! specification, including proper error code mappings to HTTP status codes.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use http::StatusCode;
 use serde::Deserialize;
@@ -265,6 +267,14 @@ pub struct ConnectError {
     /// extra trailers.
     #[serde(skip)]
     pub(crate) trailers: Option<Box<http::HeaderMap>>,
+    /// The underlying cause, if this error was converted from another error
+    /// (not serialized — never sent over the wire).
+    ///
+    /// Surfaced through [`Error::source`](std::error::Error::source).
+    /// `Arc` (rather than `Box`) so `ConnectError` stays `Clone` without
+    /// requiring the wrapped error to be.
+    #[serde(skip)]
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Shared empty `HeaderMap` for the `None` arm of the read accessors, so
@@ -290,6 +300,7 @@ impl ConnectError {
             http_status_override: None,
             response_headers: None,
             trailers: None,
+            source: None,
         }
     }
 
@@ -452,6 +463,27 @@ impl ConnectError {
         self
     }
 
+    /// Attach the underlying cause, surfaced through
+    /// [`Error::source`](std::error::Error::source).
+    ///
+    /// Unlike `message` (which is sent over the wire and shown to callers),
+    /// the source is local-only — useful for logging/observability without
+    /// leaking internal detail to the client. It is never populated by
+    /// decoding a `ConnectError` received over the wire (there is nothing to
+    /// attach), only by local code that calls this method — so `source()`
+    /// on an error a client parsed from a server response is always `None`.
+    /// Accepts either a concrete error or an already-boxed one, so it
+    /// composes with transport errors that are type-erased before reaching
+    /// this call. Replaces any source attached by a previous call.
+    #[must_use]
+    pub fn with_source(
+        mut self,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        self.source = Some(Arc::from(source.into()));
+        self
+    }
+
     /// Get the HTTP status code for this error.
     ///
     /// Returns the HTTP status override if set, otherwise derives it from the error code.
@@ -479,11 +511,17 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
-impl std::error::Error for ConnectError {}
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| &**e as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl From<std::io::Error> for ConnectError {
     fn from(err: std::io::Error) -> Self {
-        Self::internal(err.to_string())
+        Self::internal(err.to_string()).with_source(err)
     }
 }
 
@@ -491,7 +529,7 @@ impl From<std::io::Error> for ConnectError {
 /// handler.
 impl From<http::Error> for ConnectError {
     fn from(err: http::Error) -> Self {
-        Self::internal(err.to_string())
+        Self::internal(err.to_string()).with_source(err)
     }
 }
 
@@ -506,6 +544,55 @@ mod tests {
             .into();
         let e: ConnectError = http_err.into();
         assert_eq!(e.code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn from_io_error_preserves_source() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let e: ConnectError = io_err.into();
+        let source = std::error::Error::source(&e).expect("source must be preserved");
+        assert_eq!(source.to_string(), "refused");
+    }
+
+    #[test]
+    fn from_http_error_preserves_source() {
+        let http_err: http::Error = http::HeaderValue::from_bytes(b"bad\nval")
+            .unwrap_err()
+            .into();
+        let e: ConnectError = http_err.into();
+        assert!(std::error::Error::source(&e).is_some());
+    }
+
+    #[test]
+    fn with_source_is_returned_by_error_source() {
+        let cause = std::io::Error::other("boom");
+        let e = ConnectError::unavailable("wrapped").with_source(cause);
+        let source = std::error::Error::source(&e).expect("source must be set");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn with_source_accepts_already_boxed_error() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("boxed boom"));
+        let e = ConnectError::unavailable("wrapped").with_source(boxed);
+        let source = std::error::Error::source(&e).expect("source must be set");
+        assert_eq!(source.to_string(), "boxed boom");
+    }
+
+    #[test]
+    fn no_source_by_default() {
+        let e = ConnectError::internal("plain");
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn with_source_survives_clone() {
+        let cause = std::io::Error::other("boom");
+        let e = ConnectError::unavailable("wrapped")
+            .with_source(cause)
+            .clone();
+        assert!(std::error::Error::source(&e).is_some());
     }
 
     #[test]
