@@ -4711,9 +4711,15 @@ mod tests {
             .body(full_body(Bytes::new()))
             .unwrap();
 
-        let err = http.send(req).await.expect_err("connect to port 1 must fail");
+        let err = http
+            .send(req)
+            .await
+            .expect_err("connect to port 1 must fail");
         assert!(
-            err.message.as_deref().unwrap().contains("HTTP request failed"),
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("HTTP request failed"),
             "unexpected message: {err:?}"
         );
         assert!(
@@ -4739,9 +4745,15 @@ mod tests {
             .body(full_body(Bytes::new()))
             .unwrap();
 
-        let err = http.send(req).await.expect_err("connect to port 1 must fail");
+        let err = http
+            .send(req)
+            .await
+            .expect_err("connect to port 1 must fail");
         assert!(
-            err.message.as_deref().unwrap().contains("HTTPS request failed"),
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("HTTPS request failed"),
             "unexpected message: {err:?}"
         );
         assert!(

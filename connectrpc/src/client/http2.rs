@@ -1150,10 +1150,7 @@ impl tower::Service<Uri> for MakeSendRequest {
                     let tcp = io.into_inner();
                     let connector = tokio_rustls::TlsConnector::from(tls);
                     let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-                        BoxError::from(unavailable_from_transport_error(
-                            "TLS handshake failed",
-                            e,
-                        ))
+                        BoxError::from(unavailable_from_transport_error("TLS handshake failed", e))
                     })?;
 
                     // Verify ALPN negotiated h2. A server that doesn't speak h2
