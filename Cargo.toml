@@ -30,21 +30,23 @@ pin-project = "1"
 sync_wrapper = "1"
 async-trait = "0.1"
 
-# Protobuf. The 0.9 floor matches the regen baseline for the checked-in
-# generated code, and is a hard floor rather than a preference: 0.9.0 widens
-# `types::put_len_delimited_header` and the `map_codec::field_len`
-# accumulator to `u64`, so code emitted by a 0.8.x codegen does not compile
-# against a 0.9 runtime. Regenerate whenever this moves.
+# Protobuf. 0.9.1 is a hard floor rather than a preference, for two reasons.
+# 0.9.0 widens `types::put_len_delimited_header` and the
+# `map_codec::field_len` accumulator to `u64`, so code emitted by a 0.8.x
+# codegen does not compile against a 0.9 runtime; and the codegen paths call
+# `buffa_codegen::decode_request` and `tooling_decode_options`, which arrived
+# in 0.9.1. The floor also matches the regen baseline for the checked-in
+# generated code — regenerate whenever it moves.
 # (connectrpc-build also sources the generated `mod.rs` `#[allow(...)]` list
 # from `buffa_codegen::ALLOW_LINTS`.)
 # NOTE: the `connectrpc` crate pins `buffa` directly (not `workspace = true`)
 # so its `json` cargo feature can gate `buffa/json` for proto-only builds —
 # keep that floor aligned with this one when bumping.
-buffa = { version = "0.9", features = ["json"] }
-buffa-types = { version = "0.9", features = ["json"] }
-buffa-codegen = { version = "0.9" }
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
+buffa-codegen = { version = "0.9.1" }
 # `reflect` is needed for `DescriptorPool`, which backs connectrpc-reflection.
-buffa-descriptor = { version = "0.9", features = ["reflect"] }
+buffa-descriptor = { version = "0.9.1", features = ["reflect"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

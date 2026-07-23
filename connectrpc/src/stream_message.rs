@@ -214,13 +214,21 @@ mod tests {
 
     #[test]
     fn from_message_accepts_more_elements_than_the_wire_budget_allows() {
+        use buffa_types::google::protobuf::__buffa::view::ValueView;
         use buffa_types::google::protobuf::{ListValue, Value};
 
         // Enough elements to exceed buffa's 32 MiB element-memory default.
         // Element footprint is what that budget charges, not element
         // contents, so this stays small on the wire — a single large payload
         // would not trip it however big it got.
-        let n = 800_000;
+        //
+        // Two decodes must both be over budget here: the control below, which
+        // materialises owned `Value` (48 bytes), and `from_message` itself,
+        // which materialises `ValueView` (32 bytes). Sizing by the *smaller*
+        // is what clears both. Sizing by `Value` puts the view decode at 0.83x
+        // the budget, and the test then passes with `from_message`'s
+        // element-memory lift deleted outright — proving nothing.
+        let n = crate::test_budget::elements_over_default_budget::<ValueView<'_>>();
         let list = ListValue {
             values: (0..n).map(|_| Value::default()).collect(),
             ..Default::default()

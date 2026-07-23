@@ -48,7 +48,7 @@ async-trait = { workspace = true }
 # silently drop it. Keep the version in sync with the
 # `[workspace.dependencies]` `buffa` entry, which documents why the floor is
 # where it is.
-buffa = { version = "0.9", default-features = false, features = ["std", "fast-utf8"] }
+buffa = { version = "0.9.1", default-features = false, features = ["std", "fast-utf8"] }
 
 # Serialization. Non-optional even in proto-only builds: the Connect error and
 # streaming end-of-stream wire frames are always JSON regardless of the message

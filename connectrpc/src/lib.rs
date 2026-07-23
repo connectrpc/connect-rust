@@ -212,6 +212,9 @@ pub mod service;
 pub mod spec;
 pub mod stream_message;
 
+#[cfg(test)]
+pub(crate) mod test_budget;
+
 // Optional: HTTP client
 pub mod client;
 

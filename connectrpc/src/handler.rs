@@ -1224,6 +1224,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_budget::elements_over_default_budget;
     use buffa_types::google::protobuf::__buffa::view::StringValueView;
     use buffa_types::google::protobuf::StringValue;
 
@@ -1463,15 +1464,18 @@ mod tests {
     }
 
     /// Owned-message handlers decode through `Payload`/`decode_request`
-    /// rather than the view helpers, and that path silently used buffa's
-    /// defaults until the limits were threaded onto `Payload` too. Both
+    /// rather than the view helpers, so they read their budget from the
+    /// `DecodeOptions` carried on `Payload`. That is easy to leave
+    /// unattached, which silently falls back to buffa's defaults, so both
     /// owned entry points are pinned here.
     #[test]
     fn owned_message_decoding_honours_the_configured_limit() {
         use buffa_types::google::protobuf::{ListValue, Value};
 
+        // Decoded as owned `Value`s, so the owned footprint sets the count.
+        let n = elements_over_default_budget::<Value>();
         let list = ListValue {
-            values: (0..800_000).map(|_| Value::default()).collect(),
+            values: (0..n).map(|_| Value::default()).collect(),
             ..Default::default()
         };
         let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
@@ -1490,7 +1494,7 @@ mod tests {
         let decoded: ListValue =
             decode_request(&encoded, CodecFormat::Proto, &raised.decode_options())
                 .expect("raised budget must admit");
-        assert_eq!(decoded.values.len(), 800_000);
+        assert_eq!(decoded.values.len(), n);
 
         // `Payload::take_message`, used by the owned-message unary wrapper.
         let payload = crate::Payload::new(encoded.clone(), CodecFormat::Proto);
@@ -1503,18 +1507,22 @@ mod tests {
         let decoded: ListValue = payload
             .take_message()
             .expect("a payload carrying raised limits must admit");
-        assert_eq!(decoded.values.len(), 800_000);
+        assert_eq!(decoded.values.len(), n);
     }
 
     /// The budget rejection names the limit to raise, since it is the one
     /// decode failure an operator can fix without the peer changing.
     #[test]
     fn an_over_budget_decode_says_which_limit_to_raise() {
-        use buffa_types::google::protobuf::__buffa::view::ListValueView;
+        use buffa_types::google::protobuf::__buffa::view::{ListValueView, ValueView};
         use buffa_types::google::protobuf::{ListValue, Value};
 
+        // Decoded as borrowed `ValueView`s, so the view footprint — the
+        // smaller of the two — sets the count.
         let list = ListValue {
-            values: (0..800_000).map(|_| Value::default()).collect(),
+            values: (0..elements_over_default_budget::<ValueView<'_>>())
+                .map(|_| Value::default())
+                .collect(),
             ..Default::default()
         };
         let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
@@ -1550,12 +1558,12 @@ mod tests {
     /// nothing would still pass.
     #[test]
     fn element_memory_limit_is_taken_from_the_configured_limits() {
-        use buffa_types::google::protobuf::__buffa::view::ListValueView;
+        use buffa_types::google::protobuf::__buffa::view::{ListValueView, ValueView};
         use buffa_types::google::protobuf::{ListValue, Value};
 
         // Element footprint is what the budget charges, not element
         // contents, so this stays small on the wire.
-        let n = 800_000;
+        let n = elements_over_default_budget::<ValueView<'_>>();
         let list = ListValue {
             values: (0..n).map(|_| Value::default()).collect(),
             ..Default::default()
@@ -1565,7 +1573,7 @@ mod tests {
         let defaults = crate::Limits::default();
         let err =
             decode_borrowed_request_view::<ListValueView<'_>>(&encoded, &defaults.decode_options())
-                .expect_err("800k elements must exceed the 32 MiB default");
+                .expect_err("the fixture must exceed the default element-memory budget");
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
 
         let raised = crate::Limits::default().element_memory_limit(usize::MAX);
