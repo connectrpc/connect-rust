@@ -1,0 +1,16 @@
+kind: Added
+body: |-
+  **`ConnectError` now preserves the underlying cause of transport
+  failures.** A new `ConnectError::with_source` builder attaches an
+  underlying error, surfaced through `Error::source()`; `ConnectError` stays
+  `Clone` since the source is held in an `Arc`. Every place a transport
+  error was previously stringified into `message` and discarded now
+  retains it: the HTTP and HTTPS `HttpClient` transports, `Http2Connection`
+  (unix-socket connect, eager/lazy connect, TLS handshake, h2 send), and
+  `From<std::io::Error>` / `From<http::Error>` for `ConnectError`. The wire
+  format and `Display` output are unchanged; the derived `Debug` output now
+  additionally includes the source when one is attached. This is purely
+  additive ([#237]).
+
+  [#237]: https://github.com/connectrpc/connect-rust/issues/237
+time: 2026-07-23T02:36:43.000000000Z
