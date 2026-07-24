@@ -470,7 +470,7 @@ mod tests {
         let registry = Arc::new(CompressionRegistry::default());
         let mut enc = EnvelopeEncoder::new(
             Some((Arc::clone(&registry), "gzip")),
-            CompressionPolicy::default().min_size(0),
+            CompressionPolicy::default().with_min_size(0),
         );
         // Incompressible-ish random-ish payload so the compressed form stays
         // above the chain threshold.
@@ -791,7 +791,7 @@ mod tests {
         let registry = Arc::new(CompressionRegistry::default());
         let mut enc = EnvelopeEncoder::new(
             Some((registry, "gzip")),
-            CompressionPolicy::default().min_size(0),
+            CompressionPolicy::default().with_min_size(0),
         );
         let mut buf = BytesMut::new();
         enc.encode(Bytes::from_static(b"compress me"), &mut buf)

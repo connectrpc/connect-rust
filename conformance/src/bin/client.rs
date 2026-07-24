@@ -1579,13 +1579,13 @@ fn compression_encoding_name(compression: Compression) -> Option<&'static str> {
 }
 
 /// Apply request compression config if the test specified an encoding.
-/// `min_size(0)` forces compression even for tiny/empty bodies so the
+/// `with_min_size(0)` forces compression even for tiny/empty bodies so the
 /// conformance runner sees the advertised encoding applied.
 fn apply_compression(config: ClientConfig, compression: Compression) -> ClientConfig {
     match compression_encoding_name(compression) {
         Some(enc) => config
             .compress_requests(enc)
-            .with_compression_policy(connectrpc::CompressionPolicy::default().min_size(0)),
+            .with_compression_policy(connectrpc::CompressionPolicy::default().with_min_size(0)),
         None => config,
     }
 }
