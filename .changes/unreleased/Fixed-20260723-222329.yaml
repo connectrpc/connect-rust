@@ -1,0 +1,28 @@
+kind: Fixed
+body: |-
+  **A gRPC or gRPC-Web unary call now reports a trailers-only error instead of
+  the bare HTTP status** ([#241]). When a proxy answers with a non-200 status
+  and a gRPC status in the response headers — an Envoy local reply sends `503`
+  alongside `grpc-status: 14` and `grpc-message: upstream connect error` — the
+  call surfaces the server's code, message, and metadata rather than
+  `HTTP error 503`. The header status still applies only to a genuine
+  trailers-only response: a response carrying body data or HTTP/2 trailers
+  takes its status from those, never from the headers. The error code can
+  change as a result, not just the message: a proxy pairing HTTP 500 with
+  `grpc-status: 3` now yields `InvalidArgument` where it previously yielded
+  `Unknown`, so a caller matching on `ErrorCode` may observe the server's code
+  rather than the one derived from the HTTP status. A non-200 response with no
+  gRPC status of its own still reports the HTTP status as before.
+
+  **A plain gRPC unary response whose body sets the `0x80` envelope flag is
+  now a framing error** ([#242]). That flag marks a gRPC-Web trailer frame
+  and is not defined for gRPC, so a server or intermediary that set it could
+  replace the trailers received in the HTTP/2 trailer section with trailers
+  of its own choosing, including the `grpc-status`. gRPC-Web is unaffected:
+  its trailer frames are parsed as before. The flag now has a name,
+  `envelope::flags::GRPC_WEB_TRAILER`, public alongside the existing `DATA`,
+  `COMPRESSED` and `END_STREAM` flags.
+
+  [#241]: https://github.com/connectrpc/connect-rust/issues/241
+  [#242]: https://github.com/connectrpc/connect-rust/issues/242
+time: 2026-07-23T22:23:29.547732463-07:00

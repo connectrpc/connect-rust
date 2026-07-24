@@ -23,6 +23,10 @@ pub mod flags {
     pub const COMPRESSED: u8 = 0x01;
     /// End of stream (trailers follow).
     pub const END_STREAM: u8 = 0x02;
+    /// gRPC-Web trailer frame. The payload is an HTTP/1-style trailer block
+    /// rather than a message, and the flag is defined only for gRPC-Web: on
+    /// plain gRPC a set high bit is a framing error.
+    pub const GRPC_WEB_TRAILER: u8 = 0x80;
 }
 
 /// Size of the envelope header in bytes.

@@ -255,7 +255,7 @@ fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
         if frame_end > data.len() {
             return None;
         }
-        if data[offset] & 0x80 != 0 {
+        if data[offset] & crate::envelope::flags::GRPC_WEB_TRAILER != 0 {
             return Some(frame_end);
         }
         offset = frame_end;
@@ -2027,14 +2027,11 @@ where
     let status = response.status();
     let resp_headers = response.headers().clone();
 
-    // Non-200 HTTP status (connection-level error)
-    if !status.is_success() {
-        let code = http_status_to_error_code(status);
-        let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
-        err.set_response_headers(resp_headers);
-        return Err(err);
-    }
-
+    // A non-200 status is reported below rather than here: a proxy that
+    // synthesizes an error reply (an Envoy local reply sends 503 alongside
+    // `grpc-status: 14`) puts the gRPC status in the initial headers, and that
+    // status is only readable once the body has shown the response to be
+    // trailers-only.
     validate_grpc_response_content_type(&resp_headers, config)?;
 
     // Check for unsupported compression before reading the body
@@ -2096,9 +2093,17 @@ where
                 }
             }
             Some(Err(e)) => {
-                return Err(ConnectError::internal(format!(
-                    "failed to read response body: {e}"
-                )));
+                // The body of a non-200 response is read only to find a gRPC
+                // status, and the HTTP status is reported below when there is
+                // none, so a read that dies part-way through (a proxy that
+                // resets the stream after its error headers) still reports the
+                // status rather than the read failure.
+                if status.is_success() {
+                    return Err(ConnectError::internal(format!(
+                        "failed to read response body: {e}"
+                    )));
+                }
+                break;
             }
             None => break,
         }
@@ -2113,8 +2118,20 @@ where
     let mut message_count = 0u32;
 
     while !buf.is_empty() {
-        // Check for gRPC-Web trailer frame (flag 0x80)
-        if buf[0] & 0x80 != 0 {
+        // A set high bit marks a gRPC-Web trailer frame.
+        if buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0 {
+            if !matches!(config.protocol, Protocol::GrpcWeb) {
+                // Plain gRPC defines no flag in the high bit, and envelope
+                // decoding ignores unknown bits, so accepting the frame here
+                // would let a data envelope overwrite the HTTP/2 trailers.
+                let mut err = ConnectError::internal(format!(
+                    "invalid gRPC response framing: envelope flag {:#04x} \
+                     (gRPC-Web trailer marker) is not valid on a plain gRPC response",
+                    buf[0]
+                ));
+                err.set_response_headers(resp_headers);
+                return Err(err);
+            }
             let decompression = response_encoding
                 .as_deref()
                 .map(|enc| (&config.compression, enc));
@@ -2172,16 +2189,33 @@ where
     // Check for errors in trailers (HTTP/2 trailers or gRPC-Web trailer frame).
     // If we have trailers from HTTP/2 or gRPC-Web, those take precedence.
     // Only fall back to initial headers if no body data was received (trailers-only).
-    let effective_trailers = if !grpc_trailers.is_empty() {
-        &grpc_trailers
-    } else if !has_body_data {
+    let status_from_headers = grpc_trailers.is_empty() && !has_body_data;
+    let effective_trailers = if status_from_headers {
         // Trailers-only response: initial headers contain the status
         &resp_headers
     } else {
-        &grpc_trailers // empty — no trailers found
+        &grpc_trailers // empty when no trailers were found
     };
 
     if let Some(mut err) = parse_grpc_error_from_trailers(effective_trailers) {
+        if status_from_headers {
+            // The status came from the initial headers, so the entries copied
+            // alongside it are response metadata, not trailing metadata:
+            // `content-type` and friends must not surface from
+            // `ConnectError::trailers()`. They stay reachable through
+            // `response_headers()`, set below.
+            err.trailers_mut().clear();
+        }
+        err.set_response_headers(resp_headers);
+        return Err(err);
+    }
+
+    // A non-200 response is an error even when the gRPC status says otherwise
+    // or is missing entirely; an error status found above is the more specific
+    // report, so this is only reached when there was none.
+    if !status.is_success() {
+        let code = http_status_to_error_code(status);
+        let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
         err.set_response_headers(resp_headers);
         return Err(err);
     }
@@ -2482,7 +2516,7 @@ where
             // a data envelope flag rather than the gRPC-Web trailer sentinel).
             if matches!(self.protocol, Protocol::GrpcWeb)
                 && self.buf.len() >= 5
-                && self.buf[0] & 0x80 != 0
+                && self.buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0
             {
                 let trailer_len =
                     u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
@@ -2512,7 +2546,7 @@ where
             // flag) to avoid misinterpreting the trailer frame as a data message.
             let envelope_result = if matches!(self.protocol, Protocol::GrpcWeb)
                 && !self.buf.is_empty()
-                && self.buf[0] & 0x80 != 0
+                && self.buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0
             {
                 // We know the trailer frame is incomplete (checked above),
                 // so signal that more data is needed.
@@ -2576,7 +2610,7 @@ where
                         // "no usable termination metadata".
                         let parsed = if matches!(self.protocol, Protocol::GrpcWeb)
                             && !self.buf.is_empty()
-                            && self.buf[0] & 0x80 != 0
+                            && self.buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0
                         {
                             let decompression =
                                 self.encoding.as_deref().map(|enc| (&self.compression, enc));
@@ -4413,10 +4447,10 @@ fn parse_grpc_web_trailer_frame_with_compression(
     data: &[u8],
     decompression: Option<(&CompressionRegistry, &str)>,
 ) -> Option<http::HeaderMap> {
-    if data.len() < 5 || data[0] & 0x80 == 0 {
+    if data.len() < 5 || data[0] & crate::envelope::flags::GRPC_WEB_TRAILER == 0 {
         return None;
     }
-    let is_compressed = data[0] & 0x01 != 0;
+    let is_compressed = data[0] & crate::envelope::flags::COMPRESSED != 0;
     let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
     // Cap trailer frame size to prevent a malicious server from forcing
     // unbounded memory allocation. 1 MB is generous for trailer metadata.
@@ -6744,6 +6778,388 @@ mod tests {
             response.trailers().get("grpc-status").unwrap(),
             http::HeaderValue::from_static("0")
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_trailers_only_status_wins_over_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // A proxy pairs a non-200 status with a trailers-only gRPC error in the
+        // initial headers. The gRPC code is the one reported, which for this
+        // pairing is not the code the HTTP status maps to (500 is `unknown`).
+        let response = Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "3")
+            .header("grpc-message", "malformed request")
+            .header("x-request-id", "abc123")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a trailers-only gRPC error must surface as an error");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.message.as_deref(), Some("malformed request"));
+        assert_eq!(
+            err.response_headers().get("x-request-id").unwrap(),
+            "abc123"
+        );
+        // Response headers are not trailing metadata, so nothing from the
+        // header block may surface through `trailers()`.
+        assert!(
+            err.trailers().is_empty(),
+            "initial headers must not be reported as trailers: {:?}",
+            err.trailers()
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_ignores_header_status_when_body_present() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        // Conformance `trailers-only/ignore-header-if-body-present`: a status
+        // in the initial headers is only the status of a trailers-only
+        // response. With a message in the body and no trailers, the status is
+        // missing, not `9`.
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "9")
+            .body(Full::new(
+                Envelope::data(StringValue::from("hi").encode_to_bytes()).encode(),
+            ))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a response with body data and no trailers has no status");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("gRPC response missing grpc-status trailer")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_ignores_header_status_when_trailer_present() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        // Conformance `trailers-only/ignore-header-if-trailer-present`: the
+        // HTTP/2 trailer wins over the header.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "9".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(
+                Envelope::data(StringValue::from("hi").encode_to_bytes()).encode(),
+            )),
+            Ok(Frame::trailers(trailers)),
+        ];
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "8")
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the trailer status must be reported");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_ignores_header_status_when_body_present() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        // Conformance `trailers-only/ignore-header-if-body-present` for
+        // gRPC-Web: the trailer frame in the body wins over the header.
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&Envelope::data(StringValue::from("hi").encode_to_bytes()).encode());
+        let trailer_payload = b"grpc-status: 9\r\n";
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc-web")
+            .header("grpc-status", "8")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the trailer-frame status must be reported");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_non_200_with_body_reports_http_status() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        // A body means the header status does not apply, and a non-200 is an
+        // error however successful the trailers claim the call was.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(
+                Envelope::data(StringValue::from("hi").encode_to_bytes()).encode(),
+            )),
+            Ok(Frame::trailers(trailers)),
+        ];
+
+        let response = Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "3")
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a non-200 response is an error");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(err.message.as_deref(), Some("HTTP error 500"));
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_trailers_only_status_wins_over_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // The header check is protocol-agnostic, so gRPC-Web reads a
+        // trailers-only error the same way plain gRPC does.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "application/grpc-web")
+            .header("grpc-status", "14")
+            .header("grpc-message", "upstream connect error")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a trailers-only gRPC-Web error must surface as an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("upstream connect error"));
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_malformed_grpc_status_on_non_200_is_unknown() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // A present-but-unparseable status must not read as the HTTP status
+        // either: it is a protocol error in its own right.
+        let response = Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "banana")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a malformed gRPC status must not read as success");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("protocol error: malformed grpc-status: \"banana\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_non_200_without_grpc_status_uses_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a non-200 response without a gRPC status is an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("HTTP error 503"));
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_rejects_trailer_flag_in_body() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        // 0x80 is the gRPC-Web trailer marker and is not a gRPC envelope flag.
+        // Honouring it here would replace the HTTP/2 trailers with whatever the
+        // body claims.
+        let trailer_payload = b"grpc-status: 5\r\n";
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(body.freeze())),
+            Ok(Frame::trailers(trailers)),
+        ];
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the trailer flag must be rejected on plain gRPC");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "invalid gRPC response framing: envelope flag 0x80 (gRPC-Web trailer marker) is not valid on a plain gRPC response"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_framing_error_names_the_offending_flag_byte() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // Any byte with the high bit set takes the trailer branch, so the
+        // error has to report the byte received rather than a bare 0x80.
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&[0xC1]);
+        body.extend_from_slice(&0u32.to_be_bytes());
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a high-bit flag byte must be rejected on plain gRPC");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "invalid gRPC response framing: envelope flag 0xc1 (gRPC-Web trailer marker) is not valid on a plain gRPC response"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_parses_trailer_frame_after_message() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&Envelope::data(StringValue::from("hi").encode_to_bytes()).encode());
+        let trailer_payload = b"grpc-status: 0\r\nx-trailer: v\r\n";
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc-web+proto")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let response = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect("gRPC-Web trailer frames must still be parsed");
+        assert_eq!(response.view().value, "hi");
+        assert_eq!(response.trailers().get("x-trailer").unwrap(), "v");
     }
 
     #[tokio::test]
