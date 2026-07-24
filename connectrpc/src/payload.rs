@@ -321,17 +321,25 @@ impl Payload {
     ///   branch on [`format()`](Payload::format) and call
     ///   [`message()`](Payload::message) for JSON wires instead.
     /// - [`invalid_argument`](ConnectError::invalid_argument) if the wire
-    ///   bytes fail to decode as `V` — peer-supplied data, not a server
-    ///   bug.
+    ///   bytes exceed one of the payload's
+    ///   [decode options](Payload::with_decode_options)' limits, or fail to
+    ///   decode as `V` — peer-supplied data, not a server bug.
     /// - [`internal`](ConnectError::internal) if a replacement set with
     ///   [`set_message`](Payload::set_message) fails to re-encode or
     ///   decode as `V` — server-supplied data, so the asymmetry with the
-    ///   wire-bytes case is intentional.
+    ///   wire-bytes case is intentional. A replacement is decoded without
+    ///   the limits for the same reason.
     pub fn view<V>(&self) -> Result<OwnedView<V>, ConnectError>
     where
         V: MessageView<'static>,
     {
         if let Some(replaced) = &self.replaced {
+            // A replacement was just encoded from a message this process
+            // already holds, so the wire-facing decode limits do not apply:
+            // the element-memory budget is an amplification defence against a
+            // small peer payload materializing a huge one, and a server-built
+            // message can legitimately exceed it. `StreamMessage::from_message`
+            // lifts the same limits for the same reason.
             let bytes = replaced.encode(CodecFormat::Proto)?;
             return OwnedView::decode(bytes).map_err(|e| {
                 ConnectError::internal(format!("failed to decode replacement as view: {e}"))
@@ -342,7 +350,7 @@ impl Payload {
                 "Payload::view requires a proto-encoded wire; use Payload::message for JSON",
             ));
         }
-        OwnedView::decode(self.bytes.clone()).map_err(|e| {
+        OwnedView::decode_with_options(self.bytes.clone(), &self.decode_options).map_err(|e| {
             ConnectError::invalid_argument(format!("failed to decode payload as view: {e}"))
         })
     }
