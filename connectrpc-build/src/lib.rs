@@ -287,7 +287,9 @@ impl Config {
     /// or `buf build --as-file-descriptor-set -o ...`, then ship it with
     /// your source. Add `--include_source_info` to the `protoc` invocation
     /// if you want proto comments carried into the generated Rust docs
-    /// (buf includes source info by default).
+    /// (buf includes source info by default). `--include_imports` is not
+    /// optional: a set built without it omits imported message types, and
+    /// generation fails naming the first type it cannot resolve.
     ///
     /// [`Config::files`] selects which files in the set to generate code for.
     /// **These must be the proto-relative names as they appear in the
@@ -361,7 +363,8 @@ impl Config {
     /// - `protoc` or `buf` is not on `PATH` (when using those sources)
     /// - the compiler exits non-zero (syntax error, missing import, ...)
     /// - a precompiled descriptor set cannot be read or decoded
-    /// - codegen fails (unsupported proto feature)
+    /// - codegen fails (unsupported proto feature, or a method type absent
+    ///   from the descriptor set — see [`Config::descriptor_set`])
     /// - the output directory cannot be created or written to
     /// - [`Config::emit_descriptor_set`] was given a name containing path
     ///   separators, or the descriptor set cannot be written
@@ -419,7 +422,13 @@ impl Config {
         let decode_options = buffa_codegen::tooling_decode_options().map_err(|e| anyhow!("{e}"))?;
         let mut fds = decode_options
             .decode_from_slice::<FileDescriptorSet>(&descriptor_bytes)
-            .map_err(|e| descriptor_decode_error(&e, decode_options.element_memory_limit()))?;
+            .map_err(|e| {
+                descriptor_decode_error(
+                    &e,
+                    decode_options.element_memory_limit(),
+                    &self.descriptor_source,
+                )
+            })?;
 
         // 3. Generate.
         let generated = codegen::generate_files(&fds.file, &files_to_generate, &self.options)?;
@@ -533,8 +542,18 @@ impl Default for Config {
 /// an over-budget set it also names two remedies, and only one of them is
 /// reachable from here — a build script has no plugin parameter string — so
 /// this says which, and points at the connectrpc guide rather than buffa's.
-fn descriptor_decode_error(e: &buffa::DecodeError, limit: usize) -> anyhow::Error {
-    let base = buffa_codegen::decode_failure("FileDescriptorSet", e, limit);
+fn descriptor_decode_error(
+    e: &buffa::DecodeError,
+    limit: usize,
+    source: &DescriptorSource,
+) -> anyhow::Error {
+    // A precompiled set is the one source whose bytes the user can point a
+    // tool at, so name the file instead of the message type.
+    let subject = match source {
+        DescriptorSource::Precompiled(p) => format!("descriptor set '{}'", p.display()),
+        DescriptorSource::Protoc | DescriptorSource::Buf => "FileDescriptorSet".to_owned(),
+    };
+    let base = buffa_codegen::decode_failure(&subject, e, limit);
     if matches!(e, buffa::DecodeError::ElementMemoryLimitExceeded) {
         anyhow!(
             "{base}\nOf those two, only the {env} environment variable applies to a \
@@ -1488,6 +1507,7 @@ service NoteService {
         let rendered = descriptor_decode_error(
             &buffa::DecodeError::ElementMemoryLimitExceeded,
             buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+            &DescriptorSource::Protoc,
         )
         .to_string();
 
@@ -1512,12 +1532,34 @@ service NoteService {
         let rendered = descriptor_decode_error(
             &buffa::DecodeError::UnexpectedEof,
             buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+            &DescriptorSource::Protoc,
         )
         .to_string();
 
         assert!(
             !rendered.contains(buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV),
             "a truncated set must not point at the budget: {rendered}"
+        );
+    }
+
+    /// A precompiled set is the one source whose bytes the caller can open,
+    /// so the failure names the file rather than the message type.
+    #[test]
+    fn a_corrupt_precompiled_set_names_the_file() {
+        let rendered = descriptor_decode_error(
+            &buffa::DecodeError::UnexpectedEof,
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+            &DescriptorSource::Precompiled(PathBuf::from("/tmp/schema.binpb")),
+        )
+        .to_string();
+
+        assert!(
+            rendered.contains("/tmp/schema.binpb"),
+            "must name the file to open: {rendered}"
+        );
+        assert!(
+            !rendered.contains("FileDescriptorSet"),
+            "naming the file beats naming the message type: {rendered}"
         );
     }
 }
