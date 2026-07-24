@@ -49,8 +49,6 @@ use connectrpc_conformance::{
 use futures::StreamExt;
 use http::HeaderName;
 use http::HeaderValue;
-use std::process::Command;
-use std::process::Stdio;
 use tracing_subscriber::EnvFilter;
 
 /// Parse a gRPC timeout header value to milliseconds.
@@ -943,108 +941,6 @@ impl ConformanceService for ConformanceServiceImpl {
     }
 }
 
-/// Start Caddy as a reverse proxy for debugging HTTP traffic.
-/// Returns the proxy port if successful.
-fn start_caddy_proxy(server_port: u16) -> Result<(u16, std::process::Child)> {
-    // Find an available port for the proxy
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let proxy_port = listener.local_addr()?.port();
-    drop(listener);
-
-    let caddy_bin = std::env::var("CADDY_BIN").unwrap_or_else(|_| "/tmp/caddy".to_string());
-
-    // Create Caddy config - simpler version without custom keep_alive settings
-    let config = format!(
-        r#"{{
-  "logging": {{
-    "logs": {{
-      "default": {{
-        "level": "DEBUG",
-        "encoder": {{ "format": "console" }}
-      }}
-    }}
-  }},
-  "apps": {{
-    "http": {{
-      "servers": {{
-        "proxy": {{
-          "listen": [":{proxy_port}"],
-          "logs": {{ "default_logger_name": "default" }},
-          "routes": [{{
-            "handle": [{{
-              "handler": "reverse_proxy",
-              "upstreams": [{{ "dial": "127.0.0.1:{server_port}" }}]
-            }}]
-          }}]
-        }}
-      }}
-    }}
-  }}
-}}"#
-    );
-
-    let config_path = format!("/tmp/caddy-proxy-{server_port}.json");
-    std::fs::write(&config_path, &config)?;
-
-    // Start Caddy
-    let log_path = format!("/tmp/caddy-proxy-{server_port}.log");
-    let log_file = std::fs::File::create(&log_path)?;
-
-    let child = Command::new(&caddy_bin)
-        .args(["run", "--config", &config_path])
-        .stdout(Stdio::from(log_file.try_clone()?))
-        .stderr(Stdio::from(log_file))
-        .spawn()?;
-
-    // Give Caddy time to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    tracing::info!(
-        "Caddy proxy started: :{} -> :{}, logs at {}",
-        proxy_port,
-        server_port,
-        log_path
-    );
-
-    Ok((proxy_port, child))
-}
-
-/// Start tcplog as a TCP logging proxy for diagnosing connection lifecycle issues.
-/// Only useful for non-TLS connections (raw TCP proxying would break TLS handshakes).
-/// Returns the proxy port and child process.
-fn start_tcplog_proxy(server_port: u16) -> Result<(u16, std::process::Child)> {
-    // Find an available port for the proxy
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let proxy_port = listener.local_addr()?.port();
-    drop(listener);
-
-    let tcplog_bin = std::env::var("TCPLOG_BIN")
-        .unwrap_or_else(|_| "/tmp/tcplog/target/release/tcplog".to_string());
-    let log_path = format!("/tmp/tcplog-{server_port}.log");
-
-    let child = Command::new(&tcplog_bin)
-        .args([
-            &proxy_port.to_string(),
-            &format!("127.0.0.1:{server_port}"),
-            &log_path,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    // Give tcplog time to bind
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    tracing::info!(
-        "tcplog proxy started: :{} -> :{}, logging to {}",
-        proxy_port,
-        server_port,
-        log_path
-    );
-
-    Ok((proxy_port, child))
-}
-
 fn code_to_connect_error(code: connectrpc_conformance::Code) -> connectrpc::error::ErrorCode {
     use connectrpc::error::ErrorCode;
     use connectrpc_conformance::Code;
@@ -1174,19 +1070,6 @@ async fn main() -> Result<()> {
     let server_addr = bound.local_addr()?;
     tracing::info!("Server listening on {}", server_addr);
 
-    // Optionally start a debugging proxy (Caddy for HTTP-level, tcplog for TCP-level).
-    // tcplog only works for non-TLS (raw TCP proxy would break TLS handshakes).
-    let (report_port, _proxy_child) = if std::env::var("ENABLE_CADDY_PROXY").is_ok() {
-        let (proxy_port, child) = start_caddy_proxy(server_addr.port())?;
-        (proxy_port, Some(child))
-    } else if std::env::var("ENABLE_TCPLOG").is_ok() && !request.use_tls {
-        let (proxy_port, child) = start_tcplog_proxy(server_addr.port())?;
-        (proxy_port, Some(child))
-    } else {
-        (server_addr.port(), None)
-    };
-
-    // Send the response with the port to connect to (proxy or direct)
     // Include the PEM cert if TLS is enabled so the runner can trust our server
     let pem_cert = if request.server_creds.is_set() {
         request.server_creds.cert.clone()
@@ -1196,7 +1079,7 @@ async fn main() -> Result<()> {
 
     let response = ServerCompatResponse {
         host: "127.0.0.1".to_string(),
-        port: report_port as u32,
+        port: server_addr.port() as u32,
         pem_cert,
         ..Default::default()
     };
@@ -1204,7 +1087,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         "Sent ServerCompatResponse (port {}, tls={}), starting to serve requests",
-        report_port,
+        server_addr.port(),
         tls_config.is_some()
     );
 
