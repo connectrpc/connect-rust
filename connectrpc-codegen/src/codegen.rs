@@ -267,8 +267,10 @@ fn emit_service_files(
 /// # Errors
 ///
 /// Returns an error if buffa-codegen fails (e.g. unsupported proto
-/// feature) or if the generated service binding Rust does not parse
-/// under `syn` (indicates a bug in this crate).
+/// feature), if a method input/output type is absent from `proto_file`
+/// (an import missing from the descriptor set), or if the generated
+/// service binding Rust does not parse under `syn` (indicates a bug in
+/// this crate).
 pub fn generate_files(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -782,16 +784,15 @@ impl<'a> TypeResolver<'a> {
     /// Resolve a proto FQN (e.g. `.google.protobuf.Empty`) to a Rust type-path
     /// string relative to `current_package`.
     ///
-    /// In `require_extern` mode, errors if the path is not absolute or the
-    /// type is absent from the descriptor set. Otherwise falls back to the
-    /// bare type name for unknown types (rustc will point at the use site).
+    /// Errors if the type is absent from the descriptor set, and — in
+    /// `require_extern` mode — if the resolved path is not absolute.
     fn resolve_path(&self, proto_fqn: &str, current_package: &str) -> Result<String> {
         match self.ctx.rust_type_relative(proto_fqn, current_package, 0) {
             Some(path) => {
                 self.check_extern_coverage(proto_fqn, &path)?;
                 Ok(path)
             }
-            None => self.fallback_unresolved(proto_fqn).map(str::to_string),
+            None => Err(self.unresolved_type_error(proto_fqn)),
         }
     }
 
@@ -812,14 +813,21 @@ impl<'a> TypeResolver<'a> {
         Ok(())
     }
 
-    /// Fallback when a FQN is absent from the descriptor set: error in
-    /// `require_extern` mode, otherwise return the bare type name (rustc
-    /// will point at the use site if it's wrong).
-    fn fallback_unresolved<'f>(&self, proto_fqn: &'f str) -> Result<&'f str> {
-        if self.require_extern {
-            anyhow::bail!("type {proto_fqn} not found in descriptor set (missing proto import?)");
-        }
-        Ok(bare_type_name(proto_fqn))
+    /// Error for a proto FQN absent from the descriptor set. Shared by the
+    /// type and view resolution paths so both report the same fix.
+    ///
+    /// The precompiled-set hint is for [`generate_files`] only: protoc
+    /// hands the plugin path a complete import closure, so a plugin user
+    /// has no descriptor set of their own to rebuild.
+    fn unresolved_type_error(&self, proto_fqn: &str) -> anyhow::Error {
+        let hint = if self.require_extern {
+            ""
+        } else {
+            " for a precompiled descriptor set, rebuild it with --include_imports"
+        };
+        anyhow::anyhow!(
+            "type {proto_fqn} not found in descriptor set (missing proto import?{hint})"
+        )
     }
 
     /// Resolve a proto FQN to Rust type-path tokens.
@@ -845,10 +853,7 @@ impl<'a> TypeResolver<'a> {
                     self.check_extern_coverage(proto_fqn, &s.to_package)?;
                     (s.to_package, s.within_package)
                 }
-                None => (
-                    String::new(),
-                    self.fallback_unresolved(proto_fqn)?.to_string(),
-                ),
+                None => return Err(self.unresolved_type_error(proto_fqn)),
             };
         let prefix = if to_package.is_empty() {
             format!("{SENTINEL_MOD}::view")
@@ -860,7 +865,6 @@ impl<'a> TypeResolver<'a> {
 }
 
 /// Last segment of a proto FQN, e.g. `.google.protobuf.Empty` → `"Empty"`.
-/// Fallback for types absent from the resolver context.
 fn bare_type_name(proto_fqn: &str) -> &str {
     proto_fqn
         .strip_prefix('.')
@@ -3514,6 +3518,90 @@ mod tests {
         assert!(
             msg.contains("extern_path"),
             "error message lacks hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_descriptor_type_errors_on_build_script_path() {
+        // A descriptor set built without `--include_imports` carries the
+        // service but not the imported request type. The build-script path
+        // must fail here rather than emit a reference to a type that exists
+        // nowhere (issue #244).
+        let file = minimal_file(
+            Some("example.v1"),
+            ".dep.v1.Dep",
+            ".example.v1.PingResp",
+            &["PingResp"],
+        );
+        let err = generate_files(
+            std::slice::from_ref(&file),
+            &["ping.proto".into()],
+            &Options::default(),
+        )
+        .expect_err("a dangling method type must not generate successfully");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".dep.v1.Dep") && msg.contains("descriptor set"),
+            "error message should name the missing type: {msg}"
+        );
+        assert!(
+            msg.contains("--include_imports"),
+            "error message should point at the precompiled-set fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn imported_type_outside_file_to_generate_still_resolves() {
+        // The strictness above keys on presence in the descriptor set, not
+        // on membership in `file_to_generate`: an imported proto carried by
+        // the set resolves even though no code is generated for it here.
+        // This is how every WKT reference works, so it must keep working.
+        let wkt = FileDescriptorProto {
+            name: Some("google/protobuf/empty.proto".into()),
+            package: Some("google.protobuf".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Empty".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let svc = minimal_file(
+            Some("example.v1"),
+            ".google.protobuf.Empty",
+            ".example.v1.PingResp",
+            &["PingResp"],
+        );
+        let generated = generate_files(&[wkt, svc], &["ping.proto".into()], &Options::default())
+            .expect("an imported type present in the set resolves");
+        let all: String = generated.iter().map(|f| f.content.as_str()).collect();
+        assert!(
+            all.contains("buffa_types :: google :: protobuf :: Empty")
+                || all.contains("buffa_types::google::protobuf::Empty"),
+            "imported WKT should resolve through its extern mapping: {all}"
+        );
+    }
+
+    #[test]
+    fn missing_descriptor_type_on_plugin_path_omits_precompiled_hint() {
+        // protoc hands the plugin a complete import closure, so a plugin
+        // user has no descriptor set of their own to rebuild — only the
+        // missing-import half of the message applies.
+        let file = minimal_file(
+            Some("example.v1"),
+            ".dep.v1.Dep",
+            ".example.v1.PingResp",
+            &["PingResp"],
+        );
+        let extern_paths = [(".".into(), "crate::proto".into())];
+        let err = gen_service(std::slice::from_ref(&file), 0, &extern_paths, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".dep.v1.Dep") && msg.contains("missing proto import"),
+            "error message should name the missing type: {msg}"
+        );
+        assert!(
+            !msg.contains("--include_imports"),
+            "precompiled-set hint does not apply to the plugin path: {msg}"
         );
     }
 
