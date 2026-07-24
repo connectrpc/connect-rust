@@ -1,0 +1,18 @@
+kind: Fixed
+body: |-
+  **A method type missing from the descriptor set is now an error on the
+  build-script path instead of a silent bare-name reference** ([#244]).
+  `connectrpc-build` used to accept a `Config::descriptor_set` input whose
+  service referenced a type absent from the set — for example a set built
+  without `protoc --include_imports` — and report success while emitting code
+  that named a type existing nowhere, so the first signal was rustc complaining
+  about a file in `$OUT_DIR` the user never wrote. The
+  `protoc-gen-connect-rust` plugin already rejected the same input; both paths
+  now fail with the same message, naming the unresolved type and pointing at
+  `--include_imports`. Sets produced by connectrpc-build's own protoc and buf
+  sources always carry the import closure, so only `Config::descriptor_set`
+  users are affected. A corrupt precompiled set also now names the file that
+  failed to decode.
+
+  [#244]: https://github.com/connectrpc/connect-rust/issues/244
+time: 2026-07-23T22:22:29.709734822-07:00

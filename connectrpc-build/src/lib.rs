@@ -287,7 +287,9 @@ impl Config {
     /// or `buf build --as-file-descriptor-set -o ...`, then ship it with
     /// your source. Add `--include_source_info` to the `protoc` invocation
     /// if you want proto comments carried into the generated Rust docs
-    /// (buf includes source info by default).
+    /// (buf includes source info by default). `--include_imports` is not
+    /// optional: a set built without it omits imported message types, and
+    /// generation fails naming the first type it cannot resolve.
     ///
     /// [`Config::files`] selects which files in the set to generate code for.
     /// **These must be the proto-relative names as they appear in the
@@ -361,7 +363,8 @@ impl Config {
     /// - `protoc` or `buf` is not on `PATH` (when using those sources)
     /// - the compiler exits non-zero (syntax error, missing import, ...)
     /// - a precompiled descriptor set cannot be read or decoded
-    /// - codegen fails (unsupported proto feature)
+    /// - codegen fails (unsupported proto feature, or a method type absent
+    ///   from the descriptor set — see [`Config::descriptor_set`])
     /// - the output directory cannot be created or written to
     /// - [`Config::emit_descriptor_set`] was given a name containing path
     ///   separators, or the descriptor set cannot be written
@@ -411,8 +414,18 @@ impl Config {
                 (bytes, proto_relative_names(&self.files))
             }
         };
-        let mut fds = FileDescriptorSet::decode_from_slice(&descriptor_bytes)
-            .map_err(|e| anyhow!("failed to decode FileDescriptorSet: {e}"))?;
+        // A precompiled set is the one source whose bytes the user can point
+        // a tool at, so name the file they need to look at.
+        let mut fds = FileDescriptorSet::decode_from_slice(&descriptor_bytes).map_err(|e| {
+            match &self.descriptor_source {
+                DescriptorSource::Precompiled(p) => {
+                    anyhow!("failed to decode descriptor set '{}': {e}", p.display())
+                }
+                DescriptorSource::Protoc | DescriptorSource::Buf => {
+                    anyhow!("failed to decode FileDescriptorSet: {e}")
+                }
+            }
+        })?;
 
         // 3. Generate.
         let generated = codegen::generate_files(&fds.file, &files_to_generate, &self.options)?;
