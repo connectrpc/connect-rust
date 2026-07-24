@@ -308,11 +308,26 @@ impl ConnectError {
     }
 
     /// Borrow the response headers. Returns an empty map if none were set.
+    ///
+    /// On an error returned by a client call, these are the headers the
+    /// response arrived with. Every terminal error from a
+    /// [`ServerStream`](crate::client::ServerStream) carries them, whatever
+    /// the protocol and whatever ended the stream.
     pub fn response_headers(&self) -> &http::HeaderMap {
         self.response_headers.as_deref().unwrap_or(&EMPTY_HEADERS)
     }
 
     /// Borrow the response trailers. Returns an empty map if none were set.
+    ///
+    /// On an error returned by a client call, these are the trailing
+    /// metadata the RPC ended with, populated whenever any was received —
+    /// gRPC trailers or a Connect END_STREAM `metadata` object. The
+    /// status-bearing gRPC trailers (`grpc-status`, `grpc-message`,
+    /// `grpc-status-details-bin`) are excluded, because their content is
+    /// this error's [`code`](Self::code), message and
+    /// [`details`](Self::details);
+    /// [`ServerStream::trailers()`](crate::client::ServerStream::trailers)
+    /// reports the wire map verbatim if you need them.
     pub fn trailers(&self) -> &http::HeaderMap {
         self.trailers.as_deref().unwrap_or(&EMPTY_HEADERS)
     }

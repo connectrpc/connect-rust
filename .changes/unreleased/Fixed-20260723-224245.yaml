@@ -1,0 +1,16 @@
+kind: Fixed
+body: |-
+  **A propagated error no longer corrupts the response that reports it**
+  ([#202]). A handler that returns a `ConnectError` from a client call — the
+  ordinary gateway shape — hands the server an error carrying the upstream
+  response's headers, and the server echoed that block onto its own response
+  verbatim. Because the response builder appends rather than replaces, the
+  caller received two `content-type` values, which is a framing error, along
+  with the upstream's `content-length` and content codings describing a body
+  that was never sent. The server now keeps its own value for any header it
+  already set, and drops connection-scoped headers: the RFC 9110 hop-by-hop
+  set, `content-length`, and the content-coding headers. All other error
+  metadata is forwarded unchanged.
+
+  [#202]: https://github.com/connectrpc/connect-rust/issues/202
+time: 2026-07-23T22:42:45.469139238-07:00
