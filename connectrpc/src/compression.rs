@@ -7,11 +7,14 @@
 //! - `gzip` - Gzip compression via flate2 (enabled by default)
 //! - `zstd` - Zstandard compression via zstd (enabled by default)
 //!
-//! # Streaming Compression
-//!
-//! When the `streaming` feature is enabled (default), providers can also
-//! support streaming compression/decompression for handling large payloads
-//! without buffering the entire message in memory.
+//! Compression is always applied a whole message at a time, on every wire
+//! shape. The enveloped framings — Connect streaming, gRPC, and gRPC-Web —
+//! are length-prefixed: the 5-byte header carries the *compressed* length, so
+//! a message must be fully compressed before its own header can be written.
+//! Connect unary has no envelope, just a `content-encoding` body, but that
+//! body is collected in full and size-checked before it is decompressed. So
+//! neither direction ever holds a partial message, and there is no point in
+//! the pipeline at which an incremental compressor could attach.
 //!
 //! # Example
 //!
@@ -53,15 +56,9 @@
 //! ```
 
 use std::collections::HashMap;
-#[cfg(feature = "streaming")]
-use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(feature = "streaming")]
-use tokio::io::AsyncBufRead;
-#[cfg(feature = "streaming")]
-use tokio::io::AsyncRead;
 
 use crate::error::ConnectError;
 
@@ -69,20 +66,6 @@ use crate::error::ConnectError;
 fn malformed_compressed_payload(message: impl Into<String>) -> ConnectError {
     ConnectError::invalid_argument(message)
 }
-
-// ============================================================================
-// Streaming Types
-// ============================================================================
-
-/// A boxed async reader for streaming compression/decompression.
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send>>;
-
-/// A boxed async buffered reader for streaming input.
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub type BoxedAsyncBufRead = Pin<Box<dyn AsyncBufRead + Send>>;
 
 /// Trait for compression algorithm implementations.
 ///
@@ -155,26 +138,6 @@ pub trait CompressionProvider: Send + Sync + 'static {
     }
 }
 
-/// Trait for streaming compression support.
-///
-/// This trait extends [`CompressionProvider`] with streaming methods that
-/// process data incrementally without buffering the entire payload in memory.
-///
-/// Available when the `streaming` feature is enabled (default).
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub trait StreamingCompressionProvider: CompressionProvider {
-    /// Create a streaming decompressor.
-    ///
-    /// Returns an `AsyncRead` that decompresses data from the input reader.
-    fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead;
-
-    /// Create a streaming compressor.
-    ///
-    /// Returns an `AsyncRead` that compresses data from the input reader.
-    fn compress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead;
-}
-
 /// Registry of compression providers.
 ///
 /// The registry maps encoding names to their provider implementations.
@@ -183,8 +146,6 @@ pub trait StreamingCompressionProvider: CompressionProvider {
 #[derive(Clone)]
 pub struct CompressionRegistry {
     providers: Arc<HashMap<&'static str, Arc<dyn CompressionProvider>>>,
-    #[cfg(feature = "streaming")]
-    streaming_providers: Arc<HashMap<&'static str, Arc<dyn StreamingCompressionProvider>>>,
     /// Cached, sorted, comma-joined list of supported encodings for
     /// Accept-Encoding headers. Recomputed when providers are registered
     /// (rather than on every request).
@@ -207,8 +168,6 @@ impl CompressionRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(HashMap::new()),
-            #[cfg(feature = "streaming")]
-            streaming_providers: Arc::new(HashMap::new()),
             accept_encoding: Arc::from(""),
         }
     }
@@ -367,96 +326,6 @@ impl CompressionRegistry {
 
         provider.compress(data)
     }
-
-    /// Register a streaming compression provider.
-    ///
-    /// This also registers the provider for buffered compression.
-    /// Returns self for method chaining.
-    ///
-    /// Available when the `streaming` feature is enabled.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    #[must_use]
-    pub fn register_streaming<P: StreamingCompressionProvider>(mut self, provider: P) -> Self {
-        let name = provider.name();
-        let provider = Arc::new(provider);
-
-        // Register for both buffered and streaming
-        let providers = Arc::make_mut(&mut self.providers);
-        providers.insert(name, provider.clone());
-
-        let streaming_providers = Arc::make_mut(&mut self.streaming_providers);
-        streaming_providers.insert(name, provider);
-
-        self.rebuild_accept_encoding();
-        self
-    }
-
-    /// Get a streaming provider by encoding name.
-    ///
-    /// Returns `None` if no streaming provider is registered for the given name.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn get_streaming(&self, name: &str) -> Option<Arc<dyn StreamingCompressionProvider>> {
-        self.streaming_providers.get(name).cloned()
-    }
-
-    /// Check if streaming compression is supported for the given encoding name.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn supports_streaming(&self, name: &str) -> bool {
-        self.streaming_providers.contains_key(name)
-    }
-
-    /// Create a streaming decompressor for the specified encoding.
-    ///
-    /// Returns an `AsyncRead` that decompresses data from the input reader.
-    /// Returns an error if the encoding is not supported for streaming.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn decompress_stream(
-        &self,
-        encoding: &str,
-        reader: BoxedAsyncBufRead,
-    ) -> Result<BoxedAsyncRead, ConnectError> {
-        // "identity" means no compression - just return the reader as-is
-        if encoding == "identity" {
-            return Ok(reader);
-        }
-
-        let provider = self.get_streaming(encoding).ok_or_else(|| {
-            ConnectError::unimplemented(format!(
-                "streaming decompression not supported for encoding: {encoding}"
-            ))
-        })?;
-
-        Ok(provider.decompress_stream(reader))
-    }
-
-    /// Create a streaming compressor for the specified encoding.
-    ///
-    /// Returns an `AsyncRead` that compresses data from the input reader.
-    /// Returns an error if the encoding is not supported for streaming.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn compress_stream(
-        &self,
-        encoding: &str,
-        reader: BoxedAsyncBufRead,
-    ) -> Result<BoxedAsyncRead, ConnectError> {
-        // "identity" means no compression - just return the reader as-is
-        if encoding == "identity" {
-            return Ok(reader);
-        }
-
-        let provider = self.get_streaming(encoding).ok_or_else(|| {
-            ConnectError::unimplemented(format!(
-                "streaming compression not supported for encoding: {encoding}"
-            ))
-        })?;
-
-        Ok(provider.compress_stream(reader))
-    }
 }
 
 /// Policy controlling when compression is applied.
@@ -558,23 +427,12 @@ impl Default for CompressionRegistry {
     fn default() -> Self {
         let mut registry = Self::new();
 
-        // When streaming is enabled, use register_streaming to get both capabilities
-        #[cfg(all(feature = "gzip", feature = "streaming"))]
-        {
-            registry = registry.register_streaming(GzipProvider::default());
-        }
-
-        #[cfg(all(feature = "gzip", not(feature = "streaming")))]
+        #[cfg(feature = "gzip")]
         {
             registry = registry.register(GzipProvider::default());
         }
 
-        #[cfg(all(feature = "zstd", feature = "streaming"))]
-        {
-            registry = registry.register_streaming(ZstdProvider::default());
-        }
-
-        #[cfg(all(feature = "zstd", not(feature = "streaming")))]
+        #[cfg(feature = "zstd")]
         {
             registry = registry.register(ZstdProvider::default());
         }
@@ -937,23 +795,6 @@ impl CompressionProvider for GzipProvider {
     }
 }
 
-#[cfg(all(feature = "gzip", feature = "streaming"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "gzip", feature = "streaming"))))]
-impl StreamingCompressionProvider for GzipProvider {
-    fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(async_compression::tokio::bufread::GzipDecoder::new(reader))
-    }
-
-    fn compress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(
-            async_compression::tokio::bufread::GzipEncoder::with_quality(
-                reader,
-                async_compression::Level::Precise(self.level as i32),
-            ),
-        )
-    }
-}
-
 /// Zstandard compression provider with internal compressor pooling.
 ///
 /// Pools `zstd::bulk::Compressor` objects to avoid repeated allocation of
@@ -1115,23 +956,6 @@ impl CompressionProvider for ZstdProvider {
     }
 }
 
-#[cfg(all(feature = "zstd", feature = "streaming"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "zstd", feature = "streaming"))))]
-impl StreamingCompressionProvider for ZstdProvider {
-    fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(async_compression::tokio::bufread::ZstdDecoder::new(reader))
-    }
-
-    fn compress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(
-            async_compression::tokio::bufread::ZstdEncoder::with_quality(
-                reader,
-                async_compression::Level::Precise(self.level),
-            ),
-        )
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1270,29 +1094,21 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "gzip", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_gzip_streaming_honors_level() {
-        use tokio::io::AsyncReadExt;
-        async fn stream_compress(p: &GzipProvider, data: &[u8]) -> Vec<u8> {
-            let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(data.to_vec()));
-            let mut enc = p.compress_stream(reader);
-            let mut out = Vec::new();
-            enc.read_to_end(&mut out).await.unwrap();
-            out
-        }
-        let data = b"hello world, streaming gzip at the configured level".repeat(200);
-        let fast = stream_compress(&GzipProvider::with_level(1), &data).await;
-        let best = stream_compress(&GzipProvider::with_level(9), &data).await;
-        // Both must round-trip via the buffered decoder.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_honors_level() {
+        let data = b"hello world, gzip at the configured level".repeat(200);
+        let fast = GzipProvider::with_level(1).compress(&data).unwrap();
+        let best = GzipProvider::with_level(9).compress(&data).unwrap();
+        // Both must round-trip.
         for c in [&fast, &best] {
             let out = GzipProvider::default()
                 .decompress_with_limit(c, usize::MAX)
                 .unwrap();
             assert_eq!(&out[..], &data[..]);
         }
-        // Level must actually affect output (previously ignored): level 9 on
-        // highly repetitive input compresses strictly smaller than level 1.
+        // Level must actually affect output: level 9 on highly repetitive
+        // input compresses strictly smaller than level 1.
         assert!(
             best.len() < fast.len(),
             "level 9 ({}) should be smaller than level 1 ({})",
@@ -1777,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "zstd")]
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
     fn test_decompress_empty_body_with_encoding_header() {
         // Connect spec: "Servers must not attempt to decompress zero-length
         // HTTP request content." Clients may set Content-Encoding but skip
@@ -1916,81 +1732,6 @@ mod tests {
         let decompressed = registry
             .decompress_with_limit("mock", compressed, usize::MAX)
             .unwrap();
-        assert_eq!(&decompressed[..], data);
-    }
-
-    #[cfg(all(feature = "gzip", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_gzip_streaming() {
-        use tokio::io::AsyncReadExt;
-
-        let registry = CompressionRegistry::default();
-        assert!(registry.supports_streaming("gzip"));
-
-        // Create test data
-        let data = b"hello world, this is a test of streaming gzip compression";
-
-        // Compress using buffered method
-        let compressed = registry.compress("gzip", data).unwrap();
-
-        // Decompress using streaming
-        let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(compressed.to_vec()));
-        let mut decompressor = registry.decompress_stream("gzip", reader).unwrap();
-
-        let mut decompressed = Vec::new();
-        decompressor.read_to_end(&mut decompressed).await.unwrap();
-
-        assert_eq!(&decompressed[..], data);
-    }
-
-    #[cfg(all(feature = "zstd", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_zstd_streaming() {
-        use tokio::io::AsyncReadExt;
-
-        let registry = CompressionRegistry::default();
-        assert!(registry.supports_streaming("zstd"));
-
-        // Create test data
-        let data = b"hello world, this is a test of streaming zstd compression";
-
-        // Compress using buffered method
-        let compressed = registry.compress("zstd", data).unwrap();
-
-        // Decompress using streaming
-        let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(compressed.to_vec()));
-        let mut decompressor = registry.decompress_stream("zstd", reader).unwrap();
-
-        let mut decompressed = Vec::new();
-        decompressor.read_to_end(&mut decompressed).await.unwrap();
-
-        assert_eq!(&decompressed[..], data);
-    }
-
-    #[cfg(all(feature = "gzip", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_streaming_compress_decompress_roundtrip() {
-        use tokio::io::AsyncReadExt;
-
-        let registry = CompressionRegistry::default();
-
-        // Create test data
-        let data = b"hello world, this is a roundtrip test of streaming compression";
-
-        // Compress using streaming
-        let input: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(data.to_vec()));
-        let mut compressor = registry.compress_stream("gzip", input).unwrap();
-
-        let mut compressed = Vec::new();
-        compressor.read_to_end(&mut compressed).await.unwrap();
-
-        // Decompress using streaming
-        let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(compressed));
-        let mut decompressor = registry.decompress_stream("gzip", reader).unwrap();
-
-        let mut decompressed = Vec::new();
-        decompressor.read_to_end(&mut decompressed).await.unwrap();
-
         assert_eq!(&decompressed[..], data);
     }
 

@@ -53,7 +53,6 @@ serde_json = "1"
 # Compression
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 zstd = "0.13"
-async-compression = { version = "0.4", features = ["tokio"] }
 
 # Error handling
 thiserror = "2"
