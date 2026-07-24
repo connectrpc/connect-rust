@@ -1,0 +1,31 @@
+kind: Fixed
+body: |-
+  **A gateway propagating an upstream error could produce a response the
+  client could not read, losing the handler's error code** ([#202]). When a
+  handler returns a `ConnectError` that came back from a client call — the
+  ordinary gateway shape — that error carries the upstream response's
+  headers, and the server echoed them onto its own response verbatim.
+
+  Over Connect on HTTP/1.1 the consequence was total: the forwarded
+  `content-length` contradicted the body actually being written, hyper's
+  HTTP/1 encoder refused to serialize the response, and the connection
+  closed with zero bytes sent. Measured against connect-go v1.19.1, a
+  handler returning `permission_denied` surfaced at the caller as
+  `unavailable` with empty metadata, because a transport failure was all
+  the client ever saw; every handler error code collapsed the same way. A
+  forwarded `content-encoding: gzip` was a second, milder break — the
+  client tried to gunzip a plain-JSON error body, discarded it, and fell
+  back to the HTTP status. A forwarded `date` replaced the server's own,
+  since hyper emits no `Date` of its own once one is set, so responses
+  advertised the upstream's generation time.
+
+  The server now keeps its own value for any header it already set, which
+  is what kept two `content-type` values off the wire, and never forwards
+  names that describe the upstream rather than this response: the RFC 9110
+  hop-by-hop set, `content-length`, `content-type`, the content-coding
+  headers, `date`, and `grpc-status-details-bin`. All other header
+  metadata is forwarded unchanged, including every value of a multi-valued
+  name. Trailing metadata is unaffected by this change.
+
+  [#202]: https://github.com/connectrpc/connect-rust/issues/202
+time: 2026-07-23T22:42:45.469139238-07:00

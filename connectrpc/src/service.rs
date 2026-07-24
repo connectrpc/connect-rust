@@ -662,6 +662,78 @@ impl EndStreamResponse {
     }
 }
 
+/// Response headers that may never be carried from a propagated error
+/// onto this response. Three classes, none of which describe the response
+/// being built.
+///
+/// Hop-by-hop headers (RFC 9110 §7.6.1) belong to the connection the error
+/// arrived on. Body-framing headers would misdescribe our own body: a
+/// forwarded `content-length` makes hyper's HTTP/1 encoder refuse to
+/// serialize the response at all, and a forwarded content coding tells the
+/// client to decode bytes that were never encoded. `date` would report the
+/// upstream's generation time as ours — hyper emits no `Date` of its own
+/// once one is set, so the false value is the only one on the wire.
+///
+/// `grpc-status-details-bin` is here because the server writes its status
+/// into the trailers, never the header block, so the already-set rule in
+/// `echo_error_headers` cannot save it the way it saves `grpc-status` and
+/// `grpc-message` on the trailers-only path.
+fn is_unforwardable_header(name: &http::HeaderName) -> bool {
+    static KEEP_ALIVE: http::HeaderName = http::HeaderName::from_static("keep-alive");
+
+    // Hop-by-hop: scoped to a single connection.
+    *name == header::CONNECTION
+        || *name == KEEP_ALIVE
+        || *name == header::PROXY_AUTHENTICATE
+        || *name == header::PROXY_AUTHORIZATION
+        || *name == header::TE
+        || *name == header::TRAILER
+        || *name == header::TRANSFER_ENCODING
+        || *name == header::UPGRADE
+        // Body framing: describes bytes other than the ones we write.
+        || *name == header::CONTENT_LENGTH
+        || *name == header::CONTENT_TYPE
+        || *name == header::CONTENT_ENCODING
+        || *name == crate::protocol::hdr::GRPC_ENCODING
+        || *name == crate::protocol::hdr::CONNECT_CONTENT_ENCODING
+        // Provenance and status.
+        || *name == header::DATE
+        || *name == crate::protocol::hdr::GRPC_STATUS_DETAILS_BIN
+}
+
+/// Echo an error's response headers onto a response being built.
+///
+/// A `ConnectError` that came back from a client call carries the headers
+/// of the response it was parsed from, so a handler that propagates one —
+/// the ordinary `client.call(..).await?` in a gateway — is asking to
+/// re-emit another connection's headers. Two rules keep that from
+/// corrupting this response. A header this response already set wins,
+/// because `Builder::header` appends rather than replaces, and a second
+/// `content-type` on the wire is a framing error rather than extra
+/// metadata. Connection-scoped headers are dropped outright. Everything
+/// else is the server metadata the caller meant to forward, and passes
+/// through unchanged.
+fn echo_error_headers(
+    mut response: http::response::Builder,
+    err: &ConnectError,
+) -> http::response::Builder {
+    // Snapshot before appending: a multi-valued error header must still
+    // append all of its values, so the test cannot be against the map as
+    // it grows.
+    let already_set: Vec<http::HeaderName> = response
+        .headers_ref()
+        .map(|headers| headers.keys().cloned().collect())
+        .unwrap_or_default();
+
+    for (key, value) in err.response_headers() {
+        if is_unforwardable_header(key) || already_set.contains(key) {
+            continue;
+        }
+        response = response.header(key, value);
+    }
+    response
+}
+
 /// Create a streaming error response.
 ///
 /// For streaming RPCs, errors should still return HTTP 200 with the error
@@ -704,14 +776,12 @@ fn connect_streaming_error_response(
         _reader_task: None,
     };
 
-    let mut response = Response::builder().status(StatusCode::OK).header(
+    let response = Response::builder().status(StatusCode::OK).header(
         header::CONTENT_TYPE,
         Protocol::Connect.response_content_type(codec_format, true),
     );
 
-    for (key, value) in err.response_headers() {
-        response = response.header(key, value);
-    }
+    let response = echo_error_headers(response, err);
 
     response.body(body).unwrap_or_else(|_| {
         Response::new(StreamingResponseBody {
@@ -774,9 +844,7 @@ fn grpc_error_response(
         }
     }
 
-    for (key, value) in err.response_headers() {
-        response = response.header(key, value);
-    }
+    let response = echo_error_headers(response, err);
 
     response.body(body).unwrap_or_else(|_| {
         Response::new(StreamingResponseBody {
@@ -2051,9 +2119,7 @@ where
                 response = response.header(&GRPC_MESSAGE, val);
             }
         }
-        for (key, value) in err.response_headers() {
-            response = response.header(key, value);
-        }
+        let response = echo_error_headers(response, err);
         let body = GrpcUnaryBody {
             data: None,
             payload: std::collections::VecDeque::new(),
@@ -3227,14 +3293,12 @@ fn error_response(err: ConnectError) -> Response<Full<Bytes>> {
     let status = err.http_status();
     let body = err.to_json();
 
-    let mut response = Response::builder()
+    let response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type::JSON);
 
     // Add response headers from the error
-    for (key, value) in err.response_headers() {
-        response = response.header(key, value);
-    }
+    let response = echo_error_headers(response, &err);
 
     // Add trailers as trailer- prefixed headers
     let response = add_trailers(response, err.trailers());
@@ -5409,5 +5473,111 @@ mod tests {
             .expect("tests run inside a tokio runtime")
             .await
             .expect("reader task must not panic");
+    }
+
+    /// An error propagated out of a client call carries the upstream
+    /// response's headers, and a gateway handler returns it as its own
+    /// error. Echoing that block verbatim would put a second
+    /// `content-type` on the wire and describe this response's body with
+    /// the upstream's framing, so the server's own headers win and the
+    /// unforwardable ones are dropped — while the server metadata the
+    /// caller wanted forwarded still gets through.
+    ///
+    /// `content-length` is the one that actually breaks a client: hyper's
+    /// HTTP/1 encoder refuses to serialize a response whose declared
+    /// length contradicts the body, closing the connection with nothing
+    /// written, so the caller sees a transport failure rather than the
+    /// handler's error code.
+    fn upstream_error() -> ConnectError {
+        let mut upstream = http::HeaderMap::new();
+        upstream.insert(
+            header::CONTENT_TYPE,
+            "application/grpc+proto".parse().unwrap(),
+        );
+        upstream.insert(header::CONTENT_LENGTH, "4096".parse().unwrap());
+        upstream.insert(header::CONNECTION, "close".parse().unwrap());
+        upstream.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        upstream.insert(
+            header::DATE,
+            "Thu, 01 Jan 1970 00:00:00 GMT".parse().unwrap(),
+        );
+        upstream.insert(
+            crate::protocol::hdr::GRPC_ENCODING.clone(),
+            "gzip".parse().unwrap(),
+        );
+        // An upstream status proto whose code contradicts the one we send.
+        upstream.insert(
+            crate::protocol::hdr::GRPC_STATUS_DETAILS_BIN.clone(),
+            "CAcSBW5vcGU".parse().unwrap(),
+        );
+        upstream.insert("x-upstream-region", "eu-west-1".parse().unwrap());
+        upstream.append("x-upstream-tag", "a".parse().unwrap());
+        upstream.append("x-upstream-tag", "b".parse().unwrap());
+
+        let mut err = ConnectError::unavailable("upstream is down");
+        err.set_response_headers(upstream);
+        err
+    }
+
+    fn assert_safe_echo(headers: &http::HeaderMap, expected_content_type: &str) {
+        assert_eq!(
+            headers.get_all(header::CONTENT_TYPE).iter().count(),
+            1,
+            "exactly one content-type must reach the wire: {headers:?}"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            expected_content_type
+        );
+        for dropped in [
+            header::CONTENT_LENGTH,
+            header::CONNECTION,
+            header::TRANSFER_ENCODING,
+            header::DATE,
+            crate::protocol::hdr::GRPC_ENCODING.clone(),
+            crate::protocol::hdr::GRPC_STATUS_DETAILS_BIN.clone(),
+        ] {
+            assert!(
+                !headers.contains_key(&dropped),
+                "{dropped} describes the upstream response and must not be forwarded"
+            );
+        }
+
+        // The point of attaching headers to an error is that this survives.
+        assert_eq!(headers.get("x-upstream-region").unwrap(), "eu-west-1");
+        let tags: Vec<_> = headers
+            .get_all("x-upstream-tag")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(tags, ["a", "b"], "multi-valued metadata keeps every value");
+    }
+
+    #[test]
+    fn propagated_upstream_headers_do_not_corrupt_the_connect_unary_response() {
+        let response = error_response(upstream_error());
+        assert_safe_echo(response.headers(), content_type::JSON);
+    }
+
+    #[test]
+    fn propagated_upstream_headers_do_not_corrupt_the_connect_streaming_response() {
+        let response =
+            streaming_error_response(&upstream_error(), Protocol::Connect, CodecFormat::Proto);
+        assert_safe_echo(
+            response.headers(),
+            Protocol::Connect.response_content_type(CodecFormat::Proto, true),
+        );
+    }
+
+    #[test]
+    fn propagated_upstream_headers_do_not_corrupt_the_grpc_streaming_response() {
+        let response =
+            streaming_error_response(&upstream_error(), Protocol::Grpc, CodecFormat::Proto);
+        assert_safe_echo(
+            response.headers(),
+            Protocol::Grpc.response_content_type(CodecFormat::Proto, true),
+        );
+        // The trailers-only status headers are the server's own and stay.
+        assert_eq!(response.headers().get(&GRPC_STATUS).unwrap(), "14");
     }
 }

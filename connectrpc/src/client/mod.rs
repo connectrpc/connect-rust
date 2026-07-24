@@ -177,6 +177,7 @@ use crate::error::ConnectError;
 use crate::error::ErrorCode;
 use crate::error::ErrorDetail;
 use crate::protocol::Protocol;
+use crate::protocol::hdr;
 
 /// Type alias for a boxed future, used in service implementations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -1817,6 +1818,25 @@ fn build_connect_get_query(
     query
 }
 
+/// Stamp a terminal error with the metadata its response delivered.
+///
+/// The response-parsing paths build errors several layers from the
+/// response — a bounded body read, a decompression provider, a codec — and
+/// none of those layers has the headers. Rather than teach each of them,
+/// the parse functions map their errors through this on the way out.
+fn with_response_metadata<'a>(
+    headers: &'a http::HeaderMap,
+    trailers: &'a http::HeaderMap,
+) -> impl Fn(ConnectError) -> ConnectError + 'a {
+    move |mut err| {
+        err.set_response_headers(headers.clone());
+        if !trailers.is_empty() {
+            err.set_trailers(trailers.clone());
+        }
+        err
+    }
+}
+
 /// Remap decompression error codes for payloads received from the server.
 ///
 /// The compression providers classify malformed input as `invalid_argument`
@@ -1960,10 +1980,10 @@ where
             } else {
                 ErrorCode::Unknown
             };
-            return Err(ConnectError::new(
-                code,
-                format!("unexpected content-type: {ct}"),
-            ));
+            let mut err = ConnectError::new(code, format!("unexpected content-type: {ct}"));
+            err.set_response_headers(resp_headers);
+            err.set_trailers(resp_trailers);
+            return Err(err);
         }
     }
 
@@ -1977,29 +1997,37 @@ where
         .max_message_size
         .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-    let body = collect_body_bounded(response.into_body(), max_message_size).await?;
+    // Everything below fails after a complete response was received, so
+    // every error out of it carries that response's metadata.
+    let attach = with_response_metadata(&resp_headers, &resp_trailers);
+
+    let body = collect_body_bounded(response.into_body(), max_message_size)
+        .await
+        .map_err(&attach)?;
 
     let body = if let Some(encoding) = response_encoding {
         config
             .compression
             .decompress_with_limit(&encoding, body, max_message_size)
-            .map_err(map_response_decompression_error)?
+            .map_err(map_response_decompression_error)
+            .map_err(&attach)?
     } else {
         body
     };
 
     if body.len() > max_message_size {
-        return Err(ConnectError::new(
+        return Err(attach(ConnectError::new(
             ErrorCode::ResourceExhausted,
             format!(
                 "message size {} exceeds limit {}",
                 body.len(),
                 max_message_size
             ),
-        ));
+        )));
     }
 
-    let message = decode_response_view::<RespView>(body, config.codec_format)?;
+    let message = decode_response_view::<RespView>(body, config.codec_format).map_err(&attach)?;
+    drop(attach);
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -2301,6 +2329,25 @@ struct StreamEnd {
 }
 
 impl StreamEnd {
+    /// Give a failed end the metadata the response already delivered: the
+    /// response headers, which a `ServerStream` cannot exist without, and
+    /// the trailing metadata whenever the end carried any. Applied at the
+    /// one site that writes the record rather than at each site that
+    /// builds one, so no construction path can forget it.
+    ///
+    /// `self.trailers` is the wire map, which on the gRPC shapes still
+    /// holds the status-bearing keys; the error gets the filtered view, so
+    /// this recomputes what `parse_grpc_error_from_trailers` already
+    /// derived rather than overwriting it with the raw set.
+    fn attach_metadata(&mut self, headers: &http::HeaderMap) {
+        if let Err(e) = &mut self.outcome {
+            e.set_response_headers(headers.clone());
+            if let Some(trailers) = &self.trailers {
+                e.set_trailers(error_metadata_from_trailers(trailers));
+            }
+        }
+    }
+
     fn replay<T>(&self) -> Result<Option<T>, ConnectError> {
         match &self.outcome {
             Ok(()) => Ok(None),
@@ -2442,6 +2489,10 @@ where
     /// matching grpc-go's treatment of each case. A Trailers-Only response
     /// carrying `grpc-status: 0` in the headers (empty body) is a clean
     /// end.
+    ///
+    /// Whatever the cause, the returned error carries the response
+    /// metadata: [`ConnectError::response_headers()`] always, and
+    /// [`ConnectError::trailers()`] whenever termination metadata arrived.
     pub async fn message<M>(&mut self) -> Result<Option<crate::StreamMessage<M>>, ConnectError>
     where
         // `M` is an output parameter pinned to `RespView`'s owned message —
@@ -2462,8 +2513,9 @@ where
             // The single writer of the terminal record. `message_inner`
             // cannot end the stream without producing one — "ended without
             // recording why" is unrepresentable.
-            Err(end) => {
+            Err(mut end) => {
                 debug_assert!(self.end.is_none(), "terminal record written twice");
+                end.attach_metadata(&self.headers);
                 self.end.get_or_insert(end).replay()
             }
         }
@@ -2761,10 +2813,7 @@ where
 
         let end_stream = match parse_connect_end_stream(&end_stream_data) {
             Ok(end_stream) => end_stream,
-            Err(mut e) => {
-                e.set_response_headers(self.headers.clone());
-                return e.into();
-            }
+            Err(e) => return e.into(),
         };
 
         let trailers = end_stream.metadata.map(|metadata| {
@@ -3971,7 +4020,12 @@ where
     let body_limit = max_msg_size
         .saturating_add(2 * crate::envelope::HEADER_SIZE)
         .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
-    let body = collect_body_bounded(response.into_body(), body_limit).await?;
+    let body = collect_body_bounded(response.into_body(), body_limit)
+        .await
+        .map_err(with_response_metadata(
+            &resp_headers,
+            &http::HeaderMap::new(),
+        ))?;
 
     let (data, trailers) = parse_connect_client_stream_envelopes(
         body,
@@ -3980,7 +4034,9 @@ where
         max_msg_size,
         &resp_headers,
     )?;
-    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+    // The trailers are parsed by now, so a decode failure reports them too.
+    let message = decode_response_view::<RespView>(data, config.codec_format)
+        .map_err(with_response_metadata(&resp_headers, &trailers))?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -4005,12 +4061,32 @@ where
 /// decoded. A second data envelope is rejected before its payload is
 /// decompressed, so the client never spends decompression work or memory on
 /// more than the single message the RPC allows.
+///
+/// Every error out of here ends the RPC, so all of them carry the response
+/// headers — attached here rather than inside the scan, so no failure mode
+/// can omit them.
 fn parse_connect_client_stream_envelopes(
     body: Bytes,
     compression: &crate::compression::CompressionRegistry,
     encoding: Option<&str>,
     max_msg_size: usize,
     resp_headers: &http::HeaderMap,
+) -> Result<(Bytes, http::HeaderMap), ConnectError> {
+    scan_connect_client_stream_envelopes(body, compression, encoding, max_msg_size).map_err(
+        |mut err| {
+            err.set_response_headers(resp_headers.clone());
+            err
+        },
+    )
+}
+
+/// The envelope scan behind [`parse_connect_client_stream_envelopes`].
+/// Errors leave here without response headers; the caller attaches them.
+fn scan_connect_client_stream_envelopes(
+    body: Bytes,
+    compression: &crate::compression::CompressionRegistry,
+    encoding: Option<&str>,
+    max_msg_size: usize,
 ) -> Result<(Bytes, http::HeaderMap), ConnectError> {
     let mut buf = BytesMut::from(body.as_ref());
     let mut message: Option<Bytes> = None;
@@ -4036,10 +4112,7 @@ fn parse_connect_client_stream_envelopes(
                 envelope.data
             };
 
-            let end_stream = parse_connect_end_stream(&end_stream_data).map_err(|mut err| {
-                err.set_response_headers(resp_headers.clone());
-                err
-            })?;
+            let end_stream = parse_connect_end_stream(&end_stream_data)?;
 
             if let Some(metadata) = end_stream.metadata {
                 append_metadata_capped(&mut trailers, metadata);
@@ -4047,8 +4120,12 @@ fn parse_connect_client_stream_envelopes(
 
             if let Some(err) = end_stream.error {
                 let mut connect_error = end_stream_error_to_connect_error(err);
-                connect_error.set_response_headers(resp_headers.clone());
-                connect_error.set_trailers(trailers);
+                // Same filter as the server-streaming shape, so identical
+                // wire bytes give identical `ConnectError::trailers()`
+                // whichever kind of call carried them. A gateway that
+                // translates gRPC to Connect can put a `grpc-status` into
+                // END_STREAM metadata, and it means the same thing there.
+                connect_error.set_trailers(error_metadata_from_trailers(&trailers));
                 return Err(connect_error);
             }
 
@@ -4309,6 +4386,30 @@ fn add_streaming_request_headers(
     builder
 }
 
+/// The trailers that carry the status itself rather than user metadata.
+/// Their content reaches the caller as the error's `code`, `message` and
+/// `details`, so repeating them as metadata would duplicate the status and
+/// re-expose the raw `grpc-status-details-bin` bytes. The server side
+/// writes these same three names via `hdr`.
+fn is_status_trailer(name: &http::HeaderName) -> bool {
+    *name == hdr::GRPC_STATUS || *name == hdr::GRPC_MESSAGE || *name == hdr::GRPC_STATUS_DETAILS_BIN
+}
+
+/// The trailing metadata a terminal error should expose: the trailers that
+/// arrived, minus the status-bearing ones. `ServerStream::trailers()` still
+/// reports the wire trailers verbatim — the error's view and the stream's
+/// differ deliberately, and every write of an error's trailers on the
+/// response path goes through here so the two protocols agree.
+fn error_metadata_from_trailers(trailers: &http::HeaderMap) -> http::HeaderMap {
+    let mut out = http::HeaderMap::new();
+    for (key, value) in trailers {
+        if !is_status_trailer(key) {
+            out.append(key, value.clone());
+        }
+    }
+    out
+}
+
 /// Parse a gRPC error from HTTP/2 trailers or gRPC-Web trailer frame headers.
 fn parse_grpc_error_from_trailers(trailers: &http::HeaderMap) -> Option<ConnectError> {
     let raw = trailers.get("grpc-status")?;
@@ -4348,14 +4449,7 @@ fn parse_grpc_error_from_trailers(trailers: &http::HeaderMap) -> Option<ConnectE
         }
     }
 
-    // Include other trailers as error metadata
-    let out = err.trailers_mut();
-    for (key, value) in trailers.iter() {
-        let name = key.as_str();
-        if name != "grpc-status" && name != "grpc-message" && name != "grpc-status-details-bin" {
-            out.append(key, value.clone());
-        }
-    }
+    err.set_trailers(error_metadata_from_trailers(trailers));
 
     Some(err)
 }
@@ -5410,6 +5504,218 @@ mod tests {
             again.response_headers().get("x-from-headers").unwrap(),
             "yes"
         );
+    }
+
+    /// A server error carried by a well-formed Connect END_STREAM is still
+    /// an error the caller inspects for context: it must arrive with the
+    /// response headers and with the trailing metadata the same envelope
+    /// supplied, on the first read and on every sticky replay after it.
+    #[tokio::test]
+    async fn connect_end_stream_error_carries_response_metadata() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(
+            &Envelope::end_stream(Bytes::from_static(
+                b"{\"error\":{\"code\":\"permission_denied\",\"message\":\"nope\"},\
+                  \"metadata\":{\"x-from-trailers\":[\"also\"]}}",
+            ))
+            .encode(),
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers,
+            body: Full::new(body.freeze()),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(1024),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("errored END_STREAM must surface as Err");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert_eq!(err.trailers().get("x-from-trailers").unwrap(), "also");
+
+        let again = stream
+            .message()
+            .await
+            .expect_err("terminal error is sticky");
+        assert_eq!(
+            again.response_headers().get("x-from-headers").unwrap(),
+            "yes"
+        );
+        assert_eq!(again.trailers().get("x-from-trailers").unwrap(), "also");
+
+        // The stored record is the same one `message()` replayed, so the
+        // post-hoc accessor cannot disagree with it.
+        let stored = stream.error().expect("terminal error stays inspectable");
+        assert_eq!(
+            stored.response_headers().get("x-from-headers").unwrap(),
+            "yes"
+        );
+        assert_eq!(stored.trailers().get("x-from-trailers").unwrap(), "also");
+    }
+
+    /// The same guarantee on the gRPC shape: a `grpc-status` error in the
+    /// trailers reaches the caller with the response headers attached, not
+    /// just the trailers it was parsed from.
+    ///
+    /// The error's metadata and the stream's trailers are deliberately
+    /// different views of the same frame: the status-bearing keys are
+    /// already the error's `code` and `message`, so they stay out of the
+    /// metadata while `trailers()` keeps reporting the wire map verbatim.
+    #[tokio::test]
+    async fn grpc_stream_error_carries_response_metadata() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "7".parse().unwrap()); // PERMISSION_DENIED
+        trailers.insert("grpc-message", "nope".parse().unwrap());
+        trailers.insert("x-from-trailers", "also".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::trailers(trailers))];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers,
+            body: StreamBody::new(futures::stream::iter(frames)),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Grpc,
+            max_message_size: Some(1024),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("grpc-status 7 must surface as Err");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.message.as_deref(), Some("nope"));
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert_eq!(err.trailers().get("x-from-trailers").unwrap(), "also");
+
+        // The status keys stay out of the error metadata — they are the
+        // error's own code and message — but remain in the wire trailers.
+        for key in [
+            &hdr::GRPC_STATUS,
+            &hdr::GRPC_MESSAGE,
+            &hdr::GRPC_STATUS_DETAILS_BIN,
+        ] {
+            assert!(
+                !err.trailers().contains_key(key),
+                "{key} must not be duplicated into the error metadata"
+            );
+        }
+        let wire = stream.trailers().expect("wire trailers stay available");
+        assert_eq!(wire.get("grpc-status").unwrap(), "7");
+        assert_eq!(wire.get("x-from-trailers").unwrap(), "also");
+    }
+
+    /// The corner that makes the filter, not an "already has trailers"
+    /// check, the right guard: when the frame carries nothing but status
+    /// keys the curated metadata is legitimately empty, and the raw map
+    /// must not be substituted for it.
+    #[tokio::test]
+    async fn grpc_stream_error_metadata_is_empty_when_only_status_arrives() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "7".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::trailers(trailers))];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            headers,
+            body: StreamBody::new(futures::stream::iter(frames)),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Grpc,
+            max_message_size: Some(1024),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("grpc-status 7 must surface as Err");
+        assert!(
+            err.trailers().is_empty(),
+            "status-only trailers carry no user metadata: {:?}",
+            err.trailers()
+        );
+        // The empty metadata must not read as "nothing was attached": the
+        // headers still arrive, which is what distinguishes the filtered
+        // map from a record that skipped attachment altogether.
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert!(
+            stream
+                .trailers()
+                .is_some_and(|t| t.contains_key("grpc-status")),
+            "the wire trailers are still reported verbatim"
+        );
+    }
+
+    /// A Connect unary response whose content-type is not the configured
+    /// codec's is rejected without reading the body. The rejection still
+    /// carries the headers (and the `trailer-`-prefixed metadata) that
+    /// arrived, so a caller can see what the intermediary actually sent.
+    #[tokio::test]
+    async fn connect_unary_content_type_rejection_carries_response_metadata() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .header("x-from-headers", "yes")
+            .header("trailer-x-from-trailers", "also")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let config = ClientConfig::new("http://localhost".parse().unwrap());
+        let err = parse_connect_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+        )
+        .await
+        .expect_err("text/html is not a Connect response");
+
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert_eq!(err.trailers().get("x-from-trailers").unwrap(), "also");
     }
 
     /// Same contract for gRPC: an error in HTTP/2 trailers is a failed RPC
@@ -7551,6 +7857,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::DataLoss, "unexpected error: {err}");
+    }
+
+    /// A corrupt END_STREAM payload fails before any trailing metadata can
+    /// be parsed, so the response headers are the only context the caller
+    /// gets — they must be there.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn client_stream_end_stream_decompression_failure_carries_headers() {
+        use crate::envelope::flags;
+
+        let registry = crate::compression::CompressionRegistry::default();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(
+            &Envelope {
+                flags: flags::COMPRESSED | flags::END_STREAM,
+                data: Bytes::from_static(b"not gzip data"),
+            }
+            .encode(),
+        );
+
+        let mut resp_headers = http::HeaderMap::new();
+        resp_headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &resp_headers,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DataLoss, "unexpected error: {err}");
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
     }
 
     /// The response-path remap touches only the two decompression codes:
