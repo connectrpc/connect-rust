@@ -61,9 +61,8 @@ serde_json = { workspace = true }
 flate2 = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
-# Streaming compression (optional)
-async-compression = { workspace = true, optional = true }
-tokio-util = { workspace = true, features = ["codec", "io"] }
+# Envelope framing (`Encoder`/`Decoder` for the 5-byte message header)
+tokio-util = { workspace = true, features = ["codec"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -100,7 +99,7 @@ buffa-types = { workspace = true }
 h2 = { workspace = true }
 
 [features]
-default = ["gzip", "zstd", "streaming", "json"]
+default = ["gzip", "zstd", "json"]
 
 # JSON codec for protobuf message types. On by default. Disabling it drops the
 # `serde::Serialize`/`DeserializeOwned` requirement on message types (see
@@ -111,9 +110,8 @@ default = ["gzip", "zstd", "streaming", "json"]
 json = ["buffa/json"]
 
 # Compression algorithms
-gzip = ["dep:flate2", "async-compression?/gzip"]
-zstd = ["dep:zstd", "async-compression?/zstd"]
-streaming = ["dep:async-compression"]
+gzip = ["dep:flate2"]
+zstd = ["dep:zstd"]
 
 # Standalone hyper-based server (convenience feature)
 server = [

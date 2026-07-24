@@ -323,7 +323,6 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 | `json`       | Yes     | JSON codec for protobuf messages. Disable (with codegen `no_json`) for proto-only builds — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip`       | Yes     | Gzip compression via flate2                      |
 | `zstd`       | Yes     | Zstandard compression via zstd                   |
-| `streaming`  | Yes     | Streaming compression via async-compression      |
 | `client`     | No      | HTTP client transports (plaintext)               |
 | `client-tls` | No      | TLS for client transports (`HttpClient::with_tls`, `Http2Connection::connect_tls`) |
 | `server`     | No      | Standalone hyper-based server                    |
@@ -359,7 +358,7 @@ feature:
 [dependencies]
 # Note: `default-features = false` is the only way to drop `json`, so it also
 # drops the default compression features — re-list any you still want.
-connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
+connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd"] }
 ```
 
 With `json` off, message-type bounds relax from `Message + Serialize` to just

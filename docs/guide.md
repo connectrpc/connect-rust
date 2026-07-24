@@ -73,7 +73,6 @@ The runtime is feature-gated so you only pay for what you use:
 | `json` | yes | JSON codec for protobuf messages (the proto3-JSON wire format). Disabling it drops the `serde` requirement on message types — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip` | yes | Gzip compression via `flate2` |
 | `zstd` | yes | Zstandard compression via `zstd` |
-| `streaming` | yes | Streaming compression via `async-compression` |
 | `client` | no | HTTP client transports (cleartext) |
 | `client-tls` | no | TLS for client transports |
 | `server` | no | Built-in hyper server (`Server`) |
@@ -118,9 +117,9 @@ It takes two coordinated settings:
    ```toml
    # Proto-only server: no JSON codec, no serde on message types.
    # `default-features = false` is the only way to drop `json`, so it also drops
-   # the default compression features (`gzip`/`zstd`/`streaming`) — re-list the
-   # ones you still want.
-   connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
+   # the default compression features (`gzip`/`zstd`) — re-list the ones you
+   # still want.
+   connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd"] }
    ```
 
 With `json` off, the `Message + serde` requirement is replaced by the

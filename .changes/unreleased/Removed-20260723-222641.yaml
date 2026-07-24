@@ -1,0 +1,20 @@
+kind: Removed
+body: |-
+    **Removed the `streaming` feature and the `StreamingCompressionProvider`
+    API** ([#246]). **Streaming RPCs are unaffected** — the feature name invites
+    the opposite conclusion, but what it gated was an incremental-compression API
+    that no wire path could reach, not streaming RPC support.
+
+    **Breaking.** Gone: the `streaming` feature (previously on by default), the
+    `StreamingCompressionProvider` trait, the `BoxedAsyncRead` and
+    `BoxedAsyncBufRead` aliases, and `CompressionRegistry`'s `register_streaming`,
+    `get_streaming`, `supports_streaming`, `compress_stream` and
+    `decompress_stream`. A custom provider registered through `register_streaming`
+    moves to `register` and keeps working on every path that ever used it. Removed
+    API surfaces as a rustc error; a stale `streaming` entry in a
+    `features = [...]` array fails earlier still, as a Cargo resolution error —
+    drop it there too. The removal also drops the `async-compression` dependency,
+    which was compiled into every default build.
+
+    [#246]: https://github.com/connectrpc/connect-rust/issues/246
+time: 2026-07-23T22:26:41.865238285-07:00

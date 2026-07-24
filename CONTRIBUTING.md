@@ -188,7 +188,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
 - **Examples** — builds and runs the example crates
 - **Minimal features** — `cargo check` *and* `cargo test`, both
   `-p connectrpc --no-default-features`. Because the tests run, a test that
-  needs `json`, `gzip`, `zstd` or `streaming` must be
+  needs `json`, `gzip` or `zstd` must be
   `#[cfg(feature = "...")]`-gated or it fails here while passing the
   default-feature suite
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
