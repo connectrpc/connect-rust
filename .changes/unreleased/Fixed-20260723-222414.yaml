@@ -1,0 +1,24 @@
+kind: Fixed
+body: |-
+  **Terminal client errors now carry the response headers and trailers
+  consistently** ([#202]). A failed RPC reported through
+  `ServerStream::message()` — a Connect END_STREAM carrying an error, a gRPC
+  or gRPC-Web `grpc-status` error, a decode, decompression, transport or
+  deadline failure — arrives with `ConnectError::response_headers()`
+  populated, and with `ConnectError::trailers()` populated whenever
+  termination metadata was received. The same holds for the sticky replay on
+  a second `message()` call and for `ServerStream::error()`. Previously only
+  a few of these paths attached metadata, so whether a caller could read the
+  server's headers off an error depended on which protocol was in use and on
+  how the stream happened to fail. The Connect unary and client-streaming
+  parse paths gained the same guarantee — the content-type rejection, the
+  bounded body read, decompression and message decode all report the
+  metadata their response delivered. As before, the error's trailers exclude
+  `grpc-status`, `grpc-message` and `grpc-status-details-bin`, whose content
+  is already the error's code, message and details. That filter now also
+  applies on the Connect client-streaming path, so identical wire bytes give
+  identical `ConnectError::trailers()` whatever the call shape;
+  `ServerStream::trailers()` still reports the wire trailers verbatim.
+
+  [#202]: https://github.com/connectrpc/connect-rust/issues/202
+time: 2026-07-23T22:24:14.651900498-07:00
