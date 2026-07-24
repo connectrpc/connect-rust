@@ -1210,7 +1210,7 @@ async fn main() -> Result<()> {
 
     // Configure message size limits if requested by the conformance runner
     let limits = if request.message_receive_limit > 0 {
-        Limits::default().max_message_size(request.message_receive_limit as usize)
+        Limits::default().with_max_message_size(request.message_receive_limit as usize)
     } else {
         Limits::default()
     };

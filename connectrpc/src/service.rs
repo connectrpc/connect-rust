@@ -443,7 +443,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// after decompression.
 ///
 /// For **unary RPCs**, the request body contains a single message (possibly
-/// compressed). Set `max_request_body_size >= max_message_size` to allow
+/// compressed). Keep `max_request_body_size >= max_message_size` to allow
 /// uncompressed messages up to the message limit. Compressed messages may
 /// have a smaller on-wire body that expands up to `max_message_size`.
 ///
@@ -468,44 +468,29 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// These are **server** limits, applied to received requests. A client
 /// decoding responses currently uses buffa's defaults, with no equivalent
 /// override.
+///
+/// # Construction
+///
+/// Start from [`Limits::default`] or [`Limits::unlimited`] and apply the
+/// `with_*` builder methods, then read settings back through the accessor
+/// methods of the same name without the prefix:
+///
+/// ```rust
+/// use connectrpc::Limits;
+///
+/// let limits = Limits::default().with_max_message_size(8 * 1024 * 1024);
+/// assert_eq!(limits.max_message_size(), 8 * 1024 * 1024);
+/// ```
+///
+/// `Limits` is `#[non_exhaustive]`: new limits may be added in minor
+/// releases. Struct-literal and functional-update construction are not
+/// available outside the crate; use the builder methods.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Limits {
-    /// Maximum size of the request body on the wire (before decompression).
-    ///
-    /// Applies to RPCs where the body is read in full (unary and server
-    /// streaming). Should be at least `max_message_size` to allow
-    /// uncompressed messages up to the message limit. Does not apply to
-    /// client/bidi streaming where messages are processed incrementally.
-    ///
-    /// Default: 4 MB (matches tonic/grpc-go).
-    pub max_request_body_size: usize,
-
-    /// Maximum size of a single message after decompression.
-    ///
-    /// This applies uniformly to both unary and streaming RPCs, and to both
-    /// compressed and uncompressed messages. Compressed payloads are bounded
-    /// during decompression — the decompressor will never allocate more than
-    /// this limit.
-    ///
-    /// Default: 4 MB.
-    pub max_message_size: usize,
-
-    /// Maximum memory a single decode may commit to repeated, map, string
-    /// and bytes *elements*.
-    ///
-    /// This is an amplification defence, and it is charged on element
-    /// footprint rather than on contents: a few bytes on the wire can ask
-    /// the decoder to materialize a very large number of small elements,
-    /// each with its own allocation overhead, while staying well under
-    /// `max_message_size`. A single large payload is unaffected however big
-    /// it grows, because its contents are not charged.
-    ///
-    /// Raise it for a trusted peer that legitimately sends messages with
-    /// very many small elements; lower it to tighten the defence.
-    ///
-    /// Default: 32 MiB (buffa's `DEFAULT_ELEMENT_MEMORY_LIMIT`).
-    pub element_memory_limit: usize,
+    max_request_body_size: usize,
+    max_message_size: usize,
+    element_memory_limit: usize,
 }
 
 impl Default for Limits {
@@ -530,36 +515,84 @@ impl Limits {
         }
     }
 
-    /// Set the maximum request body size (on-wire, before decompression).
+    // ---- builders ---------------------------------------------------------
+
+    /// Set the maximum size of the request body on the wire (before
+    /// decompression).
     ///
-    /// Applies to unary and server streaming RPCs where the body is buffered.
-    /// See [`Limits`] for details on the relationship between limits.
+    /// Applies to RPCs where the body is read in full (unary and server
+    /// streaming). Should be at least the message size limit to allow
+    /// uncompressed messages up to that limit. Does not apply to client/bidi
+    /// streaming where messages are processed incrementally.
+    ///
+    /// Read via [`Self::max_request_body_size`]. Default: 4 MB (matches
+    /// tonic/grpc-go).
     #[must_use]
-    pub fn max_request_body_size(mut self, size: usize) -> Self {
+    pub fn with_max_request_body_size(mut self, size: usize) -> Self {
         self.max_request_body_size = size;
         self
     }
 
-    /// Set the maximum message size (after decompression).
+    /// Set the maximum size of a single message after decompression.
     ///
-    /// This bounds individual messages in both unary and streaming RPCs.
-    /// It also serves as the decompression limit.
-    /// See [`Limits`] for details on the relationship between limits.
+    /// This applies uniformly to both unary and streaming RPCs, and to both
+    /// compressed and uncompressed messages. Compressed payloads are bounded
+    /// during decompression — the decompressor will never allocate more than
+    /// this limit.
+    ///
+    /// Read via [`Self::max_message_size`]. Default: 4 MB.
     #[must_use]
-    pub fn max_message_size(mut self, size: usize) -> Self {
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
     /// Set the maximum memory a single decode may commit to repeated, map,
-    /// string and bytes elements.
+    /// string and bytes *elements*.
     ///
-    /// See [`Limits`] for what this charges and why it is separate from
-    /// `max_message_size`.
+    /// This is an amplification defence, and it is charged on element
+    /// footprint rather than on contents: a few bytes on the wire can ask
+    /// the decoder to materialize a very large number of small elements,
+    /// each with its own allocation overhead, while staying well under the
+    /// message size limit. A single large payload is unaffected however big
+    /// it grows, because its contents are not charged.
+    ///
+    /// Raise it for a trusted peer that legitimately sends messages with
+    /// very many small elements; lower it to tighten the defence.
+    ///
+    /// Read via [`Self::element_memory_limit`]. Default: 32 MiB (buffa's
+    /// `DEFAULT_ELEMENT_MEMORY_LIMIT`).
     #[must_use]
-    pub fn element_memory_limit(mut self, bytes: usize) -> Self {
+    pub fn with_element_memory_limit(mut self, bytes: usize) -> Self {
         self.element_memory_limit = bytes;
         self
+    }
+
+    // ---- accessors --------------------------------------------------------
+
+    /// The maximum size of the request body on the wire, before decompression.
+    ///
+    /// Set via [`Self::with_max_request_body_size`].
+    #[must_use]
+    pub fn max_request_body_size(&self) -> usize {
+        self.max_request_body_size
+    }
+
+    /// The maximum size of a single message after decompression.
+    ///
+    /// Set via [`Self::with_max_message_size`].
+    #[must_use]
+    pub fn max_message_size(&self) -> usize {
+        self.max_message_size
+    }
+
+    /// The maximum memory a single decode may commit to repeated, map,
+    /// string and bytes elements.
+    ///
+    /// Set via [`Self::with_element_memory_limit`].
+    #[must_use]
+    pub fn element_memory_limit(&self) -> usize {
+        self.element_memory_limit
     }
 
     /// The buffa decode options these limits imply.
@@ -1209,7 +1242,7 @@ fn create_grpc_web_envelope_stream(
 ///
 /// ```rust,ignore
 /// let service = ConnectRpcService::new(router)
-///     .with_limits(Limits::default().max_message_size(8 * 1024 * 1024));
+///     .with_limits(Limits::default().with_max_message_size(8 * 1024 * 1024));
 /// ```
 pub struct ConnectRpcService<D = Router> {
     dispatcher: Arc<D>,
@@ -3393,6 +3426,44 @@ pub mod axum_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every limit must survive the builder chain and come back out of the
+    /// accessor of the same name. Setting all three in one chain also pins
+    /// that no setter clobbers a sibling.
+    #[test]
+    fn limits_builders_round_trip_through_the_accessors() {
+        let limits = Limits::default()
+            .with_max_request_body_size(16 * 1024 * 1024)
+            .with_max_message_size(8 * 1024 * 1024)
+            .with_element_memory_limit(64 * 1024 * 1024);
+
+        assert_eq!(limits.max_request_body_size(), 16 * 1024 * 1024);
+        assert_eq!(limits.max_message_size(), 8 * 1024 * 1024);
+        assert_eq!(limits.element_memory_limit(), 64 * 1024 * 1024);
+
+        // `decode_options` reads the element budget, not one of its siblings.
+        assert_eq!(
+            limits.decode_options().element_memory_limit(),
+            64 * 1024 * 1024
+        );
+    }
+
+    /// The defaults an untouched `Limits` reports must be the documented
+    /// constants, so a caller who reads one back before setting it is not
+    /// misled about what the server is enforcing.
+    #[test]
+    fn default_limits_report_the_documented_defaults() {
+        let limits = Limits::default();
+        assert_eq!(
+            limits.max_request_body_size(),
+            DEFAULT_MAX_REQUEST_BODY_SIZE
+        );
+        assert_eq!(limits.max_message_size(), DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(
+            limits.element_memory_limit(),
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT
+        );
+    }
 
     /// A payload at or above `envelope::MIN_CHAIN_SIZE` must reach the body
     /// frames by refcount, not by copy: the emitted data frame references

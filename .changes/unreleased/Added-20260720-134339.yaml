@@ -14,7 +14,7 @@ body: |-
 
   ```rust
   ConnectRpcService::new(dispatcher)
-      .with_limits(Limits::default().element_memory_limit(128 * 1024 * 1024))
+      .with_limits(Limits::default().with_element_memory_limit(128 * 1024 * 1024))
   ```
 
   `Limits::unlimited()` lifts it along with the other limits.

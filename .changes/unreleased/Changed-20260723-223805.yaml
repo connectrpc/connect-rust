@@ -1,0 +1,35 @@
+kind: Changed
+body: |-
+    **Breaking: the `Limits` and `CompressionPolicy` setters are renamed with a
+    `with_` prefix, and the `Limits` fields behind them are now private**
+    ([#247]), to match the `with_` convention used by the other configuration
+    setters. The `Limits` fields were also `pub` and shared their names with the
+    setters, giving each value two ways to be written.
+
+    The rename is a lookup table:
+
+    | Old | New |
+    |---|---|
+    | `Limits::max_request_body_size(n)` | `Limits::with_max_request_body_size(n)` |
+    | `Limits::max_message_size(n)` | `Limits::with_max_message_size(n)` |
+    | `CompressionPolicy::min_size(n)` | `CompressionPolicy::with_min_size(n)` |
+
+    Each old setter name is now a plain accessor, so `limits.max_message_size()`
+    reads back what `with_max_message_size` set and `policy.min_size()` reads the
+    compression threshold, which had no read path before. Code that read a
+    `Limits` field directly (`limits.max_message_size`) just adds the
+    parentheses.
+
+    Writing a `Limits` field directly is what goes away. `Limits` also becomes
+    `#[non_exhaustive]` in 0.9.0, so both remaining forms stop compiling:
+    assignment to a public field, and struct-literal or functional-update
+    construction such as `Limits { max_message_size: 512, ..Default::default() }`.
+    Start from `Limits::default()` or `Limits::unlimited()` and chain the setters
+    instead. `CompressionPolicy`'s fields were already private, so it is a rename
+    plus the new accessor.
+
+    The element-memory budget setter added in this same release arrives already
+    prefixed, as `Limits::with_element_memory_limit`.
+
+    [#247]: https://github.com/connectrpc/connect-rust/issues/247
+time: 2026-07-23T22:38:05.068294686-07:00

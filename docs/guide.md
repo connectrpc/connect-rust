@@ -1710,7 +1710,7 @@ impl CompressionProvider for MyCompression {
     ) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
         // Return a reader that yields decompressed bytes. The framework
         // controls how much is read, so decompression is bounded by
-        // ConnectRpcService::max_message_size.
+        // Limits::max_message_size.
         // ...
     }
 }

@@ -50,7 +50,7 @@ fn decode_request_error(e: &buffa::DecodeError) -> ConnectError {
     match e {
         buffa::DecodeError::ElementMemoryLimitExceeded => ConnectError::invalid_argument(format!(
             "failed to decode proto request: {e}; if this peer is trusted, \
-             raise Limits::element_memory_limit"
+             raise the limit with Limits::with_element_memory_limit"
         )),
         _ => ConnectError::invalid_argument(format!("failed to decode proto request: {e}")),
     }
@@ -1475,7 +1475,7 @@ mod tests {
             ..Default::default()
         };
         let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
-        let raised = crate::Limits::default().element_memory_limit(usize::MAX);
+        let raised = crate::Limits::default().with_element_memory_limit(usize::MAX);
 
         // `decode_request`, used by the owned-message streaming wrappers.
         assert!(
@@ -1568,7 +1568,7 @@ mod tests {
                 .expect_err("800k elements must exceed the 32 MiB default");
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
 
-        let raised = crate::Limits::default().element_memory_limit(usize::MAX);
+        let raised = crate::Limits::default().with_element_memory_limit(usize::MAX);
         let view =
             decode_borrowed_request_view::<ListValueView<'_>>(&encoded, &raised.decode_options())
                 .expect("raising the limit must admit the same bytes");
@@ -1580,7 +1580,10 @@ mod tests {
     /// silently ignored.
     #[test]
     fn unlimited_limits_lift_the_element_budget() {
-        assert_eq!(crate::Limits::unlimited().element_memory_limit, usize::MAX);
+        assert_eq!(
+            crate::Limits::unlimited().element_memory_limit(),
+            usize::MAX
+        );
     }
 
     /// A context built outside the service carries buffa's defaults rather
