@@ -472,7 +472,7 @@ impl CompressionRegistry {
 /// use connectrpc::CompressionPolicy;
 ///
 /// // Only compress messages >= 4 KiB
-/// let policy = CompressionPolicy::default().min_size(4096);
+/// let policy = CompressionPolicy::default().with_min_size(4096);
 /// assert!(!policy.should_compress(1024));
 /// assert!(policy.should_compress(8192));
 ///
@@ -518,10 +518,22 @@ impl CompressionPolicy {
     ///
     /// Messages smaller than this (in bytes, before compression) will
     /// be sent uncompressed even if compression is negotiated.
+    ///
+    /// Default: 1 KiB ([`DEFAULT_COMPRESSION_MIN_SIZE`]).
     #[must_use]
-    pub fn min_size(mut self, size: usize) -> Self {
+    pub fn with_min_size(mut self, size: usize) -> Self {
         self.min_size = size;
         self
+    }
+
+    /// The minimum message size, in bytes, before compression is applied.
+    ///
+    /// Set via [`Self::with_min_size`]. This is the threshold alone, so it
+    /// says nothing about whether compression is enabled at all — ask
+    /// [`Self::should_compress`] for the decision about a given message.
+    #[must_use]
+    pub fn min_size(&self) -> usize {
+        self.min_size
     }
 
     /// Check whether compression should be applied for a message of the given size.
@@ -2093,11 +2105,26 @@ mod tests {
 
     #[test]
     fn test_compression_policy_custom_min_size() {
-        let policy = CompressionPolicy::default().min_size(4096);
+        let policy = CompressionPolicy::default().with_min_size(4096);
         assert!(!policy.should_compress(1024));
         assert!(!policy.should_compress(4095));
         assert!(policy.should_compress(4096));
         assert!(policy.should_compress(8192));
+    }
+
+    /// The threshold must be readable back, not just observable by probing
+    /// `should_compress` either side of it.
+    #[test]
+    fn compression_policy_min_size_reads_back_through_the_accessor() {
+        assert_eq!(
+            CompressionPolicy::default().min_size(),
+            DEFAULT_COMPRESSION_MIN_SIZE
+        );
+        assert_eq!(
+            CompressionPolicy::default().with_min_size(4096).min_size(),
+            4096
+        );
+        assert_eq!(CompressionPolicy::disabled().min_size(), 0);
     }
 
     #[test]
@@ -2109,7 +2136,7 @@ mod tests {
         // min_size=0 compresses even empty bodies — the Connect spec permits
         // this (receivers skip decompression for zero-length content), and
         // conformance runners check that advertised encodings are applied.
-        let zero_min = CompressionPolicy::default().min_size(0);
+        let zero_min = CompressionPolicy::default().with_min_size(0);
         assert!(zero_min.should_compress(0));
 
         let disabled = CompressionPolicy::disabled();
