@@ -61,7 +61,7 @@
 //! # Modules
 //!
 //! - [`codec`] - Message encoding/decoding (protobuf and JSON)
-//! - [`compression`] - Pluggable compression (gzip, zstd) with streaming support
+//! - [`compression`] - Pluggable compression (gzip, zstd)
 //! - [`envelope`] - Streaming message framing (5-byte header + payload)
 //! - [`error`] - ConnectRPC error types and HTTP status mapping
 //! - [`handler`] - Async handler traits for implementing RPC methods
@@ -88,7 +88,7 @@
 //!   (full-duplex bidi requires HTTP/2; browsers additionally cannot
 //!   stream request bodies, regardless of protocol)
 //! - Proto and JSON message encoding
-//! - Compression negotiation (gzip, zstd) with streaming support
+//! - Compression negotiation (gzip, zstd)
 //! - Error handling with proper HTTP status mapping
 //! - Trailers via `trailer-` prefixed headers
 //! - Envelope framing for streaming messages
@@ -154,7 +154,6 @@
 //! | `json` | ✓ | JSON codec for protobuf messages; disable for proto-only builds |
 //! | `gzip` | ✓ | Gzip compression |
 //! | `zstd` | ✓ | Zstandard compression |
-//! | `streaming` | ✓ | Streaming compression support |
 //! | `client` | ✗ | HTTP client transports (plaintext) |
 //! | `client-tls` | ✗ | TLS for client transports |
 //! | `server` | ✗ | Standalone hyper-based server |
@@ -372,18 +371,6 @@ pub use compression::GzipProvider;
 #[cfg(feature = "zstd")]
 #[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
 pub use compression::ZstdProvider;
-
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub use compression::BoxedAsyncBufRead;
-
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub use compression::BoxedAsyncRead;
-
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub use compression::StreamingCompressionProvider;
 
 // ============================================================================
 // Optional: Standalone server
