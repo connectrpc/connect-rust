@@ -21,10 +21,14 @@ body: |-
 
   It applies to every server receive path — unary, server-streaming,
   client-streaming and bidi, on both the generated dispatch and hand-registered
-  handlers, view-based and owned-message alike. A rejection now names the limit
-  to raise, since it is the one decode failure an operator can fix without the
-  peer changing anything. Clients still decode *responses* under buffa's
-  defaults; that knob is a follow-up.
+  handlers, view-based and owned-message alike. On a proto wire it also governs
+  an interceptor's own decode of the inbound request body, through both
+  `Payload::message` and `Payload::view`, on all four of those shapes — so an
+  interceptor is held to the same budget as the handler behind it. JSON bodies
+  are decoded without it, on the interceptor and handler paths alike. A
+  rejection now names the limit to raise, since it is the one decode failure an
+  operator can fix without the peer changing anything. Clients still decode
+  *responses* under buffa's defaults; that knob is a follow-up.
 
   **Breaking, for generated code only.** `decode_borrowed_request_view` and
   `decode_message_request_stream` now take the decode limits, and `Limits` is

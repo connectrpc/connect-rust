@@ -637,8 +637,17 @@ fn payload_stream_to_request_stream(stream: PayloadStream) -> RequestStream {
 
 /// Wrap a dispatcher inbound `RequestStream` (raw `Bytes`) as a
 /// [`PayloadStream`] for the interceptor chain.
-fn request_stream_to_payload_stream(stream: RequestStream, format: CodecFormat) -> PayloadStream {
-    Box::pin(stream.map(move |item| item.map(|bytes| Payload::new(bytes, format))))
+///
+/// `decode_options` comes from the request context, so an interceptor that
+/// decodes a message itself is held to the same budget as the handler.
+fn request_stream_to_payload_stream(
+    stream: RequestStream,
+    format: CodecFormat,
+    decode_options: buffa::DecodeOptions,
+) -> PayloadStream {
+    Box::pin(stream.map(move |item| {
+        item.map(|bytes| Payload::new(bytes, format).with_decode_options(decode_options.clone()))
+    }))
 }
 
 /// Run a server-streaming call through the interceptor chain, or skip
@@ -665,9 +674,10 @@ pub(crate) async fn call_server_streaming_intercepted<D: crate::Dispatcher>(
         path,
         format,
     };
+    let decode_options = ctx.decode_options().clone();
     let req = StreamRequest::new(ctx);
     let inbound: PayloadStream = Box::pin(futures::stream::once(async move {
-        Ok(Payload::new(body, format))
+        Ok(Payload::new(body, format).with_decode_options(decode_options))
     }));
     let resp = NextStream::new(interceptors, &terminal)
         .run(req, inbound)
@@ -698,8 +708,9 @@ pub(crate) async fn call_client_streaming_intercepted<D: crate::Dispatcher>(
         path,
         format,
     };
+    let decode_options = ctx.decode_options().clone();
     let req = StreamRequest::new(ctx);
-    let inbound = request_stream_to_payload_stream(requests, format);
+    let inbound = request_stream_to_payload_stream(requests, format, decode_options);
     let resp = NextStream::new(interceptors, &terminal)
         .run(req, inbound)
         .await?;
@@ -749,8 +760,9 @@ pub(crate) async fn call_bidi_streaming_intercepted<D: crate::Dispatcher>(
         path,
         format,
     };
+    let decode_options = ctx.decode_options().clone();
     let req = StreamRequest::new(ctx);
-    let inbound = request_stream_to_payload_stream(requests, format);
+    let inbound = request_stream_to_payload_stream(requests, format, decode_options);
     let resp = NextStream::new(interceptors, &terminal)
         .run(req, inbound)
         .await?;
@@ -2023,5 +2035,213 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].as_ref().unwrap(), &Bytes::from_static(b"1"));
         assert_eq!(out[1].as_ref().unwrap(), &Bytes::from_static(b"2"));
+    }
+
+    // ========================================================================
+    // Configured decode limits reach streaming interceptors
+    // ========================================================================
+
+    /// An interceptor that decodes each inbound message itself and records
+    /// the outcome, then forwards the stream untouched.
+    struct DecodeInbound(Arc<Mutex<Vec<Result<usize, ConnectError>>>>);
+
+    #[async_trait::async_trait]
+    impl Interceptor for DecodeInbound {
+        async fn intercept_streaming(
+            &self,
+            req: StreamRequest,
+            inbound: PayloadStream,
+            next: NextStream<'_>,
+        ) -> Result<StreamResponse, ConnectError> {
+            use buffa_types::google::protobuf::ListValue;
+            let seen = Arc::clone(&self.0);
+            let wrapped: PayloadStream = Box::pin(inbound.map(move |item| {
+                if let Ok(payload) = &item {
+                    seen.lock()
+                        .unwrap()
+                        .push(payload.message::<ListValue>().map(|m| m.values.len()));
+                }
+                item
+            }));
+            next.run(req, wrapped).await
+        }
+    }
+
+    /// The `view()` counterpart of `DecodeInbound`. The budget has to reach
+    /// both accessors: `view()` is the idiomatic one, so a bypass there is
+    /// the one an interceptor is most likely to hit.
+    struct ViewInbound(Arc<Mutex<Vec<Result<usize, ConnectError>>>>);
+
+    #[async_trait::async_trait]
+    impl Interceptor for ViewInbound {
+        async fn intercept_streaming(
+            &self,
+            req: StreamRequest,
+            inbound: PayloadStream,
+            next: NextStream<'_>,
+        ) -> Result<StreamResponse, ConnectError> {
+            use buffa_types::google::protobuf::__buffa::view::ListValueView;
+            let seen = Arc::clone(&self.0);
+            let wrapped: PayloadStream = Box::pin(inbound.map(move |item| {
+                if let Ok(payload) = &item {
+                    let len = payload
+                        .view::<ListValueView<'_>>()
+                        .map(|v| v.reborrow().values.len());
+                    seen.lock().unwrap().push(len);
+                }
+                item
+            }));
+            next.run(req, wrapped).await
+        }
+    }
+
+    /// A `ListValue` that is small on the wire but has more than one
+    /// element, so a one-byte element budget rejects it while the default
+    /// budget admits it.
+    fn element_heavy_body() -> Bytes {
+        use buffa_types::google::protobuf::{ListValue, Value};
+        let list = ListValue {
+            values: (0..64).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        Bytes::from(buffa::Message::encode_to_vec(&list))
+    }
+
+    /// A context whose element budget is one byte — small enough that any
+    /// element allocation exceeds it. An explicit tiny limit keeps the
+    /// fixture message small and independent of how large the decoded
+    /// element type happens to be.
+    fn tight_budget_ctx() -> RequestContext {
+        RequestContext::default().with_decode_options(
+            crate::Limits::default()
+                .element_memory_limit(1)
+                .decode_options(),
+        )
+    }
+
+    /// Assert the interceptor decoded exactly once and was rejected for
+    /// exceeding the budget, rather than for some unrelated decode failure.
+    fn assert_rejected_over_budget(seen: &[Result<usize, ConnectError>]) {
+        assert_eq!(seen.len(), 1);
+        let err = seen[0]
+            .as_ref()
+            .expect_err("a lowered element budget must reach the interceptor's own decode");
+        assert_eq!(err.code, crate::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn client_streaming_interceptor_sees_the_configured_element_budget() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(DecodeInbound(Arc::clone(&seen)))];
+        let inbound: RequestStream =
+            Box::pin(futures::stream::once(async { Ok(element_heavy_body()) }));
+        call_client_streaming_intercepted(
+            &StreamEcho,
+            &chain,
+            "p",
+            tight_budget_ctx(),
+            inbound,
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap();
+        assert_rejected_over_budget(&seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn server_streaming_interceptor_sees_the_configured_element_budget() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(DecodeInbound(Arc::clone(&seen)))];
+        call_server_streaming_intercepted(
+            &StreamEcho,
+            &chain,
+            "p",
+            tight_budget_ctx(),
+            element_heavy_body(),
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap();
+        assert_rejected_over_budget(&seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bidi_streaming_interceptor_sees_the_configured_element_budget() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(DecodeInbound(Arc::clone(&seen)))];
+        let inbound: RequestStream =
+            Box::pin(futures::stream::once(async { Ok(element_heavy_body()) }));
+        let resp = call_bidi_streaming_intercepted(
+            &StreamEcho,
+            &chain,
+            "p",
+            tight_budget_ctx(),
+            inbound,
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap();
+        let _: Vec<_> = resp.body.collect().await;
+        assert_rejected_over_budget(&seen.lock().unwrap());
+    }
+
+    /// `Payload::view` must honour the budget too, not just
+    /// `Payload::message`. Both halves are here because a `view()` that
+    /// ignored the options entirely would still fail the first half if the
+    /// fixture were simply undecodable.
+    #[tokio::test]
+    async fn interceptor_view_decode_sees_the_configured_element_budget() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(ViewInbound(Arc::clone(&seen)))];
+        let inbound: RequestStream =
+            Box::pin(futures::stream::once(async { Ok(element_heavy_body()) }));
+        call_client_streaming_intercepted(
+            &StreamEcho,
+            &chain,
+            "p",
+            tight_budget_ctx(),
+            inbound,
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap();
+        assert_rejected_over_budget(&seen.lock().unwrap());
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(ViewInbound(Arc::clone(&seen)))];
+        let inbound: RequestStream =
+            Box::pin(futures::stream::once(async { Ok(element_heavy_body()) }));
+        call_client_streaming_intercepted(
+            &StreamEcho,
+            &chain,
+            "p",
+            RequestContext::default(),
+            inbound,
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap()[0].as_ref().unwrap(), 64);
+    }
+
+    /// The control: the same bytes decode cleanly when the context carries
+    /// the default budget, so the rejections above come from the configured
+    /// limit rather than from the fixture being undecodable.
+    #[tokio::test]
+    async fn default_element_budget_admits_the_same_payload() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chain: Vec<Arc<dyn Interceptor>> = vec![Arc::new(DecodeInbound(Arc::clone(&seen)))];
+        call_server_streaming_intercepted(
+            &StreamEcho,
+            &chain,
+            "p",
+            RequestContext::default(),
+            element_heavy_body(),
+            CodecFormat::Proto,
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(*seen.first().unwrap().as_ref().unwrap(), 64);
     }
 }
