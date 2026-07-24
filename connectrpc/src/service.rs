@@ -798,10 +798,10 @@ fn encode_grpc_web_trailers(trailers: &http::HeaderMap) -> Bytes {
         trailer_payload.extend_from_slice(b"\r\n");
     }
 
-    // Envelope: flag=0x80 (trailer), 4-byte big-endian length, payload
+    // Envelope: trailer flag, 4-byte big-endian length, payload
     let len = trailer_payload.len() as u32;
     let mut frame = Vec::with_capacity(5 + trailer_payload.len());
-    frame.push(0x80); // trailer flag
+    frame.push(crate::envelope::flags::GRPC_WEB_TRAILER);
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&trailer_payload);
     Bytes::from(frame)
