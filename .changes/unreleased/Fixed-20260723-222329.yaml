@@ -1,0 +1,42 @@
+kind: Fixed
+body: |-
+  **A gRPC or gRPC-Web unary call now reports a trailers-only error instead of
+  the bare HTTP status** ([#241]). When a proxy answers with a non-200 status
+  and a gRPC status in the response headers — an Envoy local reply sends `503`
+  alongside `grpc-status: 14` and `grpc-message: upstream connect error` — the
+  call surfaces the server's code, message, and metadata rather than
+  `HTTP error 503`. This matches grpc-go, which decides that a reply is gRPC
+  from its content-type and reads the status from it; connect-go instead
+  reports the HTTP status and discards the server's code, message and metadata
+  entirely. The header status applies only to a genuine trailers-only
+  response: a response carrying body data or HTTP/2 trailers takes its status
+  from those, never from the headers, and a success delivered on a non-200 is
+  still refused. The error code can change as a result, not just the message:
+  a proxy pairing HTTP 500 with `grpc-status: 3` now yields `InvalidArgument`
+  where it previously yielded `Unknown`, so a caller matching on `ErrorCode`
+  may observe the server's code rather than the one derived from the HTTP
+  status.
+
+  A non-2xx reply that is not a usable gRPC response reports its HTTP status,
+  so an nginx or load-balancer error page still arrives as `Unavailable` on a
+  `502` and stays recognizable as retryable. What went wrong is appended to
+  the message rather than replacing the code, and this now holds however the
+  error page fails: `HTTP error 502: unexpected content-type: text/html` when
+  the proxy labels it as HTML, and `HTTP error 502: envelope decode failed:
+  ...` when the proxy keeps the gRPC content-type and the page fails framing
+  instead. A reply with no `content-type` at all is still parsed for a
+  `grpc-status`, since an absent content-type is not evidence the peer is not
+  speaking gRPC.
+
+  **A plain gRPC unary response whose body sets the `0x80` envelope flag is
+  now a framing error** ([#242]). That flag marks a gRPC-Web trailer frame
+  and is not defined for gRPC, so a server or intermediary that set it could
+  replace the trailers received in the HTTP/2 trailer section with trailers
+  of its own choosing, including the `grpc-status`. gRPC-Web is unaffected:
+  its trailer frames are parsed as before. The flag now has a name,
+  `envelope::flags::GRPC_WEB_TRAILER`, public alongside the existing `DATA`,
+  `COMPRESSED` and `END_STREAM` flags.
+
+  [#241]: https://github.com/connectrpc/connect-rust/issues/241
+  [#242]: https://github.com/connectrpc/connect-rust/issues/242
+time: 2026-07-23T22:23:29.547732463-07:00
