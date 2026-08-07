@@ -31,6 +31,7 @@
 //! [h2 #531]: https://github.com/hyperium/h2/issues/531
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -513,12 +514,14 @@ impl Http2Connection {
 /// The builder covers every [`Http2Connection`] transport: plaintext, TLS,
 /// caller-supplied connectors, and Unix sockets. HTTP/2 keep-alive and
 /// flow-control knobs are proxied directly; for hyper settings not surfaced
-/// here use [`h2_settings`](Self::h2_settings). [`tcp_connect_timeout`] is the
-/// per-address TCP bound on the built-in connector and is ignored by the
-/// custom-connector / Unix-socket terminals — use [`establishment_timeout`] there
-/// as the establishment bound.
+/// here use [`h2_settings`](Self::h2_settings). [`tcp_connect_timeout`] (the
+/// per-address TCP bound) and [`local_address`] (the source-address bind)
+/// configure the built-in connector and are ignored by the custom-connector /
+/// Unix-socket terminals — use [`establishment_timeout`] there as the
+/// establishment bound, and bind inside your own connector.
 ///
 /// [`tcp_connect_timeout`]: Self::tcp_connect_timeout
+/// [`local_address`]: Self::local_address
 /// [`establishment_timeout`]: Self::establishment_timeout
 ///
 /// [`CallOptions::with_timeout`]: super::CallOptions::with_timeout
@@ -527,6 +530,7 @@ impl Http2Connection {
 pub struct Http2ConnectionBuilder {
     tcp_connect_timeout: Option<Duration>,
     establishment_timeout: Option<Duration>,
+    local_address: Option<IpAddr>,
     h2_builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
 }
 
@@ -563,6 +567,7 @@ impl Default for Http2ConnectionBuilder {
         Self {
             tcp_connect_timeout: Some(DEFAULT_TCP_CONNECT_TIMEOUT),
             establishment_timeout: Some(DEFAULT_ESTABLISHMENT_TIMEOUT),
+            local_address: None,
             h2_builder,
         }
     }
@@ -635,6 +640,33 @@ impl Http2ConnectionBuilder {
     /// can stall `poll_ready` indefinitely — the pre-0.8.0 behaviour.
     pub fn no_establishment_timeout(mut self) -> Self {
         self.establishment_timeout = None;
+        self
+    }
+
+    /// Bind the built-in connector's TCP socket to `addr` before connecting,
+    /// so every connection (including reconnects) originates from that local
+    /// address (IP only; the source port stays ephemeral). For multi-homed
+    /// hosts where the peer derives something from the source address it
+    /// observes, or where egress must leave a specific interface. Unset by
+    /// default: the kernel picks the source address from the route to the
+    /// peer.
+    ///
+    /// Applied via hyper's [`HttpConnector::set_local_address`][hyper-la].
+    /// The resolved peer addresses are filtered to `addr`'s family, so a peer
+    /// with no address of that family fails to connect (rather than
+    /// connecting from a kernel-chosen source); there is currently no
+    /// dual-stack variant. An address this host cannot bind fails every
+    /// connect with the bind error. Like
+    /// [`tcp_connect_timeout`](Self::tcp_connect_timeout), this is
+    /// **ignored** by the custom-connector / Unix-socket terminals.
+    /// [`HttpClientBuilder`](super::HttpClientBuilder) does not expose it; use
+    /// `Http2Connection` when you need a pinned source address.
+    ///
+    /// [hyper-la]: hyper_util::client::legacy::connect::HttpConnector::set_local_address
+    #[doc(alias = "bind")]
+    #[doc(alias = "source_address")]
+    pub fn local_address(mut self, addr: IpAddr) -> Self {
+        self.local_address = Some(addr);
         self
     }
 
@@ -786,9 +818,10 @@ impl Http2ConnectionBuilder {
     ///
     /// `establishment_timeout` bounds the connector's dial *and* the HTTP/2 preface
     /// as one wall-clock budget — the same semantics as the built-in
-    /// transports. `tcp_connect_timeout` is the per-address TCP bound on the
-    /// built-in connector and is **ignored** here; to bound the dial separately
-    /// from the preface, wrap the connector in `tower::timeout::Timeout`.
+    /// transports. `tcp_connect_timeout` and `local_address` configure the
+    /// built-in connector and are **ignored** here; to bound the dial separately
+    /// from the preface, wrap the connector in `tower::timeout::Timeout`, and
+    /// bind inside the connector if you need a source address.
     #[must_use]
     pub fn lazy_with_connector<C>(self, connector: C, authority: Uri) -> Http2Connection
     where
@@ -859,11 +892,16 @@ impl Http2ConnectionBuilder {
     }
 
     /// Built-in TCP connector with `nodelay` and the configured
-    /// `tcp_connect_timeout` applied. Mirrors `HttpClientBuilder::http_connector`.
+    /// `tcp_connect_timeout` / `local_address` applied. Mirrors
+    /// `HttpClientBuilder::http_connector` (which has no `local_address`).
     fn http_connector(&self) -> hyper_util::client::legacy::connect::HttpConnector {
         let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         connector.set_nodelay(true);
         connector.set_connect_timeout(self.tcp_connect_timeout);
+        // The family filtering documented on `local_address` is hyper's
+        // happy-eyeballs path; with it disabled hyper skips a mismatched-family
+        // bind silently. `HttpConnector::new()` enables it — keep it that way.
+        connector.set_local_address(self.local_address);
         connector
     }
 
@@ -1562,6 +1600,49 @@ mod tests {
             .establishment_timeout(Duration::MAX);
         assert_eq!(max.tcp_connect_timeout, None);
         assert_eq!(max.establishment_timeout, None);
+    }
+
+    /// `local_address` is what the peer observes as the connection's source.
+    /// Linux routes all of 127/8 to `lo`, so 127.0.0.2 is bindable without
+    /// setup and distinguishable from the default 127.0.0.1 source; macOS/BSD
+    /// configure only 127.0.0.1 on loopback, hence the cfg.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn builder_local_address_is_the_observed_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let local: IpAddr = "127.0.0.2".parse().unwrap();
+        // TCP completes into the listen backlog and the plaintext h2c
+        // handshake resolves locally, so this finishes before `accept()` is
+        // polled — and a bind failure surfaces here as an error, not a hang.
+        let _conn = Http2Connection::builder()
+            .local_address(local)
+            .connect_plaintext(uri)
+            .await
+            .unwrap();
+        let (_stream, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.ip(), local);
+    }
+
+    /// A `local_address` whose family the peer has no address in fails the
+    /// connect rather than falling back to a kernel-chosen source. The peer
+    /// is a live v4 listener, so a fallback would *succeed* — `expect_err`
+    /// is what pins the no-fallback behaviour (and the happy-eyeballs
+    /// dependency noted in `http_connector`).
+    #[tokio::test]
+    async fn builder_local_address_family_mismatch_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let err = Http2Connection::builder()
+            .local_address("::1".parse().unwrap())
+            .connect_plaintext(uri)
+            .await
+            .expect_err("v6 local address to a v4-only peer must not connect");
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
     }
 
     #[tokio::test]

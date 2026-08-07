@@ -1591,6 +1591,8 @@ let conn = Http2Connection::builder()
 
 `Http2ConnectionBuilder` also proxies hyper's HTTP/2 keep-alive and flow-control knobs (`keep_alive_interval`, `keep_alive_timeout`, `keep_alive_while_idle`, `initial_stream_window_size`, `initial_connection_window_size`, `adaptive_window`), with a `TokioTimer` pre-wired so the keep-alive setters work without further plumbing. The `h2_settings(|b| ...)` escape hatch exposes the underlying hyper builder for knobs not surfaced directly. To restore the unbounded pre-0.8.0 behaviour, chain `.no_establishment_timeout().no_tcp_connect_timeout()`.
 
+On a multi-homed host, `Http2ConnectionBuilder::local_address(IpAddr)` binds the built-in connector's socket to one of the host's addresses before connecting, so the connection (and every reconnect) originates from that address — useful when the peer keys on the source address it observes, or when egress must leave a particular interface. The resolved peer addresses are filtered to that address's family; a peer with no address of that family fails to connect rather than connecting from a kernel-chosen source. Like `tcp_connect_timeout`, it applies only to the built-in TCP connector, not to the custom-connector / Unix-socket terminals. (`HttpClientBuilder` does not expose this; use `Http2Connection` when you need a pinned source address.)
+
 ### ClientConfig
 
 `ClientConfig` carries the base URI and per-call defaults that apply

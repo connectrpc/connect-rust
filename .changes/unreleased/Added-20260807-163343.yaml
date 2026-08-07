@@ -1,0 +1,20 @@
+kind: Added
+body: |-
+  **`Http2ConnectionBuilder::local_address(IpAddr)`** binds the built-in TCP
+  connector's socket to a local address before connecting, so every connection
+  the transport opens (including reconnects) originates from that address. For
+  multi-homed hosts where the peer keys on the source address it observes, or
+  where egress must leave a specific interface:
+
+  ```rust
+  let conn = Http2Connection::builder()
+      .local_address("10.1.2.3".parse()?)
+      .lazy_tls(uri, tls_config);
+  ```
+
+  Applied through hyper's `HttpConnector::set_local_address`; the resolved
+  peer addresses are filtered to the bound address's family, so a peer with no
+  address of that family fails to connect rather than connecting from a
+  kernel-chosen source. Like `tcp_connect_timeout`, it has no effect on the
+  custom-connector and Unix-socket terminals.
+time: 2026-08-07T16:33:43.772087144Z
