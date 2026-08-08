@@ -1,0 +1,18 @@
+kind: Changed
+body: |-
+  **Envelope decoding no longer copies the request body.** `Envelope::decode`
+  and `Envelope::decode_with_limit` now accept any
+  `impl Buf + Deref<Target = [u8]>`, which both `Bytes` and `BytesMut` satisfy,
+  and take the payload with `Buf::copy_to_bytes`. Both types specialize that to
+  a refcount handoff rather than a memcpy, so a caller holding a fully-collected
+  body decodes straight out of it instead of staging a `BytesMut` copy first.
+  This removes a full-body copy per gRPC and gRPC-Web unary request, per
+  server-streaming request, and per Connect client-streaming response. The copy
+  was of the whole collected body, so on the server it was bounded by
+  `Limits::max_request_body_size` (4 MiB by default, and often raised), not by
+  `max_message_size`.
+
+  Decoded payloads now alias the buffer they were decoded from instead of an
+  exact-size copy, so retaining a request or response message keeps its whole
+  source buffer alive. Copy the fields you retain if that matters.
+time: 2026-08-01T12:00:00.000000000Z

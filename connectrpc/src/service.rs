@@ -2118,7 +2118,7 @@ where
         let err = ConnectError::unimplemented("request body is empty: expected a message");
         return grpc_unary_error(&err);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
+        let mut buf = post_body;
         let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
             Ok(Some(env)) => env,
             Ok(None) => {
@@ -2427,7 +2427,7 @@ where
         let err = ConnectError::unimplemented("server streaming request requires a message");
         return streaming_error_response(&err, protocol, codec_format);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
+        let mut buf = post_body;
         let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
             Ok(Some(env)) => env,
             Ok(None) => {

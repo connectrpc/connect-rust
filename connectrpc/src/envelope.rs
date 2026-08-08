@@ -145,7 +145,9 @@ impl Envelope {
     ///
     /// **Warning:** This method has no size limit. Use [`decode_with_limit`](Self::decode_with_limit)
     /// for untrusted input to prevent denial-of-service attacks.
-    pub fn decode(buf: &mut BytesMut) -> Result<Option<Self>, ConnectError> {
+    pub fn decode(
+        buf: &mut (impl Buf + std::ops::Deref<Target = [u8]>),
+    ) -> Result<Option<Self>, ConnectError> {
         Self::decode_with_limit(buf, usize::MAX)
     }
 
@@ -159,7 +161,7 @@ impl Envelope {
     /// This protects against malicious clients declaring very large message
     /// sizes in the envelope header.
     pub fn decode_with_limit(
-        buf: &mut BytesMut,
+        buf: &mut (impl Buf + std::ops::Deref<Target = [u8]>),
         max_size: usize,
     ) -> Result<Option<Self>, ConnectError> {
         if buf.len() < HEADER_SIZE {
@@ -186,7 +188,8 @@ impl Envelope {
         }
 
         buf.advance(HEADER_SIZE);
-        let data = buf.split_to(length).freeze();
+        // Avoid a copy of our data if possible.
+        let data = buf.copy_to_bytes(length);
 
         Ok(Some(Self { flags, data }))
     }
@@ -601,6 +604,9 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        // The limit is checked before the header is taken, so an oversized
+        // frame must not desync the buffer.
+        assert_eq!(buf.len(), HEADER_SIZE, "error path must not consume");
     }
 
     #[test]
@@ -627,6 +633,75 @@ mod tests {
         buf.put_u32(u32::MAX); // length prefix
         let result = Envelope::decode(&mut buf);
         assert!(matches!(result, Ok(None)));
+    }
+
+    // Decoding a fully-collected body, with no `BytesMut` staging copy.
+
+    /// The payload must alias the source buffer, not be copied out of it.
+    /// Covers both input types: `BytesMut` carries every streaming envelope
+    /// and its zero-copy relies on an optional `copy_to_bytes` override.
+    #[test]
+    fn decode_does_not_copy_payload() {
+        let wire = Envelope::data(Bytes::from(vec![7u8; 4096])).encode();
+
+        let range = wire.as_ptr() as usize..wire.as_ptr() as usize + wire.len();
+        let decoded = Envelope::decode(&mut wire.clone()).unwrap().unwrap();
+        assert_eq!(decoded.data.len(), 4096);
+        assert!(
+            range.contains(&(decoded.data.as_ptr() as usize)),
+            "Bytes payload must point into the source buffer"
+        );
+
+        let mut buf = BytesMut::from(&wire[..]);
+        let range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+        let decoded = Envelope::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.data.len(), 4096);
+        assert!(
+            range.contains(&(decoded.data.as_ptr() as usize)),
+            "BytesMut payload must point into the source buffer"
+        );
+    }
+
+    /// Both input types decode to the expected value. Asserted against the
+    /// constructed envelope rather than against each other: they share one
+    /// function body, so a defect there returns the same wrong answer twice
+    /// and a cross-comparison would still pass.
+    #[test]
+    fn decode_matches_across_buffer_types() {
+        for flags in [flags::DATA, flags::COMPRESSED, flags::END_STREAM] {
+            let data = Bytes::from_static(b"payload");
+            let wire = Envelope { flags, data }.encode();
+
+            let from_bytes = Envelope::decode(&mut wire.clone()).unwrap().unwrap();
+            assert_eq!(from_bytes.flags, flags);
+            assert_eq!(from_bytes.data, Bytes::from_static(b"payload"));
+
+            let from_bytes_mut = Envelope::decode(&mut BytesMut::from(&wire[..]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(from_bytes_mut.flags, flags);
+            assert_eq!(from_bytes_mut.data, Bytes::from_static(b"payload"));
+        }
+    }
+
+    /// Successive envelopes decode out of one `Bytes` and leave the remainder
+    /// behind. The unary paths' "exactly one message" check and the client's
+    /// multi-envelope loop both rely on this.
+    #[test]
+    fn decode_from_bytes_advances_past_each_envelope() {
+        let mut wire = BytesMut::new();
+        wire.put_slice(&Envelope::data(Bytes::from_static(b"first")).encode());
+        wire.put_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let mut buf = wire.freeze();
+
+        let first = Envelope::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(first.data, Bytes::from_static(b"first"));
+        assert!(!buf.is_empty(), "trailing envelope must remain");
+
+        let second = Envelope::decode(&mut buf).unwrap().unwrap();
+        assert!(second.is_end_stream());
+        assert_eq!(second.data, Bytes::from_static(b"{}"));
+        assert!(buf.is_empty(), "buffer must be fully consumed");
     }
 
     // ── EnvelopeDecoder tests ───────────────────────────────────────

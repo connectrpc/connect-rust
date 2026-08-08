@@ -4012,7 +4012,7 @@ fn parse_connect_client_stream_envelopes(
     max_msg_size: usize,
     resp_headers: &http::HeaderMap,
 ) -> Result<(Bytes, http::HeaderMap), ConnectError> {
-    let mut buf = BytesMut::from(body.as_ref());
+    let mut buf = body;
     let mut message: Option<Bytes> = None;
     let mut trailers = http::HeaderMap::new();
     let mut saw_end_stream = false;
