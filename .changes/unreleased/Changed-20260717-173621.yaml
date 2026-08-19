@@ -11,9 +11,9 @@ body: |-
   the framing threshold, owned-message responses (their `String` and `Vec<u8>`
   fields cannot be handed over by reference), a response much smaller than the
   request it borrows from (capturing would keep the whole request buffer alive
-  while the response flushes), Connect-protocol unary, streaming, and any call
-  passing through an interceptor, since an interceptor may replace the body and
-  so needs it whole.
+  while the response flushes), Connect-protocol unary, and any call passing
+  through an interceptor, since an interceptor may replace the body and so
+  needs it whole.
 
   **Breaking, for custom dispatch only.** `EncodedResponse` is now
   `Response<EncodedBody>` rather than `Response<Bytes>`. If you implement the

@@ -51,7 +51,7 @@ use crate::dispatcher::RequestStream;
 use crate::error::ConnectError;
 use crate::handler::BoxStream;
 use crate::payload::Payload;
-use crate::response::{EncodedResponse, RequestContext, Response};
+use crate::response::{EncodedResponse, EncodedStream, RequestContext, Response};
 
 /// Re-export of [`async_trait::async_trait`] so interceptor authors don't
 /// need a direct `async-trait` dependency.
@@ -424,12 +424,19 @@ pub type StreamResponse = Response<PayloadStream>;
 impl StreamResponse {
     /// Build a `StreamResponse` from a dispatcher's encoded streaming
     /// response by wrapping each body item in a [`Payload`].
-    pub fn from_encoded(
-        resp: Response<BoxStream<Result<Bytes, ConnectError>>>,
-        format: CodecFormat,
-    ) -> Self {
+    ///
+    /// A [`Payload`] carries one contiguous buffer, so an item the encoder
+    /// split into segments is flattened here: a call with an interceptor
+    /// configured gives up the per-field segmented encode, because the
+    /// interceptor may read or replace the whole message. The flattened item
+    /// is still framed by reference count on the way out, so the batch-buffer
+    /// copy stays avoided.
+    pub fn from_encoded(resp: Response<EncodedStream>, format: CodecFormat) -> Self {
         resp.map_body(move |stream| -> PayloadStream {
-            Box::pin(stream.map(move |item| item.map(|bytes| Payload::new(bytes, format))))
+            Box::pin(
+                stream
+                    .map(move |item| item.map(|body| Payload::new(body.into_contiguous(), format))),
+            )
         })
     }
 
@@ -441,9 +448,9 @@ impl StreamResponse {
     /// dispatch path renders as a streaming error and then ends the
     /// stream. There is no fallible up-front conversion: stream items
     /// haven't been produced yet.
-    pub fn into_encoded(self) -> Response<BoxStream<Result<Bytes, ConnectError>>> {
-        self.map_body(|stream| -> BoxStream<Result<Bytes, ConnectError>> {
-            Box::pin(stream.map(|item| item.and_then(|payload| payload.encoded())))
+    pub fn into_encoded(self) -> Response<EncodedStream> {
+        self.map_body(|stream| -> EncodedStream {
+            Box::pin(stream.map(|item| item.and_then(|payload| payload.encoded().map(Into::into))))
         })
     }
 }
@@ -663,7 +670,7 @@ pub(crate) async fn call_server_streaming_intercepted<D: crate::Dispatcher>(
     ctx: RequestContext,
     body: Bytes,
     format: CodecFormat,
-) -> Result<Response<BoxStream<Result<Bytes, ConnectError>>>, ConnectError> {
+) -> Result<Response<EncodedStream>, ConnectError> {
     if interceptors.is_empty() {
         return dispatcher
             .call_server_streaming(path, ctx, body, format)
@@ -749,7 +756,7 @@ pub(crate) async fn call_bidi_streaming_intercepted<D: crate::Dispatcher>(
     ctx: RequestContext,
     requests: RequestStream,
     format: CodecFormat,
-) -> Result<Response<BoxStream<Result<Bytes, ConnectError>>>, ConnectError> {
+) -> Result<Response<EncodedStream>, ConnectError> {
     if interceptors.is_empty() {
         return dispatcher
             .call_bidi_streaming(path, ctx, requests, format)
@@ -1754,8 +1761,8 @@ mod tests {
             _: CodecFormat,
         ) -> crate::dispatcher::StreamingResult {
             Box::pin(async move {
-                let body: BoxStream<Result<Bytes, ConnectError>> =
-                    Box::pin(futures::stream::once(async move { Ok(request) }));
+                let body: crate::EncodedStream =
+                    Box::pin(futures::stream::once(async move { Ok(request.into()) }));
                 Ok(Response {
                     body,
                     headers: http::HeaderMap::new(),
@@ -1788,14 +1795,34 @@ mod tests {
             _: CodecFormat,
         ) -> crate::dispatcher::StreamingResult {
             Box::pin(async move {
+                let body: crate::EncodedStream = Box::pin(requests.map(|r| r.map(Into::into)));
                 Ok(Response {
-                    body: requests,
+                    body,
                     headers: http::HeaderMap::new(),
                     trailers: http::HeaderMap::new(),
                     compress: None,
                 })
             })
         }
+    }
+
+    /// An interceptor sees one contiguous `Payload` per item, so a segmented
+    /// item is flattened on the way in and comes back out contiguous.
+    #[tokio::test]
+    async fn stream_response_from_encoded_flattens_segments() {
+        let segmented = crate::EncodedBody::Segmented(vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from_static(b"cd"),
+        ]);
+        let body: EncodedStream = Box::pin(futures::stream::iter([Ok(segmented)]));
+        let resp = StreamResponse::from_encoded(Response::new(body), CodecFormat::Proto);
+        let out: Vec<_> = resp
+            .into_encoded()
+            .body
+            .map(|b| b.unwrap().into_contiguous())
+            .collect()
+            .await;
+        assert_eq!(out, [Bytes::from_static(b"abcd")]);
     }
 
     /// All three `call_*_streaming_intercepted` empty-chain fast paths
@@ -1816,12 +1843,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let out: Vec<_> = resp.body.collect().await;
+        let out: Vec<_> = resp
+            .body
+            .map(|b| b.unwrap().into_contiguous())
+            .collect()
+            .await;
         assert_eq!(out.len(), 1);
-        assert!(std::ptr::eq(
-            out[0].as_ref().unwrap().as_ptr(),
-            body.as_ptr()
-        ));
+        assert!(std::ptr::eq(out[0].as_ptr(), body.as_ptr()));
 
         // Client-streaming.
         let inbound: RequestStream = Box::pin(futures::stream::iter(vec![
@@ -1856,12 +1884,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let out: Vec<_> = resp.body.collect().await;
+        let out: Vec<_> = resp
+            .body
+            .map(|b| b.unwrap().into_contiguous())
+            .collect()
+            .await;
         assert_eq!(out.len(), 1);
-        assert!(std::ptr::eq(
-            out[0].as_ref().unwrap().as_ptr(),
-            body.as_ptr()
-        ));
+        assert!(std::ptr::eq(out[0].as_ptr(), body.as_ptr()));
     }
 
     /// `call_*_streaming_intercepted` propagates a short-circuit error
@@ -1994,9 +2023,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let out: Vec<_> = resp.body.collect().await;
+        let out: Vec<_> = resp
+            .body
+            .map(|b| b.unwrap().into_contiguous())
+            .collect()
+            .await;
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].as_ref().unwrap(), &body);
+        assert_eq!(out[0], body);
 
         // Client-streaming: 2-item inbound stream → terminal hands stream
         // to dispatcher → dispatcher's single response collapses to body.
@@ -2031,10 +2064,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let out: Vec<_> = resp.body.collect().await;
+        let out: Vec<_> = resp
+            .body
+            .map(|b| b.unwrap().into_contiguous())
+            .collect()
+            .await;
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].as_ref().unwrap(), &Bytes::from_static(b"1"));
-        assert_eq!(out[1].as_ref().unwrap(), &Bytes::from_static(b"2"));
+        assert_eq!(out[0], Bytes::from_static(b"1"));
+        assert_eq!(out[1], Bytes::from_static(b"2"));
     }
 
     // ========================================================================

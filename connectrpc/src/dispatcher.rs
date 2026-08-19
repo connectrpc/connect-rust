@@ -24,7 +24,7 @@ use crate::error::ConnectError;
 use crate::handler::BoxFuture;
 use crate::handler::BoxStream;
 use crate::payload::Payload;
-use crate::response::{EncodedResponse, RequestContext};
+use crate::response::{EncodedResponse, EncodedStream, RequestContext};
 use crate::router::MethodKind;
 use crate::spec::Spec;
 
@@ -118,11 +118,10 @@ pub type UnaryResult = BoxFuture<'static, Result<EncodedResponse, ConnectError>>
 
 /// Result type for server-streaming and bidi-streaming handler calls.
 ///
-/// The body is a stream of pre-encoded message bytes.
-pub type StreamingResult = BoxFuture<
-    'static,
-    Result<crate::response::Response<BoxStream<Result<Bytes, ConnectError>>>, ConnectError>,
->;
+/// The body is an [`EncodedStream`]: one already-encoded
+/// [`EncodedBody`](crate::EncodedBody) per response message.
+pub type StreamingResult =
+    BoxFuture<'static, Result<crate::response::Response<EncodedStream>, ConnectError>>;
 
 /// A stream of raw request message bytes (client-streaming / bidi input).
 pub type RequestStream = BoxStream<Result<Bytes, ConnectError>>;
@@ -357,22 +356,24 @@ pub mod codegen {
     pub use super::unimplemented_streaming;
     pub use super::unimplemented_unary;
 
-    /// Map a stream of typed responses through [`Encodable::encode`].
+    /// Map a stream of typed responses through
+    /// [`Encodable::encode_segments`].
     ///
     /// Used by generated `call_server_streaming` and `call_bidi_streaming`
     /// arms to convert the handler's `Stream<Item = Result<B, _>>` into
-    /// the `Stream<Item = Result<Bytes, _>>` that the dispatcher protocol
-    /// requires. `B` is any [`Encodable<Res>`](crate::Encodable) — typically `Res` itself,
-    /// but may be [`PreEncoded`](crate::PreEncoded) or
-    /// [`MaybeBorrowed`](crate::MaybeBorrowed) for handlers that encode
-    /// borrowing views per item.
+    /// the [`EncodedStream`](crate::EncodedStream) that the dispatcher
+    /// protocol requires. `B` is any [`Encodable<Res>`](crate::Encodable),
+    /// typically `Res` itself, but may be [`PreEncoded`](crate::PreEncoded)
+    /// or [`MaybeBorrowed`](crate::MaybeBorrowed) for handlers that encode
+    /// borrowing views per item. An item that can hand a large payload over
+    /// by reference count arrives segmented and, on an uncompressed
+    /// response, is framed without copying that payload. Every other item
+    /// takes the contiguous default. See [`EncodedStream`](crate::EncodedStream)
+    /// for when compression flattens it instead.
     ///
     /// [`Encodable`]: crate::Encodable
-    /// [`Encodable::encode`]: crate::Encodable::encode
-    pub fn encode_response_stream<Res, B, S>(
-        stream: S,
-        format: CodecFormat,
-    ) -> BoxStream<Result<Bytes, ConnectError>>
+    /// [`Encodable::encode_segments`]: crate::Encodable::encode_segments
+    pub fn encode_response_stream<Res, B, S>(stream: S, format: CodecFormat) -> crate::EncodedStream
     where
         Res: Message + Send + 'static,
         B: crate::Encodable<Res> + Send + 'static,
@@ -386,7 +387,7 @@ pub mod codegen {
                     format,
                 ),
                 async |(mut s, fmt)| match s.next().await {
-                    Some(Ok(res)) => Some((Encodable::<Res>::encode(&res, fmt), (s, fmt))),
+                    Some(Ok(res)) => Some((Encodable::<Res>::encode_segments(&res, fmt), (s, fmt))),
                     Some(Err(e)) => Some((Err(e), (s, fmt))),
                     None => None,
                 },

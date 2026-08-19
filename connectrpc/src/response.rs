@@ -805,7 +805,7 @@ fn checked_response_size(size: u32) -> Result<usize, ConnectError> {
 /// smaller is copied into the framing buffer downstream regardless, and a
 /// message can clear a smaller gate while none of its individual fields do,
 /// which spends the rope's cost and captures nothing. Matching the framing
-/// threshold also makes every segment map to exactly one body frame.
+/// threshold also makes every large segment map to exactly one body frame.
 ///
 /// # Errors
 ///
@@ -1211,6 +1211,19 @@ impl<M: Message + JsonSerialize> Encodable<M> for PreEncoded<M> {
 /// protocol layer — encoding happens inside the dispatcher so the body
 /// type stays generic across the trait boundary.
 pub type EncodedResponse = Response<EncodedBody>;
+
+/// The body of a streaming [`Response`] once each item is encoded: the
+/// streaming counterpart of [`EncodedResponse`]'s body.
+///
+/// Items are [`EncodedBody`] rather than `Bytes` so a message the encoder
+/// split into reference-counted segments stays split through the framing
+/// layer, which emits each large segment as its own body frame instead of
+/// copying it into the batch buffer. That only holds for an uncompressed
+/// response: compression needs one contiguous input, so a response that
+/// negotiates an encoding (the default for messages of at least
+/// `CompressionPolicy`'s `min_size` when the client advertises one) flattens
+/// each item first. Opt out per response with [`Response::compress`].
+pub type EncodedStream = ServiceStream<EncodedBody>;
 
 impl<B> Response<B> {
     /// Encode the body to bytes via [`Encodable<M>`], preserving

@@ -90,10 +90,7 @@ pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 /// `dispatcher::codegen` path; the implementation is shared with the
 /// codegen-emitted dispatcher arms (see
 /// [`encode_response_stream`](crate::dispatcher::codegen::encode_response_stream)).
-fn encode_body_stream<Res, B, S>(
-    stream: S,
-    format: CodecFormat,
-) -> BoxStream<Result<Bytes, ConnectError>>
+fn encode_body_stream<Res, B, S>(stream: S, format: CodecFormat) -> crate::EncodedStream
 where
     Res: Message + Send + 'static,
     B: Encodable<Res> + Send + 'static,
@@ -126,7 +123,7 @@ pub(crate) trait ErasedHandler: Send + Sync {
 
 /// Result type for erased streaming handlers.
 pub(crate) type StreamingHandlerResult =
-    BoxFuture<'static, Result<Response<BoxStream<Result<Bytes, ConnectError>>>, ConnectError>>;
+    BoxFuture<'static, Result<Response<crate::EncodedStream>, ConnectError>>;
 
 /// Type-erased server-streaming handler for use in the router.
 pub(crate) trait ErasedStreamingHandler: Send + Sync {
@@ -1362,11 +1359,41 @@ mod tests {
             Err(ConnectError::internal("boom")),
         ]);
         let mut out = encode_body_stream::<StringValue, _, _>(s, CodecFormat::Proto);
-        let a = out.next().await.unwrap().unwrap();
-        let b = out.next().await.unwrap().unwrap();
+        let a = out.next().await.unwrap().unwrap().into_contiguous();
+        let b = out.next().await.unwrap().unwrap().into_contiguous();
         assert_eq!(StringValue::decode_from_slice(&a).unwrap().value, "a");
         assert_eq!(StringValue::decode_from_slice(&b).unwrap().value, "b");
         assert!(out.next().await.unwrap().is_err());
+        assert!(out.next().await.is_none());
+    }
+
+    /// A body that hands its payload over in segments reaches the stream as
+    /// those segments, not flattened: the per-item encode goes through
+    /// `Encodable::encode_segments`.
+    #[tokio::test]
+    async fn encode_body_stream_forwards_segments() {
+        use crate::EncodedBody;
+        use futures::StreamExt as _;
+
+        struct Split(Bytes, Bytes);
+        impl Encodable<StringValue> for Split {
+            fn encode(&self, _: CodecFormat) -> Result<Bytes, ConnectError> {
+                unreachable!("the streaming path takes encode_segments")
+            }
+            fn encode_segments(&self, _: CodecFormat) -> Result<EncodedBody, ConnectError> {
+                Ok(EncodedBody::Segmented(vec![self.0.clone(), self.1.clone()]))
+            }
+        }
+
+        let (a, b) = (Bytes::from_static(b"\x0a\x03"), Bytes::from_static(b"abc"));
+        let s = futures::stream::iter([Ok(Split(a.clone(), b.clone()))]);
+        let mut out = encode_body_stream::<StringValue, _, _>(s, CodecFormat::Proto);
+        let item = out.next().await.unwrap().unwrap();
+        let [s0, s1] = item.segments() else {
+            panic!("expected two segments");
+        };
+        assert!(std::ptr::eq(s0.as_ptr(), a.as_ptr()));
+        assert!(std::ptr::eq(s1.as_ptr(), b.as_ptr()));
         assert!(out.next().await.is_none());
     }
 
@@ -1389,8 +1416,14 @@ mod tests {
         ]);
         let mut out =
             encode_body_stream::<StringValue, PreEncoded<StringValue>, _>(s, CodecFormat::Proto);
-        assert_eq!(out.next().await.unwrap().unwrap(), bytes_a);
-        assert_eq!(out.next().await.unwrap().unwrap(), bytes_b);
+        assert_eq!(
+            out.next().await.unwrap().unwrap().into_contiguous(),
+            bytes_a
+        );
+        assert_eq!(
+            out.next().await.unwrap().unwrap().into_contiguous(),
+            bytes_b
+        );
         assert!(out.next().await.is_none());
     }
 
@@ -1415,11 +1448,11 @@ mod tests {
         let mut out =
             encode_body_stream::<StringValue, PreEncoded<StringValue>, _>(s, CodecFormat::Json);
         assert_eq!(
-            out.next().await.unwrap().unwrap(),
+            out.next().await.unwrap().unwrap().into_contiguous(),
             Bytes::from(serde_json::to_vec(&m_a).unwrap())
         );
         assert_eq!(
-            out.next().await.unwrap().unwrap(),
+            out.next().await.unwrap().unwrap().into_contiguous(),
             Bytes::from(serde_json::to_vec(&m_b).unwrap())
         );
         assert!(out.next().await.is_none());
