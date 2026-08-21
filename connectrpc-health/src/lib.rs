@@ -135,6 +135,13 @@ pub use connect::grpc::health::v1::HEALTH_SERVICE_NAME;
 /// Re-exports of the generated `grpc.health.v1` wire types — request and
 /// response messages, `ServingStatus`, the `*_SPEC` constants. Downstream
 /// crates can build probe loops without regenerating the proto.
+///
+/// These messages do **not** retain unknown fields: anything on the wire
+/// that this crate's copy of `health.proto` does not define is skipped on
+/// decode and absent on re-encode, so they are not a lossless relay for a
+/// newer revision of the protocol. The health service itself never reads
+/// or re-emits unknown fields, so its generated types omit the bookkeeping
+/// for them.
 pub mod wire {
     pub use crate::connect::grpc::health::v1::{HEALTH_CHECK_SPEC, HEALTH_WATCH_SPEC};
     pub use crate::proto::grpc::health::v1::health_check_response::ServingStatus;

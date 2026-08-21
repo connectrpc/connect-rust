@@ -5,7 +5,6 @@
 pub struct HealthCheckRequestView<'a> {
     /// Field 1: `service`
     pub service: &'a str,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for HealthCheckRequestView<'a> {
     type Owned = super::super::HealthCheckRequest;
@@ -29,7 +28,7 @@ impl<'a> ::buffa::MessageView<'a> for HealthCheckRequestView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -46,8 +45,6 @@ impl<'a> ::buffa::MessageView<'a> for HealthCheckRequestView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -67,7 +64,6 @@ impl<'a> ::buffa::MessageView<'a> for HealthCheckRequestView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::HealthCheckRequest {
             service: self.service.to_string(),
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -81,7 +77,6 @@ impl<'a> ::buffa::ViewEncode<'a> for HealthCheckRequestView<'a> {
         if !self.service.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.service) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -95,7 +90,6 @@ impl<'a> ::buffa::ViewEncode<'a> for HealthCheckRequestView<'a> {
         if !self.service.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.service, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -254,7 +248,8 @@ impl ::serde::Serialize for HealthCheckRequestOwnedView {
 pub struct HealthCheckResponseView<'a> {
     /// Field 1: `status`
     pub status: ::buffa::EnumValue<super::super::health_check_response::ServingStatus>,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+    #[doc(hidden)]
+    pub __buffa_phantom: ::core::marker::PhantomData<&'a ()>,
 }
 impl<'a> ::buffa::MessageView<'a> for HealthCheckResponseView<'a> {
     type Owned = super::super::HealthCheckResponse;
@@ -278,7 +273,7 @@ impl<'a> ::buffa::MessageView<'a> for HealthCheckResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -297,8 +292,6 @@ impl<'a> ::buffa::MessageView<'a> for HealthCheckResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -324,7 +317,6 @@ impl<'a> ::buffa::MessageView<'a> for HealthCheckResponseView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::HealthCheckResponse {
             status: self.status,
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -341,7 +333,6 @@ impl<'a> ::buffa::ViewEncode<'a> for HealthCheckResponseView<'a> {
                 size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -358,7 +349,6 @@ impl<'a> ::buffa::ViewEncode<'a> for HealthCheckResponseView<'a> {
                 ::buffa::types::put_int32_field(1u32, val, buf);
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.

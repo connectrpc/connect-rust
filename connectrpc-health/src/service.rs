@@ -197,7 +197,6 @@ impl<C: Checker> Health for HealthService<C> {
         let status = self.checker.check(request.service).await?;
         Response::ok(HealthCheckResponse {
             status: ServingStatus::from(status).into(),
-            ..Default::default()
         })
     }
 
@@ -210,7 +209,6 @@ impl<C: Checker> Health for HealthService<C> {
         Response::stream_ok(stream.map(|status| {
             Ok::<_, ConnectError>(HealthCheckResponse {
                 status: ServingStatus::from(status).into(),
-                ..Default::default()
             })
         }))
     }
@@ -251,6 +249,34 @@ mod tests {
         (client, addr)
     }
 
+    /// The wire types are generated with `unknown_fields=false`: an
+    /// unrecognized field is accepted and skipped on both decode paths, and
+    /// is absent when the message is re-encoded. Guards against a
+    /// regeneration silently dropping the option.
+    #[test]
+    fn unknown_fields_are_skipped_not_retained() {
+        use buffa::Message;
+        use buffa::view::MessageView;
+
+        use crate::proto::grpc::health::v1::HealthCheckRequestView;
+
+        let known = HealthCheckRequest {
+            service: "acme.A".into(),
+        }
+        .encode_to_vec();
+        let mut with_unknown = known.clone();
+        // Field 15, varint 0 — not defined by `HealthCheckRequest`.
+        with_unknown.extend_from_slice(&[0x78, 0x00]);
+
+        let owned = HealthCheckRequest::decode_from_slice(&with_unknown).unwrap();
+        assert_eq!(owned.service, "acme.A");
+        assert_eq!(owned.encode_to_vec(), known);
+
+        let view = HealthCheckRequestView::decode_view(&with_unknown).unwrap();
+        assert_eq!(view.service, "acme.A");
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), known);
+    }
+
     #[tokio::test]
     async fn check_serving_service() {
         let checker = Arc::new(StaticChecker::with_services(["acme.A"]));
@@ -259,7 +285,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -283,7 +308,6 @@ mod tests {
         let err = client
             .check(HealthCheckRequest {
                 service: "acme.NoSuch".into(),
-                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -300,7 +324,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -337,7 +360,6 @@ mod tests {
         let mut stream = client
             .watch(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -395,7 +417,6 @@ mod tests {
         let mut stream = client
             .watch(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -429,7 +450,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -453,7 +473,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -464,7 +483,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -480,7 +498,6 @@ mod tests {
         );
         let oversized = HealthCheckRequest {
             service: "x".repeat(2 * crate::MAX_REQUEST_BYTES),
-            ..Default::default()
         };
         let err = client.check(oversized.clone()).await.unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
@@ -513,7 +530,6 @@ mod tests {
         let err = client
             .check(HealthCheckRequest {
                 service: "x".repeat(2048),
-                ..Default::default()
             })
             .await
             .unwrap_err();

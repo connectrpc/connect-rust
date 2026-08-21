@@ -191,32 +191,25 @@ macro_rules! impl_server_reflection {
                 Answer::Files(file_descriptor_proto) => {
                     MessageResponse::from(pb::FileDescriptorResponse {
                         file_descriptor_proto,
-                        ..Default::default()
                     })
                 }
                 Answer::ExtensionNumbers { base_type, numbers } => {
                     MessageResponse::from(pb::ExtensionNumberResponse {
                         base_type_name: base_type,
                         extension_number: numbers,
-                        ..Default::default()
                     })
                 }
                 Answer::Services(names) => MessageResponse::from(pb::ListServiceResponse {
                     service: names
                         .into_iter()
-                        .map(|name| pb::ServiceResponse {
-                            name,
-                            ..Default::default()
-                        })
+                        .map(|name| pb::ServiceResponse { name })
                         .collect(),
-                    ..Default::default()
                 }),
                 Answer::NotFound(message) => MessageResponse::from(pb::ErrorResponse {
                     // tonic and grpc-go use the gRPC status code numbering
                     // here; 5 is NOT_FOUND.
                     error_code: 5,
                     error_message: message,
-                    ..Default::default()
                 }),
             };
 
@@ -224,7 +217,6 @@ macro_rules! impl_server_reflection {
                 valid_host: request.host.clone(),
                 original_request: ::buffa::MessageField::some(request),
                 message_response: Some(message_response),
-                ..Default::default()
             })
         }
     };
@@ -300,7 +292,6 @@ mod tests {
         ServerReflectionRequest {
             host: "test-host".into(),
             message_request: Some(message_request),
-            ..Default::default()
         }
     }
 
@@ -342,6 +333,31 @@ mod tests {
         stream.close_send();
         let err = stream.message().await.unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// The wire types are generated with `unknown_fields=false`: an
+    /// unrecognized field is accepted and skipped on both decode paths, so
+    /// the request the service echoes as `original_request` re-encodes
+    /// without it. Guards against a regeneration silently dropping the
+    /// option.
+    #[test]
+    fn unknown_fields_are_skipped_not_echoed() {
+        use buffa::view::MessageView;
+
+        use crate::proto::grpc::reflection::v1::ServerReflectionRequestView;
+
+        let known = request(MessageRequest::ListServices(String::new())).encode_to_vec();
+        let mut with_unknown = known.clone();
+        // Field 15, varint 0 — not defined by `ServerReflectionRequest`.
+        with_unknown.extend_from_slice(&[0x78, 0x00]);
+
+        let owned = ServerReflectionRequest::decode_from_slice(&with_unknown).unwrap();
+        assert_eq!(owned.host, "test-host");
+        assert_eq!(owned.encode_to_vec(), known);
+
+        // The server decodes a view and echoes `to_owned_message()`.
+        let view = ServerReflectionRequestView::decode_view(&with_unknown).unwrap();
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), known);
     }
 
     #[tokio::test]

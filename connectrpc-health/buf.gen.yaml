@@ -2,7 +2,12 @@ version: v2
 plugins:
   - local: ../../buffa/target/release/protoc-gen-buffa
     out: src/generated/buffa
-    opt: [views=true, json=true]
+    # `unknown_fields=false`: nothing in the health service reads or
+    # re-emits unknown fields, so the generated types skip them on decode
+    # instead of recording them — smaller structs (no
+    # `__buffa_unknown_fields`) and no per-field bookkeeping on the request
+    # path.
+    opt: [views=true, json=true, unknown_fields=false]
   - local: ../../buffa/target/release/protoc-gen-buffa-packaging
     out: src/generated/buffa
     strategy: all

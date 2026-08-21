@@ -1,0 +1,25 @@
+kind: Changed
+body: |-
+    **`connectrpc-health` and `connectrpc-reflection` messages no longer
+    retain unknown fields.** Neither service reads or acts on a field its copy
+    of `health.proto` / `reflection.proto` does not define, so their wire types
+    are now generated with buffa's `unknown_fields=false`: an unrecognized
+    field is skipped during decode (still depth-limited) instead of being
+    recorded, and is absent from anything these types re-encode — including
+    reflection's `original_request` echo, which grpc-go re-emits verbatim.
+    This is scoped to the two crates' own `grpc.health.v1` and
+    `grpc.reflection.v1`/`v1alpha` messages; code generated for your own
+    services is unchanged. Reflection's descriptor payloads are opaque bytes
+    and unaffected.
+
+    **Breaking** for code that uses the re-exported `wire` types directly. The
+    hidden `__buffa_unknown_fields` field and the `buffa::ExtensionSet` impl are
+    gone from every message in both crates, so naming either is a rustc error
+    (`<T as buffa::MessageName>::FULL_NAME` replaces `ExtensionSet::PROTO_FQN`).
+    Struct literals such as `HealthCheckRequest { service, ..Default::default() }`
+    still compile, but every field is now named, so `clippy::needless_update`
+    fires — drop the `..Default::default()` tail. A message decoded and
+    re-encoded through these types no longer round-trips fields from a newer
+    revision of the protocol, and a body carrying more unknown fields than
+    buffa's per-decode allowance is now skipped through rather than rejected.
+time: 2026-08-21T17:00:00.000000000+00:00
