@@ -58,7 +58,43 @@
 //!
 //! For custom logic (probing a database, propagating dependency state),
 //! implement [`Checker`] directly and wrap it in [`HealthService::new`]
-//! / [`HealthService::from_arc`].
+//! / [`HealthService::from_arc`]; see the next section for the one extra
+//! call that path needs.
+//!
+//! # Request limits
+//!
+//! A `HealthCheckRequest` is one service name, so the health routes do not
+//! need the multi-megabyte request ceiling a `connectrpc` service allows by
+//! default. This crate sizes `Check` and `Watch` to [`MAX_REQUEST_BYTES`]
+//! (16 KiB) per request through per-route
+//! [`Limits`](connectrpc::Limits) — see [`request_limits`] for the exact
+//! profile — and a larger request is refused with `resource_exhausted`
+//! before it reaches the [`Checker`]. The profile *replaces* the
+//! service-wide limits on these two routes, whether those are looser or
+//! tighter.
+//!
+//! * [`install_static`] applies [`request_limits`] for you.
+//! * Registering a [`HealthService`] any other way — the generated
+//!   [`HealthExt::register`](HealthExt) or
+//!   [`Router::add_service`](connectrpc::Router::add_service) — does not, so
+//!   follow it with [`apply_request_limits`]`(router, `[`request_limits`]`())`.
+//! * To tune the health routes specifically, call [`apply_request_limits`]
+//!   with your own `Limits` after either path; the later call wins.
+//!
+//! ```no_run
+//! use connectrpc::{Limits, Router};
+//! use connectrpc_health::{apply_request_limits, install_static};
+//!
+//! let (router, health) = install_static(Router::new(), ["acme.user.v1.UserService"]);
+//! // Optional: hold the health routes to 1 KiB instead of the bundled 16 KiB.
+//! let router = apply_request_limits(
+//!     router,
+//!     Limits::default()
+//!         .with_max_request_body_size(1024)
+//!         .with_max_message_size(1024),
+//! );
+//! # drop((router, health));
+//! ```
 //!
 //! [`grpc.health.v1.Health`]: https://github.com/grpc/grpc-proto/blob/master/grpc/health/v1/health.proto
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -74,7 +110,9 @@ mod connect;
 mod proto;
 
 pub use checker::{Checker, StatusStream};
-pub use service::{HealthService, install_static};
+pub use service::{
+    HealthService, MAX_REQUEST_BYTES, apply_request_limits, install_static, request_limits,
+};
 pub use static_checker::{StaticChecker, UnknownServiceError};
 pub use status::Status;
 

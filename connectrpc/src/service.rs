@@ -61,7 +61,7 @@ use crate::codec::header as connect_header;
 use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
 use crate::deadline::DeadlinePolicy;
-use crate::dispatcher::Dispatcher;
+use crate::dispatcher::{Dispatcher, MethodDescriptor};
 use crate::envelope::Envelope;
 use crate::envelope::EnvelopeDecoder;
 use crate::error::ConnectError;
@@ -465,6 +465,18 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// `max_message_size` can still expand by orders of magnitude. Raising one
 /// does not raise the other.
 ///
+/// # Where limits are set
+///
+/// Service-wide, on [`ConnectRpcService::with_limits`] (or the `Server`
+/// builder's `with_limits`), applying to every route. A single route on a
+/// [`Router`] can carry its own `Limits` via [`Router::with_route_limits`],
+/// which replace the service-wide ones for that method in full — so a
+/// method whose requests are always small can be sized to that, and an
+/// upload-shaped method can exceed the default without raising it for the
+/// rest. The bundled `connectrpc-health` and `connectrpc-reflection`
+/// services set a 16 KiB profile on their own routes this way and expose
+/// `apply_request_limits(router, limits)` for tuning it.
+///
 /// These are **server** limits, applied to received requests. The client
 /// side has its own equivalents for received *responses*:
 /// [`ClientConfig::with_default_element_memory_limit`](crate::client::ClientConfig::with_default_element_memory_limit)
@@ -484,9 +496,11 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// ```
 ///
 /// `Limits` is `#[non_exhaustive]`: new limits may be added in minor
-/// releases. Struct-literal and functional-update construction are not
-/// available outside the crate; use the builder methods.
-#[derive(Debug, Clone)]
+/// releases (it is and will stay `Copy` — a small bundle of plain numeric
+/// bounds, carried by value on [`MethodDescriptor`]).
+/// Struct-literal and functional-update construction are not available
+/// outside the crate; use the builder methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
     max_request_body_size: usize,
@@ -1332,7 +1346,7 @@ impl<D> Clone for ConnectRpcService<D> {
     fn clone(&self) -> Self {
         Self {
             dispatcher: Arc::clone(&self.dispatcher),
-            limits: self.limits.clone(),
+            limits: self.limits,
             compression: Arc::clone(&self.compression),
             compression_policy: self.compression_policy,
             deadline_policy: self.deadline_policy.clone(),
@@ -1364,9 +1378,15 @@ impl<D: Dispatcher> ConnectRpcService<D> {
         }
     }
 
-    /// Configure request limits.
+    /// Configure the service-wide request limits.
     ///
-    /// See [`Limits`] for available options.
+    /// See [`Limits`] for available options. A route registered on a
+    /// [`Router`] can carry its own limits via
+    /// [`Router::with_route_limits`], and those replace these entirely for
+    /// that method — including upward; [`MethodDescriptor::limits`] reports
+    /// which routes do.
+    ///
+    /// [`MethodDescriptor::limits`]: crate::dispatcher::MethodDescriptor::limits
     #[must_use]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -1564,7 +1584,7 @@ where
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let dispatcher = Arc::clone(&self.dispatcher);
-        let limits = self.limits.clone();
+        let limits = self.limits;
         let compression = Arc::clone(&self.compression);
         let compression_policy = self.compression_policy;
         let deadline_policy = self.deadline_policy.clone();
@@ -1639,6 +1659,14 @@ where
         span.record("codec", tracing::field::display(rp.codec_format));
     }
 
+    // Resolve the route once. When it declares its own limits they govern
+    // every body read below, the error-path drains included; the path and
+    // descriptor are handed on so no later stage derives them again.
+    let path = req.uri().path();
+    let path = path.strip_prefix('/').unwrap_or(path).to_owned();
+    let desc = dispatcher.lookup(&path);
+    let limits = desc.and_then(|d| d.limits).unwrap_or(limits);
+
     // Only GET and POST carry RPCs. Reject every other verb uniformly with
     // 405 Method Not Allowed plus an `Allow` header (connect-go parity),
     // regardless of whether a Content-Type is present. Without this, a bodyless
@@ -1646,7 +1674,7 @@ where
     // None) would fall through to the unsupported-media-type path and be
     // misreported as 415. An unknown path still maps to 404.
     if req.method() != Method::GET && req.method() != Method::POST {
-        return reject_unsupported_method(&*dispatcher, req, limits, deadline_policy).await;
+        return reject_unsupported_method(&path, desc, req, limits, deadline_policy).await;
     }
 
     // Connect GET requests don't have a Content-Type header, so protocol
@@ -1655,6 +1683,8 @@ where
     if req.method() == Method::GET {
         return handle_unary_request(
             &*dispatcher,
+            &path,
+            desc,
             req,
             limits,
             compression,
@@ -1688,12 +1718,8 @@ where
         } else {
             Protocol::Connect
         };
-        let deadline = deadline_from_headers(
-            req.headers(),
-            timeout_protocol,
-            req.uri().path(),
-            deadline_policy,
-        );
+        let deadline =
+            deadline_from_headers(req.headers(), timeout_protocol, &path, deadline_policy);
 
         // Drain the request body to avoid broken pipe on HTTP/1.1.
         let (_parts, body) = req.into_parts();
@@ -1739,12 +1765,8 @@ where
                     "gRPC-Web text mode (application/grpc-web-text) is not supported",
                 );
                 // Drain the body to preserve HTTP/1.1 keep-alive for the error response.
-                let deadline = deadline_from_headers(
-                    req.headers(),
-                    rp.protocol,
-                    req.uri().path(),
-                    deadline_policy,
-                );
+                let deadline =
+                    deadline_from_headers(req.headers(), rp.protocol, &path, deadline_policy);
                 let (_parts, body) = req.into_parts();
                 let _ = with_request_deadline(
                     deadline,
@@ -1756,34 +1778,32 @@ where
             }
 
             // If so, take the fast path that avoids stream wrapping overhead.
-            if matches!(rp.protocol, Protocol::Grpc | Protocol::GrpcWeb) {
-                let path = req.uri().path();
-                let path = path.strip_prefix('/').unwrap_or(path);
-                if let Some(desc) = dispatcher.lookup(path)
-                    && desc.kind == MethodKind::Unary
-                {
-                    let path = path.to_owned();
-                    let response = handle_grpc_unary_request(
-                        &*dispatcher,
-                        &path,
-                        desc.spec,
-                        req,
-                        rp.protocol,
-                        rp.codec_format,
-                        limits,
-                        compression,
-                        compression_policy,
-                        deadline_policy,
-                        interceptors,
-                    )
-                    .await;
-                    return Ok(response.map(ConnectRpcBody::GrpcUnary));
-                }
+            if matches!(rp.protocol, Protocol::Grpc | Protocol::GrpcWeb)
+                && let Some(desc) = desc
+                && desc.kind == MethodKind::Unary
+            {
+                let response = handle_grpc_unary_request(
+                    &*dispatcher,
+                    &path,
+                    desc.spec,
+                    req,
+                    rp.protocol,
+                    rp.codec_format,
+                    limits,
+                    compression,
+                    compression_policy,
+                    deadline_policy,
+                    interceptors,
+                )
+                .await;
+                return Ok(response.map(ConnectRpcBody::GrpcUnary));
             }
 
             // Streaming request (Connect streaming, gRPC, or gRPC-Web)
             let response = handle_streaming_request(
                 &*dispatcher,
+                &path,
+                desc,
                 req,
                 rp.protocol,
                 rp.codec_format,
@@ -1800,6 +1820,8 @@ where
             // Unary request (Connect unary) or unknown content type (for error reporting)
             handle_unary_request(
                 &*dispatcher,
+                &path,
+                desc,
                 req,
                 limits,
                 compression,
@@ -1838,20 +1860,18 @@ application/proto";
 /// `GET` for idempotent unary methods). An unknown path returns the same
 /// `unimplemented` (HTTP 404) as any other route miss. The request body is
 /// drained first so HTTP/1.1 connections stay reusable.
-async fn reject_unsupported_method<D, B>(
-    dispatcher: &D,
+async fn reject_unsupported_method<B>(
+    path: &str,
+    desc: Option<MethodDescriptor>,
     req: Request<B>,
     limits: Limits,
     deadline_policy: &DeadlinePolicy,
 ) -> Result<Response<ConnectRpcBody>, ConnectError>
 where
-    D: Dispatcher,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let raw_path = req.uri().path();
-    let path = raw_path.strip_prefix('/').unwrap_or(raw_path).to_owned();
-    let allow = dispatcher.lookup(&path).map(|desc| {
+    let allow = desc.map(|desc| {
         if desc.kind == MethodKind::Unary && desc.idempotent {
             "GET, POST"
         } else {
@@ -1861,12 +1881,7 @@ where
 
     // Drain the request body so an early response doesn't break HTTP/1.1
     // keep-alive (see the streaming body-drop race notes).
-    let deadline = deadline_from_headers(
-        req.headers(),
-        Protocol::Connect,
-        req.uri().path(),
-        deadline_policy,
-    );
+    let deadline = deadline_from_headers(req.headers(), Protocol::Connect, path, deadline_policy);
     let (_parts, body) = req.into_parts();
     let _ = with_request_deadline(
         deadline,
@@ -1896,6 +1911,8 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_unary_request<D, B>(
     dispatcher: &D,
+    path: &str,
+    desc: Option<MethodDescriptor>,
     req: Request<B>,
     limits: Limits,
     compression: Arc<CompressionRegistry>,
@@ -1908,15 +1925,12 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Parse the path to extract service/method (owned to avoid borrowing req)
-    let path = req.uri().path();
-    let path = path.strip_prefix('/').unwrap_or(path).to_owned();
     let query_string = req.uri().query().map(|s| s.to_owned());
     let method = req.method().clone();
 
     // Extract metadata from headers using the Connect protocol (unary is always Connect)
     let mut metadata = RequestMetadata::from_headers(req.headers(), Protocol::Connect);
-    metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
+    metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
     let deadline = absolute_deadline(metadata.timeout);
 
     // Split request to consume the body
@@ -1934,9 +1948,9 @@ where
     )
     .await?;
 
-    // Look up the method descriptor to check idempotency.
+    // A miss is reported only now that the body has been drained.
     // (Non-unary kinds are allowed through — they'll error at the dispatch call.)
-    let desc = dispatcher.lookup(&path).ok_or_else(|| {
+    let desc = desc.ok_or_else(|| {
         ConnectError::unimplemented(format!("method not found: {path}"))
             .with_http_status(StatusCode::NOT_FOUND)
     })?;
@@ -2038,7 +2052,7 @@ where
     // Call the handler with the appropriate codec format.
     let resp: EncodedResponse = with_request_deadline(
         deadline,
-        call_unary_intercepted(dispatcher, interceptors, &path, ctx, body, codec_format),
+        call_unary_intercepted(dispatcher, interceptors, path, ctx, body, codec_format),
     )
     .await?;
 
@@ -2381,6 +2395,8 @@ enum StreamingDispatchKind {
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming_request<D, B>(
     dispatcher: &D,
+    path: &str,
+    method_desc: Option<MethodDescriptor>,
     req: Request<B>,
     protocol: Protocol,
     codec_format: CodecFormat,
@@ -2395,13 +2411,9 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Parse the path to extract service/method
-    let path = req.uri().path();
-    let path = path.strip_prefix('/').unwrap_or(path).to_owned();
-
     // Extract metadata before any body reads, including error-path drains.
     let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
-    metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
+    metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
     // gRPC and gRPC-Web require POST method. Backstop: non-GET/POST verbs are
     // already rejected upstream in `handle_request`, and GET never routes here.
@@ -2435,9 +2447,6 @@ where
         return streaming_error_response(&err, protocol, codec_format);
     }
 
-    // Single lookup to determine method kind.
-    let method_desc = dispatcher.lookup(&path);
-
     // Split request to consume the body
     let (parts, body) = req.into_parts();
     let extensions = parts.extensions;
@@ -2446,7 +2455,7 @@ where
     if matches!(method_desc, Some(d) if d.kind == MethodKind::BidiStreaming) {
         return handle_bidi_streaming_request(
             dispatcher,
-            &path,
+            path,
             method_desc.and_then(|d| d.spec),
             metadata,
             body,
@@ -2466,7 +2475,7 @@ where
     if matches!(method_desc, Some(d) if d.kind == MethodKind::ClientStreaming) {
         return handle_client_streaming_request(
             dispatcher,
-            &path,
+            path,
             method_desc.and_then(|d| d.spec),
             metadata,
             body,
@@ -2591,7 +2600,7 @@ where
             let fut = call_server_streaming_intercepted(
                 dispatcher,
                 interceptors,
-                &path,
+                path,
                 ctx,
                 request_body,
                 codec_format,
@@ -2605,7 +2614,7 @@ where
             let fut = call_unary_intercepted(
                 dispatcher,
                 interceptors,
-                &path,
+                path,
                 ctx,
                 request_body,
                 codec_format,
@@ -3752,6 +3761,8 @@ mod tests {
 
         let err = handle_unary_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -3779,6 +3790,8 @@ mod tests {
 
         let resp = handle_streaming_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Protocol::Grpc,
             CodecFormat::Proto,
@@ -4441,6 +4454,8 @@ mod tests {
 
         handle_unary_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -4491,6 +4506,8 @@ mod tests {
 
         handle_unary_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -4605,6 +4622,8 @@ mod tests {
 
         handle_unary_request(
             &router,
+            "svc/Get",
+            router.lookup("svc/Get"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -5651,5 +5670,413 @@ mod tests {
         );
         // The trailers-only status headers are the server's own and stay.
         assert_eq!(response.headers().get(&GRPC_STATUS).unwrap(), "14");
+    }
+
+    /// Per-route limits: a route carrying its own `Limits` is held to them on
+    /// every dispatch path, other routes keep the service-wide limits, and a
+    /// route may be looser than the service as well as tighter.
+    mod route_limits {
+        use super::*;
+        use buffa_types::google::protobuf::StringValue;
+
+        const TIGHT: usize = 64;
+        /// gRPC status text for `resource_exhausted`.
+        fn exhausted() -> String {
+            crate::ErrorCode::ResourceExhausted.grpc_code().to_string()
+        }
+
+        fn echo() -> impl crate::Handler<StringValue, StringValue> {
+            crate::handler_fn(|_ctx: RequestContext, req: StringValue| async move {
+                crate::Response::ok(req)
+            })
+        }
+
+        fn echo_stream() -> impl crate::handler::StreamingHandler<StringValue, StringValue> {
+            crate::handler::streaming_handler_fn(
+                |_ctx: RequestContext, req: StringValue| async move {
+                    crate::Response::stream_ok(futures::stream::iter([Ok(req)]))
+                },
+            )
+        }
+
+        /// `svc/Tight` and `svc/TightStream` are limited to `TIGHT` bytes;
+        /// `svc/Default` uses whatever the service is configured with.
+        fn router() -> Arc<Router> {
+            let tight = Limits::default()
+                .with_max_message_size(TIGHT)
+                .with_max_request_body_size(TIGHT);
+            Arc::new(
+                Router::new()
+                    .route("svc", "Tight", echo())
+                    .route("svc", "Default", echo())
+                    .route_server_stream("svc", "TightStream", echo_stream())
+                    .with_route_limits("/svc/Tight", tight)
+                    .with_route_limits("svc/TightStream", tight),
+            )
+        }
+
+        fn message(len: usize) -> Bytes {
+            crate::codec::encode_proto(&StringValue {
+                value: "x".repeat(len),
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        fn enveloped(msg: Bytes) -> Bytes {
+            Envelope::data(msg).encode()
+        }
+
+        fn post(path: &str, content_type: &str, body: Bytes) -> Request<Full<Bytes>> {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Full::new(body))
+                .unwrap()
+        }
+
+        async fn call<B>(
+            router: &Arc<Router>,
+            service_limits: Limits,
+            req: Request<B>,
+        ) -> Result<Response<ConnectRpcBody>, ConnectError>
+        where
+            B: Body<Data = Bytes> + Send + 'static,
+            B::Error: std::error::Error + Send + Sync + 'static,
+        {
+            handle_request(
+                Arc::clone(router),
+                req,
+                service_limits,
+                Arc::new(CompressionRegistry::new()),
+                &CompressionPolicy::default(),
+                &DeadlinePolicy::new(),
+                &[],
+            )
+            .await
+        }
+
+        /// `grpc-status` from the response headers (a trailers-only error) —
+        /// `None` for a response that carries messages.
+        fn grpc_status_header(resp: &Response<ConnectRpcBody>) -> Option<String> {
+            resp.headers()
+                .get("grpc-status")
+                .map(|v| v.to_str().unwrap().to_owned())
+        }
+
+        /// `grpc-status` from the body trailers of a response that started
+        /// streaming.
+        async fn grpc_status_trailer(resp: Response<ConnectRpcBody>) -> Option<String> {
+            let body = resp.into_body().collect().await.unwrap();
+            body.trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .map(|v| v.to_str().unwrap().to_owned())
+        }
+
+        #[tokio::test]
+        async fn connect_unary_route_limit_rejects_oversized_and_spares_other_routes() {
+            let router = router();
+            let big = message(2 * TIGHT);
+            let default = Limits::default();
+
+            let err = call(
+                &router,
+                default,
+                post("/svc/Tight", "application/proto", big.clone()),
+            )
+            .await
+            .err()
+            .expect("route limit must reject the oversized body");
+            assert_eq!(err.code, crate::ErrorCode::ResourceExhausted);
+
+            let ok = call(
+                &router,
+                default,
+                post("/svc/Default", "application/proto", big),
+            )
+            .await
+            .expect("service-wide limits admit it on another route");
+            assert_eq!(ok.status(), StatusCode::OK);
+
+            let ok = call(
+                &router,
+                default,
+                post("/svc/Tight", "application/proto", message(8)),
+            )
+            .await
+            .expect("a request within the route limit is served");
+            assert_eq!(ok.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn grpc_unary_fast_path_honours_route_limit() {
+            let router = router();
+            let big = enveloped(message(2 * TIGHT));
+            let default = Limits::default();
+
+            let resp = call(
+                &router,
+                default,
+                post("/svc/Tight", "application/grpc", big.clone()),
+            )
+            .await
+            .expect("gRPC errors are trailers-only responses");
+            assert_eq!(grpc_status_header(&resp), Some(exhausted()));
+
+            let resp = call(
+                &router,
+                default,
+                post("/svc/Default", "application/grpc", big),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grpc_status_header(&resp), None);
+            assert_eq!(grpc_status_trailer(resp).await.as_deref(), Some("0"));
+        }
+
+        #[tokio::test]
+        async fn streaming_path_honours_route_limit() {
+            let router = router();
+            let default = Limits::default();
+
+            let big = enveloped(message(2 * TIGHT));
+            let resp = call(
+                &router,
+                default,
+                post("/svc/TightStream", "application/grpc", big),
+            )
+            .await
+            .expect("gRPC errors are trailers-only responses");
+            assert_eq!(grpc_status_header(&resp), Some(exhausted()));
+
+            let small = enveloped(message(8));
+            let resp = call(
+                &router,
+                default,
+                post("/svc/TightStream", "application/grpc", small),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grpc_status_header(&resp), None);
+            assert_eq!(grpc_status_trailer(resp).await.as_deref(), Some("0"));
+        }
+
+        /// The route's limits replace the service-wide ones outright, so a
+        /// route can admit what the rest of the service refuses.
+        #[tokio::test]
+        async fn route_limit_can_loosen_service_limit() {
+            let service_tight = Limits::default()
+                .with_max_message_size(TIGHT)
+                .with_max_request_body_size(TIGHT);
+            let router = Arc::new(
+                Router::new()
+                    .route("svc", "Upload", echo())
+                    .route("svc", "Default", echo())
+                    .with_route_limits("/svc/Upload", Limits::default()),
+            );
+            let big = message(2 * TIGHT);
+
+            let ok = call(
+                &router,
+                service_tight,
+                post("/svc/Upload", "application/proto", big.clone()),
+            )
+            .await
+            .expect("the route's own (default) limits admit it");
+            assert_eq!(ok.status(), StatusCode::OK);
+
+            let err = call(
+                &router,
+                service_tight,
+                post("/svc/Default", "application/proto", big),
+            )
+            .await
+            .err()
+            .expect("the service-wide limit still governs other routes");
+            assert_eq!(err.code, crate::ErrorCode::ResourceExhausted);
+        }
+
+        /// Bytes the server read from a 64 × 1 KiB body before answering `req`.
+        async fn bytes_polled(router: &Arc<Router>, req: http::request::Builder) -> usize {
+            let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let body = CountingBody {
+                frames: std::iter::repeat_n(Bytes::from(vec![0u8; 1024]), 64).collect(),
+                pulled: Arc::clone(&pulled),
+            };
+            let _ = call(router, Limits::default(), req.body(body).unwrap()).await;
+            pulled.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Requests refused before dispatch — wrong verb, unknown content
+        /// type, unsupported encoding — still drain the body for keep-alive,
+        /// and on a route with its own limits that drain stops at the route's
+        /// limit (after the first 1 KiB frame here) rather than the
+        /// service-wide one (all 64 KiB).
+        #[tokio::test]
+        async fn pre_dispatch_error_drains_honour_route_limit() {
+            let router = router();
+            let put = || Request::builder().method(Method::PUT);
+            let post = || Request::builder().method(Method::POST);
+
+            // 405: verb not allowed.
+            assert_eq!(bytes_polled(&router, put().uri("/svc/Tight")).await, 1024);
+            assert_eq!(
+                bytes_polled(&router, put().uri("/svc/Default")).await,
+                64 * 1024
+            );
+            // 415: unknown content type.
+            let unknown_ct =
+                |b: http::request::Builder| b.header(header::CONTENT_TYPE, "application/foo");
+            assert_eq!(
+                bytes_polled(&router, unknown_ct(post().uri("/svc/Tight"))).await,
+                1024
+            );
+            assert_eq!(
+                bytes_polled(&router, unknown_ct(post().uri("/svc/Default"))).await,
+                64 * 1024
+            );
+            // Unsupported request compression on a streaming route.
+            let bogus_encoding = |b: http::request::Builder| {
+                b.header(header::CONTENT_TYPE, "application/grpc")
+                    .header("grpc-encoding", "bogus")
+            };
+            assert_eq!(
+                bytes_polled(&router, bogus_encoding(post().uri("/svc/TightStream"))).await,
+                1024
+            );
+            assert_eq!(
+                bytes_polled(&router, bogus_encoding(post().uri("/svc/Default"))).await,
+                64 * 1024
+            );
+        }
+
+        #[tokio::test]
+        async fn connect_get_honours_route_limit() {
+            use base64::Engine as _;
+            let tight = Limits::default().with_max_message_size(TIGHT);
+            let router = Arc::new(
+                Router::new()
+                    .route_idempotent("svc", "TightGet", echo())
+                    .route_idempotent("svc", "DefaultGet", echo())
+                    .with_route_limits("svc/TightGet", tight),
+            );
+            let msg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message(2 * TIGHT));
+            let get = |path: &str| {
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "{path}?encoding=proto&base64=1&connect=v1&message={msg}"
+                    ))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap()
+            };
+            let err = call(&router, Limits::default(), get("/svc/TightGet"))
+                .await
+                .err()
+                .expect("over the route limit");
+            assert_eq!(err.code, crate::ErrorCode::ResourceExhausted);
+            let ok = call(&router, Limits::default(), get("/svc/DefaultGet"))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn client_streaming_path_honours_route_limit() {
+            let tight = Limits::default().with_max_message_size(TIGHT);
+            let concat = crate::handler::client_streaming_handler_fn(
+                |_ctx: RequestContext, mut reqs: crate::ServiceStream<StringValue>| async move {
+                    use futures::StreamExt as _;
+                    let mut out = String::new();
+                    while let Some(r) = reqs.next().await {
+                        out.push_str(&r?.value);
+                    }
+                    crate::Response::ok(StringValue {
+                        value: out,
+                        ..Default::default()
+                    })
+                },
+            );
+            let router = Arc::new(
+                Router::new()
+                    .route_client_stream("svc", "Concat", concat)
+                    .with_route_limits("svc/Concat", tight),
+            );
+            let mut two = enveloped(message(8)).to_vec();
+            two.extend_from_slice(&enveloped(message(2 * TIGHT)));
+            let resp = call(
+                &router,
+                Limits::default(),
+                post("/svc/Concat", "application/grpc", Bytes::from(two)),
+            )
+            .await
+            .unwrap();
+            // The first message is within the limit; the second is not, and
+            // the error arrives in the trailers of an already-started stream.
+            assert_eq!(grpc_status_trailer(resp).await, Some(exhausted()));
+        }
+
+        /// The third `Limits` field, the decode budget, follows the route too:
+        /// a message that is tiny on the wire but allocates 64 elements is
+        /// refused on a route whose budget is one byte and served elsewhere.
+        #[tokio::test]
+        async fn route_limit_carries_the_element_budget() {
+            use buffa_types::google::protobuf::{ListValue, Value};
+            let count = || {
+                crate::handler_fn(|_ctx: RequestContext, req: ListValue| async move {
+                    crate::Response::ok(StringValue {
+                        value: req.values.len().to_string(),
+                        ..Default::default()
+                    })
+                })
+            };
+            let router = Arc::new(
+                Router::new()
+                    .route("svc", "TightCount", count())
+                    .route("svc", "Count", count())
+                    .with_route_limits(
+                        "svc/TightCount",
+                        Limits::default().with_element_memory_limit(1),
+                    ),
+            );
+            let list = Bytes::from(buffa::Message::encode_to_vec(&ListValue {
+                values: (0..64).map(|_| Value::default()).collect(),
+                ..Default::default()
+            }));
+            let err = call(
+                &router,
+                Limits::default(),
+                post("/svc/TightCount", "application/proto", list.clone()),
+            )
+            .await
+            .err()
+            .expect("over the route's element budget");
+            assert_eq!(err.code, crate::ErrorCode::InvalidArgument);
+            let ok = call(
+                &router,
+                Limits::default(),
+                post("/svc/Count", "application/proto", list),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+        }
+
+        /// The lookup runs before the body read, but a miss must still surface
+        /// as `unimplemented` after the drain, not as a limits error.
+        #[tokio::test]
+        async fn unknown_route_still_reports_not_found() {
+            let router = router();
+            let err = call(
+                &router,
+                Limits::default(),
+                post("/svc/Missing", "application/proto", message(8)),
+            )
+            .await
+            .err()
+            .expect("miss");
+            assert_eq!(err.code, crate::ErrorCode::Unimplemented);
+        }
     }
 }
