@@ -2,15 +2,21 @@ kind: Added
 body: |-
   **`ConnectError` now preserves the underlying cause of transport
   failures.** A new `ConnectError::with_source` builder attaches an
-  underlying error, surfaced through `Error::source()`; `ConnectError` stays
-  `Clone` since the source is held in an `Arc`. Every place a transport
-  error was previously stringified into `message` and discarded now
-  retains it: the HTTP and HTTPS `HttpClient` transports, `Http2Connection`
-  (unix-socket connect, eager/lazy connect, TLS handshake, h2 send), and
-  `From<std::io::Error>` / `From<http::Error>` for `ConnectError`. The wire
-  format and `Display` output are unchanged; the derived `Debug` output now
-  additionally includes the source when one is attached. This is purely
-  additive ([#237]).
+  underlying error, surfaced through `Error::source()` and, as a
+  `SharedSource` handle that can be moved into another error type, through
+  `ConnectError::source_arc()` (with `with_shared_source` to re-attach one);
+  `ConnectError` stays `Clone` since the source is held in an `Arc`. The
+  built-in client transports now retain the cause wherever a failure they
+  classify was previously stringified into `message` and discarded: the HTTP
+  and HTTPS `HttpClient` transports, `Http2Connection` (unix-socket connect,
+  eager/lazy connect and its establishment timeout, TLS handshake, h2 send),
+  and `From<std::io::Error>` / `From<http::Error>` for `ConnectError`.
+  `ConnectError::unavailable_from_transport` exposes the same convention to
+  custom `ClientTransport` implementations. Errors the call path synthesises
+  itself (the call deadline, request build/encode, response decode, a
+  body-read reset) do not carry one. The wire format and `Display` output are
+  unchanged; the derived `Debug` output now additionally includes the source
+  when one is attached. This is purely additive ([#237]).
 
   [#237]: https://github.com/connectrpc/connect-rust/issues/237
 time: 2026-07-23T02:36:43.000000000Z

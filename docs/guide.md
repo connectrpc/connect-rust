@@ -1697,6 +1697,8 @@ pub struct ConnectError {
     pub details: Vec<ErrorDetail>,
     // response headers and trailers: private, exposed via the
     // response_headers()/trailers() accessors and their _mut variants
+    // source: private, exposed via std::error::Error::source() and
+    // source_arc(); never serialized
 }
 ```
 
@@ -1726,17 +1728,34 @@ typed protobuf messages) before returning. These flow through to
 clients in the standard Connect error-detail wire format.
 
 To keep an underlying error's cause available for logging without
-sending it to the client, attach it with `.with_source(err)`; it's
-surfaced through `Error::source()` but never serialized. Transport
-failures on the client (DNS, connection refused/reset, TLS handshake,
-timeout) populate this automatically, so `err.source()` reveals the
-original transport error even though `err.to_string()` only shows the
-Connect-level message. `source()` is local-only: it's set only by code
-that calls `.with_source(..)` in this process, so a `ConnectError`
-decoded from a server's response — including one an interceptor
-constructs from RPC status metadata — always has `source() == None`,
-even when its `message` is populated. Only locally-originated errors
-(client transport failures, `From<std::io::Error>`) carry a source.
+sending it to the client, attach it with `.with_source(err)`. It is
+surfaced through `std::error::Error::source()` (bring the trait into
+scope, or call `std::error::Error::source(&err)`) and, as a
+`SharedSource` handle that can be moved into another error type,
+through `err.source_arc()`; it is never serialized. A `ConnectError`
+decoded from a server's response therefore always has
+`.source().is_none()`, even when its `message` is populated; only an
+error that code in this process attached a cause to carries one.
+
+On the client, a source is present when the *transport* classified the
+failure and absent when the call path did. The built-in transports
+attach the underlying `hyper` / `rustls` / `std::io` error for DNS
+resolution, connection refused, TLS handshake, HTTP/2 connection
+establishment (including its timeout) and request send, so
+`err.source()` yields the original typed error, which can be downcast
+to inspect an `io::ErrorKind`, for example. Only that error's `Display`
+text reaches `message`, and it is repeated there deliberately so that
+plain `{}` formatting stays informative; a renderer that also walks
+the source chain, such as `anyhow`'s `{:#}`, will print it twice.
+Errors the call path synthesises itself do not carry a source: the
+call deadline (`with_timeout` / `with_default_timeout`) whenever it
+fires, request construction and encoding failures, response decoding,
+and a reset while reading the response body (whose error type the
+public call functions bound only by `Display`). A custom
+`ClientTransport` that returns its own `ConnectError` should call
+`.with_source(..)` itself, or build the error with
+`ConnectError::unavailable_from_transport`, to follow the same
+convention.
 
 ## Compression
 

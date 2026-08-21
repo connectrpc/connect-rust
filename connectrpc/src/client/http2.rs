@@ -41,7 +41,7 @@ use http::Request;
 use http::Response;
 use http::Uri;
 
-use super::{BoxFuture, ClientBody, ClientTransport, unavailable_from_transport_error};
+use super::{BoxFuture, ClientBody, ClientTransport};
 use crate::error::ConnectError;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -106,7 +106,7 @@ fn unix_connector(
         let path = path.clone();
         async move {
             let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
-                unavailable_from_transport_error(
+                ConnectError::unavailable_from_transport(
                     format_args!("unix socket connect to {} failed", path.display()),
                     e,
                 )
@@ -948,7 +948,7 @@ impl Http2ConnectionBuilder {
 async fn drive_connect(conn: &mut Http2Connection, ctx: &str) -> Result<(), ConnectError> {
     std::future::poll_fn(|cx| conn.inner.poll_ready(cx))
         .await
-        .map_err(|e| unavailable_from_transport_error(ctx, e))
+        .map_err(|e| ConnectError::unavailable_from_transport(ctx, e))
 }
 
 impl tower::Service<Request<ClientBody>> for Http2Connection {
@@ -1041,7 +1041,7 @@ impl ClientTransport for SharedHttp2Connection {
         Box::pin(async move {
             svc.oneshot(request)
                 .await
-                .map_err(|e| unavailable_from_transport_error("h2 send failed", e))
+                .map_err(|e| ConnectError::unavailable_from_transport("h2 send failed", e))
         })
     }
 }
@@ -1188,7 +1188,10 @@ impl tower::Service<Uri> for MakeSendRequest {
                     let tcp = io.into_inner();
                     let connector = tokio_rustls::TlsConnector::from(tls);
                     let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-                        BoxError::from(unavailable_from_transport_error("TLS handshake failed", e))
+                        BoxError::from(ConnectError::unavailable_from_transport(
+                            "TLS handshake failed",
+                            e,
+                        ))
                     })?;
 
                     // Verify ALPN negotiated h2. A server that doesn't speak h2
@@ -1244,10 +1247,10 @@ where
     match timeout {
         Some(dur) => match tokio::time::timeout(dur, fut).await {
             Ok(res) => res.map_err(Into::into),
-            Err(elapsed) => Err(unavailable_from_transport_error(
-                format_args!("connection establishment did not complete within {dur:?}"),
-                elapsed,
-            )
+            Err(elapsed) => Err(ConnectError::unavailable(format!(
+                "connection establishment did not complete within {dur:?}"
+            ))
+            .with_source(elapsed)
             .into()),
         },
         None => fut.await.map_err(Into::into),

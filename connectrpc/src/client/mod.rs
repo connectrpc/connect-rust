@@ -199,10 +199,12 @@ pub fn full_body(b: Bytes) -> ClientBody {
 
 /// Walk an error's `source()` chain looking for a [`ConnectError`].
 ///
-/// Boxed trait objects cannot appear as links in the chain: `Box<dyn Error>`
-/// does not itself implement `Error` (the blanket impl requires a sized
-/// type), so every link is a concrete error type and a plain `downcast_ref`
-/// at each link is exhaustive.
+/// A plain `downcast_ref` at each link is exhaustive as long as no link is a
+/// sized smart-pointer wrapper: `Box<dyn Error>` does not itself implement
+/// `Error` (the blanket impl requires a sized type), so a boxed cause is
+/// stored and walked as the concrete type behind it. `ConnectError`'s own
+/// `Arc`'d source is surfaced by dereferencing (`&**arc`), so that link too
+/// carries the wrapped type's vtable rather than `Arc`'s.
 fn find_connect_error_in_chain(
     mut err: &(dyn std::error::Error + 'static),
 ) -> Option<ConnectError> {
@@ -212,23 +214,6 @@ fn find_connect_error_in_chain(
         }
         err = err.source()?;
     }
-}
-
-/// Build an `unavailable` [`ConnectError`] for a transport failure: the
-/// message is `"{context}: {err}"` (unchanged from before `source()` was
-/// tracked) and `err` is retained as the returned error's `source()`, so
-/// its cause (DNS failure, connection reset, TLS failure, timeout, ...)
-/// isn't lost even though only the `Display` text reaches the wire.
-///
-/// `err` is boxed once up front and reused for both the message and the
-/// source, rather than boxing again inside `with_source`.
-fn unavailable_from_transport_error(
-    context: impl std::fmt::Display,
-    err: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-) -> ConnectError {
-    let err = err.into();
-    let message = format!("{context}: {err}");
-    ConnectError::unavailable(message).with_source(err)
 }
 
 /// Map a [`ClientTransport::send`] failure into the error surfaced to the
@@ -248,7 +233,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     find_connect_error_in_chain(&err)
-        .unwrap_or_else(|| unavailable_from_transport_error(context, err))
+        .unwrap_or_else(|| ConnectError::unavailable_from_transport(context, err))
 }
 
 /// Extra slack added to client-side response buffer caps beyond the message
@@ -299,7 +284,10 @@ pub trait ClientTransport: Clone + Send + Sync + 'static {
     /// discarding any outer wrappers' `Display` context. A transport can use
     /// this to control the surfaced error classification, for example
     /// returning `deadline_exceeded` from a timeout middleware. Errors with
-    /// no `ConnectError` in their chain are wrapped as `unavailable`.
+    /// no `ConnectError` in their chain are wrapped as `unavailable` with the
+    /// original retained as the [source](ConnectError::with_source); a
+    /// transport that builds its own `ConnectError` for such a failure can
+    /// use [`ConnectError::unavailable_from_transport`] to match.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Send an HTTP request and receive a response.
@@ -814,10 +802,9 @@ impl ClientTransport for HttpClient {
                 }
                 let client = client.clone();
                 Box::pin(async move {
-                    client
-                        .request(request)
-                        .await
-                        .map_err(|e| unavailable_from_transport_error("HTTP request failed", e))
+                    client.request(request).await.map_err(|e| {
+                        ConnectError::unavailable_from_transport("HTTP request failed", e)
+                    })
                 })
             }
             #[cfg(feature = "client-tls")]
@@ -834,10 +821,9 @@ impl ClientTransport for HttpClient {
                 }
                 let client = client.clone();
                 Box::pin(async move {
-                    client
-                        .request(request)
-                        .await
-                        .map_err(|e| unavailable_from_transport_error("HTTPS request failed", e))
+                    client.request(request).await.map_err(|e| {
+                        ConnectError::unavailable_from_transport("HTTPS request failed", e)
+                    })
                 })
             }
         }

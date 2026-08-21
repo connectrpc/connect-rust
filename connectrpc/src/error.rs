@@ -270,12 +270,24 @@ pub struct ConnectError {
     /// The underlying cause, if this error was converted from another error
     /// (not serialized — never sent over the wire).
     ///
-    /// Surfaced through [`Error::source`](std::error::Error::source).
-    /// `Arc` (rather than `Box`) so `ConnectError` stays `Clone` without
-    /// requiring the wrapped error to be.
+    /// Surfaced through [`Error::source`](std::error::Error::source) and
+    /// [`ConnectError::source_arc`]. `Arc` (rather than `Box`) so
+    /// `ConnectError` stays `Clone` without requiring the wrapped error to be.
     #[serde(skip)]
-    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+    source: Option<SharedSource>,
 }
+
+/// The type of a [`ConnectError`]'s retained cause, as returned by
+/// [`ConnectError::source_arc`] and accepted by
+/// [`ConnectError::with_shared_source`]. Shared so `ConnectError` can stay
+/// `Clone`.
+///
+/// Downcast the handle itself to inspect the concrete error
+/// (`cause.downcast_ref::<std::io::Error>()`). If it is stored as another
+/// error type's `#[source]` field, that type's `source()` chain shows an
+/// opaque `Arc` link rather than the wrapped error, because std implements
+/// `Error` for `Arc<T>` but not for `Box<T>`.
+pub type SharedSource = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Shared empty `HeaderMap` for the `None` arm of the read accessors, so
 /// callers can iterate / `.get()` unconditionally.
@@ -489,7 +501,14 @@ impl ConnectError {
     /// on an error a client parsed from a server response is always `None`.
     /// Accepts either a concrete error or an already-boxed one, so it
     /// composes with transport errors that are type-erased before reaching
-    /// this call. Replaces any source attached by a previous call.
+    /// this call. (The same conversion also accepts a bare `String` or
+    /// `&str`, which becomes a source with no type to downcast to — pass a
+    /// real error type.) Replaces any source attached by a previous call.
+    ///
+    /// This does not touch `message`. The crate's own transport errors put
+    /// the cause's `Display` text in `message` *and* attach it here, so plain
+    /// `{}` formatting stays informative; a renderer that also walks the
+    /// source chain will show that text twice.
     #[must_use]
     pub fn with_source(
         mut self,
@@ -497,6 +516,73 @@ impl ConnectError {
     ) -> Self {
         self.source = Some(Arc::from(source.into()));
         self
+    }
+
+    /// Attach a cause already held as a [`SharedSource`] — typically one taken
+    /// from another `ConnectError` with [`source_arc`](Self::source_arc) when
+    /// rebuilding an error under a different code. Passing such a handle to
+    /// [`with_source`](Self::with_source) instead would compile but wrap it in
+    /// a second `Arc` link that hides the concrete type from `downcast_ref`.
+    #[must_use]
+    pub fn with_shared_source(mut self, source: SharedSource) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// The underlying cause as a shared handle, for carrying it into another
+    /// error type. [`Error::source`](std::error::Error::source) returns the
+    /// same error by reference when it only needs inspecting.
+    ///
+    /// ```rust
+    /// use connectrpc::{ConnectError, SharedSource};
+    ///
+    /// #[derive(Debug, thiserror::Error)]
+    /// enum FetchError {
+    ///     #[error("profile service unreachable")]
+    ///     Unreachable(#[source] SharedSource),
+    ///     #[error(transparent)]
+    ///     Rpc(ConnectError),
+    /// }
+    ///
+    /// fn classify(err: ConnectError) -> FetchError {
+    ///     match err.source_arc() {
+    ///         Some(cause) => FetchError::Unreachable(cause),
+    ///         None => FetchError::Rpc(err),
+    ///     }
+    /// }
+    ///
+    /// let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    /// let e = classify(ConnectError::unavailable("connect failed").with_source(refused));
+    /// let FetchError::Unreachable(cause) = &e else { panic!() };
+    /// // Downcast the handle itself; see `SharedSource` for why the outer
+    /// // error's `source()` chain shows an `Arc` link here instead.
+    /// let io = cause.downcast_ref::<std::io::Error>().unwrap();
+    /// assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+    /// ```
+    #[must_use]
+    pub fn source_arc(&self) -> Option<SharedSource> {
+        self.source.clone()
+    }
+
+    /// Build an `unavailable` error from a raw client transport failure,
+    /// keeping the failure both in `message` (as `"{context}: {err}"`) and as
+    /// the [source](Self::with_source).
+    ///
+    /// This is the convention the built-in transports follow for the
+    /// failures they classify themselves; a custom
+    /// [`ClientTransport`](crate::client::ClientTransport) can use it to
+    /// match them. Pass the underlying transport error, not a `ConnectError`:
+    /// the result is always `unavailable`, so wrapping an already-classified
+    /// error here would bury its code — return that error directly instead.
+    /// (Contrast the `From<std::io::Error>` impl, which is for handler-side
+    /// I/O and yields `internal`.)
+    #[must_use]
+    pub fn unavailable_from_transport(
+        context: impl std::fmt::Display,
+        err: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        let err = err.into();
+        Self::unavailable(format!("{context}: {err}")).with_source(err)
     }
 
     /// Get the HTTP status code for this error.
@@ -610,6 +696,59 @@ mod tests {
         assert!(std::error::Error::source(&e).is_some());
     }
 
+    /// The whole safety argument for `source` is one `#[serde(skip)]`; pin
+    /// that a local-only cause never reaches the wire in either direction.
+    #[test]
+    fn source_is_neither_serialized_nor_deserialized() {
+        let e =
+            ConnectError::unavailable("boom").with_source(std::io::Error::other("secret cause"));
+        let json = String::from_utf8(e.to_json().to_vec()).unwrap();
+        assert!(
+            !json.contains("source") && !json.contains("secret cause"),
+            "{json}"
+        );
+        let with_key = json.replacen('{', r#"{"source":"injected","#, 1);
+        let round: ConnectError = serde_json::from_str(&with_key).unwrap();
+        assert!(std::error::Error::source(&round).is_none());
+    }
+
+    #[test]
+    fn source_arc_can_be_carried_and_downcast() {
+        let e = ConnectError::unavailable("wrapped").with_source(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        let carried: SharedSource = e.source_arc().expect("source must be set");
+        drop(e);
+        let io = carried
+            .downcast_ref::<std::io::Error>()
+            .expect("concrete type survives the Arc");
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn with_shared_source_keeps_the_link_transparent() {
+        let first = ConnectError::unavailable("a").with_source(std::io::Error::other("io"));
+        let second = ConnectError::internal("b")
+            .with_shared_source(first.source_arc().expect("first has a source"));
+        let link = std::error::Error::source(&second).expect("second has a source");
+        assert!(link.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn unavailable_from_transport_keeps_cause_in_message_and_source() {
+        let e = ConnectError::unavailable_from_transport(
+            "connect failed",
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        );
+        assert_eq!(e.code, ErrorCode::Unavailable);
+        assert_eq!(e.message.as_deref(), Some("connect failed: refused"));
+        let io = std::error::Error::source(&e)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .expect("source is the io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
     #[test]
     fn test_grpc_code_round_trip() {
         let codes = [
@@ -663,8 +802,10 @@ mod tests {
 
     #[test]
     fn connect_error_stays_under_result_large_err_threshold() {
-        // clippy::result_large_err fires at 128 bytes. Keep some headroom so
-        // adding a small field doesn't immediately re-trip the lint.
+        // clippy::result_large_err fires at 128 bytes. This test is set to
+        // trip well before that (88 of 96 with the `source` Arc), so growth
+        // prompts boxing a field here rather than a lint in a downstream
+        // crate.
         const THRESHOLD: usize = 96;
         let size = std::mem::size_of::<ConnectError>();
         assert!(
