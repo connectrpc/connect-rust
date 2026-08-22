@@ -591,7 +591,7 @@ mod tests {
         let registry = Arc::new(CompressionRegistry::default());
         let mut enc = EnvelopeEncoder::new(
             Some((Arc::clone(&registry), "gzip")),
-            CompressionPolicy::default().min_size(0),
+            CompressionPolicy::default().with_min_size(0),
         );
         let body = EncodedBody::Segmented(vec![
             Bytes::from(vec![b'a'; 4096]),

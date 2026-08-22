@@ -460,6 +460,12 @@ impl<B> Response<B> {
     ///
     /// `true` forces compression, `false` disables it, `None` (or
     /// never calling this) defers to the server's policy.
+    ///
+    /// Compression needs one contiguous input, so a compressed response
+    /// gives up the segmented encode that lets a view body's large fields
+    /// reach the transport without a copy (see [`EncodedStream`]). For a
+    /// response dominated by large, already-compressed or incompressible
+    /// `bytes` fields, `compress(false)` is usually the faster choice.
     #[must_use]
     pub fn compress(mut self, enabled: impl Into<Option<bool>>) -> Self {
         self.compress = enabled.into();
@@ -536,7 +542,13 @@ pub type InboundStream<M> = ServiceStream<crate::StreamMessage<M>>;
 ///
 /// The single-buffer case is kept unboxed: a small message that was never
 /// worth segmenting costs no allocation to carry.
+///
+/// Prefer [`segments`](Self::segments) / [`into_contiguous`](Self::into_contiguous)
+/// over matching on the variants: the split is not canonical (compare two
+/// bodies in tests via `into_contiguous()`), and further representations may
+/// be added.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EncodedBody {
     /// One contiguous buffer — what a non-segmenting encode produces.
     Contiguous(Bytes),
@@ -1222,7 +1234,22 @@ pub type EncodedResponse = Response<EncodedBody>;
 /// response: compression needs one contiguous input, so a response that
 /// negotiates an encoding (the default for messages of at least
 /// `CompressionPolicy`'s `min_size` when the client advertises one) flattens
-/// each item first. Opt out per response with [`Response::compress`].
+/// each item first, and the segmented encode was then wasted work. Opt out
+/// per response with [`Response::compress`].
+///
+/// A hand-written [`Dispatcher`](crate::Dispatcher) or test double that
+/// produced `Bytes` items before 0.9 converts each item, and recovers a
+/// single buffer on the way out with [`EncodedBody::into_contiguous`]:
+///
+/// ```rust
+/// use connectrpc::{ConnectError, EncodedBody, EncodedStream, Response};
+/// use bytes::Bytes;
+/// use futures::{stream, StreamExt};
+///
+/// let items = stream::iter([Ok::<_, ConnectError>(Bytes::from_static(b"encoded"))]);
+/// let response: Response<EncodedStream> = Response::stream(items.map(|r| r.map(EncodedBody::from)));
+/// # let _ = response;
+/// ```
 pub type EncodedStream = ServiceStream<EncodedBody>;
 
 impl<B> Response<B> {

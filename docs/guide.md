@@ -571,6 +571,16 @@ async fn redact(
 }
 ```
 
+A view body's large `bytes` and `string` fields reach the transport by
+reference count rather than being copied into one buffer, on unary and
+streaming responses alike (each stream item is encoded the same way).
+Two things restore the copy: an owned-message body, whose fields the
+encoder cannot borrow, and compression, which needs one contiguous
+input. Under the default `CompressionPolicy` any response over 1 KiB to
+a client advertising `gzip` is compressed, so a handler streaming large,
+poorly-compressible view items should return
+`Response::stream(..).compress(false)` to keep the copy-free path.
+
 The `'a` on the trait method also lets the body borrow from `&self`
 (e.g. cached server state). View bodies only encode for the proto
 codec - JSON clients receive `unimplemented`; see
