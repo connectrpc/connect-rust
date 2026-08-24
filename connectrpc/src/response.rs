@@ -149,6 +149,26 @@ impl RequestContext {
         self.headers.get(key)
     }
 
+    /// Mutable access to the request headers.
+    ///
+    /// This is the hook an [`Interceptor`](crate::Interceptor) uses to add
+    /// or rewrite request metadata before calling `next.run(req)` — an
+    /// auth token, a propagated trace context, a tenant id. Inner
+    /// interceptors and the handler see the mutated map.
+    ///
+    /// On the server, protocol-derived values (the
+    /// [`deadline`](Self::deadline), codec, negotiated compression) were
+    /// resolved from the headers *before* interceptors ran; rewriting
+    /// `connect-timeout-ms`, `grpc-timeout`, `content-type`, or
+    /// `accept-encoding` here changes only what downstream code reads, not
+    /// dispatch behavior. On a client-side chain the edited map is what goes
+    /// on the wire, so those headers are load-bearing there. As with
+    /// [`extensions_mut`](Self::extensions_mut), a *handler* mutating its
+    /// own by-value `ctx` affects nothing downstream.
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.headers
+    }
+
     /// Absolute request deadline parsed from the protocol's timeout header
     /// (`Connect-Timeout-Ms` or `grpc-timeout`), if the client asserted one.
     ///
@@ -1568,6 +1588,23 @@ mod tests {
         let mut ctx = RequestContext::new(HeaderMap::new());
         ctx.extensions_mut().insert(Tag(1));
         assert_eq!(ctx.extensions().get::<Tag>(), Some(&Tag(1)));
+    }
+
+    #[test]
+    fn request_context_headers_mut() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-keep", HeaderValue::from_static("k"));
+        let mut ctx = RequestContext::new(headers);
+        ctx.headers_mut()
+            .insert("authorization", HeaderValue::from_static("Bearer t"));
+        assert_eq!(ctx.header("authorization").unwrap(), "Bearer t");
+        assert_eq!(
+            ctx.header("x-keep").unwrap(),
+            "k",
+            "existing entries survive"
+        );
+        ctx.headers_mut().remove("x-keep");
+        assert!(ctx.header("x-keep").is_none());
     }
 
     #[cfg(feature = "server")]

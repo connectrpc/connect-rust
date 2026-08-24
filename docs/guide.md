@@ -1026,7 +1026,7 @@ boundary, span builder, validator, or rate limiter actually wants.
 
 ```rust,ignore
 use connectrpc::interceptor::{UnaryRequest, UnaryResponse};
-use connectrpc::{ConnectError, Interceptor, Next};
+use connectrpc::{ConnectError, Interceptor, Next, Payload, Response};
 
 struct Logging;
 
@@ -1081,11 +1081,11 @@ process-wide), use `with_interceptor_arc(Arc<dyn Interceptor>)`.
 ### Reading and rewriting the request
 
 `UnaryRequest` is `{ ctx: RequestContext, payload: Payload }`. Mutating
-`ctx` (headers, extensions) before `next.run` propagates to the handler.
-The `payload` is the request body — wire bytes plus a lazy decode
-cache. Most interceptors never read it; ones that do call
-`payload.message::<M>()` to decode once and cache, so the handler's
-decode is free:
+`ctx` through `ctx.headers_mut()` or `ctx.extensions_mut()` before
+`next.run` propagates to the handler. The `payload` is the request body
+— wire bytes plus a lazy decode cache. Most interceptors never read it;
+ones that do call `payload.message::<M>()` to decode once and cache, so
+the handler's decode is free:
 
 ```rust,ignore
 async fn intercept_unary(
@@ -1106,12 +1106,12 @@ async fn intercept_unary(
 }
 ```
 
-### Short-circuiting
+### Short-circuiting and re-running
 
 Returning without calling `next.run()` short-circuits the chain —
 neither inner interceptors nor the handler run. Returning `Err`
-surfaces the error on the protocol's normal error path, including
-any `response_headers` the error carries:
+surfaces the error on the protocol's normal error path, including any
+`response_headers` the error carries:
 
 ```rust,ignore
 async fn intercept_unary(
@@ -1129,6 +1129,30 @@ async fn intercept_unary(
     };
     self.tokens.verify(token)?;
     next.run(req).await
+}
+```
+
+Returning `Ok` without calling `next` works too. Build the body from a
+typed message with `Payload::from_message`, which encodes lazily in the
+request's wire format:
+
+```rust,ignore
+if let Some(reply) = self.cache.get(req.payload.message::<LookupRequest>()?) {
+    return Ok(Response::new(Payload::from_message(reply.clone(), req.payload.format())));
+}
+next.run(req).await
+```
+
+The opposite of short-circuiting is running the chain more than once.
+`Next` is `Clone`, and `UnaryRequest::try_clone()` copies the context and
+body, so a retry looks like this (gate it on `Spec::idempotency_level`;
+on the server a re-run invokes the handler again):
+
+```rust,ignore
+let spare = req.try_clone()?;
+match next.clone().run(req).await {
+    Err(e) if e.code == ErrorCode::Unavailable => next.run(spare).await,
+    done => done,
 }
 ```
 

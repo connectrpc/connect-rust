@@ -67,8 +67,8 @@ use crate::envelope::EnvelopeDecoder;
 use crate::error::ConnectError;
 use crate::handler::BoxStream;
 use crate::interceptor::{
-    Interceptor, call_bidi_streaming_intercepted, call_client_streaming_intercepted,
-    call_server_streaming_intercepted, call_unary_intercepted,
+    Interceptor, InterceptorChain, call_bidi_streaming_intercepted,
+    call_client_streaming_intercepted, call_server_streaming_intercepted, call_unary_intercepted,
 };
 use crate::protocol::Protocol;
 use crate::response::{EncodedResponse, RequestContext};
@@ -1321,9 +1321,9 @@ pub struct ConnectRpcService<D = Router> {
     compression: Arc<CompressionRegistry>,
     compression_policy: CompressionPolicy,
     deadline_policy: DeadlinePolicy,
-    /// Unary interceptor chain, outermost first. The `Arc<[..]>` is one
-    /// pointer to clone per request regardless of chain length.
-    interceptors: Arc<[Arc<dyn Interceptor>]>,
+    /// Interceptor chain, outermost first. One pointer to clone per
+    /// request regardless of chain length.
+    interceptors: InterceptorChain,
 }
 
 // Manual Clone impl because `#[derive(Clone)]` would add a `D: Clone` bound,
@@ -1336,7 +1336,7 @@ impl<D> Clone for ConnectRpcService<D> {
             compression: Arc::clone(&self.compression),
             compression_policy: self.compression_policy,
             deadline_policy: self.deadline_policy.clone(),
-            interceptors: Arc::clone(&self.interceptors),
+            interceptors: self.interceptors.clone(),
         }
     }
 }
@@ -1360,7 +1360,7 @@ impl<D: Dispatcher> ConnectRpcService<D> {
             compression: Arc::new(CompressionRegistry::default()),
             compression_policy: CompressionPolicy::default(),
             deadline_policy: DeadlinePolicy::new(),
-            interceptors: Arc::default(),
+            interceptors: InterceptorChain::default(),
         }
     }
 
@@ -1448,11 +1448,7 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     /// which takes ownership and wraps for you.
     #[must_use]
     pub fn with_interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
-        // The Arc<[..]> is shared across cloned service handles; rebuild
-        // it on registration. Registration is a cold path.
-        let mut v: Vec<Arc<dyn Interceptor>> = self.interceptors.to_vec();
-        v.push(interceptor);
-        self.interceptors = Arc::from(v);
+        self.interceptors.push(interceptor);
         self
     }
 
@@ -1568,7 +1564,7 @@ where
         let compression = Arc::clone(&self.compression);
         let compression_policy = self.compression_policy;
         let deadline_policy = self.deadline_policy.clone();
-        let interceptors = Arc::clone(&self.interceptors);
+        let interceptors = self.interceptors.clone();
 
         // Only create and attach the tracing span when a subscriber would
         // actually observe it. For disabled-debug (the common production case),

@@ -1,0 +1,29 @@
+kind: Added
+body: |-
+  Interceptor plumbing for a re-runnable (retry-style) chain and for
+  interceptors that synthesize a response. All additive; no dispatch behavior
+  changes:
+
+  - **`RequestContext::headers_mut()`** — mutable access to request headers,
+    the accessor an interceptor uses to inject auth or trace metadata before
+    `next.run(req)`. (`extensions_mut()` already existed; the docs claimed
+    headers were mutable but no public accessor allowed it.)
+  - **`Payload::from_message(msg, format)`** — the lazily-*encoded*
+    counterpart of `Payload::new`: wraps a typed message and encodes only when
+    `encoded()` runs, memoizing the result (a replacement set with
+    `set_message` is now also encoded at most once). Lets an interceptor
+    short-circuit with a synthesized response; the dispatch path re-encodes
+    it in the negotiated format if the two differ (`Payload::encoded_as`).
+    `bytes()` is empty for such a payload; `Payload`'s `Debug` output now
+    labels that field `wire_len`.
+  - **`Payload::try_clone()`** and **`UnaryRequest::try_clone()`** — explicit
+    copies (encoded bytes, cloned context, empty decode cache) for an
+    interceptor that needs a second request.
+  - **`UnaryRequest::from_parts(ctx, payload)`** — constructor for the
+    `#[non_exhaustive]` request from an existing `Payload`; `StreamRequest`
+    is now `Clone`.
+  - **`Next` is now `Clone`**, so a unary interceptor can run the rest of
+    the chain more than once (`next.clone().run(first)` then
+    `next.run(second)`); the consuming `run(self)` keeps the single-call
+    case explicit.
+time: 2026-08-13T04:31:36.268465697Z
