@@ -993,6 +993,17 @@ assert_eq!(GREET_SERVICE_GREET_SPEC.stream_type, StreamType::Unary);
 assert_eq!(GREET_SERVICE_GREET_SPEC.origin, SpecOrigin::Server);
 ```
 
+The generated client passes the same constant to the runtime with its
+`origin` flipped, `GREET_SERVICE_GREET_SPEC.with_origin(SpecOrigin::Client)`,
+so that is the value a client-side interceptor observes. Because `Spec`'s
+`PartialEq` covers every field, that value is **not** `==` to the constant;
+an interceptor that runs on both sides and asks "is this the `Greet`
+method?" should use `spec.same_method(GREET_SERVICE_GREET_SPEC)` (or
+compare `procedure`), which ignores `origin`. The low-level
+`connectrpc::client::call_*` entry points take a `Spec` for the same
+reason; see the `call_unary` and `Spec::client` rustdoc for hand-written
+and dynamic callers.
+
 > **Both dispatch paths populate `ctx.spec()`.** A code-generated
 > `FooServiceServer<T>` always supplies a `Spec`. The dynamic `Router`
 > (used by `FooServiceExt::register(Router)`) does too — the generated

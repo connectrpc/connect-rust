@@ -312,55 +312,37 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const CONFORMANCE_SERVICE_SERVICE_NAME: &str = "connectrpc.conformance.v1.ConformanceService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Unary` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Unary` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const CONFORMANCE_SERVICE_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/connectrpc.conformance.v1.ConformanceService/Unary",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `ServerStream` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `ServerStream` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const CONFORMANCE_SERVICE_SERVER_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/connectrpc.conformance.v1.ConformanceService/ServerStream",
         ::connectrpc::StreamType::ServerStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `ClientStream` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `ClientStream` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const CONFORMANCE_SERVICE_CLIENT_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/connectrpc.conformance.v1.ConformanceService/ClientStream",
         ::connectrpc::StreamType::ClientStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `BidiStream` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `BidiStream` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const CONFORMANCE_SERVICE_BIDI_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/connectrpc.conformance.v1.ConformanceService/BidiStream",
         ::connectrpc::StreamType::BidiStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Unimplemented` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Unimplemented` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/connectrpc.conformance.v1.ConformanceService/Unimplemented",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `IdempotentUnary` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `IdempotentUnary` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/connectrpc.conformance.v1.ConformanceService/IdempotentUnary",
         ::connectrpc::StreamType::Unary,
@@ -1238,8 +1220,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                CONFORMANCE_SERVICE_SERVICE_NAME,
-                "Unary",
+                CONFORMANCE_SERVICE_UNARY_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1281,8 +1263,8 @@ where
         ::connectrpc::client::call_server_stream(
                 &self.transport,
                 &self.config,
-                CONFORMANCE_SERVICE_SERVICE_NAME,
-                "ServerStream",
+                CONFORMANCE_SERVICE_SERVER_STREAM_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1356,8 +1338,8 @@ where
         ::connectrpc::client::call_client_stream(
                 &self.transport,
                 &self.config,
-                CONFORMANCE_SERVICE_SERVICE_NAME,
-                "ClientStream",
+                CONFORMANCE_SERVICE_CLIENT_STREAM_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 requests,
                 options,
             )
@@ -1395,8 +1377,8 @@ where
         ::connectrpc::client::call_bidi_stream(
                 &self.transport,
                 &self.config,
-                CONFORMANCE_SERVICE_SERVICE_NAME,
-                "BidiStream",
+                CONFORMANCE_SERVICE_BIDI_STREAM_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 options,
             )
             .await
@@ -1439,8 +1421,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                CONFORMANCE_SERVICE_SERVICE_NAME,
-                "Unimplemented",
+                CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1484,8 +1466,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                CONFORMANCE_SERVICE_SERVICE_NAME,
-                "IdempotentUnary",
+                CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

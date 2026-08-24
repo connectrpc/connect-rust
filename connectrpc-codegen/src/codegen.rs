@@ -1302,18 +1302,20 @@ fn generate_all_message_encodable_impls(
 /// Generate code for a single service.
 /// Reject RPC method sets whose generated Rust identifiers collide.
 ///
-/// Each proto method `Foo` produces both `foo` and `foo_with_options` on the
-/// client. Two methods that normalize to the same snake_case name (e.g.
-/// `GetFoo` and `get_foo`), or one whose snake form equals another's
-/// `_with_options` form, would emit duplicate definitions and fail to
-/// compile with an error pointing at generated code rather than the proto.
+/// Each proto method `Foo` produces `foo` and `foo_with_options` on the
+/// client and the module-scope constant `{SVC}_FOO_SPEC`. Two methods that
+/// normalize to the same snake_case name (e.g. `GetFoo` and `get_foo`), or
+/// one whose snake form equals another's plus a generated suffix (`Get` +
+/// `GetWithOptions`; `Get` + `GetSpec`), would emit duplicate definitions
+/// and fail to compile with an error pointing at generated code rather than
+/// the proto.
 fn check_method_collisions(service_name: &str, service: &ServiceDescriptorProto) -> Result<()> {
     let mut seen: HashMap<String, String> = HashMap::new();
     for m in &service.method {
         let proto_name = m.name.as_deref().unwrap_or("");
         let snake = proto_name.to_snake_case();
-        let with_opts = format!("{snake}_with_options");
-        for ident in [snake.as_str(), with_opts.as_str()] {
+        let idents = [snake.clone(), format!("{snake}_with_options")];
+        for ident in &idents {
             if let Some(prev) = seen.get(ident) {
                 anyhow::bail!(
                     "service {service_name}: RPC methods {prev:?} and {proto_name:?} \
@@ -1321,8 +1323,9 @@ fn check_method_collisions(service_name: &str, service: &ServiceDescriptorProto)
                 );
             }
         }
-        seen.insert(snake, proto_name.to_string());
-        seen.insert(with_opts, proto_name.to_string());
+        for ident in idents {
+            seen.insert(ident, proto_name.to_string());
+        }
     }
     Ok(())
 }
@@ -1570,15 +1573,7 @@ fn generate_service(
     let client_methods: Vec<TokenStream> = service
         .method
         .iter()
-        .map(|m| {
-            generate_client_method(
-                &service_name_const,
-                &full_service_name,
-                m,
-                resolver,
-                package,
-            )
-        })
+        .map(|m| generate_client_method(service, &full_service_name, m, resolver, package))
         .collect::<Result<Vec<_>>>()?;
 
     // Generate monomorphic FooServiceServer<T> dispatcher.
@@ -1676,8 +1671,9 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
     };
 
     // Per-method `Spec` constants. Stable, allocation-free metadata that the
-    // dispatcher threads into `RequestContext::spec` and that user code can
-    // reference directly (e.g. for tracing labels or routing tables).
+    // dispatcher threads into `RequestContext::spec`, that generated client
+    // methods pass to `call_*` (with `origin` flipped to `Client`), and that
+    // user code can reference directly.
     let spec_consts = generate_spec_consts(&full_service_name, service);
 
     Ok(quote! {
@@ -1774,12 +1770,10 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
     })
 }
 
-/// Construct the identifier for a per-method `Spec` constant.
-///
-/// The name is derived from the service and method names, e.g.
-/// `ELIZA_SERVICE_SAY_SPEC` for `ElizaService.Say`. Lives at module scope so
-/// both the server dispatcher and (later) the generated client can reference
-/// the same constant.
+/// Construct the identifier for the per-method `Spec` constant,
+/// `{SERVICE}_{METHOD}_SPEC`, e.g. `ELIZA_SERVICE_SAY_SPEC` for
+/// `ElizaService.Say`. Referenced by the generated `Dispatcher::lookup` and,
+/// with `.with_origin(SpecOrigin::Client)`, by generated client methods.
 fn method_spec_const_ident(service: &ServiceDescriptorProto, method_name: &str) -> Ident {
     let service_name = service.name.as_deref().unwrap_or("");
     format_ident!(
@@ -1792,11 +1786,10 @@ fn method_spec_const_ident(service: &ServiceDescriptorProto, method_name: &str) 
 /// Emit one `pub const … : ::connectrpc::Spec` per method.
 ///
 /// Each constant captures the method's procedure path, stream type, and
-/// idempotency level. Constructed via `Spec::server(...)` so
-/// `Spec::origin == SpecOrigin::Server`; a future generated client will
-/// emit a sibling constant via `Spec::client(...)`. The constants are
-/// referenced by the generated `Dispatcher::lookup` impl and are also
-/// stable public API for user code.
+/// idempotency level, constructed via `Spec::server(...)`. It is the single
+/// source of a method's static facts: the dispatcher surfaces it on
+/// `RequestContext::spec`, and generated client methods pass the same
+/// constant with `origin` flipped to `Client`.
 fn generate_spec_consts(
     full_service_name: &str,
     service: &ServiceDescriptorProto,
@@ -1825,14 +1818,14 @@ fn generate_spec_consts(
                 }
                 _ => quote! { ::connectrpc::IdempotencyLevel::Unknown },
             };
-            let doc = format!(
-                "Static [`Spec`](::connectrpc::Spec) for the server-side `{method_name}` RPC.\n\n\
-                 The dispatcher surfaces this on\n\
-                 [`RequestContext::spec`](::connectrpc::RequestContext::spec)."
-            );
-            let doc_tokens = doc_attrs(&doc);
+            let doc = doc_attrs(&format!(
+                "Static [`Spec`](::connectrpc::Spec) for the `{method_name}` RPC, as seen \
+                 by the server; the generated client passes it with \
+                 [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with \
+                 [`Spec::same_method`](::connectrpc::Spec::same_method))."
+            ));
             quote! {
-                #doc_tokens
+                #doc
                 pub const #spec_const: ::connectrpc::Spec =
                     ::connectrpc::Spec::server(#procedure, #stream_type)
                         .with_idempotency_level(#idempotency_level);
@@ -2245,13 +2238,17 @@ fn generate_trait_method(
 /// ClientConfig defaults, so the no-options variant still picks up any
 /// client-wide defaults the user configured.
 fn generate_client_method(
-    service_name_const: &Ident,
+    service: &ServiceDescriptorProto,
     full_service_name: &str,
     method: &MethodDescriptorProto,
     resolver: &TypeResolver<'_>,
     package: &str,
 ) -> Result<TokenStream> {
     let method_name = method.name.as_deref().unwrap_or("");
+    // The method's module-scope `*_SPEC` constant, passed to the runtime with
+    // `origin` flipped to `Client` (see `generate_spec_consts`).
+    let spec_const = method_spec_const_ident(service, method_name);
+    let client_spec = quote! { #spec_const.with_origin(::connectrpc::SpecOrigin::Client) };
     let method_snake = make_field_ident(&method_name.to_snake_case());
     let method_with_opts = format_ident!("{}_with_options", method_name.to_snake_case());
     let input_type = resolver.rust_type(method.input_type.as_deref().unwrap_or(""), package)?;
@@ -2304,7 +2301,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_client_stream(
                 &self.transport, &self.config,
-                #service_name_const, #method_name,
+                #client_spec,
                 requests, options,
             ).await
         };
@@ -2325,7 +2322,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_bidi_stream(
                 &self.transport, &self.config,
-                #service_name_const, #method_name, options,
+                #client_spec, options,
             ).await
         };
         short_args = quote! {};
@@ -2342,7 +2339,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_server_stream(
                 &self.transport, &self.config,
-                #service_name_const, #method_name,
+                #client_spec,
                 request, options,
             ).await
         };
@@ -2360,7 +2357,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_unary(
                 &self.transport, &self.config,
-                #service_name_const, #method_name,
+                #client_spec,
                 request, options,
             ).await
         };
@@ -4958,6 +4955,9 @@ mod tests {
         assert!(say.contains(r#""/pkg.EchoService/Say""#), "{say}");
         assert!(say.contains("StreamType::Unary"), "{say}");
         assert!(say.contains("IdempotencyLevel::NoSideEffects"), "{say}");
+        // One constant per method: no client sibling is emitted.
+        assert!(!say.contains("CLIENT_SPEC"), "{say}");
+        assert!(!say.contains("Spec::client("), "{say}");
 
         let subscribe = render(&consts[1]);
         assert!(
@@ -4975,6 +4975,50 @@ mod tests {
 
         let chat = render(&consts[3]);
         assert!(chat.contains("StreamType::BidiStream"), "{chat}");
+    }
+
+    /// `Get` + `GetSpec` do not collide: their constants are `X_GET_SPEC` and
+    /// `X_GET_SPEC_SPEC`, and `get_spec` is only ever a client method name.
+    /// Methods named `Client` and `Spec` are ordinary too.
+    #[test]
+    fn spec_const_names_do_not_collide_with_method_names() {
+        let m = |name: &str| MethodDescriptorProto {
+            name: Some(name.into()),
+            input_type: Some(".pkg.Req".into()),
+            output_type: Some(".pkg.Resp".into()),
+            ..Default::default()
+        };
+        let service = ServiceDescriptorProto {
+            name: Some("X".into()),
+            method: vec![m("Get"), m("GetSpec"), m("Put"), m("Client"), m("Spec")],
+            ..Default::default()
+        };
+        check_method_collisions("X", &service).unwrap();
+    }
+
+    /// Generated client methods identify the RPC to the runtime by the
+    /// module-scope `*_SPEC` constant with `origin` flipped to `Client`, not
+    /// by service/method strings.
+    #[test]
+    fn client_methods_pass_spec_const_as_client() {
+        let out = format_minimal_service(false);
+        assert!(
+            !out.contains("CLIENT_SPEC"),
+            "no client sibling const: {out}"
+        );
+        // The unary call site: transport, config, then the const as client.
+        let call = out
+            .find("::connectrpc::client::call_unary(")
+            .expect("minimal service has a unary client method");
+        let window = &out[call..(call + 240).min(out.len())];
+        assert!(
+            window.contains("PING_SERVICE_PING_SPEC.with_origin(::connectrpc::SpecOrigin::Client)"),
+            "call_unary must receive the Spec const with client origin:\n{window}"
+        );
+        assert!(
+            !window.contains("PING_SERVICE_SERVICE_NAME"),
+            "the (service, method) string pair is gone from client call sites:\n{window}"
+        );
     }
 
     #[test]

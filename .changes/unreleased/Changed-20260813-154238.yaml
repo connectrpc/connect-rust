@@ -1,0 +1,39 @@
+kind: Changed
+body: |-
+  **Breaking (low-level client API):** the `connectrpc::client::call_unary`,
+  `call_unary_get`, `call_server_stream`, `call_client_stream`, and
+  `call_bidi_stream` free functions now take a `spec: Spec` in place of the
+  `service: &str, method: &str` pair. Generated clients are the callers in
+  practice and are updated by regenerating (automatic for `connectrpc-build`
+  users); a hand-written caller changes
+
+  ```rust
+  call_unary(&t, &cfg, "pkg.GreetService", "Greet", req, opts)
+  ```
+
+  to
+
+  ```rust
+  use connectrpc::{Spec, SpecOrigin, StreamType};
+
+  call_unary(&t, &cfg, GREET_SERVICE_GREET_SPEC.with_origin(SpecOrigin::Client), req, opts)
+  // or, without generated code:
+  call_unary(&t, &cfg, Spec::client("/pkg.GreetService/Greet", StreamType::Unary), req, opts)
+  ```
+
+  Generated client methods now pass their method's existing
+  `<SERVICE>_<METHOD>_SPEC` constant with `origin` flipped via the new
+  `Spec::with_origin(SpecOrigin::Client)`. This is what lets the upcoming
+  client-side interceptors see the method's stream type and idempotency
+  level, not just its path.
+
+  Notes for hand-written callers: `Spec::client` takes a `&'static str`, so a
+  caller whose method names arrive at runtime should intern each distinct
+  procedure once rather than leak per call (see the `Spec::client` docs); an
+  entry point given a spec of the wrong stream shape or a server-origin spec
+  now returns an `Internal` error before sending anything, as does a procedure
+  that is not a valid URI path. The value a client
+  interceptor sees is not `==` to the generated constant (its `origin`
+  differs); the new `Spec::same_method` compares method identity across
+  sides. Regenerate checked-in code with `task generate:all`.
+time: 2026-08-13T15:42:38.580786038Z

@@ -38,10 +38,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const BLOAT_ECHO_SERVICE_SERVICE_NAME: &str = "bench.v1.BloatEchoService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Echo` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Echo` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BLOAT_ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BloatEchoService/Echo",
         ::connectrpc::StreamType::Unary,
@@ -435,8 +432,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                BLOAT_ECHO_SERVICE_SERVICE_NAME,
-                "Echo",
+                BLOAT_ECHO_SERVICE_ECHO_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

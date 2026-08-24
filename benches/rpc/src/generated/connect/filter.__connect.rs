@@ -38,10 +38,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const FILTER_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.filter.v1.FilterService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Redact` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Redact` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const FILTER_SERVICE_REDACT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.filter.v1.FilterService/Redact",
         ::connectrpc::StreamType::Unary,
@@ -448,8 +445,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                FILTER_SERVICE_SERVICE_NAME,
-                "Redact",
+                FILTER_SERVICE_REDACT_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

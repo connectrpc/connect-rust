@@ -42,19 +42,13 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const HEALTH_SERVICE_NAME: &str = "grpc.health.v1.Health";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Check` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Check` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const HEALTH_CHECK_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/grpc.health.v1.Health/Check",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Watch` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Watch` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const HEALTH_WATCH_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/grpc.health.v1.Health/Watch",
         ::connectrpc::StreamType::ServerStream,
@@ -555,8 +549,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                HEALTH_SERVICE_NAME,
-                "Check",
+                HEALTH_CHECK_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -595,8 +588,7 @@ where
         ::connectrpc::client::call_server_stream(
                 &self.transport,
                 &self.config,
-                HEALTH_SERVICE_NAME,
-                "Watch",
+                HEALTH_WATCH_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

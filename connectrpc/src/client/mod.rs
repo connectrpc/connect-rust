@@ -178,6 +178,7 @@ use crate::error::ErrorCode;
 use crate::error::ErrorDetail;
 use crate::protocol::Protocol;
 use crate::protocol::hdr;
+use crate::spec::{Spec, SpecOrigin, StreamType};
 
 /// Type alias for a boxed future, used in service implementations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -865,7 +866,10 @@ pub struct ClientConfig {
 impl ClientConfig {
     /// Create a new client configuration with the given base URI.
     ///
-    /// Uses Connect protocol with protobuf encoding by default.
+    /// Uses Connect protocol with protobuf encoding by default. Request
+    /// URIs are the base's scheme, authority and path prefix (trailing
+    /// slash trimmed) followed by the method's `/package.Service/Method`;
+    /// a query string on the base URI is not carried over.
     pub fn new(base_uri: Uri) -> Self {
         Self {
             base_uri,
@@ -1452,6 +1456,101 @@ fn client_deadline(timeout: Option<Duration>, protocol: Protocol) -> Option<std:
         .and_then(|t| std::time::Instant::now().checked_add(t))
 }
 
+/// Build the request URI for `procedure` against `config.base_uri`, with an
+/// optional query string (the Connect GET path).
+///
+/// Reuses the base URI's already-parsed scheme and authority and only builds
+/// a new path-and-query: any path prefix on the base (trailing slash
+/// trimmed) followed by `procedure`, which carries its own leading slash
+/// (callers run [`check_client_spec`] first). A query string on the *base*
+/// URI is not carried over. In the common case — no base path prefix, no
+/// query — the path is the `&'static` procedure itself and nothing is
+/// allocated.
+fn procedure_uri(
+    config: &ClientConfig,
+    procedure: &'static str,
+    query: Option<&str>,
+) -> Result<Uri, ConnectError> {
+    use http::uri::PathAndQuery;
+    let base_path = config.base_uri.path().trim_end_matches('/');
+    let path_and_query = if base_path.is_empty() && query.is_none() {
+        // `from_static` would panic on a byte that is illegal in a path (a
+        // space, `#`, non-ASCII); `check_client_spec` only checks the slash
+        // shape, so validate here and report it like every other bad URI.
+        // `Bytes::from_static` keeps this branch allocation-free.
+        PathAndQuery::from_maybe_shared(Bytes::from_static(procedure.as_bytes()))
+            .map_err(|e| ConnectError::internal(format!("invalid request path: {e}")))?
+    } else {
+        let mut s = String::with_capacity(
+            base_path.len() + procedure.len() + query.map_or(0, |q| q.len() + 1),
+        );
+        s.push_str(base_path);
+        s.push_str(procedure);
+        if let Some(q) = query {
+            s.push('?');
+            s.push_str(q);
+        }
+        PathAndQuery::from_maybe_shared(Bytes::from(s))
+            .map_err(|e| ConnectError::internal(format!("invalid request path: {e}")))?
+    };
+    let mut parts = http::uri::Parts::default();
+    parts.scheme = config.base_uri.scheme().cloned();
+    parts.authority = config.base_uri.authority().cloned();
+    parts.path_and_query = Some(path_and_query);
+    Uri::from_parts(parts).map_err(|e| {
+        ConnectError::internal(format!(
+            "invalid request URI from base {}: {e}",
+            config.base_uri
+        ))
+    })
+}
+
+/// The entry point that matches a stream shape, for error messages.
+fn entry_point_for(stream_type: StreamType) -> &'static str {
+    match stream_type {
+        StreamType::Unary => "call_unary",
+        StreamType::ClientStream => "call_client_stream",
+        StreamType::ServerStream => "call_server_stream",
+        StreamType::BidiStream => "call_bidi_stream",
+    }
+}
+
+/// Validate a caller-supplied [`Spec`] against the entry point it reached.
+///
+/// Generated clients always pass a matching client-origin spec; these checks
+/// exist for hand-written callers, where the mistakes below would otherwise
+/// surface far from their cause (a protocol error from the server, a client
+/// interceptor observing `SpecOrigin::Server`, a mangled request URI). All
+/// are caller bugs, so the error is `Internal`, in every build profile.
+fn check_client_spec(
+    spec: Spec,
+    expected: StreamType,
+    entry_point: &str,
+) -> Result<(), ConnectError> {
+    if spec.stream_type != expected {
+        return Err(ConnectError::internal(format!(
+            "{entry_point} called with a {:?} Spec for {}; use {}",
+            spec.stream_type,
+            spec.procedure,
+            entry_point_for(spec.stream_type),
+        )));
+    }
+    if spec.origin != SpecOrigin::Client {
+        return Err(ConnectError::internal(format!(
+            "{entry_point} called with a server-side Spec for {}; pass \
+             FOO_SPEC.with_origin(SpecOrigin::Client) or Spec::client(..)",
+            spec.procedure,
+        )));
+    }
+    if !crate::spec::procedure_is_well_formed(spec.procedure) {
+        return Err(ConnectError::internal(format!(
+            "Spec::procedure {:?} must look like \"/package.Service/Method\"",
+            spec.procedure,
+        )));
+    }
+    Ok(())
+}
+
 /// Enforce a client-side deadline by wrapping a future in `timeout_at`.
 ///
 /// gRPC deadline semantics: the deadline applies to the **entire call** from
@@ -1713,11 +1812,29 @@ where
 ///
 /// This is the core function used by generated clients to make RPC calls.
 /// It handles encoding, compression, and protocol details.
+///
+/// `spec` identifies the method and must have
+/// [`SpecOrigin::Client`]. Generated clients pass
+/// their per-method `*_SPEC` constant with
+/// [`.with_origin(SpecOrigin::Client)`](Spec::with_origin); a hand-written
+/// caller does the same, or builds one with
+/// [`Spec::client("/pkg.Service/Method", StreamType::Unary)`](Spec::client),
+/// chaining [`with_idempotency_level`](Spec::with_idempotency_level) when
+/// known (see [`Spec::client`] for callers whose method names are only
+/// known at runtime). The request path is `spec.procedure` under
+/// `config.base_uri`.
+///
+/// # Errors
+///
+/// Besides transport, protocol, and decode failures: `Internal`, before
+/// anything is sent, if `spec` is not a client-side [`StreamType::Unary`]
+/// spec with a well-formed procedure — a caller bug that generated clients
+/// cannot produce. The other entry points apply the same check for their
+/// stream shape.
 pub async fn call_unary<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     request: Req,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
@@ -1728,15 +1845,9 @@ where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::Unary, "call_unary")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     // Encode the request body
     let body = match config.codec_format {
@@ -1840,6 +1951,10 @@ where
 /// side-effect-free queries. Only the Connect protocol supports this;
 /// gRPC/gRPC-Web are POST-only.
 ///
+/// `spec` identifies the method as for [`call_unary`]. Its
+/// [`idempotency_level`](Spec::idempotency_level) is **not** consulted:
+/// choosing GET is the caller's decision.
+///
 /// # Deterministic encoding
 ///
 /// For effective caching, the encoded message should be deterministic (same
@@ -1849,12 +1964,12 @@ where
 ///
 /// # Errors
 ///
-/// Returns `invalid_argument` if `config.protocol` is not `Connect`.
+/// Returns `invalid_argument` if `config.protocol` is not `Connect`;
+/// `Internal` for a mismatched `spec` (see [`call_unary`]).
 pub async fn call_unary_get<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     request: Req,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
@@ -1865,6 +1980,7 @@ where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::Unary, "call_unary_get")?;
     // Connect GET is a Connect-protocol-only feature.
     if !matches!(config.protocol, Protocol::Connect) {
         return Err(ConnectError::invalid_argument(
@@ -1873,10 +1989,6 @@ where
     }
 
     let options = effective_options(config, options);
-
-    // Build the base URI (no query yet)
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
 
     // Encode the request body
     let body = match config.codec_format {
@@ -1923,10 +2035,7 @@ where
     let query =
         build_connect_get_query(use_base64, compressed_with, encoding_name, &encoded_message);
 
-    let full_uri = format!("{base_str}/{service}/{method}?{query}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid GET URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, Some(&query))?;
 
     let deadline = client_deadline(options.timeout, Protocol::Connect);
 
@@ -2670,7 +2779,7 @@ enum BodyPoll {
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut stream = call_server_stream(&transport, &config, "svc", "method", req, CallOptions::default()).await?;
+/// let mut stream = call_server_stream(&transport, &config, SVC_METHOD_SPEC.with_origin(SpecOrigin::Client), req, CallOptions::default()).await?;
 /// println!("headers: {:?}", stream.headers());
 /// while let Some(msg) = stream.message().await? {
 ///     println!("got message: {:?}", msg);
@@ -3132,9 +3241,13 @@ where
 /// messages incrementally as they arrive. Use [`ServerStream::message()`] to
 /// read messages one at a time.
 ///
+/// `spec` identifies the method as for [`call_unary`], with
+/// [`StreamType::ServerStream`].
+///
 /// # Errors
 ///
 /// Returns immediately with an error if:
+/// - `spec` is mismatched (`Internal`, see [`call_unary`])
 /// - The request cannot be encoded or sent
 /// - The server responds with a non-200 status (protocol-level error)
 /// - A successful gRPC or gRPC-Web response declares a content type
@@ -3151,8 +3264,7 @@ where
 pub async fn call_server_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     request: Req,
     options: CallOptions,
 ) -> Result<ServerStream<T::ResponseBody, RespView>, ConnectError>
@@ -3163,15 +3275,9 @@ where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::ServerStream, "call_server_stream")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     // Encode the request body
     let body = match config.codec_format {
@@ -3524,7 +3630,7 @@ enum RecvState<B, RespView> {
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut stream = call_bidi_stream(&transport, &config, "svc", "method", CallOptions::default()).await?;
+/// let mut stream = call_bidi_stream(&transport, &config, SVC_METHOD_SPEC.with_origin(SpecOrigin::Client), CallOptions::default()).await?;
 /// stream.send(request1).await?;
 /// stream.send(request2).await?;
 /// stream.close_send();
@@ -3972,11 +4078,20 @@ where
 /// [`BidiStream::message`] call — this supports full-duplex servers that
 /// wait for the first request message before sending response headers.
 ///
+/// `spec` identifies the method as for [`call_unary`], with
+/// [`StreamType::BidiStream`].
+///
+/// # Errors
+///
+/// Returns `Internal` before opening the stream for a mismatched `spec`
+/// (see [`call_unary`]). Transport and protocol errors surface from
+/// [`BidiStream::message`].
+///
 /// # Example
 ///
 /// ```rust,ignore
 /// let mut stream = call_bidi_stream::<_, MyReq, MyRespView>(
-///     &transport, &config, "my.Service", "Method", CallOptions::default(),
+///     &transport, &config, MY_SERVICE_METHOD_SPEC.with_origin(SpecOrigin::Client), CallOptions::default(),
 /// ).await?;
 /// stream.send(req).await?;
 /// stream.close_send();
@@ -3985,8 +4100,7 @@ where
 pub async fn call_bidi_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     options: CallOptions,
 ) -> Result<BidiStream<T::ResponseBody, Req, RespView>, ConnectError>
 where
@@ -3996,15 +4110,9 @@ where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::BidiStream, "call_bidi_stream")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     // Set up the channel-backed request body. Channel depth 32 matches
     // typical h2 stream window; sends beyond this backpressure naturally.
@@ -4101,7 +4209,7 @@ where
 ///
 /// ```rust,ignore
 /// let resp = call_client_stream(
-///     &transport, &config, "svc", "Method",
+///     &transport, &config, SVC_METHOD_SPEC.with_origin(SpecOrigin::Client),
 ///     connectrpc::stream_iter(vec![req1, req2]),
 ///     CallOptions::default(),
 /// ).await?;
@@ -4127,12 +4235,13 @@ where
 ///
 /// Returns an error if a request message cannot be encoded, the transport
 /// fails, the whole-call deadline expires, the server responds with an
-/// error, or the response cannot be decoded.
+/// error, the response cannot be decoded, or (`Internal`, before anything
+/// is sent) `spec` is mismatched — see [`call_unary`] for how `spec`
+/// identifies the method.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     requests: impl ClientRequestStream<Req>,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
@@ -4143,15 +4252,9 @@ where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::ClientStream, "call_client_stream")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     let compression_for_encoder = config.request_compression.as_ref().map(|enc| {
         (
@@ -5213,8 +5316,7 @@ mod tests {
         let err = call_server_stream::<_, StringValue, StringValueView<'static>>(
             &transport,
             &config,
-            "test.Service",
-            "ServerStream",
+            Spec::client("/test.Service/ServerStream", StreamType::ServerStream),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -6916,8 +7018,7 @@ mod tests {
         let err = call_unary::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "Unary",
+            Spec::client("/test.Service/Unary", StreamType::Unary),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -6937,8 +7038,7 @@ mod tests {
         let err = call_unary_get::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "UnaryGet",
+            Spec::client("/test.Service/UnaryGet", StreamType::Unary),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -6958,8 +7058,7 @@ mod tests {
         let err = call_server_stream::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "ServerStream",
+            Spec::client("/test.Service/ServerStream", StreamType::ServerStream),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -6979,8 +7078,7 @@ mod tests {
         let mut stream = call_bidi_stream::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "Bidi",
+            Spec::client("/test.Service/Bidi", StreamType::BidiStream),
             CallOptions::default(),
         )
         .await
@@ -7007,8 +7105,7 @@ mod tests {
         let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "ClientStream",
+            Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
             futures::stream::iter([StringValue::from("hello")]),
             CallOptions::default(),
         )
@@ -7129,8 +7226,7 @@ mod tests {
             call_client_stream::<_, StringValue, StringValueView<'static>>(
                 &transport,
                 &config,
-                "test.Service",
-                "ClientStream",
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
                 futures::stream::empty::<StringValue>(),
                 CallOptions::default().with_timeout(Duration::from_millis(100)),
             ),
@@ -7176,8 +7272,7 @@ mod tests {
             call_client_stream::<_, StringValue, StringValueView<'static>>(
                 &transport,
                 &config,
-                "test.Service",
-                "ClientStream",
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
                 futures::stream::empty::<StringValue>(),
                 CallOptions::default(),
             ),
@@ -7221,8 +7316,7 @@ mod tests {
             call_client_stream::<_, StringValue, StringValueView<'static>>(
                 &transport,
                 &config,
-                "test.Service",
-                "ClientStream",
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
                 stream_iter(requests),
                 CallOptions::default().with_timeout(Duration::from_millis(100)),
             ),
@@ -7298,8 +7392,7 @@ mod tests {
         let response = call_client_stream::<_, StringValue, StringValueView<'static>>(
             &transport,
             &config,
-            "test.Service",
-            "ClientStream",
+            Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
             stream_iter([StringValue::from("req")]),
             CallOptions::default(),
         )
@@ -7335,8 +7428,7 @@ mod tests {
         let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
             &FailingTransport,
             &config,
-            "test.Service",
-            "ClientStream",
+            Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
             stream_iter([StringValue::from("req")]),
             CallOptions::default(),
         )
@@ -8788,6 +8880,101 @@ mod tests {
             add_unary_request_headers(builder, &config, Some(Duration::from_millis(500)), None);
         let req = builder.body(()).unwrap();
         assert_eq!(req.headers().get("grpc-timeout").unwrap(), "500m");
+    }
+
+    // ========================================================================
+    // procedure_uri / Spec plumbing
+    // ========================================================================
+
+    /// `Spec::procedure` carries the leading slash, so the request path is
+    /// base + procedure with any trailing slash on the base collapsed —
+    /// the same wire path the old `{base}/{service}/{method}` produced.
+    #[test]
+    fn procedure_uri_joins_base_and_procedure() {
+        const P: &str = "/pkg.Svc/Do";
+        for base in [
+            "http://h:8080",
+            "http://h:8080/",
+            "http://h:8080/prefix/",
+            "https://[::1]:8443/prefix",
+        ] {
+            let config = ClientConfig::new(base.parse().unwrap());
+            let uri = procedure_uri(&config, P, None).unwrap();
+            let want = format!("{}/pkg.Svc/Do", base.trim_end_matches('/'));
+            assert_eq!(uri.to_string(), want, "base {base}");
+        }
+        let config = ClientConfig::new("http://h".parse().unwrap());
+        let uri = procedure_uri(&config, P, Some("connect=v1&encoding=proto")).unwrap();
+        assert_eq!(uri.path(), P);
+        assert_eq!(uri.query(), Some("connect=v1&encoding=proto"));
+        // A query on the *base* URI is dropped rather than spliced into the
+        // path (string concatenation used to produce "/?a=1/pkg.Svc/Do").
+        let config = ClientConfig::new("http://h/?a=1".parse().unwrap());
+        let uri = procedure_uri(&config, P, None).unwrap();
+        assert_eq!((uri.path(), uri.query()), (P, None));
+    }
+
+    /// `check_client_spec` accepts exactly a client-side spec of the entry
+    /// point's stream shape, and each caller bug it rejects gets an
+    /// `Internal` error that says what to do instead — in every build
+    /// profile, not just debug.
+    #[test]
+    fn check_client_spec_table() {
+        use StreamType::*;
+        for st in [Unary, ClientStream, ServerStream, BidiStream] {
+            let ok = Spec::client("/pkg.Svc/M", st);
+            assert!(
+                check_client_spec(ok, st, entry_point_for(st)).is_ok(),
+                "{st:?}"
+            );
+        }
+        // Wrong entry point: names the right one.
+        let err = check_client_spec(
+            Spec::client("/pkg.Svc/Watch", ServerStream),
+            Unary,
+            "call_unary",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        let msg = err.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("call_unary called with a ServerStream Spec for /pkg.Svc/Watch")
+                && msg.contains("use call_server_stream"),
+            "{msg}"
+        );
+        // Server-side spec on a client call.
+        let err =
+            check_client_spec(Spec::server("/pkg.Svc/M", Unary), Unary, "call_unary").unwrap_err();
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("server-side Spec"),
+            "{err:?}"
+        );
+        // Malformed procedures share `spec::procedure_is_well_formed` with
+        // `Spec::client`'s debug assertion (tested in spec.rs); a `Spec` that
+        // fails it cannot be built here in a debug test binary.
+    }
+
+    /// End to end through a public entry point: the check runs before any
+    /// transport work, so no request is attempted.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn wrong_stream_type_spec_is_internal_error_before_send() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        let config = ClientConfig::new("http://unused.invalid".parse().unwrap());
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &HttpClient::plaintext(),
+            &config,
+            Spec::client("/pkg.Svc/Watch", StreamType::ServerStream),
+            StringValue::from("x"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("mismatched spec must fail fast");
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
     }
 
     // ========================================================================

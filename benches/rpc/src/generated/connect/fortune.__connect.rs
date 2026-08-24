@@ -42,10 +42,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const FORTUNE_SERVICE_SERVICE_NAME: &str = "fortune.v1.FortuneService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `GetFortunes` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `GetFortunes` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const FORTUNE_SERVICE_GET_FORTUNES_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/fortune.v1.FortuneService/GetFortunes",
         ::connectrpc::StreamType::Unary,
@@ -447,8 +444,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                FORTUNE_SERVICE_SERVICE_NAME,
-                "GetFortunes",
+                FORTUNE_SERVICE_GET_FORTUNES_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

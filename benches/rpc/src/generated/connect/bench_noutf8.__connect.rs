@@ -42,10 +42,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const LOG_INGEST_SERVICE_SERVICE_NAME: &str = "bench.noutf8.v1.LogIngestService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Ingest` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Ingest` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.noutf8.v1.LogIngestService/Ingest",
         ::connectrpc::StreamType::Unary,
@@ -446,8 +443,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                LOG_INGEST_SERVICE_SERVICE_NAME,
-                "Ingest",
+                LOG_INGEST_SERVICE_INGEST_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

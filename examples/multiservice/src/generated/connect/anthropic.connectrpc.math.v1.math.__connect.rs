@@ -46,10 +46,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const MATH_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.math.v1.MathService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Add` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Add` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const MATH_SERVICE_ADD_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.math.v1.MathService/Add",
         ::connectrpc::StreamType::Unary,
@@ -454,8 +451,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                MATH_SERVICE_SERVICE_NAME,
-                "Add",
+                MATH_SERVICE_ADD_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
