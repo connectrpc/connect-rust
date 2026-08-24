@@ -481,9 +481,10 @@ impl Server {
     /// underlying service.
     ///
     /// Delegates to [`ConnectRpcService::with_interceptor`]. Interceptors
-    /// run after envelope decoding, decompression, and protocol header
-    /// parsing, and before the handler — they see the parsed request, not
-    /// the wire bytes. The first interceptor registered runs **outermost**:
+    /// run after the request body has been read and decompressed and before
+    /// it is decoded — they see the parsed request head and a lazily decoded
+    /// body, not the wire bytes; a credential check belongs in Tower
+    /// middleware, before the body is read. The first interceptor registered runs **outermost**:
     /// first on the way in, last on the way out. To share one interceptor
     /// instance across several `Server`s, use
     /// [`with_interceptor_arc`](Self::with_interceptor_arc).
