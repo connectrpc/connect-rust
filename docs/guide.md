@@ -43,14 +43,14 @@ complete dependency block for a typical (JSON-capable) service:
 
 ```toml
 [dependencies]
-connectrpc = "0.8"
+connectrpc = "0.9"
 buffa = { version = "0.9", features = ["json"] }
 buffa-types = { version = "0.9", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-connectrpc-build = "0.8"
+connectrpc-build = "0.9"
 ```
 
 The `buffa`/`serde` entries come from buffa's generated message types.
@@ -84,16 +84,16 @@ Common combinations:
 
 ```toml
 # Just the server, behind axum
-connectrpc = { version = "0.8", features = ["axum"] }
+connectrpc = { version = "0.9", features = ["axum"] }
 
 # Server + client, both with TLS
-connectrpc = { version = "0.8", features = ["axum", "client", "tls"] }
+connectrpc = { version = "0.9", features = ["axum", "client", "tls"] }
 
 # Built-in server (no axum)
-connectrpc = { version = "0.8", features = ["server"] }
+connectrpc = { version = "0.9", features = ["server"] }
 
 # Minimal (wasm-friendly: no networking, no native compression)
-connectrpc = { version = "0.8", default-features = false }
+connectrpc = { version = "0.9", default-features = false }
 ```
 
 ### Proto-only (no-JSON) builds
@@ -119,7 +119,7 @@ It takes two coordinated settings:
    # `default-features = false` is the only way to drop `json`, so it also drops
    # the default compression features (`gzip`/`zstd`) — re-list the ones you
    # still want.
-   connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd"] }
+   connectrpc = { version = "0.9", default-features = false, features = ["server", "gzip", "zstd"] }
    ```
 
 With `json` off, the `Message + serde` requirement is replaced by the
@@ -178,7 +178,7 @@ Generate code with `connectrpc-build` in `build.rs`:
 
 ```toml
 [build-dependencies]
-connectrpc-build = "0.8"
+connectrpc-build = "0.9"
 ```
 
 ```rust
@@ -1447,8 +1447,8 @@ route for `httpGet:` probes; add the gRPC service for `grpc:` probes.
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.8", features = ["server"] }
-connectrpc-health = "0.8"
+connectrpc = { version = "0.9", features = ["server"] }
+connectrpc-health = "0.9"
 ```
 
 ```rust,no_run
@@ -1514,8 +1514,8 @@ Server-only deployments turn it off:
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.8", features = ["server"] }
-connectrpc-health = { version = "0.8", default-features = false }
+connectrpc = { version = "0.9", features = ["server"] }
+connectrpc-health = { version = "0.9", default-features = false }
 ```
 
 That drops `connectrpc/client` (the HTTP/2 transport stack) from the
@@ -1543,8 +1543,8 @@ gRPC, gRPC-Web, and the Connect protocol alike.
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.8", features = ["server"] }
-connectrpc-reflection = "0.8"
+connectrpc = { version = "0.9", features = ["server"] }
+connectrpc-reflection = "0.9"
 ```
 
 Emit a descriptor set from your build script (see

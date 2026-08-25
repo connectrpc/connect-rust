@@ -13,6 +13,582 @@ Entries for unreleased changes live as fragment files under
 one. This file is assembled from `.changes/` at release time — do not edit it
 directly.
 
+## [0.9.0] - 2026-08-24
+
+### Added
+
+- **`BidiStream::into_split`** splits a bidirectional stream into
+  independently owned `BidiSendHalf` and `BidiRecvHalf`, so the two sides
+  can be driven from separate tasks (true full duplex). The split is a plain
+  move of the stream's two sides — no locking is added. Dropping the send
+  half (or calling `close_send`) ends the request body cleanly while the
+  RPC continues; dropping the receive half cancels the RPC, matching the
+  behavior of dropping a whole `BidiStream`.
+
+- **`protoc-gen-connect-rust` now advertises proto edition 2024** as its
+  maximum supported edition ([#229]). Previously `protoc` refused to run the
+  generator against an `edition = "2024"` file at all. Generated stubs are
+  unchanged: the features edition 2024 introduced, `enforce_naming_style`
+  and `default_symbol_visibility`, are enforced by `protoc` while compiling
+  and do not affect the service descriptors the generator reads.
+  
+  [#229]: https://github.com/connectrpc/connect-rust/issues/229
+
+- **The decode-time element-memory budget is now configurable.** buffa 0.9
+  introduced a 32 MiB budget on the memory a single decode may commit to
+  repeated, map, string and bytes *elements* — an amplification defence,
+  charged on element footprint rather than on contents, so a few bytes on the
+  wire cannot ask the decoder to materialize a very large number of small
+  elements. A single large payload is unaffected however big it grows.
+  
+  Until now that budget applied to every received message with no way to
+  change it, so a legitimate message carrying very many small elements that
+  0.8 accepted would be rejected with no recourse. Servers set it through the
+  existing `Limits`:
+  
+  ```rust
+  ConnectRpcService::new(dispatcher)
+      .with_limits(Limits::default().with_element_memory_limit(128 * 1024 * 1024))
+  ```
+  
+  `Limits::unlimited()` lifts it along with the other limits.
+  
+  It applies to every server receive path — unary, server-streaming,
+  client-streaming and bidi, on both the generated dispatch and hand-registered
+  handlers, view-based and owned-message alike. On a proto wire it also governs
+  an interceptor's own decode of the inbound request body, through both
+  `Payload::message` and `Payload::view`, on all four of those shapes — so an
+  interceptor is held to the same budget as the handler behind it. JSON bodies
+  are decoded without it, on the interceptor and handler paths alike. A
+  rejection now names the limit to raise, since it is the one decode failure an
+  operator can fix without the peer changing anything.
+  
+  **Clients get the same control over responses.** A client decoding a
+  response of very many small elements hit the same 32 MiB wall with no
+  override. `ClientConfig::with_default_element_memory_limit` sets a default
+  and `CallOptions::with_element_memory_limit` overrides it per call, the same
+  config-default/per-call pair `max_message_size` already uses, and it covers
+  unary, server-streaming, client-streaming and bidi responses. It is set on
+  both codecs, but defends less on JSON: `serde_json` materializes the owned
+  message before the budget is consulted, so there the budget bounds the
+  view decode rather than the parse.
+  
+  An over-budget response is `resource_exhausted`, matching the neighbouring
+  `max_message_size` overflow rather than reporting a limit as an internal
+  error, and it names the setter that raises it. Neither knob is a breaking
+  change: both types are already `#[non_exhaustive]`, and leaving them unset
+  keeps buffa's default.
+  
+  **Breaking, for generated code only.** `decode_borrowed_request_view` and
+  `decode_message_request_stream` now take the decode limits, and `Limits` is
+  `#[non_exhaustive]` so further limits can be added without another break.
+  Both functions are `#[doc(hidden)]` and called only from generated dispatch,
+  so regenerating with the matching `protoc-gen-connect-rust` is the whole
+  migration — which 0.9.0 already requires for buffa 0.9.
+
+- **`ConnectError` now preserves the underlying cause of transport
+  failures.** A new `ConnectError::with_source` builder attaches an
+  underlying error, surfaced through `Error::source()` and, as a
+  `SharedSource` handle that can be moved into another error type, through
+  `ConnectError::source_arc()` (with `with_shared_source` to re-attach one);
+  `ConnectError` stays `Clone` since the source is held in an `Arc`. The
+  built-in client transports now retain the cause wherever a failure they
+  classify was previously stringified into `message` and discarded: the HTTP
+  and HTTPS `HttpClient` transports, `Http2Connection` (unix-socket connect,
+  eager/lazy connect and its establishment timeout, TLS handshake, h2 send),
+  and `From<std::io::Error>` / `From<http::Error>` for `ConnectError`.
+  `ConnectError::unavailable_from_transport` exposes the same convention to
+  custom `ClientTransport` implementations. Errors the call path synthesises
+  itself (the call deadline, request build/encode, response decode, a
+  body-read reset) do not carry one. The wire format and `Display` output are
+  unchanged; the derived `Debug` output now additionally includes the source
+  when one is attached. This is purely additive ([#237]).
+  
+  [#237]: https://github.com/connectrpc/connect-rust/issues/237
+
+- **`Http2ConnectionBuilder::local_address(IpAddr)`** binds the built-in TCP
+  connector's socket to a local address before connecting, so every connection
+  the transport opens (including reconnects) originates from that address. For
+  multi-homed hosts where the peer keys on the source address it observes, or
+  where egress must leave a specific interface:
+  
+  ```rust
+  let conn = Http2Connection::builder()
+      .local_address("10.1.2.3".parse()?)
+      .lazy_tls(uri, tls_config);
+  ```
+  
+  Applied through hyper's `HttpConnector::set_local_address`; the resolved
+  peer addresses are filtered to the bound address's family, so a peer with no
+  address of that family fails to connect rather than connecting from a
+  kernel-chosen source. Like `tcp_connect_timeout`, it has no effect on the
+  custom-connector and Unix-socket terminals.
+
+- Interceptor plumbing for a re-runnable (retry-style) chain and for
+  interceptors that synthesize a response. All additive; no dispatch behavior
+  changes:
+  
+  - **`RequestContext::headers_mut()`** — mutable access to request headers,
+    the accessor an interceptor uses to inject auth or trace metadata before
+    `next.run(req)`. (`extensions_mut()` already existed; the docs claimed
+    headers were mutable but no public accessor allowed it.)
+  - **`Payload::from_message(msg, format)`** — the lazily-*encoded*
+    counterpart of `Payload::new`: wraps a typed message and encodes only when
+    `encoded()` runs, memoizing the result (a replacement set with
+    `set_message` is now also encoded at most once). Lets an interceptor
+    short-circuit with a synthesized response; the dispatch path re-encodes
+    it in the negotiated format if the two differ (`Payload::encoded_as`).
+    `bytes()` is empty for such a payload; `Payload`'s `Debug` output now
+    labels that field `wire_len`.
+  - **`Payload::try_clone()`** and **`UnaryRequest::try_clone()`** — explicit
+    copies (encoded bytes, cloned context, empty decode cache) for an
+    interceptor that needs a second request.
+  - **`UnaryRequest::from_parts(ctx, payload)`** — constructor for the
+    `#[non_exhaustive]` request from an existing `Payload`; `StreamRequest`
+    is now `Clone`.
+  - **`Next` is now `Clone`**, so a unary interceptor can run the rest of
+    the chain more than once (`next.clone().run(first)` then
+    `next.run(second)`); the consuming `run(self)` keeps the single-call
+    case explicit.
+
+- **Per-route request limits.** `Router::with_route_limits(procedure, limits)`
+  gives one method its own `Limits`, replacing the service-wide ones from
+  `ConnectRpcService::with_limits` for requests to that route, so request
+  body size, message size and decode budget can be sized per RPC rather than
+  only globally — tighter for a method whose requests are always small,
+  looser for an upload-shaped one, without moving the ceiling for every other
+  route. The route's limits are surfaced on `MethodDescriptor::limits` (with
+  a `with_limits` builder for custom dispatchers) and apply on every dispatch
+  path, including the body drain of a request refused before dispatch.
+  `Router::has_method` now accepts the path with or without its leading
+  slash, matching `with_spec` and `with_route_limits`. `Limits` is now
+  `Copy`, `PartialEq` and `Eq`, so an existing `limits.clone()` trips
+  `clippy::clone_on_copy`; drop the `.clone()`.
+
+### Changed
+
+- **Updated to buffa 0.9, which requires regenerating your generated code.**
+  The floor is hard rather than a preference: buffa 0.9 widens its size
+  arithmetic to `u64`, so code emitted by a 0.8.x codegen no longer compiles
+  against the 0.9 runtime. Regenerate through `connectrpc-build`,
+  `buffa-build`, or your `buf generate` pipeline after upgrading. The
+  `extern_path` targets a generated crate points at must likewise be buffa
+  0.9 output.
+  
+  One behaviour change is worth knowing before you upgrade: buffa 0.9
+  applies a decode-time element-memory budget, 32 MiB by default, bounding
+  the footprint a decode may materialize in repeated, map, string and bytes
+  elements. It is an amplification defence, and it charges element footprint
+  rather than element contents — so a large payload does not trip it however
+  big it grows, but a message carrying very many small elements can, and
+  such a message is now rejected where buffa 0.8 accepted it.
+  
+  `StreamMessage::to_owned_message` and `UnaryResponse::into_owned_parts`
+  ride on buffa's now-infallible `OwnedView::to_owned_message`. Neither
+  signature changes.
+
+
+- **Breaking: client-streaming calls take an async `Stream` of requests**
+  instead of a synchronous iterator. `call_client_stream` and the generated
+  client methods accept `impl ClientRequestStream<Req>` — a sealed trait
+  implemented automatically for every `Stream<Item = Req> + Send + 'static`,
+  carrying tailored compiler diagnostics — so request messages can be
+  produced as they become available, without buffering the upload or
+  blocking a thread. The stream backs the HTTP request body directly: the
+  transport polls it as it is able to send, so backpressure is HTTP/2 flow
+  control and a server that ends the RPC mid-upload no longer goes
+  unnoticed while the stream is idle. The `Stream` trait and a
+  `stream_iter` adapter (`futures::stream::iter`) are re-exported from
+  `connectrpc::client`, with `stream_iter` also at the crate root, so
+  migrating a ready collection is
+  `client.sum(connectrpc::stream_iter(requests))` with no new
+  dependency. Because the stream backs the request body, it must be
+  `Send + 'static`: streams that borrow local data must be made owning.
+  Note that dropping a client-streaming call now cancels it: messages the
+  stream had not yet yielded are never delivered.
+
+
+- **Breaking: the `Limits` and `CompressionPolicy` setters are renamed with a
+  `with_` prefix, and the `Limits` fields behind them are now private**
+  ([#247]), to match the `with_` convention used by the other configuration
+  setters. The `Limits` fields were also `pub` and shared their names with the
+  setters, giving each value two ways to be written.
+  
+  The rename is a lookup table:
+  
+  | Old | New |
+  |---|---|
+  | `Limits::max_request_body_size(n)` | `Limits::with_max_request_body_size(n)` |
+  | `Limits::max_message_size(n)` | `Limits::with_max_message_size(n)` |
+  | `CompressionPolicy::min_size(n)` | `CompressionPolicy::with_min_size(n)` |
+  
+  Each old setter name is now a plain accessor, so `limits.max_message_size()`
+  reads back what `with_max_message_size` set and `policy.min_size()` reads the
+  compression threshold, which had no read path before. Code that read a
+  `Limits` field directly (`limits.max_message_size`) just adds the
+  parentheses.
+  
+  Writing a `Limits` field directly is what goes away. `Limits` also becomes
+  `#[non_exhaustive]` in 0.9.0, so both remaining forms stop compiling:
+  assignment to a public field, and struct-literal or functional-update
+  construction such as `Limits { max_message_size: 512, ..Default::default() }`.
+  Start from `Limits::default()` or `Limits::unlimited()` and chain the setters
+  instead. `CompressionPolicy`'s fields were already private, so it is a rename
+  plus the new accessor.
+  
+  The element-memory budget setter added in this same release arrives already
+  prefixed, as `Limits::with_element_memory_limit`.
+  
+  [#247]: https://github.com/connectrpc/connect-rust/issues/247
+
+
+- **Breaking (low-level client API):** the `connectrpc::client::call_unary`,
+  `call_unary_get`, `call_server_stream`, `call_client_stream`, and
+  `call_bidi_stream` free functions now take a `spec: Spec` in place of the
+  `service: &str, method: &str` pair. Generated clients are the callers in
+  practice and are updated by regenerating (automatic for `connectrpc-build`
+  users); a hand-written caller changes
+  
+  ```rust
+  call_unary(&t, &cfg, "pkg.GreetService", "Greet", req, opts)
+  ```
+  
+  to
+  
+  ```rust
+  use connectrpc::{Spec, SpecOrigin, StreamType};
+  
+  call_unary(&t, &cfg, GREET_SERVICE_GREET_SPEC.with_origin(SpecOrigin::Client), req, opts)
+  // or, without generated code:
+  call_unary(&t, &cfg, Spec::client("/pkg.GreetService/Greet", StreamType::Unary), req, opts)
+  ```
+  
+  Generated client methods now pass their method's existing
+  `<SERVICE>_<METHOD>_SPEC` constant with `origin` flipped via the new
+  `Spec::with_origin(SpecOrigin::Client)`. This gives a client-side
+  interceptor, when one is registered, the method's stream type and
+  idempotency level, not just its path.
+  
+  Notes for hand-written callers: `Spec::client` takes a `&'static str`, so a
+  caller whose method names arrive at runtime should intern each distinct
+  procedure once rather than leak per call (see the `Spec::client` docs); an
+  entry point given a spec of the wrong stream shape or a server-origin spec
+  now returns an `Internal` error before sending anything, as does a procedure
+  that is not a valid URI path. The value a client
+  interceptor sees is not `==` to the generated constant (its `origin`
+  differs); the new `Spec::same_method` compares method identity across
+  sides. Regenerate checked-in code with `task generate:all`.
+
+
+- Large response messages are no longer copied into the framing buffer on the server. Uncompressed (and compressed) payloads of at least 16 KiB are emitted as their own HTTP body data frame by reference count, so encoding a streaming or gRPC unary response costs one payload copy instead of two. Envelope wire bytes are unchanged — only HTTP-level frame boundaries differ (the 5-byte envelope header may arrive in a separate frame from its payload, which the protocol has always permitted).
+
+
+- **A gRPC or gRPC-Web unary response whose body is an `OwnedView` no longer
+  copies its large fields when encoding.** A view's fields are slices into the
+  buffer it was decoded from, so they are handed to the HTTP body by reference
+  count and reach the socket as their own data frames. Past the framing
+  threshold the encode stops growing with the payload, because only the
+  framing is still being written.
+  
+  Encoding stays contiguous where segmenting would not pay: responses below
+  the framing threshold, owned-message responses (their `String` and `Vec<u8>`
+  fields cannot be handed over by reference), a response much smaller than the
+  request it borrows from (capturing would keep the whole request buffer alive
+  while the response flushes), Connect-protocol unary, and any call passing
+  through an interceptor, since an interceptor may replace the body and so
+  needs it whole.
+  
+  **Breaking, for custom dispatch only.** `EncodedResponse` is now
+  `Response<EncodedBody>` rather than `Response<Bytes>`. If you implement the
+  `Dispatcher` trait, or construct or consume `EncodedResponse` values, build
+  one with `Bytes::into()` and recover a single buffer with
+  `EncodedBody::into_contiguous()`. Interceptors are unaffected —
+  `UnaryResponse` still carries a contiguous `Payload`, because an interceptor
+  may replace the whole body — note that this also means a call with an
+  interceptor configured takes the contiguous path.
+
+
+- **Streaming responses no longer copy large fields that the encoder can hand
+  over by reference count.** Each item of a server-streaming or bidi response,
+  each client-streaming response, and a unary response served over gRPC or
+  gRPC-Web is now encoded through `Encodable::encode_segments`, and the
+  framing layer emits every segment at or above the 16 KiB framing threshold
+  as its own body frame, unmoved, while the tag/length fragments between large
+  fields ride in the batch buffer with the envelope header. The encoded message
+  bytes are unchanged; a segmented message is now split across more HTTP body
+  frames. In practice this reaches handlers that stream `OwnedView` items
+  (or `MaybeBorrowed::Borrowed` wrapping one) and any custom `Encodable` whose
+  `encode_segments` yields segments. Owned-message items, bare views,
+  `PreEncoded`, and `StreamMessage` items encode contiguously as before
+  (though the whole message is still framed by reference count past the
+  threshold), as do JSON responses, Connect-protocol unary, and calls passing
+  through an interceptor.
+  
+  The segmented encode applies only to an *uncompressed* response. With the
+  default `CompressionPolicy` (compress from 1 KiB) and a client that
+  advertises an encoding, every item large enough to segment is compressed
+  instead, which needs the message contiguous — so on that path the segmented
+  encode is flattened again and costs more than the contiguous encode it
+  replaced. Opt out per response with `Response::compress(false)`, or raise
+  `CompressionPolicy::with_min_size`, when the payload is already compressed
+  or the copy matters more than the bytes.
+  
+  **Breaking, for custom dispatch only.** `StreamingResult`'s body is now
+  `EncodedStream` (`ServiceStream<EncodedBody>`) rather than a stream of
+  `Bytes`, mirroring `EncodedResponse`, and `StreamResponse::from_encoded` /
+  `StreamResponse::into_encoded` follow. A hand-written `Dispatcher` or test
+  double converts with
+  `Response::stream(items.map(|r| r.map(EncodedBody::from)))` and recovers a
+  single buffer per item with `EncodedBody::into_contiguous()`; `EncodedBody`
+  is also now `#[non_exhaustive]`, so match through its accessors rather than
+  its variants. Generated dispatchers and handler traits are unaffected, so no
+  regeneration is needed.
+
+
+- **`connectrpc-health` and `connectrpc-reflection` bound their routes to 16
+  KiB per request message.** `install_static` and `install` now apply a
+  per-route `Limits` profile (`MAX_REQUEST_BYTES`, `request_limits()`) sized
+  to the small fixed shape of `HealthCheckRequest` and
+  `ServerReflectionRequest`; a larger message is refused with
+  `resource_exhausted` where 0.8 accepted anything up to the service-wide
+  limit. The profile replaces the service-wide limits on those routes in both
+  directions. Each crate's new `apply_request_limits(router, limits)` tunes
+  those routes specifically — pass `request_limits()` after another
+  registration path (`HealthExt::register`, `Router::add_service`, a single
+  reflection version), or your own `Limits` after any path, including a
+  service configured tighter than 16 KiB; the later call wins.
+
+### Removed
+
+- **Removed the `streaming` feature and the `StreamingCompressionProvider`
+  API** ([#246]). **Streaming RPCs are unaffected** — the feature name invites
+  the opposite conclusion, but what it gated was an incremental-compression API
+  that no wire path could reach, not streaming RPC support.
+  
+  **Breaking.** Gone: the `streaming` feature (previously on by default), the
+  `StreamingCompressionProvider` trait, the `BoxedAsyncRead` and
+  `BoxedAsyncBufRead` aliases, and `CompressionRegistry`'s `register_streaming`,
+  `get_streaming`, `supports_streaming`, `compress_stream` and
+  `decompress_stream`. A custom provider registered through `register_streaming`
+  moves to `register` and keeps working on every path that ever used it. Removed
+  API surfaces as a rustc error; a stale `streaming` entry in a
+  `features = [...]` array fails earlier still, as a Cargo resolution error —
+  drop it there too. The removal also drops the `async-compression` dependency,
+  which was compiled into every default build.
+  
+  [#246]: https://github.com/connectrpc/connect-rust/issues/246
+
+### Fixed
+
+- **Initial `BidiStream::message()` cancellation no longer breaks the receive side**.
+  Dropping the first receive while it is waiting for response headers or Connect
+  error-body parsing now leaves initialization pending for the next `message()`
+  call, while real transport, deadline, and protocol failures stay terminal and
+  sticky. Dropping the `BidiStream` (or failing the call at its deadline) now
+  aborts the in-flight initialization task instead of detaching it: a stalled
+  server can no longer pin an abandoned call's resources, and dropping the
+  stream cancels the call outright rather than flushing buffered request
+  messages in the background — callers that need the request delivered must
+  drive the call via `message()` before dropping. `message()` now requires
+  `B: 'static` and the view type to be `'static`, which every transport and
+  generated view type already satisfies.
+
+- `connectrpc-build` now passes `--include_source_info` to `protoc`, so proto
+  comments are carried into the generated Rust documentation ([#222]). Users of
+  `Config::descriptor_set` must add `--include_source_info` to their own
+  `protoc` invocation to get the same benefit; `buf`-built sets already
+  include source info. The set written by `Config::emit_descriptor_set` now
+  has `SourceCodeInfo` stripped for the protoc and buf sources — reflection
+  does not need it, and stripping keeps embedded descriptor bytes lean and
+  proto comments out of shipped binaries (precompiled sets are still written
+  through unchanged). Service and method comments are now sanitized for
+  rustdoc the same way buffa sanitizes message and field comments: markdown
+  and HTML metacharacters are escaped, bare URLs are autolinked, indented
+  blocks are rendered as text, and unterminated fences are closed, so
+  arbitrary proto comments cannot break a consumer's `cargo doc`. Code
+  fences in proto comments are also made inert — an unannotated fence
+  becomes `text` and any other gains `ignore` (keeping its language, so a
+  `rust` fence is still syntax-highlighted) — because rustdoc would
+  otherwise compile a fence's contents as a doctest in the consuming crate,
+  where a proto comment's example has no imports and names proto types.
+  Paragraph breaks and continuation-line indentation in service and method
+  comments are also preserved instead of being flattened.
+  
+  [#222]: https://github.com/connectrpc/connect-rust/issues/222
+
+- **Abandoning a `call_client_stream` call now stops the in-flight transport
+  send** ([#224]). Dropping the call future or hitting its deadline while the
+  transport is still waiting for response headers no longer leaves the send
+  polling the transport indefinitely. Note that abandonment now cancels the
+  underlying request: a request that was still being sent when the call was
+  abandoned may never reach the server, so a caller that needs the request
+  delivered must drive the call to completion.
+  
+  [#224]: https://github.com/connectrpc/connect-rust/issues/224
+
+- **A Connect or gRPC call whose deadline expires now reports
+  `deadline_exceeded` when the transport fails first.** A server enforcing the
+  same deadline aborts the RPC independently, so its RST_STREAM can arrive
+  before the client's own timer fires. The in-flight body read then failed
+  first and the call reported `internal`, attributing to the client what was
+  really a timeout the caller asked for. Which code you got came down to timer
+  coarseness and scheduler delay, so the same call could report either one run
+  to run.
+  
+  Transport errors surfacing after the deadline has elapsed are now classified
+  as `deadline_exceeded`, the rule the missing-`grpc-status` path already
+  applied and which both now share. The transport cause is kept in the
+  message, so a
+  genuine transport fault that merely happened after the deadline is still
+  diagnosable, and a failure before the deadline is still `internal`. [#210]
+  
+  [#210]: https://github.com/connectrpc/connect-rust/issues/210
+
+- **Code generation handles large schemas.** buffa 0.9's element-memory budget
+  is charged per element on struct size rather than on encoded bytes, and
+  descriptor structs are wide, so the 32 MiB default rejected descriptor sets
+  that are entirely legitimate — ordinary schemas of a few hundred `.proto`
+  files, not pathological ones.
+  
+  `protoc-gen-connect-rust` and `connectrpc-build` decode the compiler's own
+  output, which is not the untrusted input that budget defends against, so both
+  now decode under buffa 0.9.1's 1 GiB tooling budget. Both honour the same
+  overrides buffa's own plugins do — the `element_memory_limit=` plugin option
+  and the `BUFFA_ELEMENT_MEMORY_LIMIT` environment variable — so one setting
+  raises every plugin in a `buf generate` run rather than needing a
+  connect-specific twin. See "Very large schemas" in the guide.
+  
+  Descriptor sets supplied at *runtime* stay bounded, because a reflection
+  service may be fed descriptors by a peer rather than by its own build. An
+  over-budget set there now reports the new `ReflectionError::ElementBudget`,
+  which says the bytes are well-formed and the schema is simply large, rather
+  than a decode failure that reads like corruption.
+
+- **A method type missing from the descriptor set is now an error on the
+  build-script path instead of a silent bare-name reference** ([#244]).
+  `connectrpc-build` used to accept a `Config::descriptor_set` input whose
+  service referenced a type absent from the set — for example a set built
+  without `protoc --include_imports` — and report success while emitting code
+  that named a type existing nowhere, so the first signal was rustc complaining
+  about a file in `$OUT_DIR` the user never wrote. The
+  `protoc-gen-connect-rust` plugin already rejected the same input; both paths
+  now fail with the same message, naming the unresolved type and pointing at
+  `--include_imports`. Sets produced by connectrpc-build's own protoc and buf
+  sources always carry the import closure, so only `Config::descriptor_set`
+  users are affected. A corrupt precompiled set also now names the file that
+  failed to decode.
+  
+  [#244]: https://github.com/connectrpc/connect-rust/issues/244
+
+- **A gRPC or gRPC-Web unary call now reports a trailers-only error instead of
+  the bare HTTP status** ([#241]). When a proxy answers with a non-200 status
+  and a gRPC status in the response headers — an Envoy local reply sends `503`
+  alongside `grpc-status: 14` and `grpc-message: upstream connect error` — the
+  call surfaces the server's code, message, and metadata rather than
+  `HTTP error 503`. This matches grpc-go, which decides that a reply is gRPC
+  from its content-type and reads the status from it; connect-go instead
+  reports the HTTP status and discards the server's code, message and metadata
+  entirely. The header status applies only to a genuine trailers-only
+  response: a response carrying body data or HTTP/2 trailers takes its status
+  from those, never from the headers, and a success delivered on a non-200 is
+  still refused. The error code can change as a result, not just the message:
+  a proxy pairing HTTP 500 with `grpc-status: 3` now yields `InvalidArgument`
+  where it previously yielded `Unknown`, so a caller matching on `ErrorCode`
+  may observe the server's code rather than the one derived from the HTTP
+  status.
+  
+  A non-2xx reply that is not a usable gRPC response reports its HTTP status,
+  so an nginx or load-balancer error page still arrives as `Unavailable` on a
+  `502` and stays recognizable as retryable. What went wrong is appended to
+  the message rather than replacing the code, and this now holds however the
+  error page fails: `HTTP error 502: unexpected content-type: text/html` when
+  the proxy labels it as HTML, and `HTTP error 502: envelope decode failed:
+  ...` when the proxy keeps the gRPC content-type and the page fails framing
+  instead. A reply with no `content-type` at all is still parsed for a
+  `grpc-status`, since an absent content-type is not evidence the peer is not
+  speaking gRPC.
+  
+  **A plain gRPC unary response whose body sets the `0x80` envelope flag is
+  now a framing error** ([#242]). That flag marks a gRPC-Web trailer frame
+  and is not defined for gRPC, so a server or intermediary that set it could
+  replace the trailers received in the HTTP/2 trailer section with trailers
+  of its own choosing, including the `grpc-status`. gRPC-Web is unaffected:
+  its trailer frames are parsed as before. The flag now has a name,
+  `envelope::flags::GRPC_WEB_TRAILER`, public alongside the existing `DATA`,
+  `COMPRESSED` and `END_STREAM` flags.
+  
+  [#241]: https://github.com/connectrpc/connect-rust/issues/241
+  [#242]: https://github.com/connectrpc/connect-rust/issues/242
+
+- **Terminal client errors now carry the response headers and trailers
+  consistently** ([#202]). A failed RPC reported through
+  `ServerStream::message()` — a Connect END_STREAM carrying an error, a gRPC
+  or gRPC-Web `grpc-status` error, a decode, decompression, transport or
+  deadline failure — arrives with `ConnectError::response_headers()`
+  populated, and with `ConnectError::trailers()` populated whenever
+  termination metadata was received. The same holds for the sticky replay on
+  a second `message()` call and for `ServerStream::error()`. Previously only
+  a few of these paths attached metadata, so whether a caller could read the
+  server's headers off an error depended on which protocol was in use and on
+  how the stream happened to fail. The Connect unary and client-streaming
+  parse paths gained the same guarantee — the content-type rejection, the
+  bounded body read, decompression and message decode all report the
+  metadata their response delivered. As before, the error's trailers exclude
+  `grpc-status`, `grpc-message` and `grpc-status-details-bin`, whose content
+  is already the error's code, message and details. That filter now also
+  applies on the Connect client-streaming path, so identical wire bytes give
+  identical `ConnectError::trailers()` whatever the call shape;
+  `ServerStream::trailers()` still reports the wire trailers verbatim.
+  
+  [#202]: https://github.com/connectrpc/connect-rust/issues/202
+
+- **A gateway propagating an upstream error could produce a response the
+  client could not read, losing the handler's error code** ([#202]). When a
+  handler returns a `ConnectError` that came back from a client call — the
+  ordinary gateway shape — that error carries the upstream response's
+  headers, and the server echoed them onto its own response verbatim.
+  
+  Over Connect on HTTP/1.1 the consequence was total: the forwarded
+  `content-length` contradicted the body actually being written, hyper's
+  HTTP/1 encoder refused to serialize the response, and the connection
+  closed with zero bytes sent. Measured against connect-go v1.19.1, a
+  handler returning `permission_denied` surfaced at the caller as
+  `unavailable` with empty metadata, because a transport failure was all
+  the client ever saw; every handler error code collapsed the same way. A
+  forwarded `content-encoding: gzip` was a second, milder break — the
+  client tried to gunzip a plain-JSON error body, discarded it, and fell
+  back to the HTTP status. A forwarded `date` replaced the server's own,
+  since hyper emits no `Date` of its own once one is set, so responses
+  advertised the upstream's generation time.
+  
+  The server now keeps its own value for any header it already set, which
+  is what kept two `content-type` values off the wire, and never forwards
+  names that describe the upstream rather than this response: the RFC 9110
+  hop-by-hop set, `content-length`, `content-type`, the content-coding
+  headers, `date`, and `grpc-status-details-bin`. All other header
+  metadata is forwarded unchanged, including every value of a multi-valued
+  name. Trailing metadata is unaffected by this change.
+  
+  [#202]: https://github.com/connectrpc/connect-rust/issues/202
+
+- **Streaming gRPC responses now validate their declared content type during response initialization**.
+  Server-streaming calls reject a wrong gRPC / gRPC-Web protocol family or codec before returning a response stream, while bidirectional calls reject it on the first receive. Such responses previously entered normal stream processing, where they could fail later or appear to complete successfully. The check runs before a trailers-only `grpc-status` is read, as it already does on the unary path, so a reply in the wrong content-type family is rejected rather than believed for its status, and a non-2xx reply that is not speaking gRPC now names the offending content type after its HTTP status on streaming calls too. Existing compatibility behavior for missing and bare-family content types is unchanged.
+
+### Security
+
+- **Documented where server interceptors run relative to the request body,
+  and where authentication belongs.** An `Interceptor` runs after the
+  request body has been read and decompressed under `Limits` but *before* the
+  message is decoded, so an interceptor that rejects a call never pays for
+  the decode — the step whose memory cost can exceed the wire size by orders
+  of magnitude. The guide's interceptor section and comparison table, its
+  examples, the `Interceptor` trait doc, and
+  `ConnectRpcService::with_interceptor` now state this ordering, give the
+  bounds an unauthenticated request can cost under the default limits, and
+  direct *authentication* to Tower middleware (which runs before any body
+  byte is read) and *authorization* to interceptors. No runtime behavior
+  changed.
+
 ## [0.8.1] - 2026-07-02
 
 ### Fixed

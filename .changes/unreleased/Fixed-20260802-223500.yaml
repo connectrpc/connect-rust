@@ -1,5 +1,0 @@
-kind: Fixed
-body: |-
-  **Streaming gRPC responses now validate their declared content type during response initialization**.
-  Server-streaming calls reject a wrong gRPC / gRPC-Web protocol family or codec before returning a response stream, while bidirectional calls reject it on the first receive. Such responses previously entered normal stream processing, where they could fail later or appear to complete successfully. The check runs before a trailers-only `grpc-status` is read, as it already does on the unary path, so a reply in the wrong content-type family is rejected rather than believed for its status, and a non-2xx reply that is not speaking gRPC now names the offending content type after its HTTP status on streaming calls too. Existing compatibility behavior for missing and bare-family content types is unchanged.
-time: 2026-08-02T22:35:00-04:00
