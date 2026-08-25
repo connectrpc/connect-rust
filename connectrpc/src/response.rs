@@ -480,6 +480,12 @@ impl<B> Response<B> {
     ///
     /// `true` forces compression, `false` disables it, `None` (or
     /// never calling this) defers to the server's policy.
+    ///
+    /// Compression needs one contiguous input, so a compressed response
+    /// gives up the segmented encode that lets a view body's large fields
+    /// reach the transport without a copy (see [`EncodedStream`]). For a
+    /// response dominated by large, already-compressed or incompressible
+    /// `bytes` fields, `compress(false)` is usually the faster choice.
     #[must_use]
     pub fn compress(mut self, enabled: impl Into<Option<bool>>) -> Self {
         self.compress = enabled.into();
@@ -556,7 +562,13 @@ pub type InboundStream<M> = ServiceStream<crate::StreamMessage<M>>;
 ///
 /// The single-buffer case is kept unboxed: a small message that was never
 /// worth segmenting costs no allocation to carry.
+///
+/// Prefer [`segments`](Self::segments) / [`into_contiguous`](Self::into_contiguous)
+/// over matching on the variants: the split is not canonical (compare two
+/// bodies in tests via `into_contiguous()`), and further representations may
+/// be added.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EncodedBody {
     /// One contiguous buffer — what a non-segmenting encode produces.
     Contiguous(Bytes),
@@ -825,7 +837,7 @@ fn checked_response_size(size: u32) -> Result<usize, ConnectError> {
 /// smaller is copied into the framing buffer downstream regardless, and a
 /// message can clear a smaller gate while none of its individual fields do,
 /// which spends the rope's cost and captures nothing. Matching the framing
-/// threshold also makes every segment map to exactly one body frame.
+/// threshold also makes every large segment map to exactly one body frame.
 ///
 /// # Errors
 ///
@@ -1231,6 +1243,34 @@ impl<M: Message + JsonSerialize> Encodable<M> for PreEncoded<M> {
 /// protocol layer — encoding happens inside the dispatcher so the body
 /// type stays generic across the trait boundary.
 pub type EncodedResponse = Response<EncodedBody>;
+
+/// The body of a streaming [`Response`] once each item is encoded: the
+/// streaming counterpart of [`EncodedResponse`]'s body.
+///
+/// Items are [`EncodedBody`] rather than `Bytes` so a message the encoder
+/// split into reference-counted segments stays split through the framing
+/// layer, which emits each large segment as its own body frame instead of
+/// copying it into the batch buffer. That only holds for an uncompressed
+/// response: compression needs one contiguous input, so a response that
+/// negotiates an encoding (the default for messages of at least
+/// `CompressionPolicy`'s `min_size` when the client advertises one) flattens
+/// each item first, and the segmented encode was then wasted work. Opt out
+/// per response with [`Response::compress`].
+///
+/// A hand-written [`Dispatcher`](crate::Dispatcher) or test double that
+/// produced `Bytes` items before 0.9 converts each item, and recovers a
+/// single buffer on the way out with [`EncodedBody::into_contiguous`]:
+///
+/// ```rust
+/// use connectrpc::{ConnectError, EncodedBody, EncodedStream, Response};
+/// use bytes::Bytes;
+/// use futures::{stream, StreamExt};
+///
+/// let items = stream::iter([Ok::<_, ConnectError>(Bytes::from_static(b"encoded"))]);
+/// let response: Response<EncodedStream> = Response::stream(items.map(|r| r.map(EncodedBody::from)));
+/// # let _ = response;
+/// ```
+pub type EncodedStream = ServiceStream<EncodedBody>;
 
 impl<B> Response<B> {
     /// Encode the body to bytes via [`Encodable<M>`], preserving

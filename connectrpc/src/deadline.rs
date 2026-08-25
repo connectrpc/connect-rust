@@ -20,7 +20,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::Stream;
 use pin_project::pin_project;
 use tokio::time::Sleep;
@@ -287,11 +286,11 @@ impl DeadlinePolicy {
     /// policy adds no overhead.
     ///
     /// Requires a tokio runtime; constructs `tokio::time::Sleep` internally.
-    pub(crate) fn enforce_on_response_stream(
+    pub(crate) fn enforce_on_response_stream<T: Send + 'static>(
         &self,
-        stream: BoxStream<Result<Bytes, ConnectError>>,
+        stream: BoxStream<Result<T, ConnectError>>,
         remaining: Option<Duration>,
-    ) -> BoxStream<Result<Bytes, ConnectError>> {
+    ) -> BoxStream<Result<T, ConnectError>> {
         let absolute = if self.enforce_on_streams {
             remaining
         } else {
@@ -344,11 +343,11 @@ impl<S> DeadlineStream<S> {
     }
 }
 
-impl<S> Stream for DeadlineStream<S>
+impl<S, T> Stream for DeadlineStream<S>
 where
-    S: Stream<Item = Result<Bytes, ConnectError>>,
+    S: Stream<Item = Result<T, ConnectError>>,
 {
-    type Item = Result<Bytes, ConnectError>;
+    type Item = Result<T, ConnectError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -414,6 +413,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use futures::StreamExt;
 
     fn ms(n: u64) -> Duration {

@@ -30,6 +30,7 @@
 //!     .merge(connect_router.into_axum_router());
 //! ```
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -945,7 +946,7 @@ impl StreamingResponseBody {
     /// in the final envelope. For gRPC, trailers are sent as HTTP/2 trailing
     /// HEADERS frames.
     fn new(
-        response_stream: BoxStream<Result<Bytes, ConnectError>>,
+        response_stream: crate::EncodedStream,
         trailers: http::HeaderMap,
         protocol: Protocol,
         compression: Option<(Arc<CompressionRegistry>, &'static str)>,
@@ -1077,14 +1078,20 @@ impl StreamFinalizer {
 /// The 16 KiB threshold bounds memory for the pathological case (fast
 /// synchronous producer with large items).
 ///
+/// A message at or above `MIN_CHAIN_SIZE` is not batched: its envelope header
+/// is flushed with whatever precedes it and each of its large segments becomes
+/// a data frame of its own, by reference count. The small fragments between
+/// or after those segments ride in `buf`, so such a message can add a short
+/// data frame per large field rather than one per poll cycle.
+///
 /// # Terminal state machine
 ///
 /// At stream end (source returns `None` or `Err`), if `buf` is non-empty,
 /// the data frame is emitted FIRST, and the finalizer frame is staged for
 /// the next poll. This ensures partial batches aren't dropped.
 struct BatchingEnvelopeStream {
-    /// Source of encoded message bytes (already proto/JSON encoded).
-    source: futures::stream::Fuse<BoxStream<Result<Bytes, ConnectError>>>,
+    /// Source of encoded messages (already proto/JSON encoded).
+    source: futures::stream::Fuse<crate::EncodedStream>,
     /// Accumulation buffer — envelopes are appended here until flush.
     buf: bytes::BytesMut,
     /// Envelope encoder — writes 5-byte header + optional compression.
@@ -1095,20 +1102,20 @@ struct BatchingEnvelopeStream {
     finalizer: StreamFinalizer,
     /// Finalizer frame staged for the next poll (when buf was non-empty at end).
     pending_final: Option<Frame<Bytes>>,
-    /// Large payload (post-compression, when negotiated) staged for the next
-    /// poll: emitted as its
-    /// own data frame (refcount clone) right after the header flush, instead
-    /// of being copied into `buf`. See [`EnvelopeEncoder::encode_chained`].
+    /// Segments of the current envelope not yet emitted, in wire order. Its
+    /// header (and everything before it) is already in `buf` or flushed, so
+    /// these precede anything else the stream produces. See
+    /// [`EnvelopeEncoder::encode_chained`] and [`Self::drain_segments`].
     ///
     /// [`EnvelopeEncoder::encode_chained`]: crate::envelope::EnvelopeEncoder::encode_chained
-    pending_payload: Option<Bytes>,
+    pending_segments: VecDeque<Bytes>,
     /// Fused-done flag.
     done: bool,
 }
 
 impl BatchingEnvelopeStream {
     fn new(
-        source: BoxStream<Result<Bytes, ConnectError>>,
+        source: crate::EncodedStream,
         trailers: http::HeaderMap,
         compression: Option<(Arc<CompressionRegistry>, &'static str)>,
         compression_policy: CompressionPolicy,
@@ -1121,7 +1128,7 @@ impl BatchingEnvelopeStream {
             trailers,
             finalizer,
             pending_final: None,
-            pending_payload: None,
+            pending_segments: VecDeque::new(),
             done: false,
         }
     }
@@ -1130,6 +1137,36 @@ impl BatchingEnvelopeStream {
     #[inline]
     fn flush_buf(&mut self) -> Frame<Bytes> {
         Frame::data(self.buf.split().freeze())
+    }
+
+    /// Advance through `pending_segments`, returning the next data frame to
+    /// emit if one is due.
+    ///
+    /// A segment of at least `MIN_CHAIN_SIZE` becomes its own data frame by
+    /// reference count, after flushing `buf` so the envelope header and any
+    /// earlier bytes go out ahead of it. A smaller segment (the tag/length
+    /// fragment between two large fields, or a short tail) is copied into
+    /// `buf` and rides with whatever is batched next, since a frame of its own
+    /// would cost a 9-byte HTTP/2 frame header to save a copy of a few bytes.
+    /// `None` means every pending segment has been consumed and `buf` may be
+    /// extended with the next envelope.
+    fn drain_segments(&mut self) -> Option<Frame<Bytes>> {
+        while let Some(segment) = self.pending_segments.pop_front() {
+            if segment.len() < crate::envelope::MIN_CHAIN_SIZE {
+                self.buf.extend_from_slice(&segment);
+                // A body made only of small segments must not grow `buf`
+                // past the batch bound the source loop enforces.
+                if self.buf.len() >= STREAM_BATCH_THRESHOLD {
+                    return Some(self.flush_buf());
+                }
+            } else if self.buf.is_empty() {
+                return Some(Frame::data(segment));
+            } else {
+                self.pending_segments.push_front(segment);
+                return Some(self.flush_buf());
+            }
+        }
+        None
     }
 }
 
@@ -1141,15 +1178,19 @@ impl Stream for BatchingEnvelopeStream {
             return Poll::Ready(None);
         }
 
-        // Staged large payload from a prior poll — its envelope header was
-        // already flushed, so this must precede everything else (including
-        // a staged finalizer).
-        if let Some(payload) = self.pending_payload.take() {
-            return Poll::Ready(Some(Ok(Frame::data(payload))));
+        // Segments staged by a prior poll: their envelope header was already
+        // flushed, so they precede everything else (including a staged
+        // finalizer).
+        if let Some(frame) = self.drain_segments() {
+            return Poll::Ready(Some(Ok(frame)));
         }
 
         // Staged finalizer from a prior poll (buf was non-empty at stream end).
+        // Only ever staged once the source has ended, which cannot happen
+        // while segments are pending: the source is not polled until they
+        // drain.
         if let Some(frame) = self.pending_final.take() {
+            debug_assert!(self.pending_segments.is_empty());
             self.done = true;
             return Poll::Ready(Some(Ok(frame)));
         }
@@ -1194,11 +1235,13 @@ impl Stream for BatchingEnvelopeStream {
                         return Poll::Ready(Some(Ok(self.flush_buf())));
                     }
                 }
-                Poll::Ready(Some(Ok(data))) => {
+                Poll::Ready(Some(Ok(body))) => {
                     let me = &mut *self;
+                    debug_assert!(me.pending_segments.is_empty());
                     match me.encoder.encode_chained(
-                        data,
+                        body,
                         &mut me.buf,
+                        &mut me.pending_segments,
                         crate::envelope::MIN_CHAIN_SIZE,
                     ) {
                         Err(err) => {
@@ -1218,14 +1261,14 @@ impl Stream for BatchingEnvelopeStream {
                                 return Poll::Ready(Some(Ok(self.flush_buf())));
                             }
                         }
-                        Ok(Some(payload)) => {
-                            // Large payload: `buf` now ends with
-                            // its 5-byte envelope header. Flush the buffer and
-                            // stage the payload as the next frame, unmoved.
-                            self.pending_payload = Some(payload);
-                            return Poll::Ready(Some(Ok(self.flush_buf())));
+                        Ok(()) => {
+                            // Segments are pending only for a large payload:
+                            // `buf` now ends with its envelope header and the
+                            // segments follow, the large ones unmoved.
+                            if let Some(frame) = self.drain_segments() {
+                                return Poll::Ready(Some(Ok(frame)));
+                            }
                         }
-                        Ok(None) => {}
                     }
                     if self.buf.len() >= STREAM_BATCH_THRESHOLD {
                         return Poll::Ready(Some(Ok(self.flush_buf())));
@@ -1240,7 +1283,7 @@ impl Stream for BatchingEnvelopeStream {
 
 /// Create a Connect-protocol envelope stream (ends with END_STREAM envelope).
 fn create_envelope_stream(
-    response_stream: BoxStream<Result<Bytes, ConnectError>>,
+    response_stream: crate::EncodedStream,
     trailers: http::HeaderMap,
     compression: Option<(Arc<CompressionRegistry>, &'static str)>,
     compression_policy: CompressionPolicy,
@@ -1256,7 +1299,7 @@ fn create_envelope_stream(
 
 /// Create a gRPC envelope stream that sends HTTP/2 trailers.
 fn create_grpc_envelope_stream(
-    response_stream: BoxStream<Result<Bytes, ConnectError>>,
+    response_stream: crate::EncodedStream,
     trailers: http::HeaderMap,
     compression: Option<(Arc<CompressionRegistry>, &'static str)>,
     compression_policy: CompressionPolicy,
@@ -1272,7 +1315,7 @@ fn create_grpc_envelope_stream(
 
 /// Create a gRPC-Web envelope stream that encodes trailers as a body frame.
 fn create_grpc_web_envelope_stream(
-    response_stream: BoxStream<Result<Bytes, ConnectError>>,
+    response_stream: crate::EncodedStream,
     trailers: http::HeaderMap,
     compression: Option<(Arc<CompressionRegistry>, &'static str)>,
     compression_policy: CompressionPolicy,
@@ -2607,14 +2650,10 @@ where
                 codec_format,
             );
             match with_request_deadline(deadline, fut).await {
-                // Wrap single response in a one-item stream
-                // The streaming machinery carries contiguous message bytes,
-                // and re-enveloping happens per item downstream, so a
-                // client-streaming response flattens here.
-                Ok(r) => r.map_body(|body| -> BoxStream<Result<Bytes, ConnectError>> {
-                    Box::pin(futures::stream::once(
-                        async move { Ok(body.into_contiguous()) },
-                    ))
+                // Wrap the single response in a one-item stream. Its
+                // segments, if any, ride through to the framing layer.
+                Ok(r) => r.map_body(|body| -> crate::EncodedStream {
+                    Box::pin(futures::stream::once(async move { Ok(body) }))
                 }),
                 Err(e) => return streaming_error_response(&e, protocol, codec_format),
             }
@@ -2796,10 +2835,8 @@ where
     }
 
     let stream_compression = response_encoding.map(|encoding| (compression, encoding));
-    let response_stream: BoxStream<Result<Bytes, ConnectError>> =
-        Box::pin(futures::stream::once(async {
-            Ok(resp.body.into_contiguous())
-        }));
+    let response_stream: crate::EncodedStream =
+        Box::pin(futures::stream::once(async { Ok(resp.body) }));
     let effective_policy = compression_policy.with_override(resp.compress);
     let body = StreamingResponseBody::new(
         response_stream,
@@ -3536,7 +3573,7 @@ mod tests {
 
         let payload = Bytes::from(vec![0x42u8; crate::envelope::MIN_CHAIN_SIZE]);
         let original_ptr = payload.as_ptr();
-        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone().into())]).boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3574,7 +3611,7 @@ mod tests {
         use futures::StreamExt as _;
 
         let payload = Bytes::from_static(b"small");
-        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone().into())]).boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3604,7 +3641,9 @@ mod tests {
             Ok(large.clone()),
             Ok(small.clone()),
         ];
-        let source = futures::stream::iter(items).boxed();
+        let source = futures::stream::iter(items)
+            .map(|r| r.map(Into::into))
+            .boxed();
         let mut stream = std::pin::pin!(create_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3644,7 +3683,9 @@ mod tests {
             Ok::<_, ConnectError>(large.clone()),
             Err(ConnectError::internal("boom")),
         ];
-        let source = futures::stream::iter(items).boxed();
+        let source = futures::stream::iter(items)
+            .map(|r| r.map(Into::into))
+            .boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3659,6 +3700,163 @@ mod tests {
         let trailers = stream.next().await.unwrap().unwrap();
         let map = trailers.into_trailers().unwrap();
         assert_eq!(map.get("grpc-status").unwrap(), "13", "internal = 13");
+        assert!(stream.next().await.is_none());
+    }
+
+    /// An item the encoder split into segments keeps its large segments as
+    /// their own frames, by refcount, while the tag/length fragments between
+    /// them ride in the batch buffer: header+lead, large A, fragment,
+    /// large B, then the next (small) envelope with the trailing fragment
+    /// ahead of it, then trailers. Reassembled, the bytes decode to the same
+    /// envelopes a contiguous encode would have produced.
+    #[tokio::test]
+    async fn streaming_segmented_item_chains_each_large_segment() {
+        use crate::response::EncodedBody;
+        use futures::StreamExt as _;
+
+        let min = crate::envelope::MIN_CHAIN_SIZE;
+        let lead = Bytes::from_static(b"tag");
+        let a = Bytes::from(vec![0xA1u8; min]);
+        let mid = Bytes::from_static(b"ln");
+        let b = Bytes::from(vec![0xB2u8; min + 1]);
+        let tail = Bytes::from_static(b"t");
+        let segmented = EncodedBody::Segmented(vec![
+            lead.clone(),
+            a.clone(),
+            mid.clone(),
+            b.clone(),
+            tail.clone(),
+        ]);
+        let first_message = segmented.clone().into_contiguous();
+        let small = Bytes::from_static(b"next");
+        let items = [
+            Ok::<_, ConnectError>(segmented),
+            Ok(EncodedBody::Contiguous(small.clone())),
+        ];
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            futures::stream::iter(items).boxed(),
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let mut frames = Vec::new();
+        let mut terminal = None;
+        while let Some(frame) = stream.next().await {
+            match frame.unwrap().into_data() {
+                Ok(data) => frames.push(data),
+                Err(frame) => terminal = Some(frame),
+            }
+        }
+
+        let hdr = crate::envelope::HEADER_SIZE;
+        let lens: Vec<usize> = frames.iter().map(Bytes::len).collect();
+        assert_eq!(
+            lens,
+            [
+                hdr + lead.len(),
+                a.len(),
+                mid.len(),
+                b.len(),
+                tail.len() + hdr + small.len()
+            ]
+        );
+        assert!(
+            std::ptr::eq(frames[1].as_ptr(), a.as_ptr()),
+            "A by refcount"
+        );
+        assert!(
+            std::ptr::eq(frames[3].as_ptr(), b.as_ptr()),
+            "B by refcount"
+        );
+        assert!(terminal.expect("trailers frame").is_trailers());
+
+        let mut wire = bytes::BytesMut::new();
+        for frame in &frames {
+            wire.extend_from_slice(frame);
+        }
+        let first = Envelope::decode(&mut wire).unwrap().unwrap();
+        let second = Envelope::decode(&mut wire).unwrap().unwrap();
+        assert_eq!(first.data, first_message);
+        assert_eq!(second.data, small);
+        assert!(wire.is_empty());
+    }
+
+    /// With an async producer the trailing fragment of a segmented item must
+    /// be flushed when the source goes `Pending`, so the peer can decode the
+    /// message before the next item exists: header+lead, large, tail, then
+    /// `Pending`.
+    #[tokio::test]
+    async fn streaming_segmented_tail_flushes_before_pending() {
+        use crate::response::EncodedBody;
+        use futures::StreamExt as _;
+
+        let min = crate::envelope::MIN_CHAIN_SIZE;
+        let lead = Bytes::from_static(b"tag");
+        let big = Bytes::from(vec![9u8; min]);
+        let tail = Bytes::from_static(b"end");
+        let item = EncodedBody::Segmented(vec![lead.clone(), big.clone(), tail.clone()]);
+        let source = futures::stream::iter([Ok::<_, ConnectError>(item)])
+            .chain(futures::stream::pending())
+            .boxed();
+        let mut stream = Box::pin(create_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let hdr = crate::envelope::HEADER_SIZE;
+        let f1 = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(f1.len(), hdr + lead.len());
+        let f2 = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert!(std::ptr::eq(f2.as_ptr(), big.as_ptr()));
+        let f3 = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(f3, tail, "tail must not wait for the next item");
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(stream.as_mut().poll_next(&mut cx).is_pending());
+    }
+
+    /// A source error right after a segmented item still emits every staged
+    /// segment, in order, before the error finalizer.
+    #[tokio::test]
+    async fn streaming_error_after_segmented_item_preserves_order() {
+        use crate::response::EncodedBody;
+        use futures::StreamExt as _;
+
+        let min = crate::envelope::MIN_CHAIN_SIZE;
+        let a = Bytes::from(vec![1u8; min]);
+        let b = Bytes::from(vec![2u8; min]);
+        let items = [
+            Ok::<_, ConnectError>(EncodedBody::Segmented(vec![a.clone(), b.clone()])),
+            Err(ConnectError::internal("boom")),
+        ];
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            futures::stream::iter(items).boxed(),
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let head = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(head.len(), crate::envelope::HEADER_SIZE);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().into_data().unwrap(),
+            a
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().into_data().unwrap(),
+            b
+        );
+        let trailers = stream
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13", "internal = 13");
         assert!(stream.next().await.is_none());
     }
 
@@ -4214,7 +4412,8 @@ mod tests {
         // then one trailers frame.
         let items: Vec<Result<Bytes, ConnectError>> =
             (0..10).map(|_| Ok(Bytes::from_static(b"msg"))).collect();
-        let source: BoxStream<_> = Box::pin(futures::stream::iter(items));
+        let source: crate::EncodedStream =
+            Box::pin(futures::stream::iter(items).map(|r| r.map(Into::into)));
 
         let stream = BatchingEnvelopeStream::new(
             source,
@@ -4243,7 +4442,8 @@ mod tests {
         // 9KB items: first fills buf to 9K < 16K → loop, second fills to 18K ≥ 16K → flush.
         let big = Bytes::from(vec![b'x'; 9 * 1024]);
         let items: Vec<Result<Bytes, ConnectError>> = (0..4).map(|_| Ok(big.clone())).collect();
-        let source: BoxStream<_> = Box::pin(futures::stream::iter(items));
+        let source: crate::EncodedStream =
+            Box::pin(futures::stream::iter(items).map(|r| r.map(Into::into)));
 
         let stream = BatchingEnvelopeStream::new(
             source,
@@ -4281,8 +4481,8 @@ mod tests {
     fn batching_connect_finalizer_is_data_frame() {
         // Connect protocol finalizer is an END_STREAM envelope (data frame),
         // not an HTTP/2 trailers frame.
-        let source: BoxStream<_> = Box::pin(futures::stream::once(async {
-            Ok(Bytes::from_static(b"x"))
+        let source: crate::EncodedStream = Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"x").into())
         }));
         let stream = BatchingEnvelopeStream::new(
             source,
@@ -4311,7 +4511,8 @@ mod tests {
             Ok(Bytes::from_static(b"c")),
             Err(ConnectError::internal("boom")),
         ];
-        let source: BoxStream<_> = Box::pin(futures::stream::iter(items));
+        let source: crate::EncodedStream =
+            Box::pin(futures::stream::iter(items).map(|r| r.map(Into::into)));
         let stream = BatchingEnvelopeStream::new(
             source,
             http::HeaderMap::new(),

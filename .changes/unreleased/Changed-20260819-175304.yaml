@@ -1,0 +1,38 @@
+kind: Changed
+body: |-
+  **Streaming responses no longer copy large fields that the encoder can hand
+  over by reference count.** Each item of a server-streaming or bidi response,
+  each client-streaming response, and a unary response served over gRPC or
+  gRPC-Web is now encoded through `Encodable::encode_segments`, and the
+  framing layer emits every segment at or above the 16 KiB framing threshold
+  as its own body frame, unmoved, while the tag/length fragments between large
+  fields ride in the batch buffer with the envelope header. The encoded message
+  bytes are unchanged; a segmented message is now split across more HTTP body
+  frames. In practice this reaches handlers that stream `OwnedView` items
+  (or `MaybeBorrowed::Borrowed` wrapping one) and any custom `Encodable` whose
+  `encode_segments` yields segments. Owned-message items, bare views,
+  `PreEncoded`, and `StreamMessage` items encode contiguously as before
+  (though the whole message is still framed by reference count past the
+  threshold), as do JSON responses, Connect-protocol unary, and calls passing
+  through an interceptor.
+
+  The segmented encode applies only to an *uncompressed* response. With the
+  default `CompressionPolicy` (compress from 1 KiB) and a client that
+  advertises an encoding, every item large enough to segment is compressed
+  instead, which needs the message contiguous — so on that path the segmented
+  encode is flattened again and costs more than the contiguous encode it
+  replaced. Opt out per response with `Response::compress(false)`, or raise
+  `CompressionPolicy::with_min_size`, when the payload is already compressed
+  or the copy matters more than the bytes.
+
+  **Breaking, for custom dispatch only.** `StreamingResult`'s body is now
+  `EncodedStream` (`ServiceStream<EncodedBody>`) rather than a stream of
+  `Bytes`, mirroring `EncodedResponse`, and `StreamResponse::from_encoded` /
+  `StreamResponse::into_encoded` follow. A hand-written `Dispatcher` or test
+  double converts with
+  `Response::stream(items.map(|r| r.map(EncodedBody::from)))` and recovers a
+  single buffer per item with `EncodedBody::into_contiguous()`; `EncodedBody`
+  is also now `#[non_exhaustive]`, so match through its accessors rather than
+  its variants. Generated dispatchers and handler traits are unaffected, so no
+  regeneration is needed.
+time: 2026-08-19T17:53:04.066187220Z

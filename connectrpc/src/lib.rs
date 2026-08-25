@@ -275,6 +275,7 @@ pub use request::ServiceRequest;
 pub use response::Encodable;
 pub use response::EncodedBody;
 pub use response::EncodedResponse;
+pub use response::EncodedStream;
 pub use response::InboundStream;
 pub use response::MaybeBorrowed;
 pub use response::PreEncoded;

@@ -1007,6 +1007,63 @@ mod tests {
         );
     }
 
+    /// A server stream of `OwnedView` items whose `data` field clears the
+    /// framing threshold: each item is encoded in segments, the large field
+    /// travels to the socket as its own body chunk by reference count, and
+    /// the client still reads back exactly the messages the handler produced.
+    /// A small item in the middle takes the contiguous path in the same
+    /// stream, so both shapes interleave on one HTTP/1.1 chunked body.
+    #[tokio::test]
+    async fn server_stream_segmented_view_items_round_trip() {
+        use buffa::Message as _;
+        use buffa::view::OwnedView;
+
+        fn item(sequence: i32, len: usize) -> OwnedView<EchoResponseView<'static>> {
+            let owned = EchoResponse {
+                sequence,
+                data: "x".repeat(len),
+                ..Default::default()
+            };
+            OwnedView::decode(owned.encode_to_bytes()).unwrap()
+        }
+        const SIZES: [usize; 4] = [20 * 1024, 7, 48 * 1024, 16 * 1024];
+
+        let handler = connectrpc::streaming_handler_fn(|_ctx, _req: EchoRequest| async {
+            let items = SIZES
+                .iter()
+                .enumerate()
+                .map(|(i, len)| Ok(item(i as i32, *len)));
+            // Compression would flatten each item to feed the compressor;
+            // the segmented path is the uncompressed one.
+            Ok(Response::stream(futures::stream::iter(items)).compress(false))
+        });
+        let router =
+            Router::new().route_server_stream(ECHO_SERVICE_SERVICE_NAME, "ServerStream", handler);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router.into_axum_router())
+                .await
+                .unwrap();
+        });
+
+        let mut stream = make_client(addr)
+            .server_stream(EchoRequest::default())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while let Some(msg) = stream.message().await.unwrap() {
+            assert!(msg.view().data.bytes().all(|b| b == b'x'));
+            got.push((msg.view().sequence, msg.view().data.len()));
+        }
+        let expected: Vec<(i32, usize)> = SIZES
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (i as i32, *l))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
     /// Same as [`server_stream_pre_encoded_round_trip`] but for bidi —
     /// covers the `BidiStreamingViewHandlerWrapper` → `EchoServiceServer`
     /// → `ConnectRpcService` chain with `type Item = PreEncoded<…>`. Uses
