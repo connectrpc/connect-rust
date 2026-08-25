@@ -2268,21 +2268,11 @@ where
         }
     }
 
-    let expected_content_type = config.codec_format.content_type();
-    if let Some(resp_content_type) = response.headers().get(http::header::CONTENT_TYPE) {
-        let ct = resp_content_type.to_str().unwrap_or("");
-        if !ct.starts_with(expected_content_type) {
-            let code = if ct.starts_with(content_type::PROTO) || ct.starts_with(content_type::JSON)
-            {
-                ErrorCode::Internal
-            } else {
-                ErrorCode::Unknown
-            };
-            let mut err = ConnectError::new(code, format!("unexpected content-type: {ct}"));
-            err.set_response_headers(resp_headers);
-            err.set_trailers(resp_trailers);
-            return Err(err);
-        }
+    if let Err(mut err) =
+        validate_connect_response_content_type(&resp_headers, config.codec_format, false)
+    {
+        err.set_trailers(resp_trailers);
+        return Err(err);
     }
 
     let response_encoding = response
@@ -2594,6 +2584,69 @@ where
         body: message,
         trailers: grpc_trailers,
     })
+}
+
+/// Validate the `content-type` of a 200 Connect response against the
+/// client's configured codec and the RPC shape it was made for.
+///
+/// A response that is a Connect content-type for the shape but not the
+/// configured codec's is `internal`, because the peer speaks Connect and the
+/// two sides disagree; anything else is `unknown`, because the peer —
+/// typically a proxy's error page — is not speaking Connect at all. For a
+/// stream "a Connect content-type" is the `application/connect+*` family,
+/// as in connect-go's `validateResponse`; for unary it is exactly
+/// `application/proto` or `application/json`, where connect-go draws the
+/// line at `application/*`. Media-type parameters (`; charset=utf-8`) are
+/// ignored, and the match is exact and case-sensitive after they are
+/// stripped (as in connect-go and the gRPC validator), so
+/// `application/protobuf` is `unknown` rather than a prefix match for
+/// `application/proto`.
+///
+/// A missing header is accepted, the same policy as the gRPC validator and
+/// the unary Connect path. connect-go rejects an absent header as `unknown`,
+/// but an intermediary that strips `content-type` from an otherwise
+/// well-formed reply would then turn a success into an error for no gain.
+/// The cost is that a header-less body that is not Connect fails on its
+/// framing instead, with whatever code the framing failure carries.
+///
+/// Only meaningful on the 200 path: a non-200 Connect response carries a
+/// JSON error body whatever its content-type, and the callers parse that
+/// first so HTTP status keeps precedence.
+fn validate_connect_response_content_type(
+    resp_headers: &http::HeaderMap,
+    codec_format: CodecFormat,
+    is_streaming: bool,
+) -> Result<(), ConnectError> {
+    let Some(resp_content_type) = resp_headers.get(http::header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+
+    let ct = resp_content_type.to_str().unwrap_or("");
+    let ct_normalized = ct
+        .split_once(';')
+        .map_or(ct, |(media_type, _params)| media_type)
+        .trim();
+    let expected = Protocol::Connect.response_content_type(codec_format, is_streaming);
+    if ct_normalized == expected {
+        return Ok(());
+    }
+
+    let same_family = if is_streaming {
+        ct_normalized.starts_with("application/connect+")
+    } else {
+        ct_normalized == content_type::PROTO || ct_normalized == content_type::JSON
+    };
+    let code = if same_family {
+        ErrorCode::Internal
+    } else {
+        ErrorCode::Unknown
+    };
+    let mut err = ConnectError::new(
+        code,
+        format!("unexpected content-type: {ct} (expected {expected})"),
+    );
+    err.set_response_headers(resp_headers.clone());
+    Err(err)
 }
 
 /// Validate the `content-type` of a gRPC / gRPC-Web response against the
@@ -3250,8 +3303,14 @@ where
 /// - `spec` is mismatched (`Internal`, see [`call_unary`])
 /// - The request cannot be encoded or sent
 /// - The server responds with a non-200 status (protocol-level error)
-/// - A successful gRPC or gRPC-Web response declares a content type
-///   incompatible with the configured protocol or codec
+/// - A successful response declares a content type incompatible with the
+///   configured protocol or codec: `Internal` when it is in the right
+///   family (`application/connect+*`, `application/grpc+*`,
+///   `application/grpc-web+*`) but names the wrong codec, `Unknown` when it
+///   is not in the family at all — typically a proxy's error page. Media-type
+///   parameters are ignored, and a response with no `content-type` header is
+///   accepted, so an intermediary that strips the header does not fail an
+///   otherwise well-formed call.
 ///
 /// Errors that occur during the stream (e.g., in gRPC trailers or the
 /// END_STREAM envelope) are returned by [`ServerStream::message()`].
@@ -3345,7 +3404,9 @@ where
 ///
 /// Handles gRPC-family HTTP-status and content-type gating (shared with the
 /// unary path via [`check_grpc_response_head`]), trailers-only gRPC error
-/// detection, non-200 Connect error body parsing, and response encoding
+/// detection, non-200 Connect error body parsing, Connect content-type
+/// gating on the 200 path (shared with the unary and client-streaming paths
+/// via [`validate_connect_response_content_type`]), and response encoding
 /// extraction. Used by both [`call_server_stream`] (passing fields
 /// from `&ClientConfig`) and [`BidiStream::message`] (passing fields from its
 /// owned `StreamConfig` snapshot).
@@ -3432,6 +3493,14 @@ where
         let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
         err.set_response_headers(response_headers);
         return Err(err);
+    }
+
+    if matches!(protocol, Protocol::Connect) {
+        // Connect and gRPC share envelope framing, so without this a gRPC
+        // reply would be read as Connect messages and a proxy's HTML error
+        // page as a corrupt envelope; the gRPC arm settled its content-type
+        // above.
+        validate_connect_response_content_type(&response_headers, codec_format, true)?;
     }
 
     // Get the response encoding for compressed envelopes (protocol-aware header)
@@ -3827,7 +3896,9 @@ where
     /// Returns `Ok(None)` only when the server finished **cleanly**; a
     /// server error carried in the termination metadata is returned as
     /// `Err`, sticky across calls — see [`ServerStream::message()`] for the
-    /// full contract.
+    /// full contract. The first call also reports the response-head
+    /// rejections [`call_server_stream`] lists — a non-200 status or an
+    /// incompatible content type — since that is where the head arrives.
     pub async fn message<M>(&mut self) -> Result<Option<crate::StreamMessage<M>>, ConnectError>
     where
         // Same output-parameter shape as `ServerStream::message` — see the
@@ -4235,9 +4306,10 @@ where
 ///
 /// Returns an error if a request message cannot be encoded, the transport
 /// fails, the whole-call deadline expires, the server responds with an
-/// error, the response cannot be decoded, or (`Internal`, before anything
-/// is sent) `spec` is mismatched — see [`call_unary`] for how `spec`
-/// identifies the method.
+/// error, the response declares an incompatible content type (classified
+/// as for [`call_server_stream`]), the response cannot be decoded, or
+/// (`Internal`, before anything is sent) `spec` is mismatched — see
+/// [`call_unary`] for how `spec` identifies the method.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
@@ -4415,13 +4487,13 @@ where
         return Err(err);
     }
 
-    let encoding = response
-        .headers()
+    let resp_headers = response.headers().clone();
+    validate_connect_response_content_type(&resp_headers, config.codec_format, true)?;
+
+    let encoding = resp_headers
         .get(config.protocol.content_encoding_header())
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
-
-    let resp_headers = response.headers().clone();
 
     let max_msg_size = options
         .max_message_size
@@ -5085,8 +5157,14 @@ mod tests {
         builder.body(Full::new(Bytes::new())).unwrap()
     }
 
+    /// Every streaming protocol gates the 200 path on its content-type, and
+    /// all of them classify a mismatch the same way: a recognised family with
+    /// the wrong codec is `internal`, anything else is `unknown`. The Connect
+    /// rows are the pin for #275 — Connect and gRPC share envelope framing,
+    /// so without the gate a gRPC reply decodes as Connect messages and a
+    /// proxy's HTML error page decodes as an oversized envelope.
     #[tokio::test]
-    async fn streaming_grpc_response_content_type_rejects_mismatches() {
+    async fn streaming_response_content_type_rejects_mismatches() {
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
 
         let compression = CompressionRegistry::new();
@@ -5115,10 +5193,48 @@ mod tests {
                 "application/grpc-web+proto",
                 ErrorCode::Internal,
             ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/grpc+proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "text/html",
+                ErrorCode::Unknown,
+            ),
+            // The unary Connect type is the wrong shape, not the wrong codec,
+            // and the bare family type has no codec at all.
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/connect",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/connect+json",
+                ErrorCode::Internal,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Json,
+                "application/connect+proto",
+                ErrorCode::Internal,
+            ),
         ];
 
         for (protocol, codec_format, actual, expected_code) in rejected {
-            let expected = protocol.response_content_type(codec_format, false);
+            let expected = protocol.response_content_type(codec_format, true);
             let err = make_server_stream::<_, StringValueView<'static>>(
                 streaming_response(Some(actual)),
                 protocol,
@@ -5131,19 +5247,24 @@ mod tests {
             .await
             .expect_err("incompatible content type must reject stream construction");
 
-            assert_eq!(err.code, expected_code, "content-type {actual}");
+            assert_eq!(err.code, expected_code, "{protocol} content-type {actual}");
             assert!(
                 err.message.as_deref().is_some_and(|message| {
                     message.contains(actual) && message.contains(expected)
-                })
+                }),
+                "{protocol} content-type {actual}: {:?}",
+                err.message
             );
             assert_eq!(err.response_headers()["x-request-id"], "abc123");
             assert_eq!(err.response_headers()[http::header::CONTENT_TYPE], actual);
         }
     }
 
+    /// The lenient cases the gate must keep accepting: media-type parameters
+    /// are ignored, a missing header is tolerated for proxies that strip it,
+    /// and the bare gRPC family type stands in for any codec.
     #[tokio::test]
-    async fn streaming_grpc_response_content_type_preserves_compatibility() {
+    async fn streaming_response_content_type_preserves_compatibility() {
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
 
         let compression = CompressionRegistry::new();
@@ -5169,13 +5290,17 @@ mod tests {
                 Some("application/grpc+json"),
             ),
             (Protocol::GrpcWeb, CodecFormat::Proto, None),
-            // Connect streaming is not content-type-gated here; a mismatch
-            // surfaces later as an end-of-stream or decode failure.
             (
                 Protocol::Connect,
                 CodecFormat::Proto,
-                Some("application/grpc+proto"),
+                Some("application/connect+proto"),
             ),
+            (
+                Protocol::Connect,
+                CodecFormat::Json,
+                Some("application/connect+json; charset=utf-8"),
+            ),
+            (Protocol::Connect, CodecFormat::Proto, None),
         ];
 
         for (protocol, codec_format, content_type) in accepted {
@@ -5189,7 +5314,53 @@ mod tests {
                 None,
             )
             .await
-            .expect("established compatibility case must remain accepted");
+            .unwrap_or_else(|err| {
+                panic!("{protocol} content-type {content_type:?} must stay accepted: {err}")
+            });
+        }
+    }
+
+    /// The unary Connect path shares the streaming classifier, so its rules
+    /// are pinned here in one place: the other codec's unary type is
+    /// `internal`, a streaming type or a prefix superstring of the expected
+    /// type is `unknown`, parameters are ignored, and a missing header is
+    /// accepted.
+    #[test]
+    fn unary_connect_response_content_type_classification() {
+        let classify = |content_type: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_str(content_type).unwrap(),
+                );
+            }
+            validate_connect_response_content_type(&headers, CodecFormat::Proto, false)
+                .map_err(|err| (err.code, err.message))
+        };
+
+        assert_eq!(classify(Some("application/proto")), Ok(()));
+        assert_eq!(classify(Some("application/proto; charset=utf-8")), Ok(()));
+        assert_eq!(classify(None), Ok(()));
+        assert_eq!(
+            classify(Some("application/json")),
+            Err((
+                ErrorCode::Internal,
+                Some(
+                    "unexpected content-type: application/json (expected application/proto)".into()
+                )
+            ))
+        );
+        for not_connect_unary in [
+            "application/protobuf",
+            "application/connect+proto",
+            "text/html",
+        ] {
+            assert_eq!(
+                classify(Some(not_connect_unary)).unwrap_err().0,
+                ErrorCode::Unknown,
+                "{not_connect_unary}"
+            );
         }
     }
 
@@ -5221,6 +5392,31 @@ mod tests {
                 "HTTP error 502: unexpected content-type: text/html (expected application/grpc+proto)"
             )
         );
+
+        // Connect keeps the same precedence: a non-200 reply is an error body
+        // to parse, whatever content-type it arrived under, so the gate only
+        // sees 200s.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .body(Full::new(Bytes::from_static(
+                br#"{"code":"unavailable","message":"upstream down"}"#,
+            )))
+            .unwrap();
+        let err = make_server_stream::<_, StringValueView<'static>>(
+            response,
+            Protocol::Connect,
+            &CompressionRegistry::new(),
+            CodecFormat::Proto,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a non-200 Connect reply is an error whatever its content-type");
+
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("upstream down"));
     }
 
     /// The unary and streaming parsers see the same response head and must
@@ -7340,43 +7536,41 @@ mod tests {
             .expect("drop signal sender vanished without firing");
     }
 
-    // Success path: a well-formed Connect client-streaming response decodes
-    // normally through the directly-awaited transport send.
+    /// Replies with a fixed 200 response, whatever the request.
     #[cfg(feature = "client")]
-    #[tokio::test]
-    async fn client_stream_returns_well_formed_response() {
+    #[derive(Clone)]
+    struct FixedResponseTransport {
+        content_type: &'static str,
+        body: Bytes,
+    }
+
+    #[cfg(feature = "client")]
+    impl ClientTransport for FixedResponseTransport {
+        type ResponseBody = Full<Bytes>;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            let response = Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, self.content_type)
+                .header("x-request-id", "abc123")
+                .body(Full::new(self.body.clone()))
+                .unwrap();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    /// A DATA envelope carrying a `StringValue("ok")`, then an END_STREAM
+    /// envelope with empty (`{}`) trailers — the Connect client-stream
+    /// terminus.
+    #[cfg(feature = "client")]
+    fn well_formed_connect_client_stream_body() -> Bytes {
         use buffa::Message;
-        use buffa_types::google::protobuf::__buffa::view::StringValueView;
         use buffa_types::google::protobuf::StringValue;
 
-        #[derive(Clone)]
-        struct FixedResponseTransport {
-            body: Bytes,
-        }
-
-        impl ClientTransport for FixedResponseTransport {
-            type ResponseBody = Full<Bytes>;
-            type Error = std::io::Error;
-
-            fn send(
-                &self,
-                _request: Request<ClientBody>,
-            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
-                let body = self.body.clone();
-                Box::pin(async move {
-                    let response = Response::builder()
-                        .status(http::StatusCode::OK)
-                        .header(http::header::CONTENT_TYPE, "application/connect+proto")
-                        .body(Full::new(body))
-                        .unwrap();
-                    Ok(response)
-                })
-            }
-        }
-
-        // DATA envelope carrying the response message, then an END_STREAM
-        // envelope with empty (`{}`) trailers — the Connect client-stream
-        // terminus.
         let data =
             crate::envelope::Envelope::data(Bytes::from(StringValue::from("ok").encode_to_vec()))
                 .encode();
@@ -7384,8 +7578,20 @@ mod tests {
         let mut body = BytesMut::new();
         body.extend_from_slice(&data);
         body.extend_from_slice(&end);
+        body.freeze()
+    }
+
+    // Success path: a well-formed Connect client-streaming response decodes
+    // normally through the directly-awaited transport send.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_returns_well_formed_response() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
         let transport = FixedResponseTransport {
-            body: body.freeze(),
+            content_type: "application/connect+proto",
+            body: well_formed_connect_client_stream_body(),
         };
         let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
 
@@ -7399,6 +7605,45 @@ mod tests {
         .await
         .expect("well-formed client-streaming response must decode");
         assert_eq!(response.view().value, "ok");
+    }
+
+    /// The Connect client-streaming path is gated on content-type like the
+    /// other Connect shapes (#275): a 200 whose body happens to frame as
+    /// Connect is still refused when its content-type says the peer is not
+    /// speaking Connect, and the rejection carries the response headers.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_rejects_non_connect_content_type() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        for (content_type, expected_code) in [
+            ("text/html", ErrorCode::Unknown),
+            ("application/grpc+proto", ErrorCode::Unknown),
+            ("application/connect+json", ErrorCode::Internal),
+        ] {
+            let transport = FixedResponseTransport {
+                content_type,
+                body: well_formed_connect_client_stream_body(),
+            };
+            let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
+                &transport,
+                &config,
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
+                stream_iter([StringValue::from("req")]),
+                CallOptions::default(),
+            )
+            .await
+            .expect_err("a non-Connect content-type must be refused before the body is read");
+
+            assert_eq!(err.code, expected_code, "content-type {content_type}");
+            let expected_message = format!(
+                "unexpected content-type: {content_type} (expected application/connect+proto)"
+            );
+            assert_eq!(err.message.as_deref(), Some(expected_message.as_str()));
+            assert_eq!(err.response_headers()["x-request-id"], "abc123");
+        }
     }
 
     // A transport send failure surfaces through the

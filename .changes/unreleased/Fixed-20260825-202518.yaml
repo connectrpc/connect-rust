@@ -1,0 +1,28 @@
+kind: Fixed
+body: |-
+    **Streaming Connect responses now validate their content-type before the
+    body is read.** Server-streaming and bidirectional calls over the Connect
+    protocol reject a 200 response whose `content-type` is not
+    `application/connect+{codec}` before constructing the stream, and
+    client-streaming calls reject it before reading the body, classifying the
+    mismatch the way the unary path already did: `internal` for a Connect
+    streaming type naming the wrong codec, `unknown` for anything else. Connect
+    and gRPC share envelope framing, so previously a gRPC-typed reply was
+    decoded as Connect and its messages handed to the caller until the body
+    ended without `END_STREAM`, and a proxy's 200 `text/html` error page was
+    parsed as a corrupt envelope and reported as `resource_exhausted` rather
+    than `unknown` ([#275]). The rejection carries the response headers, a
+    non-200 Connect reply still parses its error body first whatever its
+    content-type, media-type parameters are ignored, and a missing header is
+    still accepted, as on the gRPC and unary paths.
+
+    The unary Connect check now shares this classifier, which tightens it in
+    one case: a unary server replying with a superstring of the expected type,
+    such as `application/protobuf` for a proto client, was accepted by the old
+    prefix match and now fails with `unknown: unexpected content-type:
+    application/protobuf (expected application/proto)`. There is no
+    client-side opt-out; fix the server's content-type. The unary message also
+    now names the expected type, as the gRPC message already did.
+
+    [#275]: https://github.com/connectrpc/connect-rust/issues/275
+time: 2026-08-25T20:25:18.249474988+00:00
