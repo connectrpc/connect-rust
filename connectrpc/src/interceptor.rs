@@ -1,8 +1,9 @@
 //! RPC-level interceptors.
 //!
 //! Interceptors are the typed equivalent of `tower` middleware: they wrap
-//! a single RPC *after* envelope decoding, decompression, and header
-//! parsing, and *before* the handler runs. Two surfaces:
+//! a single RPC *after* the request head is parsed and the body read and
+//! decompressed, and *before* the message is decoded or the handler runs.
+//! Two surfaces:
 //!
 //! - **Unary** ([`Interceptor::intercept_unary`]): sees a [`UnaryRequest`]
 //!   (the [`Spec`](crate::Spec), headers, deadline, extensions, and a
@@ -78,6 +79,21 @@ pub use async_trait::async_trait;
 /// `Interceptor` is an async trait. Annotate the impl with the
 /// [`connectrpc::async_trait`](crate::async_trait) re-export — there is
 /// no separate `async-trait` dependency to add.
+///
+/// # When it runs
+///
+/// After the request head is parsed and — for unary and server-streaming
+/// calls — after the body has been read and decompressed under the
+/// service's [`Limits`](crate::Limits), but before the message is decoded:
+/// the [`Payload`] an interceptor receives decodes only when something reads
+/// it. Returning `Err` from an interceptor therefore never pays for a decode,
+/// the step whose memory cost can exceed the wire size by orders of
+/// magnitude. It does pay for the bounded body read, which Tower middleware
+/// wrapping the service does not, so a pure credential check (authentication)
+/// belongs in middleware and an interceptor is the place for checks that need
+/// the resolved [`Spec`](crate::Spec) or the parsed headers (authorization,
+/// tracing, validation). The user guide gives the exact bounds:
+/// <https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md#authentication-and-the-cost-of-an-unauthenticated-request>.
 ///
 /// # Example
 ///
@@ -160,14 +176,14 @@ pub trait Interceptor: Send + Sync + 'static {
     ///
     /// ```rust,ignore
     /// #[connectrpc::async_trait]
-    /// impl Interceptor for AuthInterceptor {
+    /// impl Interceptor for AuthzInterceptor {
     ///     async fn intercept_streaming(
     ///         &self,
     ///         req: StreamRequest,
     ///         inbound: PayloadStream,
     ///         next: NextStream<'_>,
     ///     ) -> Result<StreamResponse, ConnectError> {
-    ///         // Auth runs once at establishment, not per message.
+    ///         // Authorization runs once at establishment, not per message.
     ///         let path = req.ctx.path().expect("dispatch sets path");
     ///         self.authorize(path, req.ctx.headers()).await?;
     ///         next.run(req, inbound).await

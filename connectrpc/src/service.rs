@@ -1461,8 +1461,11 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// The first interceptor registered runs **outermost**: first on the
     /// way in, last on the way out (matching `connect-go`'s
-    /// `WithInterceptors`). Interceptors run after envelope decoding,
-    /// decompression, and header parsing, and before the handler.
+    /// `WithInterceptors`). Interceptors run after the request body has
+    /// been read and decompressed under this service's [`Limits`] and
+    /// before it is decoded; a credential check that should run before any
+    /// body byte is read belongs in Tower middleware around the service
+    /// instead. See [`Interceptor`]'s "When it runs".
     ///
     /// When no interceptors are registered the dispatch path is identical
     /// to a build without this call — there is no per-request allocation
