@@ -1,0 +1,15 @@
+kind: Changed
+body: |-
+    **`connectrpc-health` and `connectrpc-reflection` bound their routes to 16
+    KiB per request message.** `install_static` and `install` now apply a
+    per-route `Limits` profile (`MAX_REQUEST_BYTES`, `request_limits()`) sized
+    to the small fixed shape of `HealthCheckRequest` and
+    `ServerReflectionRequest`; a larger message is refused with
+    `resource_exhausted` where 0.8 accepted anything up to the service-wide
+    limit. The profile replaces the service-wide limits on those routes in both
+    directions. Each crate's new `apply_request_limits(router, limits)` tunes
+    those routes specifically — pass `request_limits()` after another
+    registration path (`HealthExt::register`, `Router::add_service`, a single
+    reflection version), or your own `Limits` after any path, including a
+    service configured tighter than 16 KiB; the later call wins.
+time: 2026-08-21T18:00:01.000000000+00:00

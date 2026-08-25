@@ -1478,9 +1478,35 @@ health.shutdown();
 
 For custom logic (e.g. report `NotServing` while a database connection
 is down), implement the `Checker` trait directly and wrap it in
-`HealthService::new(...)` or `HealthService::from_arc(...)`. The default
-`Checker::watch` body returns `Unimplemented`, which is fine for
+`HealthService::new(...)` or `HealthService::from_arc(...)`. The
+default `Checker::watch` body returns `Unimplemented`, which is fine for
 Check-only probes; override it if your probes call Watch.
+
+**The health routes accept at most 16 KiB per request.** A
+`HealthCheckRequest` is one service name, so `install_static` sizes
+`Check` and `Watch` to `connectrpc_health::request_limits()` — a
+per-route `Limits` profile (see [Request limits](#request-limits)) that
+replaces the service-wide limits on those two routes, whether those are
+looser or tighter — and a larger request is refused with
+`resource_exhausted` before it reaches the checker. Registering a
+`HealthService` any other way (`HealthExt::register`,
+`Router::add_service`) does not apply it, so follow that with
+`apply_request_limits(router, request_limits())`. To tune the health
+routes specifically, call `apply_request_limits` with your own `Limits`
+after either path; the later call wins:
+
+```rust,ignore
+use connectrpc::Limits;
+use connectrpc_health::{apply_request_limits, install_static};
+
+let (router, health) = install_static(Router::new(), [/* ... */]);
+let router = apply_request_limits(
+    router,
+    Limits::default()
+        .with_max_request_body_size(1024)
+        .with_max_message_size(1024),
+);
+```
 
 The `HealthClient` (for in-process probes, integration tests, sidecar
 tooling) is gated on a `client` Cargo feature that is **on by default**.
@@ -1533,6 +1559,28 @@ let bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app.fds.bin"));
 let reflector = Reflector::from_descriptor_set_bytes(bytes)?;
 // `router` is your service router from `register()`.
 let router = install(router, reflector); // mounts v1 + v1alpha
+```
+
+**The reflection routes accept at most 16 KiB per request message.** A
+`ServerReflectionRequest` is a host plus one symbol or file name, so
+`install` sizes both versions' routes to
+`connectrpc_reflection::request_limits()` — a per-route `Limits` profile
+(see [Request limits](#request-limits)) that replaces the service-wide
+limits on those routes, whether those are looser or tighter; the RPC is
+a bidirectional stream, so the bound is per message rather than per
+call. Mounting a single version through the generated
+`ServerReflectionExt::register` (or using `Router::add_service`) does
+not apply it, so follow that with
+`apply_request_limits(router, request_limits())`. To tune the
+reflection routes specifically, call `apply_request_limits` with your
+own `Limits` after either path; the later call wins:
+
+```rust,ignore
+use connectrpc::Limits;
+use connectrpc_reflection::{apply_request_limits, install};
+
+let router = install(router, reflector);
+let router = apply_request_limits(router, Limits::default().with_max_message_size(1024));
 ```
 
 Alternatively, when your buffa codegen has reflection enabled, serve
@@ -1640,6 +1688,51 @@ if let Some(remaining) = ctx.time_remaining() {
     options = options.with_timeout(remaining.saturating_sub(margin));
 }
 ```
+
+### Request limits
+
+`Limits` bounds what a request may cost before a handler sees it: the
+body as read from the socket (`with_max_request_body_size`, 4 MB), each
+message after decompression (`with_max_message_size`, 4 MB), and the
+memory a decode may commit to repeated and string elements
+(`with_element_memory_limit`, 32 MiB). The body and message limits are
+enforced while reading and inflating, so an oversized or highly
+compressed request is refused with `resource_exhausted` without ever
+being fully buffered. Set them service-wide on `ConnectRpcService`:
+
+```rust,ignore
+let service = ConnectRpcService::new(router)
+    .with_limits(Limits::default().with_max_message_size(1024 * 1024));
+```
+
+A single route can carry its own `Limits` with
+`Router::with_route_limits`, and those replace the service-wide ones for
+that method — every field, not a field-by-field minimum. Use it to
+size a method to its actual request profile: one whose legitimate
+requests are a few hundred bytes need not accept the service default,
+and one upload-shaped method can exceed the default without raising it
+for everything else.
+
+```rust,ignore
+let router = service
+    .register(Router::new())
+    .with_route_limits(
+        PING_SERVICE_PING_SPEC.procedure,
+        Limits::default()
+            .with_max_request_body_size(16 * 1024)
+            .with_max_message_size(16 * 1024),
+    );
+```
+
+Per-route limits are a `Router` feature; the generated monomorphic
+`FooServiceServer<T>` dispatchers use the service-wide limits.
+
+The bundled `connectrpc-health` and `connectrpc-reflection` services
+use this mechanism on their own routes: `install_static` and `install`
+apply a 16 KiB-per-message profile (`request_limits()`), and each
+crate's `apply_request_limits(router, limits)` re-applies or tunes it —
+see [Health checking](#health-checking) and
+[Server reflection](#server-reflection).
 
 ## Clients
 

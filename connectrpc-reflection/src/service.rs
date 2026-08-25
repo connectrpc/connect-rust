@@ -54,7 +54,11 @@ impl ReflectionService {
 ///
 /// Unlike `connectrpc_health::install_static`, no handle is returned:
 /// a [`Reflector`] is immutable once built, so there is nothing to flip
-/// at runtime.
+/// at runtime. Both routes are set to [`request_limits`] (16 KiB per
+/// request message) via [`apply_request_limits`], which replaces the
+/// service-wide limits on those routes even when they are tighter; to tune
+/// them, call `apply_request_limits(router, yours)` on the returned router —
+/// the later call wins.
 #[must_use]
 pub fn install(router: Router, reflector: Reflector) -> Router {
     let service = Arc::new(ReflectionService::new(reflector));
@@ -62,7 +66,66 @@ pub fn install(router: Router, reflector: Reflector) -> Router {
         Arc::clone(&service),
         router,
     );
-    crate::connect::grpc::reflection::v1alpha::ServerReflectionExt::register(service, router)
+    let router =
+        crate::connect::grpc::reflection::v1alpha::ServerReflectionExt::register(service, router);
+    apply_request_limits(router, request_limits())
+}
+
+/// The largest request message, after decompression, the reflection routes
+/// accept under [`request_limits`]: 16 KiB.
+///
+/// A `ServerReflectionRequest` carries a host plus one file name, symbol or
+/// type name, so a legitimate request is well under a kilobyte; 16 KiB leaves
+/// generous headroom while sizing the routes to their actual request profile
+/// rather than the general-purpose service-wide default. Reflection is a
+/// bidirectional stream, so this bounds each message, not how many a client
+/// may send.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
+
+/// The per-route [`Limits`](connectrpc::Limits) this crate sets on its
+/// routes: message size capped at [`MAX_REQUEST_BYTES`] (and the request
+/// body, which only governs non-streaming calls, at that plus the 5-byte
+/// envelope), decode budget left at the `connectrpc` default.
+#[must_use]
+pub fn request_limits() -> connectrpc::Limits {
+    connectrpc::Limits::default()
+        .with_max_request_body_size(MAX_REQUEST_BYTES + connectrpc::envelope::HEADER_SIZE)
+        .with_max_message_size(MAX_REQUEST_BYTES)
+}
+
+/// Set whichever of the `v1` and `v1alpha` reflection routes are registered
+/// on `router` to `limits`, replacing the service-wide limits for them
+/// (whether looser or tighter).
+///
+/// [`install`] already applies [`request_limits`]. Call this yourself,
+/// usually with [`request_limits`], after registering a [`ReflectionService`]
+/// through the generated `ServerReflectionExt::register` or
+/// [`Router::add_service`](connectrpc::Router::add_service), since those
+/// generic registration paths cannot; or call it after either path with your
+/// own [`Limits`](connectrpc::Limits) to tune the reflection routes
+/// specifically. The later call wins.
+///
+/// # Panics
+///
+/// Panics if neither reflection route is registered on `router`.
+#[must_use]
+pub fn apply_request_limits(mut router: Router, limits: connectrpc::Limits) -> Router {
+    let mut applied = false;
+    for spec in [
+        crate::connect::grpc::reflection::v1::SERVER_REFLECTION_SERVER_REFLECTION_INFO_SPEC,
+        crate::connect::grpc::reflection::v1alpha::SERVER_REFLECTION_SERVER_REFLECTION_INFO_SPEC,
+    ] {
+        if router.has_method(spec.procedure) {
+            router = router.with_route_limits(spec.procedure, limits);
+            applied = true;
+        }
+    }
+    assert!(
+        applied,
+        "connectrpc_reflection::apply_request_limits: no reflection route is registered \
+         on this router — register `ReflectionService` before applying its limits"
+    );
+    router
 }
 
 /// Implements the generated `ServerReflection` trait for one protocol
@@ -219,7 +282,10 @@ mod tests {
     /// client targeting it. The server runs until the test exits.
     async fn spawn_reflection_server() -> ServerReflectionClient<HttpClient> {
         let reflector = Reflector::from_descriptor_set_bytes(&test_set_bytes()).unwrap();
-        let router = install(Router::new(), reflector);
+        spawn_router(install(Router::new(), reflector)).await
+    }
+
+    async fn spawn_router(router: Router) -> ServerReflectionClient<HttpClient> {
         let app = router.into_axum_router();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -236,6 +302,46 @@ mod tests {
             message_request: Some(message_request),
             ..Default::default()
         }
+    }
+
+    /// `install` holds both routes to MAX_REQUEST_BYTES per message: an
+    /// oversized request ends the stream with `resource_exhausted`.
+    #[tokio::test]
+    async fn oversized_request_is_refused() {
+        let client = spawn_reflection_server().await;
+        let mut stream = client.server_reflection_info().await.unwrap();
+        stream
+            .send(request(MessageRequest::FileContainingSymbol(
+                "x".repeat(2 * crate::MAX_REQUEST_BYTES),
+            )))
+            .await
+            .unwrap();
+        stream.close_send();
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// An integrator's own `apply_request_limits` after `install` replaces
+    /// the bundled profile: tightened to 1 KiB, a 2 KiB request the default
+    /// 16 KiB would serve is refused.
+    #[tokio::test]
+    async fn integrator_limits_replace_the_bundled_profile() {
+        let reflector = Reflector::from_descriptor_set_bytes(&test_set_bytes()).unwrap();
+        let router = apply_request_limits(
+            install(Router::new(), reflector),
+            connectrpc::Limits::default().with_max_message_size(1024),
+        );
+        let client = spawn_router(router).await;
+        let mut stream = client.server_reflection_info().await.unwrap();
+        stream
+            .send(request(MessageRequest::FileContainingSymbol(
+                "x".repeat(2048),
+            )))
+            .await
+            .unwrap();
+        stream.close_send();
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
     }
 
     #[tokio::test]

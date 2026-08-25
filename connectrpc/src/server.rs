@@ -2181,7 +2181,7 @@ mod tests {
             .with_max_request_body_size(1024)
             .with_max_message_size(512);
         let server = Server::new(Router::new())
-            .with_limits(limits.clone())
+            .with_limits(limits)
             .with_compression(CompressionRegistry::default())
             .with_compression_policy(CompressionPolicy::default().with_min_size(8192))
             .with_http1_keep_alive(false);

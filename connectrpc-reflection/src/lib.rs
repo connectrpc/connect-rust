@@ -33,7 +33,8 @@
 //! ```
 //!
 //! [`install`] registers both protocol versions; use the generated
-//! extension traits directly if you want only one.
+//! extension traits directly if you want only one (and see
+//! [Request limits](#request-limits) below for the extra call that needs).
 //!
 //! Alternatively, when your buffa codegen has reflection enabled, skip
 //! the build-script step and serve straight from the generated package's
@@ -49,6 +50,40 @@
 //! per-file descriptor bytes; the pool path re-encodes (semantically
 //! faithful, unknown fields preserved). See [`Reflector`] for the
 //! trade-off.
+//!
+//! # Request limits
+//!
+//! A `ServerReflectionRequest` is a host plus one symbol, file name or type
+//! name, so the reflection routes do not need the multi-megabyte request
+//! ceiling a `connectrpc` service allows by default. This crate sizes them
+//! to [`MAX_REQUEST_BYTES`] (16 KiB) per request *message* through per-route
+//! [`Limits`](connectrpc::Limits) — see [`request_limits`] for the exact
+//! profile; `ServerReflectionInfo` is a bidirectional stream, so the bound
+//! is per message rather than per call. A larger message ends the stream
+//! with `resource_exhausted`. The profile *replaces* the service-wide limits
+//! on these routes, whether those are looser or tighter.
+//!
+//! * [`install`] applies [`request_limits`] for you, to both versions.
+//! * Registering a [`ReflectionService`] any other way — one version through
+//!   the generated [`ServerReflectionExt::register`](ServerReflectionExt), or
+//!   [`Router::add_service`](connectrpc::Router::add_service) — does not, so
+//!   follow it with [`apply_request_limits`]`(router, `[`request_limits`]`())`;
+//!   it covers whichever versions are mounted.
+//! * To tune the reflection routes specifically, call
+//!   [`apply_request_limits`] with your own `Limits` after either path; the
+//!   later call wins.
+//!
+//! ```no_run
+//! use connectrpc::{Limits, Router};
+//! use connectrpc_reflection::{Reflector, apply_request_limits, install};
+//!
+//! # fn descriptor_set_bytes() -> &'static [u8] { &[] }
+//! let reflector = Reflector::from_descriptor_set_bytes(descriptor_set_bytes()).unwrap();
+//! let router = install(Router::new(), reflector);
+//! // Optional: hold reflection messages to 1 KiB instead of the bundled 16 KiB.
+//! let router = apply_request_limits(router, Limits::default().with_max_message_size(1024));
+//! # drop(router);
+//! ```
 //!
 //! # What gets exposed
 //!
@@ -95,7 +130,9 @@ mod connect;
 mod proto;
 
 pub use reflector::{ReflectionError, Reflector};
-pub use service::{ReflectionService, install};
+pub use service::{
+    MAX_REQUEST_BYTES, ReflectionService, apply_request_limits, install, request_limits,
+};
 
 /// The wire-format `FileDescriptorSet` for this crate's protos
 /// (`grpc.reflection.v1` and `v1alpha`, from the public Buf Schema
@@ -121,7 +158,12 @@ pub use connect::grpc::reflection::v1::SERVER_REFLECTION_SERVICE_NAME;
 /// # fn descriptor_set_bytes() -> &'static [u8] { &[] }
 /// let reflector = Reflector::from_descriptor_set_bytes(descriptor_set_bytes()).unwrap();
 /// let service = Arc::new(ReflectionService::new(reflector));
-/// let router = service.register(Router::new()); // v1 only
+/// // v1 only; `apply_request_limits` bounds whichever versions are mounted.
+/// let router = service.register(Router::new());
+/// let router = connectrpc_reflection::apply_request_limits(
+///     router,
+///     connectrpc_reflection::request_limits(),
+/// );
 /// ```
 pub use connect::grpc::reflection::v1::{ServerReflection, ServerReflectionExt};
 
