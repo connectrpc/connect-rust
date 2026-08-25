@@ -4915,22 +4915,42 @@ where
     B: Body<Data = Bytes>,
     B::Error: std::fmt::Display,
 {
-    let mut buf = BytesMut::new();
     let mut stream = std::pin::pin!(body);
+    // Hold the first frame by refcount so a one-frame body is never copied.
+    let mut head: Option<Bytes> = None;
+    let mut joined: Option<BytesMut> = None;
+    let mut len: usize = 0;
+
     loop {
         match std::future::poll_fn(|cx| stream.as_mut().poll_frame(cx)).await {
             Some(Ok(frame)) => {
                 // Trailer frames are skipped: Connect unary/error bodies don't
                 // use HTTP trailers (those come via `trailer-` prefixed headers
                 // or the JSON body).
-                if let Ok(data) = frame.into_data() {
-                    if buf.len().saturating_add(data.len()) > max_size {
-                        return Err(ConnectError::new(
-                            ErrorCode::ResourceExhausted,
-                            format!("response body size exceeds limit {max_size}"),
-                        ));
-                    }
-                    buf.extend_from_slice(&data);
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                len = len.saturating_add(data.len());
+                if len > max_size {
+                    return Err(ConnectError::new(
+                        ErrorCode::ResourceExhausted,
+                        format!("response body size exceeds limit {max_size}"),
+                    ));
+                }
+                if data.is_empty() {
+                    continue;
+                }
+                match &mut joined {
+                    Some(buf) => buf.extend_from_slice(&data),
+                    None => match head.take() {
+                        None => head = Some(data),
+                        Some(first) => {
+                            let mut buf = BytesMut::with_capacity(len);
+                            buf.extend_from_slice(&first);
+                            buf.extend_from_slice(&data);
+                            joined = Some(buf);
+                        }
+                    },
                 }
             }
             Some(Err(e)) => {
@@ -4943,7 +4963,12 @@ where
             None => break,
         }
     }
-    Ok(buf.freeze())
+
+    Ok(match (head, joined) {
+        (_, Some(buf)) => buf.freeze(),
+        (Some(first), None) => first,
+        (None, None) => Bytes::new(),
+    })
 }
 
 /// Percent-decode a gRPC message string.
@@ -9110,6 +9135,43 @@ mod tests {
         drop(tx);
         let got = collect_body_bounded(body, 10, None).await.unwrap();
         assert_eq!(&got[..], b"foobar");
+    }
+
+    /// A one-frame body must be handed back by reference count, not copied.
+    /// This is the point of the single-frame path, and nothing else pins it.
+    #[tokio::test]
+    async fn collect_body_bounded_single_frame_does_not_copy() {
+        let src = Bytes::from(vec![9u8; 4096]);
+
+        let got = collect_body_bounded(Full::new(src.clone()), 8192)
+            .await
+            .unwrap();
+
+        assert_eq!(got.len(), 4096);
+        assert!(
+            std::ptr::addr_eq(got.as_ptr(), src.as_ptr()),
+            "single-frame body must not be copied"
+        );
+    }
+
+    /// The promotion path still concatenates correctly once a second frame
+    /// arrives, and the result no longer aliases the first frame.
+    #[tokio::test]
+    async fn collect_body_bounded_multi_frame_promotes() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        let first = Bytes::from_static(b"foo");
+        tx.send(Ok(first.clone())).await.unwrap();
+        tx.send(Ok(Bytes::from_static(b"bar"))).await.unwrap();
+        tx.send(Ok(Bytes::from_static(b"baz"))).await.unwrap();
+        drop(tx);
+
+        let got = collect_body_bounded(body, 100).await.unwrap();
+        assert_eq!(&got[..], b"foobarbaz");
+        assert!(
+            !std::ptr::addr_eq(got.as_ptr(), first.as_ptr()),
+            "a promoted body must be a fresh buffer"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,9 @@
+kind: Changed
+body: |-
+  **Client response bodies that arrive in one frame are no longer copied.**
+  `collect_body_bounded` holds the first data frame by reference count and
+  returns it directly when no second frame follows, which is the common case
+  for unary responses and error bodies. Multi-frame bodies concatenate as
+  before, now starting from an exactly-sized buffer. The size limit is still
+  enforced before any frame is retained.
+time: 2026-08-01T19:00:00.000000000Z
