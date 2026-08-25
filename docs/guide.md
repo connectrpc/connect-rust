@@ -399,8 +399,17 @@ other, so raising the build-time bound has no effect on either.
 ## Implementing servers
 
 A service is a Rust trait generated from your `.proto` file. The
-trait name matches the proto service name (`GreetService` becomes
-`trait GreetService`), and each RPC becomes an async method.
+trait name is the proto service name in UpperCamelCase (`GreetService`
+becomes `trait GreetService`; `greet_service` would too), and each RPC
+becomes an async method.
+
+Every service in a proto package is generated into one Rust module, so
+the names derived from them must be distinct after that normalization:
+two services that differ only in case or underscores (`XGet` and
+`X_Get`), or a service and method pair whose words split differently
+from another's (`XGet.Foo` and `X.GetFoo` both name the
+`X_GET_FOO_SPEC` constant), are rejected at generation time with a
+message naming both sides. Rename one of them in the proto.
 
 ### Handler signatures
 
