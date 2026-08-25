@@ -23,9 +23,9 @@ body: |-
 
   Generated client methods now pass their method's existing
   `<SERVICE>_<METHOD>_SPEC` constant with `origin` flipped via the new
-  `Spec::with_origin(SpecOrigin::Client)`. This is what lets the upcoming
-  client-side interceptors see the method's stream type and idempotency
-  level, not just its path.
+  `Spec::with_origin(SpecOrigin::Client)`. This gives a client-side
+  interceptor, when one is registered, the method's stream type and
+  idempotency level, not just its path.
 
   Notes for hand-written callers: `Spec::client` takes a `&'static str`, so a
   caller whose method names arrive at runtime should intern each distinct
