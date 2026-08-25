@@ -1254,8 +1254,10 @@ pub type EncodedResponse = Response<EncodedBody>;
 /// response: compression needs one contiguous input, so a response that
 /// negotiates an encoding (the default for messages of at least
 /// `CompressionPolicy`'s `min_size` when the client advertises one) flattens
-/// each item first, and the segmented encode was then wasted work. Opt out
-/// per response with [`Response::compress`].
+/// each item first, and the segmented encode was then wasted work — though
+/// no more than about one percent of the compressor's own, so not worth
+/// avoiding for its own sake. Opt out per response with
+/// [`Response::compress`].
 ///
 /// A hand-written [`Dispatcher`](crate::Dispatcher) or test double that
 /// produced `Bytes` items before 0.9 converts each item, and recovers a
