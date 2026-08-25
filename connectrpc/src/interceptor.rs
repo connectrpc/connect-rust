@@ -68,10 +68,10 @@ pub use async_trait::async_trait;
 
 /// A unary RPC interceptor.
 ///
-/// Implement [`intercept_unary`](Interceptor::intercept_unary) to wrap a
-/// call. The default implementation is a passthrough — calling
-/// [`next.run(req)`](Next::run) — so an interceptor that only cares about
-/// (say) streaming RPCs in a future release is forwards-compatible.
+/// Implement [`intercept_unary`](Interceptor::intercept_unary) and/or
+/// [`intercept_streaming`](Interceptor::intercept_streaming) to wrap a
+/// call. Each has a passthrough default — calling `next.run(..)` — so an
+/// interceptor that only cares about one shape implements only that one.
 ///
 /// Use [`unary_interceptor`] for a closure-shaped interceptor without a
 /// dedicated type.
