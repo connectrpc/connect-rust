@@ -18,6 +18,7 @@ http-body-util = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
+tower = { workspace = true }
 futures = { workspace = true }
 redis = { version = "1.0", default-features = false, features = ["tokio-comp"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -74,6 +75,10 @@ harness = false
 
 [[bench]]
 name = "view_rope_encode"
+harness = false
+
+[[bench]]
+name = "stream_compressed_encode"
 harness = false
 
 [lints]
