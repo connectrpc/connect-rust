@@ -33,7 +33,7 @@ mod tests {
         mut bidi: connectrpc::client::BidiStream<B, EchoRequest, EchoResponseView<'static>>,
     ) where
         B: connectrpc::http_body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
-        B::Error: std::fmt::Display,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         fn assert_send<T: Send>(_: T) {}
         // The async-block wrappers are load-bearing: asserting the bare

@@ -1873,6 +1873,16 @@ This is also how the wasm example
 ([`examples/wasm-client/`](../examples/wasm-client)) plugs in a
 browser `fetch`-based transport.
 
+A hand-written `ClientTransport` must give its `ResponseBody` an error
+type that converts into `Box<dyn std::error::Error + Send + Sync>` —
+any `std::error::Error + Send + Sync + 'static` type, or that boxed
+type itself; the call functions and the generated clients require it
+so that a failure while reading the body can be kept as the surfaced
+error's `source()` (see [Errors and status
+codes](#errors-and-status-codes)). If the body you wrap reports a
+`Display`-only error, implement `Error` for it or adapt the body with
+`http_body_util::BodyExt::map_err`.
+
 ## Errors and status codes
 
 `ConnectError` is the error type for both server-returned and
@@ -1925,25 +1935,44 @@ decoded from a server's response therefore always has
 `.source().is_none()`, even when its `message` is populated; only an
 error that code in this process attached a cause to carries one.
 
-On the client, a source is present when the *transport* classified the
-failure and absent when the call path did. The built-in transports
-attach the underlying `hyper` / `rustls` / `std::io` error for DNS
-resolution, connection refused, TLS handshake, HTTP/2 connection
-establishment (including its timeout) and request send, so
-`err.source()` yields the original typed error, which can be downcast
-to inspect an `io::ErrorKind`, for example. Only that error's `Display`
-text reaches `message`, and it is repeated there deliberately so that
-plain `{}` formatting stays informative; a renderer that also walks
-the source chain, such as `anyhow`'s `{:#}`, will print it twice.
-Errors the call path synthesises itself do not carry a source: the
-call deadline (`with_timeout` / `with_default_timeout`) whenever it
-fires, request construction and encoding failures, response decoding,
-and a reset while reading the response body (whose error type the
-public call functions bound only by `Display`). A custom
-`ClientTransport` that returns its own `ConnectError` should call
-`.with_source(..)` itself, or build the error with
-`ConnectError::unavailable_from_transport`, to follow the same
-convention.
+On the client, a source is present whenever the failure came from the
+transport, whether it happened before or after the response headers
+arrived (provided the transport followed the convention at the end of
+this section), and absent when the call path synthesised the error
+itself. The built-in transports attach the underlying `hyper` /
+`rustls` / `std::io` error for DNS resolution, connection refused, TLS
+handshake, HTTP/2 connection establishment (including its timeout)
+and request send; a failure while reading the response body — a
+stream reset mid-body, say — is attached by the call path on every
+RPC shape, which is why the public call functions and the generated
+clients require the transport's body error type to convert into
+`Box<dyn std::error::Error + Send + Sync>` (any
+`std::error::Error + Send + Sync + 'static` type does, and so does that
+boxed type itself). The one exception is a non-2xx gRPC response whose
+body dies while being read for a `grpc-status`: the HTTP status is the
+error reported, and the read failure is dropped rather than attached.
+Either way `err.source()` yields the error the transport reported, as
+its own type: for the built-in transports that is a `hyper` /
+`hyper-util` error whose own `source()` chain leads on to the
+underlying `io::Error` or `h2` reset, so walking the chain (or the
+transport's error directly, for a custom transport that reports
+`io::Error`) reaches an `io::ErrorKind` to inspect. Only that error's
+`Display` text reaches `message`, and it is repeated there
+deliberately so that plain `{}` formatting stays informative; a
+renderer that also walks the source chain, such as `anyhow`'s `{:#}`,
+will print it twice. Errors with no transport cause behind them do not
+carry a source: the call deadline (`with_timeout` /
+`with_default_timeout`) when the local timer fires, request
+construction and encoding failures, and response decoding. A body read
+that fails after the deadline has passed is reported as
+`deadline_exceeded` but keeps the read error as its source, since the
+reset that ended the stream is still the most specific fact about the
+failure. A custom `ClientTransport` that returns its own `ConnectError`
+from `send` should call `.with_source(..)` itself, or build the error
+with `ConnectError::unavailable_from_transport`, to follow the same
+convention; a `ConnectError` its *body* reports is not surfaced
+verbatim the way one from `send` is, but is attached as the source of
+an `internal` (or `deadline_exceeded`) error.
 
 ## Compression
 
