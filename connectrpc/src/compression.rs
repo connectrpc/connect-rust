@@ -457,6 +457,29 @@ impl Default for CompressionRegistry {
 // Built-in Providers
 // ============================================================================
 
+/// Bytes the gzip container adds around the deflate stream: a 10-byte header
+/// and an 8-byte CRC32 + ISIZE trailer.
+#[cfg(feature = "gzip")]
+const GZIP_FRAMING_LEN: usize = 18;
+
+/// Hand a finished compressed buffer over as the response frame's `Bytes`,
+/// giving back the slack first when the buffer is mostly slack.
+///
+/// The buffer was sized to the codec's worst-case bound, a little over the
+/// input length, but compressible payloads finish far below that, and
+/// `Bytes::from` keeps the whole allocation alive for as long as the frame
+/// is queued. Shrinking when more than half the buffer is unused bounds
+/// what a queued frame pins to about twice its compressed size; the copy it
+/// costs is at most the compressed length, which is the small case by
+/// construction.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+fn compressed_output(mut output: Vec<u8>) -> Bytes {
+    if output.capacity() > 2 * output.len() {
+        output.shrink_to_fit();
+    }
+    Bytes::from(output)
+}
+
 /// Gzip compression provider with internal state pooling.
 ///
 /// Pools `flate2::Compress` and `flate2::Decompress` objects to avoid the
@@ -585,7 +608,19 @@ impl GzipProvider {
         compressor: &mut flate2::Compress,
         data: &[u8],
     ) -> Result<Bytes, ConnectError> {
-        let mut output = Vec::with_capacity(data.len() + 32);
+        // Size the buffer once from deflate's worst case, as zstd's
+        // `compress_bound` does. This is zlib-rs's own conservative bound
+        // (`zlib_rs::deflate::bound`, the non-default-window branch), about
+        // `len * 1.14`; it is at or above every branch that function can
+        // take for flate2's configuration here (raw deflate, 15-bit window)
+        // at every level 0-9, so one call with the whole input and `Finish`
+        // always fits. The fast level this provider defaults to really does
+        // grow incompressible input by a few percent, so the tighter figure
+        // classic zlib quotes for its default parameters would not do. The
+        // buffer becomes the returned `Bytes`, so it is also what a queued
+        // response frame pins until it is written (see `compressed_output`).
+        let deflate_bound = data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
+        let mut output = Vec::with_capacity(GZIP_FRAMING_LEN + deflate_bound);
 
         // Gzip header (RFC 1952): fixed 10 bytes, no optional fields
         output.extend_from_slice(&[
@@ -597,11 +632,17 @@ impl GzipProvider {
             0xff, // OS = unknown
         ]);
 
-        // Deflate-compress the data
+        // Deflate-compress the data. The bound above leaves room for the
+        // whole stream, so the reserve below only fires if it was wrong;
+        // `reserve_exact` so that even then the buffer grows by what is
+        // needed rather than doubling back to the over-allocation this
+        // sizing exists to avoid.
         let start_in = compressor.total_in();
         loop {
             let consumed = (compressor.total_in() - start_in) as usize;
-            output.reserve(output.capacity().max(4096));
+            if output.len() == output.capacity() {
+                output.reserve_exact(4096);
+            }
             let status = compressor
                 .compress_vec(
                     &data[consumed..],
@@ -620,7 +661,7 @@ impl GzipProvider {
         output.extend_from_slice(&crc.sum().to_le_bytes());
         output.extend_from_slice(&(data.len() as u32).to_le_bytes());
 
-        Ok(Bytes::from(output))
+        Ok(compressed_output(output))
     }
 
     fn decompress_inner(
@@ -948,7 +989,7 @@ impl CompressionProvider for ZstdProvider {
         let mut compressor = self.take_compressor()?;
         let result = compressor
             .compress(data)
-            .map(Bytes::from)
+            .map(compressed_output)
             .map_err(|e| ConnectError::internal(format!("zstd compression failed: {e}")));
         self.return_compressor(compressor);
         result
@@ -1334,6 +1375,73 @@ mod tests {
         assert!(
             capacity < SMALL_MESSAGE_RETENTION_BOUND,
             "small zstd message retained a {capacity}-byte backing buffer"
+        );
+    }
+
+    /// A compressible 1 MiB payload compresses to a few KiB; the frame that
+    /// carries it must not keep an input-sized working buffer alive behind
+    /// it.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_compress_does_not_retain_the_working_buffer() {
+        let provider = GzipProvider::default();
+        let data = vec![0u8; 1024 * 1024];
+        let compressed = provider.compress(&data).unwrap();
+        let len = compressed.len();
+        assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
+        let capacity = backing_capacity(compressed);
+        assert!(
+            capacity <= 2 * len,
+            "compressed frame of {len} bytes retained a {capacity}-byte buffer"
+        );
+    }
+
+    /// Incompressible input is the worst case for the output bound: the
+    /// frame must still come out at about the input size, not a multiple.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_compress_incompressible_input_is_sized_once() {
+        // A simple LCG: byte-level noise deflate cannot shrink.
+        let mut state = 0x9e37_79b9_u32;
+        let data: Vec<u8> = (0..1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        // The initial sizing, exactly: any capacity above it means the
+        // buffer grew, which is the regression this test exists to catch.
+        // Every level is covered because the bound is claimed for all of
+        // them and only a realloc would betray a level it does not hold for.
+        let sized_once =
+            GZIP_FRAMING_LEN + data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
+        for level in [0, 1, 6, 9] {
+            let provider = GzipProvider::with_level(level);
+            let compressed = provider.compress(&data).unwrap();
+            let len = compressed.len();
+            assert!(len >= data.len(), "noise should not compress: {len} bytes");
+            let capacity = backing_capacity(compressed);
+            assert!(
+                capacity <= sized_once,
+                "level {level}: incompressible frame of {len} bytes retained a \
+                 {capacity}-byte buffer, sized for {sized_once}"
+            );
+        }
+    }
+
+    /// Same as the gzip retention test, for the zstd provider.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_zstd_compress_does_not_retain_the_working_buffer() {
+        let provider = ZstdProvider::default();
+        let data = vec![0u8; 1024 * 1024];
+        let compressed = provider.compress(&data).unwrap();
+        let len = compressed.len();
+        assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
+        let capacity = backing_capacity(compressed);
+        assert!(
+            capacity <= 2 * len,
+            "compressed frame of {len} bytes retained a {capacity}-byte buffer"
         );
     }
 
