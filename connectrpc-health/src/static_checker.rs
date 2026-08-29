@@ -260,7 +260,7 @@ impl Checker for StaticChecker {
             let services = self.lock();
             services.get(service).map(|sender| *sender.borrow())
         };
-        snapshot.ok_or_else(|| ConnectError::not_found(format!("unknown service {service}")))
+        snapshot.ok_or_else(|| unknown_service(service))
     }
 
     async fn watch(&self, service: &str) -> Result<StatusStream, ConnectError> {
@@ -270,8 +270,52 @@ impl Checker for StaticChecker {
         };
         receiver
             .map(StatusStream::from_watch)
-            .ok_or_else(|| ConnectError::not_found(format!("unknown service {service}")))
+            .ok_or_else(|| unknown_service(service))
     }
+}
+
+/// Longest prefix of a peer-supplied service name echoed into a `not_found`
+/// error, in bytes.
+///
+/// The error message travels back as a `grpc-message` header or a Connect
+/// error body, so echoing the whole name would let a request-sized name
+/// (up to [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES)) come back at
+/// several times its size once percent-encoded. Any legitimate
+/// fully-qualified service name fits well inside this bound.
+const MAX_ECHOED_NAME_BYTES: usize = 128;
+
+/// A peer-supplied service name as it appears in an error message: verbatim
+/// up to [`MAX_ECHOED_NAME_BYTES`], beyond that cut there with the original
+/// length noted.
+///
+/// Unquoted, unlike [`UnknownServiceError`]'s Display: this text is the wire
+/// error message clients have always received for a miss, and it stays
+/// byte-for-byte the same for every name inside the bound.
+struct Echoed<'a>(&'a str);
+
+impl std::fmt::Display for Echoed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self.0;
+        if name.len() <= MAX_ECHOED_NAME_BYTES {
+            return f.write_str(name);
+        }
+        // `str::floor_char_boundary` is not stable at the crate's MSRV.
+        let mut end = MAX_ECHOED_NAME_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        write!(
+            f,
+            "{}... [name truncated, {} bytes]",
+            &name[..end],
+            name.len()
+        )
+    }
+}
+
+/// The `not_found` error for a service name the checker does not know.
+fn unknown_service(service: &str) -> ConnectError {
+    ConnectError::not_found(format!("unknown service {}", Echoed(service)))
 }
 
 #[cfg(test)]
@@ -721,6 +765,51 @@ mod tests {
         assert!(
             err.to_string().contains("acme."),
             "Display must include the prefix verbatim: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_service_echoes_short_names_whole() {
+        let err = unknown_service("acme.user.v1.UserService");
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("unknown service acme.user.v1.UserService")
+        );
+
+        let at_the_bound = "s".repeat(MAX_ECHOED_NAME_BYTES);
+        assert_eq!(
+            unknown_service(&at_the_bound).message,
+            Some(format!("unknown service {at_the_bound}"))
+        );
+    }
+
+    #[test]
+    fn unknown_service_truncates_long_names_at_a_char_boundary() {
+        // A 4-byte char straddles the bound; slicing inside it would panic.
+        let name = format!("{}\u{1F600}tail", "s".repeat(126));
+        let err = unknown_service(&name);
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+        assert_eq!(
+            err.message,
+            Some(format!(
+                "unknown service {}... [name truncated, {} bytes]",
+                "s".repeat(126),
+                name.len()
+            ))
+        );
+
+        // The largest name the routes admit still yields a short message.
+        let huge = "x".repeat(crate::MAX_REQUEST_BYTES);
+        let message = unknown_service(&huge).message.unwrap();
+        assert!(
+            message.len() < 2 * MAX_ECHOED_NAME_BYTES,
+            "{}",
+            message.len()
+        );
+        assert!(
+            message.ends_with("[name truncated, 16384 bytes]"),
+            "{message}"
         );
     }
 }

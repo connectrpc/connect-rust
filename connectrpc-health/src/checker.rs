@@ -25,7 +25,10 @@ use crate::Status;
 ///     async fn check(&self, service: &str) -> Result<Status, ConnectError> {
 ///         match service {
 ///             "" | "acme.user.v1.UserService" => Ok(Status::Serving),
-///             _ => Err(ConnectError::not_found(format!("unknown service {service}"))),
+///             // Echo the name only if you bound it first: the routes admit
+///             // names up to `MAX_REQUEST_BYTES`, and an error message is
+///             // sent back to the caller.
+///             _ => Err(ConnectError::not_found("unknown service")),
 ///         }
 ///     }
 /// }
@@ -37,7 +40,12 @@ pub trait Checker: Send + Sync + 'static {
     /// # Errors
     ///
     /// Return `Err(ConnectError::not_found(_))` for any service the
-    /// implementation doesn't recognize.
+    /// implementation doesn't recognize. `service` is peer-supplied and may
+    /// be up to [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES) long, so do
+    /// not echo it whole into the error message:
+    /// [`StaticChecker`](crate::StaticChecker) caps its
+    /// echo at 128 bytes, while a custom implementation's message is bounded
+    /// only by what it writes.
     fn check(&self, service: &str) -> impl Future<Output = Result<Status, ConnectError>> + Send;
 
     /// Subscribe to status changes for `service`. The returned

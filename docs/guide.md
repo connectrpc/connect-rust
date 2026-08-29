@@ -1488,7 +1488,12 @@ Check-only probes; override it if your probes call Watch.
 per-route `Limits` profile (see [Request limits](#request-limits)) that
 replaces the service-wide limits on those two routes, whether those are
 looser or tighter — and a larger request is refused with
-`resource_exhausted` before it reaches the checker. Registering a
+`resource_exhausted` before it reaches the checker. The profile also
+holds the decode budget to four times the 16 KiB message bound (64
+KiB), and `StaticChecker`'s `not_found` error echoes at most 128 bytes
+of an unregistered name, so the error message is bounded by a constant
+rather than by the size of the request (a custom `Checker` bounds its
+own error text). Registering a
 `HealthService` any other way (`HealthExt::register`,
 `Router::add_service`) does not apply it, so follow that with
 `apply_request_limits(router, request_limits())`. To tune the health
@@ -1496,13 +1501,13 @@ routes specifically, call `apply_request_limits` with your own `Limits`
 after either path; the later call wins:
 
 ```rust,ignore
-use connectrpc::Limits;
-use connectrpc_health::{apply_request_limits, install_static};
+use connectrpc_health::{apply_request_limits, install_static, request_limits};
 
 let (router, health) = install_static(Router::new(), [/* ... */]);
+// Start from `request_limits()` so the rest of the profile carries over.
 let router = apply_request_limits(
     router,
-    Limits::default()
+    request_limits()
         .with_max_request_body_size(1024)
         .with_max_message_size(1024),
 );
@@ -1568,7 +1573,13 @@ let router = install(router, reflector); // mounts v1 + v1alpha
 (see [Request limits](#request-limits)) that replaces the service-wide
 limits on those routes, whether those are looser or tighter; the RPC is
 a bidirectional stream, so the bound is per message rather than per
-call. Mounting a single version through the generated
+call. The profile also holds the per-message decode budget to four
+times the 16 KiB bound (64 KiB), and a lookup miss echoes at most 128
+bytes of the queried name in its
+`ErrorResponse`, so the error text is bounded by a constant rather than
+by the size of the request; the protocol's own `original_request` and
+`valid_host` echoes remain, so a response is at most about twice the
+request that produced it. Mounting a single version through the generated
 `ServerReflectionExt::register` (or using `Router::add_service`) does
 not apply it, so follow that with
 `apply_request_limits(router, request_limits())`. To tune the
@@ -1576,11 +1587,11 @@ reflection routes specifically, call `apply_request_limits` with your
 own `Limits` after either path; the later call wins:
 
 ```rust,ignore
-use connectrpc::Limits;
-use connectrpc_reflection::{apply_request_limits, install};
+use connectrpc_reflection::{apply_request_limits, install, request_limits};
 
 let router = install(router, reflector);
-let router = apply_request_limits(router, Limits::default().with_max_message_size(1024));
+// Start from `request_limits()` so the rest of the profile carries over.
+let router = apply_request_limits(router, request_limits().with_max_message_size(1024));
 ```
 
 Alternatively, when your buffa codegen has reflection enabled, serve

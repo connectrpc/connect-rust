@@ -106,6 +106,41 @@ impl From<buffa::DecodeError> for ReflectionError {
     }
 }
 
+/// Longest prefix of a peer-supplied name echoed into a `not_found`
+/// `ErrorResponse`, in bytes.
+///
+/// The reflection protocol already echoes the whole request back in
+/// `original_request`; repeating a request-sized name (up to
+/// [`MAX_REQUEST_BYTES`](crate::MAX_REQUEST_BYTES)) a second time in the
+/// error message, Debug-escaped, would let a single request pull back a
+/// response several times its size. Any legitimate file name, symbol or
+/// type name fits well inside this bound.
+const MAX_ECHOED_NAME_BYTES: usize = 128;
+
+/// A peer-supplied name as it appears in an error message: Debug-quoted, and
+/// cut to [`MAX_ECHOED_NAME_BYTES`] with the original length noted.
+struct Echoed<'a>(&'a str);
+
+impl std::fmt::Display for Echoed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self.0;
+        if name.len() <= MAX_ECHOED_NAME_BYTES {
+            return write!(f, "{name:?}");
+        }
+        // `str::floor_char_boundary` is not stable at the crate's MSRV.
+        let mut end = MAX_ECHOED_NAME_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        write!(
+            f,
+            "{:?}... [name truncated, {} bytes]",
+            &name[..end],
+            name.len()
+        )
+    }
+}
+
 /// The answer to a single reflection query, protocol-version agnostic.
 ///
 /// `service.rs` maps this onto the generated `v1` / `v1alpha` response
@@ -354,7 +389,7 @@ impl Reflector {
                 return Answer::Files(source.closure(fd));
             }
         }
-        Answer::NotFound(format!("file {name:?} not found"))
+        Answer::NotFound(format!("file {} not found", Echoed(name)))
     }
 
     pub(crate) fn file_containing_symbol(&self, symbol: &str) -> Answer {
@@ -363,13 +398,14 @@ impl Reflector {
                 return Answer::Files(source.closure(fd));
             }
         }
-        Answer::NotFound(format!("symbol {symbol:?} not found"))
+        Answer::NotFound(format!("symbol {} not found", Echoed(symbol)))
     }
 
     pub(crate) fn file_containing_extension(&self, containing_type: &str, number: i32) -> Answer {
         let not_found = || {
             Answer::NotFound(format!(
-                "extension {number} of type {containing_type:?} not found"
+                "extension {number} of type {} not found",
+                Echoed(containing_type)
             ))
         };
         let Ok(number) = u32::try_from(number) else {
@@ -408,7 +444,7 @@ impl Reflector {
                 numbers,
             };
         }
-        Answer::NotFound(format!("message {normalized:?} not found"))
+        Answer::NotFound(format!("message {} not found", Echoed(name)))
     }
 
     pub(crate) fn list_services(&self) -> Answer {
@@ -568,6 +604,79 @@ mod tests {
 
     const SELF_V1: &str = "grpc.reflection.v1.ServerReflection";
     const SELF_V1ALPHA: &str = "grpc.reflection.v1alpha.ServerReflection";
+
+    #[test]
+    fn echoed_quotes_short_names_whole() {
+        assert_eq!(Echoed("acme.api.Search").to_string(), "\"acme.api.Search\"");
+        let at_the_bound = "s".repeat(MAX_ECHOED_NAME_BYTES);
+        assert_eq!(
+            Echoed(&at_the_bound).to_string(),
+            format!("{at_the_bound:?}")
+        );
+    }
+
+    #[test]
+    fn echoed_truncates_long_names_at_a_char_boundary() {
+        // 126 ASCII bytes then a 4-byte char straddling the 128-byte bound:
+        // the cut must land before it, never inside it.
+        let name = format!("{}\u{1F600}tail", "s".repeat(126));
+        assert_eq!(
+            Echoed(&name).to_string(),
+            format!(
+                "\"{}\"... [name truncated, {} bytes]",
+                "s".repeat(126),
+                name.len()
+            )
+        );
+
+        // The largest name the routes admit still yields a short message.
+        let huge = "x".repeat(crate::MAX_REQUEST_BYTES);
+        let echoed = Echoed(&huge).to_string();
+        assert!(echoed.len() < 2 * MAX_ECHOED_NAME_BYTES, "{}", echoed.len());
+        assert!(
+            echoed.ends_with("[name truncated, 16384 bytes]"),
+            "{echoed}"
+        );
+    }
+
+    #[test]
+    fn echoed_bound_is_on_name_bytes_not_escaped_output() {
+        // Debug escaping expands a control character to `\u{1}` (5 chars),
+        // so the rendered message runs past the byte bound on the name; it
+        // stays a constant multiple of that bound, never of the input.
+        let control = "\u{1}".repeat(crate::MAX_REQUEST_BYTES);
+        let echoed = Echoed(&control).to_string();
+        assert!(echoed.len() < 6 * MAX_ECHOED_NAME_BYTES, "{}", echoed.len());
+        assert!(
+            echoed.ends_with("[name truncated, 16384 bytes]"),
+            "{echoed}"
+        );
+    }
+
+    #[test]
+    fn lookup_misses_echo_a_bounded_name() {
+        let reflector = Reflector::from_descriptor_set_bytes(&test_set().encode_to_vec()).unwrap();
+        let huge = "x".repeat(crate::MAX_REQUEST_BYTES);
+        for answer in [
+            reflector.file_by_filename(&huge),
+            reflector.file_containing_symbol(&huge),
+            reflector.file_containing_extension(&huge, 1),
+            reflector.all_extension_numbers_of_type(&huge),
+        ] {
+            let Answer::NotFound(message) = answer else {
+                panic!("expected NotFound");
+            };
+            assert!(
+                message.len() < 3 * MAX_ECHOED_NAME_BYTES,
+                "{}",
+                message.len()
+            );
+            assert!(
+                message.contains("[name truncated, 16384 bytes]"),
+                "{message}"
+            );
+        }
+    }
 
     /// A two-file set: `acme/base.proto` (imported) and `acme/api.proto`
     /// exercising every symbol kind the index covers.
