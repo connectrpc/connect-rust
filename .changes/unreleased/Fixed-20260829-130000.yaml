@@ -1,0 +1,13 @@
+kind: Fixed
+body: |-
+    **Compressed response frames no longer pin an oversized working buffer.**
+    The gzip encoder sized its output buffer at the input length and then
+    doubled it on the first compression call, and the buffer became the
+    frame's `Bytes` as-is, so every queued gzip response frame held about
+    twice its uncompressed size in memory until HTTP/2 wrote it. The buffer
+    is now sized once from deflate's worst-case bound, as the zstd path
+    already sized its own from `compress_bound`, and both encoders give back
+    the unused capacity when the compressed frame is under half of it. A
+    queued compressible frame now pins at most about twice its compressed
+    size; an incompressible one, about its input size.
+time: 2026-08-29T13:00:00.000000000+00:00
