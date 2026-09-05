@@ -480,6 +480,14 @@ implementation, built on the same hyper/h2 stack). Measured on Intel Xeon
 Platinum 8488C with [buffa](https://github.com/anthropics/buffa) as the proto
 library. Higher is better unless noted.
 
+The bench drivers also run every server benchmark against tonic with
+[grpc-rust](https://github.com/grpc/grpc-rust)'s `tonic-protobuf` codec
+(Google's `protobuf` v4 runtime on upb), reported as `tonic-protobuf`.
+Numbers for that arm are not published here yet. Its first build compiles
+`protoc` and a protoc plugin from C++ source, so it needs cmake and a C++17
+compiler; see
+[`benches/rpc-grpc-rust/README.md`](benches/rpc-grpc-rust/README.md).
+
 ### Single-request latency
 
 Criterion benchmarks at concurrency=1 (no h2 contention), measuring per-request
@@ -559,7 +567,7 @@ Handler performs a network round-trip to a [valkey](https://valkey.io/)
 container (`HGETALL` of 12 fortune messages, ~800 bytes), adds an ephemeral
 record, sorts, and encodes a 13-message response. This is the shape of a
 typical read-mostly service: RPC framing + async I/O wait + moderate-size
-response. All three servers use an 8-connection valkey pool; client uses
+response. Every server uses an 8-connection valkey pool; client uses
 8 h2 connections so protocol framing is the only variable.
 
 <details><summary>Raw data (req/s, c=256)</summary>

@@ -160,6 +160,122 @@ pub async fn start_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// A benchmark server running as a child process, killed on drop.
+///
+/// Every server binary in this suite binds an ephemeral loopback port and
+/// prints the bound address as its first stdout line; `start` reads that
+/// line to learn where to connect.
+pub struct ServerProcess {
+    child: std::process::Child,
+    /// The address the server reported on startup.
+    pub addr: SocketAddr,
+}
+
+impl ServerProcess {
+    /// Spawns `cmd args...` and blocks until it has printed its address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process cannot be spawned, exits before printing an
+    /// address, or prints something that is not a socket address.
+    pub fn start(cmd: &str, args: &[&str]) -> Self {
+        use std::io::BufRead;
+
+        let mut child = std::process::Command::new(cmd)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to start {cmd}: {e}"));
+
+        let stdout = child.stdout.take().expect("no stdout");
+        let mut line = String::new();
+        let bytes_read = std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("failed to read server address");
+        assert!(
+            bytes_read != 0,
+            "server {cmd} exited before printing its address"
+        );
+        let addr: SocketAddr = line.trim().parse().unwrap_or_else(|e| {
+            panic!("failed to parse server address from {cmd} ({line:?}): {e}")
+        });
+
+        // Give the server a moment to be fully ready for connections.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        Self { child, addr }
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Returns `$RPC_BENCH_BIN_DIR/<bin>` when that variable is set, so the
+/// bench drivers can run from a directory of prebuilt server binaries (for
+/// example on a dedicated benchmarking host with no Rust, Go or C++
+/// toolchain) instead of invoking `cargo build` / `go build` themselves.
+///
+/// # Panics
+///
+/// Panics if the variable is set but the binary is missing, since silently
+/// falling back to a local build would defeat the point.
+pub fn prebuilt_bin(bin: &str) -> Option<String> {
+    let dir = std::env::var_os("RPC_BENCH_BIN_DIR").filter(|d| !d.is_empty())?;
+    let path = std::path::Path::new(&dir).join(bin);
+    assert!(
+        path.is_file(),
+        "RPC_BENCH_BIN_DIR is set but {} does not exist",
+        path.display()
+    );
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Builds `bin` from the out-of-workspace `benches/rpc-grpc-rust` crate
+/// (tonic + tonic-protobuf servers on Google's upb-kernel `protobuf`
+/// runtime) in release mode and returns the binary's path.
+///
+/// That crate is excluded from the workspace because its codegen needs the
+/// grpc-rust toolchain (protoc 35.1 plus the C++ `protoc-gen-rust-grpc`
+/// plugin, cmake-built on first use), so it has its own `target/`. When
+/// `GRPC_RUST_PROTOC_DIR` names a directory of prebuilt binaries the cmake
+/// build is skipped (`--no-default-features`), matching that crate's README.
+///
+/// # Panics
+///
+/// Panics if the build fails; the bench cannot proceed without the server.
+pub fn build_grpc_rust_bin(bin: &str) -> String {
+    if let Some(path) = prebuilt_bin(bin) {
+        return path;
+    }
+    eprintln!("  Building {bin} (benches/rpc-grpc-rust)...");
+    let crate_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../rpc-grpc-rust");
+    let mut cmd = std::process::Command::new("cargo");
+    // --target-dir pins the output location even under CARGO_TARGET_DIR or a
+    // `[build] target-dir` config, so the returned path is always right.
+    cmd.args(["build", "--release", "--bin", bin, "--message-format=short"])
+        .arg("--manifest-path")
+        .arg(format!("{crate_dir}/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(format!("{crate_dir}/target"));
+    if std::env::var_os("GRPC_RUST_PROTOC_DIR").is_some() {
+        cmd.arg("--no-default-features");
+    }
+    let status = cmd
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for {bin}: {e}"));
+    assert!(
+        status.success(),
+        "failed to build {bin} (see benches/rpc-grpc-rust/README.md for toolchain setup)"
+    );
+    format!("{crate_dir}/target/release/{bin}")
+}
+
 /// Create a client for the given address, protocol, and codec format.
 ///
 /// gRPC requires HTTP/2 (uses `HttpClient::plaintext_http2_only()`), while Connect and

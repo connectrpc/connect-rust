@@ -388,7 +388,7 @@ tasks:
       - cargo bench -p rpc-bench --bench rpc_bench -- --quick --warm-up-time 1 --measurement-time 3
 
   bench:cross:
-    desc: Run cross-implementation benchmarks (connectrpc vs tonic vs connect-go)
+    desc: Run cross-implementation benchmarks (connectrpc vs tonic vs tonic-protobuf vs connect-go)
     cmds:
       - cargo bench -p rpc-bench --bench cross_impl_bench
 
@@ -411,7 +411,7 @@ tasks:
       - cargo bench -p rpc-bench --bench cross_impl_bench -- --quick --warm-up-time 1 --measurement-time 3
 
   bench:fortunes:
-    desc: Run fortunes benchmark (connectrpc vs tonic vs connect-go)
+    desc: Run fortunes benchmark (connectrpc vs tonic vs tonic-protobuf vs connect-go)
     cmds:
       - cargo run --release -p rpc-bench --bin fortune_bench
 
@@ -431,7 +431,7 @@ tasks:
       - cargo run --release -p rpc-bench --bin fortune_bench -- --protocols --multi-conn=8
 
   bench:echo:
-    desc: Run echo benchmark (connectrpc vs tonic, framework overhead only)
+    desc: Run echo benchmark (connectrpc vs tonic vs tonic-protobuf, framework overhead only)
     cmds:
       - cargo run --release -p rpc-bench --bin echo_bench
 
@@ -441,7 +441,7 @@ tasks:
       - cargo run --release -p rpc-bench --bin echo_bench -- --quick
 
   bench:log:
-    desc: Run log-ingest benchmark (decode-heavy, buffa-view vs prost-owned)
+    desc: Run log-ingest benchmark (decode-heavy, buffa-view vs prost-owned vs upb)
     cmds:
       - cargo run --release -p rpc-bench --bin log_bench
 
@@ -449,6 +449,19 @@ tasks:
     desc: Run log-ingest benchmark with shorter duration
     cmds:
       - cargo run --release -p rpc-bench --bin log_bench -- --quick
+
+  # GRPC_RUST_PROTOC_DIR (prebuilt protoc 35.1 + protoc-gen-rust-grpc) skips the
+  # cmake toolchain build; see benches/rpc-grpc-rust/README.md.
+  bench:grpc-rust:build:
+    desc: Build the grpc-rust bench crate (tonic-protobuf servers); first run cmake-builds protoc + protoc-gen-rust-grpc
+    cmds:
+      - cargo build --release --manifest-path benches/rpc-grpc-rust/Cargo.toml --bins ${GRPC_RUST_PROTOC_DIR:+--no-default-features}
+
+  bench:grpc-rust:lint:
+    desc: Clippy + fmt check for the out-of-workspace grpc-rust bench crate (CI does not cover it)
+    cmds:
+      - cargo fmt --manifest-path benches/rpc-grpc-rust/Cargo.toml --all -- --check
+      - cargo clippy --manifest-path benches/rpc-grpc-rust/Cargo.toml --all-targets ${GRPC_RUST_PROTOC_DIR:+--no-default-features} -- -D warnings
 
   bench:generate:
     desc: Regenerate benchmark Rust code from protos
@@ -494,14 +507,23 @@ tasks:
     cmds:
       - ./benches/profile_server.sh tonic {{.DURATION}} {{.CONCURRENCY}}
 
+  profile:tonic-protobuf:
+    desc: Profile tonic-protobuf (upb) fortune server (CPU + heap)
+    vars:
+      DURATION: '{{.DURATION | default "300"}}'
+      CONCURRENCY: '{{.CONCURRENCY | default "64"}}'
+    cmds:
+      - ./benches/profile_server.sh tonic-protobuf {{.DURATION}} {{.CONCURRENCY}}
+
   profile:compare:
-    desc: Profile both servers and print comparative summary
+    desc: Profile all three fortune servers and print comparative summary
     vars:
       DURATION: '{{.DURATION | default "300"}}'
       CONCURRENCY: '{{.CONCURRENCY | default "64"}}'
     cmds:
       - ./benches/profile_server.sh connectrpc {{.DURATION}} {{.CONCURRENCY}}
       - ./benches/profile_server.sh tonic {{.DURATION}} {{.CONCURRENCY}}
+      - ./benches/profile_server.sh tonic-protobuf {{.DURATION}} {{.CONCURRENCY}}
       - echo "Results in /tmp/connectrpc-profile/"
 
   profile:echo:
@@ -513,10 +535,11 @@ tasks:
     cmds:
       - ./benches/profile_server.sh echo-connectrpc {{.DURATION}} {{.CONCURRENCY}} {{.N_CONNS}}
       - ./benches/profile_server.sh echo-tonic {{.DURATION}} {{.CONCURRENCY}} {{.N_CONNS}}
-      - echo "Results in /tmp/connectrpc-profile/echo-{{'{'}}connectrpc,tonic{{'}'}}/"
+      - ./benches/profile_server.sh echo-tonic-protobuf {{.DURATION}} {{.CONCURRENCY}} {{.N_CONNS}}
+      - echo "Results in /tmp/connectrpc-profile/echo-{{'{'}}connectrpc,tonic,tonic-protobuf{{'}'}}/"
 
   profile:log:
-    desc: Profile log-ingest server (decode-heavy, buffa-view vs prost-owned)
+    desc: Profile log-ingest server (decode-heavy, buffa-view vs prost-owned vs upb)
     vars:
       DURATION: '{{.DURATION | default "30"}}'
       CONCURRENCY: '{{.CONCURRENCY | default "64"}}'
@@ -525,7 +548,8 @@ tasks:
     cmds:
       - ./benches/profile_server.sh log-connectrpc {{.DURATION}} {{.CONCURRENCY}} {{.N_CONNS}} {{.RECORDS}}
       - ./benches/profile_server.sh log-tonic {{.DURATION}} {{.CONCURRENCY}} {{.N_CONNS}} {{.RECORDS}}
-      - echo "Results in /tmp/connectrpc-profile/log-{{'{'}}connectrpc,tonic{{'}'}}/"
+      - ./benches/profile_server.sh log-tonic-protobuf {{.DURATION}} {{.CONCURRENCY}} {{.N_CONNS}} {{.RECORDS}}
+      - echo "Results in /tmp/connectrpc-profile/log-{{'{'}}connectrpc,tonic,tonic-protobuf{{'}'}}/"
 
   # ===========================================================================
   # Cleanup
@@ -535,4 +559,5 @@ tasks:
     desc: Remove all build artifacts
     cmds:
       - cargo clean
+      - cargo clean --manifest-path benches/rpc-grpc-rust/Cargo.toml
       - task: conformance:clean

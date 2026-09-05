@@ -1,10 +1,11 @@
-//! Echo benchmark: connectrpc-rs vs tonic, framework overhead only.
+//! Echo benchmark: connectrpc-rs vs tonic (prost and upb-protobuf codecs),
+//! framework overhead only.
 //!
 //! Unlike fortune_bench, this eliminates the database, spawn_blocking, and
 //! complex message encoding from the critical path. The handler just copies
 //! a short string from request to response. What remains is:
 //!
-//!   - HTTP/2 framing (h2 crate — shared between both frameworks)
+//!   - HTTP/2 framing (h2 crate — shared by all three servers)
 //!   - Protocol detection + envelope framing
 //!   - Dispatch (monomorphic `FooServiceServer<T>` vs tonic's match)
 //!   - Proto encode/decode of one string field
@@ -13,15 +14,15 @@
 //! This makes framework-specific overhead a much larger fraction of
 //! per-request CPU, so small improvements become visible.
 
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, Http2Connection, HttpClient, SharedHttp2Connection};
+use rpc_bench::ServerProcess;
 use rpc_bench::connect::bench::v1::*;
 use rpc_bench::proto::bench::v1::*;
 
@@ -39,51 +40,12 @@ const MAX_LATENCY_SAMPLES: usize = 500_000;
 /// short enough that memcpy doesn't dominate.
 const PAYLOAD: &str = "lorem ipsum dolor sit amet, consectetur adipiscing elit sed do e";
 
-// ── Server process management ────────────────────────────────────────
-
-struct ServerProcess {
-    child: Child,
-    addr: SocketAddr,
-}
-
-impl ServerProcess {
-    fn start(cmd: &str, args: &[&str]) -> Self {
-        let mut child = Command::new(cmd)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to start {cmd}: {e}"));
-
-        let stdout = child.stdout.take().expect("no stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .expect("failed to read server address");
-        if bytes_read == 0 {
-            panic!("server {cmd} exited before printing its address");
-        }
-        let addr: SocketAddr = line.trim().parse().unwrap_or_else(|e| {
-            panic!("failed to parse server address from {cmd} ({line:?}): {e}")
-        });
-
-        std::thread::sleep(Duration::from_millis(50));
-
-        Self { child, addr }
-    }
-}
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 // ── Build helpers ────────────────────────────────────────────────────
 
 fn build_connectrpc_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("echo_server") {
+        return path;
+    }
     eprintln!("  Building connectrpc-rs echo server...");
     let output = Command::new("cargo")
         .args([
@@ -105,6 +67,9 @@ fn build_connectrpc_server() -> String {
 }
 
 fn build_tonic_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("echo-server-tonic") {
+        return path;
+    }
     eprintln!("  Building tonic echo server...");
     let output = Command::new("cargo")
         .args([
@@ -123,6 +88,10 @@ fn build_tonic_server() -> String {
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/../../target/release/echo-server-tonic")
+}
+
+fn build_tonic_protobuf_server() -> String {
+    rpc_bench::build_grpc_rust_bin("echo-server-tonic-protobuf")
 }
 
 // ── Benchmark result ─────────────────────────────────────────────────
@@ -193,7 +162,13 @@ async fn bench_server(
 
     // Warmup phase.
     tokio::time::sleep(warmup).await;
-    count.store(0, Ordering::Relaxed);
+    // A server that rejects every call (e.g. an unimplemented method after a
+    // stub regen) would otherwise report 0 req/s instead of failing.
+    let warmed = count.swap(0, Ordering::Relaxed);
+    assert!(
+        warmed > 0,
+        "{impl_name}: no request succeeded during warmup"
+    );
     latencies.lock().await.clear();
     let measure_start = Instant::now();
 
@@ -299,7 +274,13 @@ async fn bench_server_multiconn(
     }
 
     tokio::time::sleep(warmup).await;
-    count.store(0, Ordering::Relaxed);
+    // A server that rejects every call (e.g. an unimplemented method after a
+    // stub regen) would otherwise report 0 req/s instead of failing.
+    let warmed = count.swap(0, Ordering::Relaxed);
+    assert!(
+        warmed > 0,
+        "{impl_name}: no request succeeded during warmup"
+    );
     latencies.lock().await.clear();
     let measure_start = Instant::now();
 
@@ -361,10 +342,12 @@ async fn main() {
     eprintln!("\nBuilding servers...");
     let connectrpc_bin = build_connectrpc_server();
     let tonic_bin = build_tonic_server();
+    let tonic_protobuf_bin = build_tonic_protobuf_server();
 
     let servers = [
         ("connectrpc-rs", &connectrpc_bin, Protocol::Grpc),
         ("tonic", &tonic_bin, Protocol::Grpc),
+        ("tonic-protobuf", &tonic_protobuf_bin, Protocol::Grpc),
     ];
 
     let mut results = Vec::new();
