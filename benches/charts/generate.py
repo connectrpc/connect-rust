@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate SVG bar charts for connectrpc-rs vs tonic benchmarks.
+"""Generate SVG bar charts for the connectrpc-rs vs tonic vs tonic-protobuf benchmarks.
 
 Reads benchmark data from this file's BENCHMARKS dict (update after
-running `task bench:echo --multi-conn=8` and `task bench:log`) and
-emits SVG charts to benches/charts/ plus a README-ready markdown
-table block.
+running `task bench:echo -- --multi-conn=8`, `task bench:log` and
+`task bench:cross`) and emits SVG charts to benches/charts/ plus a
+README-ready markdown table block.
 
 Usage:
     python3 benches/charts/generate.py
@@ -16,9 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # ── Benchmark data ──────────────────────────────────────────────────────
-# Update these after running the benchmarks. Values are requests/sec.
-# Source: task bench:echo -- --multi-conn=8  and  task bench:log
-# Machine: Intel Xeon Platinum 8488C, buffa @ 4edfba6
+# Update these after running the benchmarks. Values are requests/sec, except
+# the latency block (microseconds). The README tables add descriptive row
+# labels and a unary_large row that is kept out of the chart for scale.
+# Source: task bench:echo -- --multi-conn=8, task bench:log, task bench:cross
+# Machine: c7i.metal-24xl (Intel Xeon Platinum 8488C, bare metal, turbo off),
+# 2026-09-05; tonic 0.14.6, tonic-protobuf from grpc-rust @ 7053afcd.
 
 BENCHMARKS = {
     # Echo: 64-byte string, pure framework overhead (8 h2 connections)
@@ -27,8 +30,9 @@ BENCHMARKS = {
         "unit": "requests/sec",
         "groups": ["c=16", "c=64", "c=256"],
         "series": {
-            "connectrpc-rs": [170_292, 238_498, 252_000],
-            "tonic":         [168_811, 234_304, 247_167],
+            "connectrpc-rs":  [191_000, 299_340, 270_112],
+            "tonic":          [192_695, 299_477, 265_847],
+            "tonic-protobuf": [192_867, 301_132, 267_648],
         },
     },
     # Log-ingest: 50 records × ~22KB, decode-heavy (8 h2 connections)
@@ -37,8 +41,9 @@ BENCHMARKS = {
         "unit": "requests/sec",
         "groups": ["c=16", "c=64", "c=256"],
         "series": {
-            "connectrpc-rs":  [32_257, 73_313, 112_027],
-            "tonic":          [28_110, 68_690,  84_171],
+            "connectrpc-rs":  [30_761, 75_866, 135_958],
+            "tonic":          [27_746, 72_325, 119_302],
+            "tonic-protobuf": [30_275, 78_578, 132_410],
         },
     },
     # Single-request latency (criterion, no contention)
@@ -47,8 +52,9 @@ BENCHMARKS = {
         "unit": "microseconds (lower is better)",
         "groups": ["unary_small", "unary_logs_50", "client_stream", "server_stream"],
         "series": {
-            "connectrpc-rs": [ 87.6, 195.0, 166.1, 109.8],
-            "tonic":         [170.8, 338.5, 223.8, 110.1],
+            "connectrpc-rs":  [ 80.7, 219.5, 182.3, 108.8],
+            "tonic":          [ 79.4, 302.3, 167.7, 105.9],
+            "tonic-protobuf": [ 79.1, 251.6, 163.2, 110.6],
         },
     },
 }
@@ -58,6 +64,7 @@ BENCHMARKS = {
 COLORS = {
     "connectrpc-rs":        "#4C78A8",  # blue (our primary)
     "tonic":                "#F58518",  # orange
+    "tonic-protobuf":       "#54A24B",  # green
 }
 
 # ── SVG generation (adapted from buffa/benchmarks/charts/generate.py) ──
@@ -210,9 +217,9 @@ def _pct(val: float, baseline: float) -> str:
         v = f"{int(round(val)):,}"
     else:
         v = f"{val:.1f}"
-    if baseline == val:
-        return v
     diff = (val - baseline) / baseline * 100
+    if abs(diff) < 0.5:
+        return v
     sign = "+" if diff > 0 else "\u2212"
     return f"{v} ({sign}{abs(diff):.0f}%)"
 
