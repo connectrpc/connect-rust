@@ -453,7 +453,7 @@ tasks:
   # GRPC_RUST_PROTOC_DIR (prebuilt protoc 35.1 + protoc-gen-rust-grpc) skips the
   # cmake toolchain build; see benches/rpc-grpc-rust/README.md.
   bench:grpc-rust:build:
-    desc: Build the grpc-rust bench crate (tonic-protobuf servers); first run cmake-builds protoc + protoc-gen-rust-grpc
+    desc: Build the grpc-rust bench crate (tonic-protobuf servers + client_bench); first run cmake-builds protoc + protoc-gen-rust-grpc
     cmds:
       - cargo build --release --manifest-path benches/rpc-grpc-rust/Cargo.toml --bins ${GRPC_RUST_PROTOC_DIR:+--no-default-features}
 
@@ -462,6 +462,16 @@ tasks:
     cmds:
       - cargo fmt --manifest-path benches/rpc-grpc-rust/Cargo.toml --all -- --check
       - cargo clippy --manifest-path benches/rpc-grpc-rust/Cargo.toml --all-targets ${GRPC_RUST_PROTOC_DIR:+--no-default-features} -- -D warnings
+
+  bench:clients:
+    desc: Run client-stack benchmark (connectrpc-rs vs tonic vs grpc-rust `grpc`, same server)
+    cmds:
+      - cargo run --release --manifest-path benches/rpc-grpc-rust/Cargo.toml --bin client_bench ${GRPC_RUST_PROTOC_DIR:+--no-default-features} -- {{.CLI_ARGS}}
+
+  bench:clients:quick:
+    desc: Run client-stack benchmark with shorter duration
+    cmds:
+      - cargo run --release --manifest-path benches/rpc-grpc-rust/Cargo.toml --bin client_bench ${GRPC_RUST_PROTOC_DIR:+--no-default-features} -- --quick {{.CLI_ARGS}}
 
   bench:generate:
     desc: Regenerate benchmark Rust code from protos

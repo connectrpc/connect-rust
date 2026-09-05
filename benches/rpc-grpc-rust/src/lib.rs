@@ -1,6 +1,7 @@
-//! Benchmark servers built on grpc-rust's `tonic-protobuf` codec (Google's
-//! `protobuf` v4 runtime on the upb kernel) for comparison against
-//! connectrpc-rs + buffa and tonic + prost.
+//! Benchmark servers and clients built on grpc-rust — the `tonic-protobuf`
+//! codec (Google's `protobuf` v4 runtime on the upb kernel) and the `grpc`
+//! client channel — for comparison against connectrpc-rs + buffa and
+//! tonic + prost.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -22,6 +23,18 @@ use tonic::transport::server::TcpIncoming;
 pub mod pb {
     grpc::include_proto!("bench");
     include!(concat!(env!("OUT_DIR"), "/fortune_grpc.pb.rs"));
+}
+
+/// prost message types and tonic client stubs for `bench.v1`, used by the
+/// tonic arm of `client_bench`.
+#[allow(
+    unreachable_pub,
+    missing_debug_implementations,
+    clippy::all,
+    clippy::pedantic
+)]
+pub mod tonic_pb {
+    tonic::include_proto!("bench.v1");
 }
 
 /// Binds an ephemeral loopback port with `TCP_NODELAY` and prints the

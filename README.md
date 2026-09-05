@@ -482,10 +482,11 @@ library. Higher is better unless noted.
 
 The bench drivers also run every server benchmark against tonic with
 [grpc-rust](https://github.com/grpc/grpc-rust)'s `tonic-protobuf` codec
-(Google's `protobuf` v4 runtime on upb), reported as `tonic-protobuf`.
-Numbers for that arm are not published here yet. Its first build compiles
-`protoc` and a protoc plugin from C++ source, so it needs cmake and a C++17
-compiler; see
+(Google's `protobuf` v4 runtime on upb), reported as `tonic-protobuf`, and
+`task bench:clients` compares the connectrpc-rs, tonic and grpc-rust `grpc`
+client stacks against one server. Numbers for those arms are not published
+here yet. Their first build compiles `protoc` and a protoc plugin from C++
+source, so it needs cmake and a C++17 compiler; see
 [`benches/rpc-grpc-rust/README.md`](benches/rpc-grpc-rust/README.md).
 
 ### Single-request latency
