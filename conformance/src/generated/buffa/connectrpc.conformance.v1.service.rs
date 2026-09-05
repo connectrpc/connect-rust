@@ -308,18 +308,21 @@ impl ::buffa::ExtensionSet for UnaryResponseDefinition {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for UnaryResponseDefinition {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = UnaryResponseDefinition;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct UnaryResponseDefinition")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<UnaryResponseDefinition, A::Error> {
@@ -344,9 +347,9 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                         "responseHeaders" | "response_headers" => {
                             __f_response_headers = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<Header>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -362,9 +365,9 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                         "responseTrailers" | "response_trailers" => {
                             __f_response_trailers = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<Header>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -380,9 +383,9 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                         "responseDelayMs" | "response_delay_ms" => {
                             __f_response_delay_ms = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = u32;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<u32, D::Error> {
@@ -405,9 +408,9 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                         }
                         "responseData" | "response_data" => {
                             struct _DeserSeed;
-                            impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                            impl<'de> ::serde::de::DeserializeSeed<'de> for _DeserSeed {
                                 type Value = ::buffa::alloc::vec::Vec<u8>;
-                                fn deserialize<D: serde::Deserializer<'de>>(
+                                fn deserialize<D: ::serde::Deserializer<'de>>(
                                     self,
                                     d: D,
                                 ) -> ::core::result::Result<
@@ -426,7 +429,7 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                             if let Some(v) = v {
                                 if __oneof_response.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'response'",
                                         ),
                                     );
@@ -450,7 +453,7 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                             if let Some(v) = v {
                                 if __oneof_response.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'response'",
                                         ),
                                     );
@@ -463,7 +466,7 @@ impl<'de> serde::Deserialize<'de> for UnaryResponseDefinition {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
@@ -3966,18 +3969,21 @@ impl ::buffa::ExtensionSet for RawHTTPRequest {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for RawHTTPRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = RawHTTPRequest;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct RawHTTPRequest")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<RawHTTPRequest, A::Error> {
@@ -4004,9 +4010,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                         "verb" => {
                             __f_verb = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::string::String;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -4022,9 +4028,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                         "uri" => {
                             __f_uri = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::string::String;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -4040,9 +4046,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                         "headers" => {
                             __f_headers = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<Header>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -4058,9 +4064,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                         "rawQueryParams" | "raw_query_params" => {
                             __f_raw_query_params = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<Header>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -4076,11 +4082,11 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                         "encodedQueryParams" | "encoded_query_params" => {
                             __f_encoded_query_params = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<
                                         raw_http_request::EncodedQueryParam,
                                     >;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -4107,7 +4113,7 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                             if let Some(v) = v {
                                 if __oneof_body.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'body'",
                                         ),
                                     );
@@ -4131,7 +4137,7 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                             if let Some(v) = v {
                                 if __oneof_body.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'body'",
                                         ),
                                     );
@@ -4144,7 +4150,7 @@ impl<'de> serde::Deserialize<'de> for RawHTTPRequest {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
@@ -4599,18 +4605,21 @@ impl ::buffa::ExtensionSet for MessageContents {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for MessageContents {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for MessageContents {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = MessageContents;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct MessageContents")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<MessageContents, A::Error> {
@@ -4625,9 +4634,9 @@ impl<'de> serde::Deserialize<'de> for MessageContents {
                         "compression" => {
                             __f_compression = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::EnumValue<Compression>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -4642,9 +4651,9 @@ impl<'de> serde::Deserialize<'de> for MessageContents {
                         }
                         "binary" => {
                             struct _DeserSeed;
-                            impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                            impl<'de> ::serde::de::DeserializeSeed<'de> for _DeserSeed {
                                 type Value = ::buffa::alloc::vec::Vec<u8>;
-                                fn deserialize<D: serde::Deserializer<'de>>(
+                                fn deserialize<D: ::serde::Deserializer<'de>>(
                                     self,
                                     d: D,
                                 ) -> ::core::result::Result<
@@ -4663,7 +4672,7 @@ impl<'de> serde::Deserialize<'de> for MessageContents {
                             if let Some(v) = v {
                                 if __oneof_data.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'data'",
                                         ),
                                     );
@@ -4687,7 +4696,7 @@ impl<'de> serde::Deserialize<'de> for MessageContents {
                             if let Some(v) = v {
                                 if __oneof_data.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'data'",
                                         ),
                                     );
@@ -4711,7 +4720,7 @@ impl<'de> serde::Deserialize<'de> for MessageContents {
                             if let Some(v) = v {
                                 if __oneof_data.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'data'",
                                         ),
                                     );
@@ -4724,7 +4733,7 @@ impl<'de> serde::Deserialize<'de> for MessageContents {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
@@ -5392,18 +5401,21 @@ impl ::buffa::ExtensionSet for RawHTTPResponse {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for RawHTTPResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = RawHTTPResponse;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct RawHTTPResponse")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<RawHTTPResponse, A::Error> {
@@ -5422,9 +5434,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
                         "statusCode" | "status_code" => {
                             __f_status_code = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = u32;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<u32, D::Error> {
@@ -5437,9 +5449,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
                         "headers" => {
                             __f_headers = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<Header>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -5455,9 +5467,9 @@ impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
                         "trailers" => {
                             __f_trailers = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::vec::Vec<Header>;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -5482,7 +5494,7 @@ impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
                             if let Some(v) = v {
                                 if __oneof_body.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'body'",
                                         ),
                                     );
@@ -5506,7 +5518,7 @@ impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
                             if let Some(v) = v {
                                 if __oneof_body.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'body'",
                                         ),
                                     );
@@ -5519,7 +5531,7 @@ impl<'de> serde::Deserialize<'de> for RawHTTPResponse {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }

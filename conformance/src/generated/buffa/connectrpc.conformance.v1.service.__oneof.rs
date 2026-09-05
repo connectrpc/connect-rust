@@ -20,12 +20,12 @@ pub mod unary_response_definition {
             Self::Some(Response::from(v))
         }
     }
-    impl serde::Serialize for Response {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Response {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::ResponseData(v) => {
@@ -35,7 +35,7 @@ pub mod unary_response_definition {
                     )?;
                 }
                 Self::Error(v) => {
-                    map.serialize_entry("error", v)?;
+                    map.serialize_entry("error", &**v)?;
                 }
             }
             map.end()
@@ -71,19 +71,19 @@ pub mod raw_http_request {
             Self::Some(Body::from(v))
         }
     }
-    impl serde::Serialize for Body {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Body {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Unary(v) => {
-                    map.serialize_entry("unary", v)?;
+                    map.serialize_entry("unary", &**v)?;
                 }
                 Self::Stream(v) => {
-                    map.serialize_entry("stream", v)?;
+                    map.serialize_entry("stream", &**v)?;
                 }
             }
             map.end()
@@ -106,12 +106,12 @@ pub mod message_contents {
             Self::BinaryMessage(::buffa::alloc::boxed::Box::new(v))
         }
     }
-    impl serde::Serialize for Data {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Data {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Binary(v) => {
@@ -121,7 +121,7 @@ pub mod message_contents {
                     map.serialize_entry("text", v)?;
                 }
                 Self::BinaryMessage(v) => {
-                    map.serialize_entry("binaryMessage", v)?;
+                    map.serialize_entry("binaryMessage", &**v)?;
                 }
             }
             map.end()
@@ -157,19 +157,19 @@ pub mod raw_http_response {
             Self::Some(Body::from(v))
         }
     }
-    impl serde::Serialize for Body {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Body {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Unary(v) => {
-                    map.serialize_entry("unary", v)?;
+                    map.serialize_entry("unary", &**v)?;
                 }
                 Self::Stream(v) => {
-                    map.serialize_entry("stream", v)?;
+                    map.serialize_entry("stream", &**v)?;
                 }
             }
             map.end()
