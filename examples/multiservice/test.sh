@@ -13,10 +13,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Building multiservice example..."
-cargo build -p multiservice-example
+cargo build ${CI:+--locked} -p multiservice-example
 
 echo "Starting multiservice-server on $ADDR..."
-ADDR="$ADDR" cargo run -p multiservice-example --bin multiservice-server &
+ADDR="$ADDR" cargo run ${CI:+--locked} -p multiservice-example --bin multiservice-server &
 SERVER_PID=$!
 
 # Wait for server to be ready
@@ -38,7 +38,7 @@ if ! curl -s "http://$ADDR/health" > /dev/null 2>&1; then
 fi
 
 echo "Running multiservice-client..."
-cargo run -p multiservice-example --bin multiservice-client
+cargo run ${CI:+--locked} -p multiservice-example --bin multiservice-client
 STATUS=$?
 
 if [ $STATUS -eq 0 ]; then

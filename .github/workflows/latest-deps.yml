@@ -1,0 +1,36 @@
+name: Latest dependencies
+
+# CI builds against the committed Cargo.lock, so a new upstream release that
+# breaks the build or the tests does not show up on ordinary PRs. This job is
+# where it shows up: once a week (and on demand) it resolves every
+# dependency to the newest compatible version and runs the test suite, which is
+# what a downstream crate depending on connectrpc gets.
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  PROTOC_VERSION: "33.5"
+
+jobs:
+  latest:
+    name: Test against latest compatible dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0 (sha-pinned)
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve newest compatible versions
+        run: cargo update --verbose
+      - run: cargo test --workspace --all-features
+      - run: cargo test -p connectrpc --no-default-features

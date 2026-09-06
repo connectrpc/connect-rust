@@ -464,7 +464,7 @@ tasks:
   generate:all:
     desc: Regenerate all checked-in Rust code from protos
     cmds:
-      - cargo build --release -p connectrpc-codegen --bin protoc-gen-connect-rust
+      - cargo build --release ${CI:+--locked} -p connectrpc-codegen --bin protoc-gen-connect-rust
       - cargo build --release --manifest-path ../buffa/Cargo.toml -p protoc-gen-buffa -p protoc-gen-buffa-packaging
       - task: example:eliza:generate
       - task: example:multiservice:generate

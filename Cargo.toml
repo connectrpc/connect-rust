@@ -35,8 +35,9 @@ async-trait = "0.1"
 # `map_codec::field_len` accumulator to `u64`, so code emitted by a 0.8.x
 # codegen does not compile against a 0.9 runtime; and the codegen paths call
 # `buffa_codegen::decode_request` and `tooling_decode_options`, which arrived
-# in 0.9.1. Within 0.9.x the floor tracks the regen baseline for the checked-in
-# generated code — regenerate whenever it moves.
+# in 0.9.1. The regen baseline for the checked-in generated code is the buffa
+# version in Cargo.lock, not this floor; bump the lock and regenerate together
+# (see CONTRIBUTING.md), and raise the floor only when generated code needs it.
 # (connectrpc-build also sources the generated `mod.rs` `#[allow(...)]` list
 # from `buffa_codegen::ALLOW_LINTS`.)
 # NOTE: the `connectrpc` crate pins `buffa` directly (not `workspace = true`)

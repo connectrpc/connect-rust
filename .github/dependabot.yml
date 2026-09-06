@@ -1,0 +1,19 @@
+# Keeps the committed Cargo.lock current. CI builds with --locked, so without
+# these PRs the lockfile would drift behind what users resolve.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Only the lockfile moves; Cargo.toml requirements are never rewritten, so
+    # declared floors stay the true minimums rather than tracking the latest
+    # release. (For cargo, Dependabot offers only this and `auto`, which raises
+    # requirements on every update.) A semver-incompatible upgrade is therefore
+    # a deliberate, hand-written Cargo.toml change.
+    versioning-strategy: lockfile-only
+    # One PR for the week's updates.
+    groups:
+      compatible:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5

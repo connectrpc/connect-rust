@@ -13,10 +13,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Building eliza-server..."
-cargo build -p eliza-example --bin eliza-server
+cargo build ${CI:+--locked} -p eliza-example --bin eliza-server
 
 echo "Starting eliza-server on $ADDR..."
-cargo run -p eliza-example --bin eliza-server -- --addr "$ADDR" &
+cargo run ${CI:+--locked} -p eliza-example --bin eliza-server -- --addr "$ADDR" &
 SERVER_PID=$!
 
 for i in $(seq 1 30); do
