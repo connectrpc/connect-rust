@@ -6,7 +6,7 @@
 //!
 //! | Transport | Protocol | Use when |
 //! |---|---|---|
-//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** Honest `poll_ready`, composes with `tower::balance`. |
+//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** One multiplexed connection with reconnect and an in-flight bound; the underlying [`Http2Connection`] has honest `poll_ready` and composes with `tower::balance`. |
 //! | [`HttpClient`] | HTTP/1.1 + HTTP/2 (ALPN) | Connect protocol over h/1.1, or you genuinely don't know which protocol the server speaks. |
 //!
 //! # For gRPC: `SharedHttp2Connection`

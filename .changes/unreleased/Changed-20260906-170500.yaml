@@ -1,0 +1,13 @@
+kind: Changed
+body: |-
+    **`SharedHttp2Connection` sends directly on the hyper connection handle;
+    `bound` now caps in-flight requests.** Each request clones the live hyper
+    request handle and sends on it, taking the reconnect state machine's lock
+    only when there is no open connection, which removes the `tower::buffer`
+    worker task and its per-call hop and wakeups. `Http2Connection::shared(bound)`
+    keeps its signature: `bound` is now the number of requests that may be in
+    flight (sent and awaiting response headers) rather than the depth of the
+    worker's queue. It must still be non-zero. `shared` no longer has to be
+    called inside a Tokio runtime, and the workspace no longer enables tower's
+    `buffer` feature.
+time: 2026-09-06T17:05:00.000000000+00:00

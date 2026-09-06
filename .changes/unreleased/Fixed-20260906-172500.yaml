@@ -1,0 +1,14 @@
+kind: Fixed
+body: |-
+    `SharedHttp2Connection`: the first request after a graceful GOAWAY arrived
+    while another stream was still open failed with `h2 send failed: operation
+    was canceled` without reaching the wire (#285). Readiness is now checked
+    when the request is made rather than ahead of time by a worker, so that
+    request goes out on a new connection, and a request that races a closing
+    connection is resent. Two related fixes: a request abandoned while it
+    was establishing the connection (for example at its deadline) no longer
+    leaves a half-finished attempt and its establishment timeout to the next
+    request (the attempt now runs to completion on its own task), and connect failures that the transport classified
+    itself (such as the `invalid_argument` scheme check) keep their code
+    instead of being re-wrapped as `unavailable`.
+time: 2026-09-06T17:25:00.000000000+00:00
