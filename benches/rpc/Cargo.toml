@@ -56,6 +56,9 @@ name = "log_server_noutf8"
 [[bin]]
 name = "log_load_noutf8"
 
+[[bin]]
+name = "unary_load"
+
 [[bench]]
 name = "rpc_bench"
 harness = false

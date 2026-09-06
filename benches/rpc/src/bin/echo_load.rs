@@ -1,6 +1,6 @@
 //! Standalone load generator for profiling echo servers.
 //!
-//! Usage: `echo_load <addr> [duration_secs] [concurrency] [n_conns]`
+//! Usage: `echo_load <addr> [duration_secs] [concurrency] [n_conns] [payload_bytes]`
 //!
 //! Uses gRPC (HTTP/2) always. `n_conns` spreads load across N
 //! SharedHttp2Connection instances to reduce h2 mutex contention,
@@ -24,6 +24,12 @@ async fn main() {
     let duration = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30u64);
     let concurrency: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
     let n_conns: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+    // Default is the 64-byte PAYLOAD; a larger value repeats it to that length,
+    // e.g. to straddle h2's 256-byte DATA-frame chain threshold.
+    let payload_bytes: usize = args
+        .get(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PAYLOAD.len());
 
     let uri: http::Uri = format!("http://{addr}").parse().unwrap();
     let config = ClientConfig::new(uri.clone()).with_protocol(Protocol::Grpc);
@@ -42,7 +48,7 @@ async fn main() {
     }
 
     let request = EchoRequest {
-        message: PAYLOAD.to_string(),
+        message: PAYLOAD.repeat(payload_bytes.div_ceil(PAYLOAD.len()))[..payload_bytes].to_string(),
         ..Default::default()
     };
 
