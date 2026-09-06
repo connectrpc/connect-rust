@@ -2050,9 +2050,8 @@ where
         );
     }
     // Accept-Encoding so the server can compress the response.
-    let accept = config.compression.accept_encoding_header();
-    if !accept.is_empty() {
-        builder = builder.header(http::header::ACCEPT_ENCODING, accept);
+    if let Some(accept) = config.compression.accept_encoding_value() {
+        builder = builder.header(http::header::ACCEPT_ENCODING, accept.clone());
     }
 
     // Merge user-provided headers
@@ -4739,39 +4738,39 @@ fn add_unary_request_headers(
 ) -> http::request::Builder {
     builder = builder.header(
         http::header::CONTENT_TYPE,
-        unary_request_content_type(config),
+        http::HeaderValue::from_static(unary_request_content_type(config)),
     );
 
     match config.protocol {
         Protocol::Connect => {
-            builder = builder.header(connect_header::PROTOCOL_VERSION, "1");
+            builder = builder.header(
+                connect_header::PROTOCOL_VERSION,
+                http::HeaderValue::from_static("1"),
+            );
             // Connect unary uses standard content-encoding / accept-encoding.
             // Only set Content-Encoding if compression was actually applied.
             if let Some(encoding) = applied_content_encoding {
                 builder = builder.header(http::header::CONTENT_ENCODING, encoding);
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header(http::header::ACCEPT_ENCODING, accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header(http::header::ACCEPT_ENCODING, accept.clone());
             }
         }
         Protocol::Grpc => {
-            builder = builder.header("te", "trailers");
+            builder = builder.header("te", http::HeaderValue::from_static("trailers"));
             if let Some(ref encoding) = config.request_compression {
                 builder = builder.header("grpc-encoding", encoding.as_str());
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header("grpc-accept-encoding", accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header("grpc-accept-encoding", accept.clone());
             }
         }
         Protocol::GrpcWeb => {
             if let Some(ref encoding) = config.request_compression {
                 builder = builder.header("grpc-encoding", encoding.as_str());
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header("grpc-accept-encoding", accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header("grpc-accept-encoding", accept.clone());
             }
         }
     }
@@ -4794,15 +4793,18 @@ fn add_streaming_request_headers(
 ) -> http::request::Builder {
     builder = builder.header(
         http::header::CONTENT_TYPE,
-        streaming_request_content_type(config),
+        http::HeaderValue::from_static(streaming_request_content_type(config)),
     );
 
     match config.protocol {
         Protocol::Connect => {
-            builder = builder.header(connect_header::PROTOCOL_VERSION, "1");
+            builder = builder.header(
+                connect_header::PROTOCOL_VERSION,
+                http::HeaderValue::from_static("1"),
+            );
         }
         Protocol::Grpc => {
-            builder = builder.header("te", "trailers");
+            builder = builder.header("te", http::HeaderValue::from_static("trailers"));
         }
         Protocol::GrpcWeb => {}
     }
@@ -4813,9 +4815,8 @@ fn add_streaming_request_headers(
     if let Some(ref encoding) = config.request_compression {
         builder = builder.header(encoding_header, encoding.as_str());
     }
-    let accept = config.compression.accept_encoding_header();
-    if !accept.is_empty() {
-        builder = builder.header(accept_header, accept);
+    if let Some(accept) = config.compression.accept_encoding_value() {
+        builder = builder.header(accept_header, accept.clone());
     }
 
     if let Some(timeout) = timeout {

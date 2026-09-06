@@ -1,0 +1,7 @@
+kind: Added
+body: |-
+    `Envelope::decode_from_bytes_with_limit` unframes an envelope from a
+    collected `Bytes` body without first copying it into a `BytesMut`, and
+    `CompressionRegistry::accept_encoding_value` exposes the registry's
+    supported-encodings list as a ready-made `HeaderValue`.
+time: 2026-09-06T16:21:00.000000000+00:00

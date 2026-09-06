@@ -1,0 +1,11 @@
+kind: Changed
+body: |-
+    **Fewer allocations per request.** A unary gRPC request is unframed out of
+    the collected body by reference count instead of being copied first (one
+    fewer full copy of every request body), the request's header map is moved
+    into the handler's `RequestContext` rather than cloned, and the
+    `content-type`, encoding, `te` and protocol-version header values on server
+    responses and client requests are static values, with the accept-encoding
+    value built once per `CompressionRegistry` and shared. Together this is
+    nine fewer heap allocations per small unary gRPC call on the server.
+time: 2026-09-06T15:50:00.000000000+00:00
