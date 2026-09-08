@@ -433,17 +433,17 @@ tasks:
   bench:echo:
     desc: Run echo benchmark (connectrpc vs tonic vs tonic-protobuf, framework overhead only)
     cmds:
-      - cargo run --release -p rpc-bench --bin echo_bench
+      - cargo run --release -p rpc-bench --bin echo_bench -- {{.CLI_ARGS}}
 
   bench:echo:quick:
     desc: Run echo benchmark with shorter duration
     cmds:
-      - cargo run --release -p rpc-bench --bin echo_bench -- --quick
+      - cargo run --release -p rpc-bench --bin echo_bench -- --quick {{.CLI_ARGS}}
 
   bench:log:
     desc: Run log-ingest benchmark (decode-heavy, buffa-view vs prost-owned vs upb)
     cmds:
-      - cargo run --release -p rpc-bench --bin log_bench
+      - cargo run --release -p rpc-bench --bin log_bench -- {{.CLI_ARGS}}
 
   bench:log:quick:
     desc: Run log-ingest benchmark with shorter duration

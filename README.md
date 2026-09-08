@@ -488,21 +488,20 @@ disabled), client and servers on the same host over loopback. Higher is
 better unless noted.
 
 grpc-rust's own `grpc` crate is a client channel with no server, so it does
-not appear in the server tables; `task bench:clients` compares it against the
-connectrpc-rs and tonic clients instead. The `tonic-protobuf` arm's first build compiles `protoc` and a
+not appear in the server tables; the [Client stacks](#client-stacks) table
+compares it against the connectrpc-rs and tonic clients. The `tonic-protobuf` arm's first build compiles `protoc` and a
 protoc plugin from C++ source, so it needs cmake and a C++17 compiler; see
 [`benches/rpc-grpc-rust/README.md`](benches/rpc-grpc-rust/README.md).
 
 The short version: on small unary calls, echo throughput and server streaming
-the three Rust stacks are within 3% of each other, and connectrpc-rs is 9–14%
+the two tonic configurations are within 3% of connectrpc-rs, and connectrpc-rs is 9–14%
 slower than either tonic configuration on a 10-message client stream, which is
 a framework cost (the server hands each streamed request message across tasks
 on its way to the handler). The proto library accounts for the rest: a
 50-record log-batch request completes 40% faster with buffa's zero-copy views
 than with prost and 17% faster than with upb at concurrency 1, which under
-load becomes 13% more throughput than prost and level with upb (−3% to +3%
-across concurrency levels); and upb's arena copies make the 1 MB gzip'd
-payload 13% slower.
+load becomes 5–13% more throughput than prost (13% at c=256) and level with
+upb (−3% to +3%); and the upb arm is 13% slower on the 1 MB gzip'd payload.
 
 ### Single-request latency
 
@@ -556,31 +555,34 @@ Run with `task bench:echo -- --multi-conn=8`.
 
 ### Client stacks
 
-The tables above hold the client fixed and vary the server; this one holds the
-server fixed (the connectrpc-rs echo server) and varies the client: the
-generated connectrpc-rs client over `HttpClient` (hyper-util's pooled client)
-and over `SharedHttp2Connection` (one raw h2 connection), tonic's generated
-client, and grpc-rust's `grpc` channel with its `protobuf` codec. Closed loop,
-64-byte echo, each cell the median of three 10-second runs.
+The other tables in this section hold the client fixed (connectrpc-rs) and vary
+the server; this one holds the server fixed (the connectrpc-rs echo server) and
+varies the client: the generated connectrpc-rs client over `HttpClient`
+(hyper-util's pooled client, one per connection) and over
+`SharedHttp2Connection` (one raw h2 connection each, no pool), tonic's
+generated client (tonic-prost, built from the same grpc-rust revision), and
+grpc-rust's `grpc` channel with its `protobuf` codec. All four speak gRPC over
+h2 to the same server; closed loop, 64-byte echo, requests in flight spread
+round-robin over the connections, each cell the median-throughput run of three
+10-second runs.
 
 <details><summary>Raw data (req/s)</summary>
 
-| Connections × concurrency | connectrpc-rs `HttpClient` | connectrpc-rs `SharedHttp2Connection` | tonic | grpc-rust |
-|---|---:|---:|---:|---:|
-| 1 × 1 | 17,343 | 17,176 (−1%) | 17,273 | 15,133 (−13%) |
-| 1 × 16 | 36,372 | 36,287 | 35,277 (−3%) | 37,139 (+2%) |
-| 1 × 64 | 41,145 | 40,546 (−1%) | 35,934 (−13%) | 36,898 (−10%) |
-| 8 × 1 | 17,262 | 17,217 | 17,177 | 15,049 (−13%) |
-| 8 × 16 | 191,527 | 189,871 (−1%) | 191,933 | 181,187 (−5%) |
-| 8 × 64 | 300,751 | 297,133 (−1%) | 298,744 (−1%) | 292,344 (−3%) |
+| Connections | Requests in flight | connectrpc-rs `HttpClient` | connectrpc-rs `SharedHttp2Connection` | tonic | grpc-rust |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 17,343 | 17,176 (−1%) | 17,273 | 15,133 (−13%) |
+| 1 | 16 | 36,372 | 36,287 | 35,277 (−3%) | 37,139 (+2%) |
+| 1 | 64 | 41,145 | 40,546 (−1%) | 35,934 (−13%) | 36,898 (−10%) |
+| 8 | 16 | 191,527 | 189,871 (−1%) | 191,933 | 181,187 (−5%) |
+| 8 | 64 | 300,751 | 297,133 (−1%) | 298,744 (−1%) | 292,344 (−3%) |
 
 At one request at a time the three hyper-based clients take 57–58 μs per call
 (p50) and grpc-rust's channel 65 μs. With 64 requests in flight on a single
 connection the two connectrpc-rs transports keep scaling to 41k req/s where
-tonic and grpc-rust level off at 36–37k; spread over 8 connections all four
-are within 5%.
+tonic and grpc-rust level off at 36–37k; with the same 64 requests spread over
+8 connections all four are within 3%.
 
-Run with `task bench:clients`.
+Run with `task bench:clients -- --repeat=3`.
 
 </details>
 
