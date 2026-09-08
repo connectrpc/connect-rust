@@ -4,8 +4,7 @@ body: |-
     task hand-off per message.** The request stream handed to the handler now
     decodes envelopes from the HTTP body as the handler polls it, instead of
     being fed through a bounded channel by a separately spawned reader task, so
-    a message no longer crosses two extra tasks (and, on a multi-threaded
-    runtime, usually two worker threads) between the connection and the
-    handler. Whatever a handler leaves unread is still drained in the
+    a message no longer passes through an extra task and channel between the
+    connection and the handler. Whatever a handler leaves unread is still drained in the
     background, bounded as before, so HTTP/1.1 connections stay reusable.
 time: 2026-09-08T16:30:00.000000000+00:00

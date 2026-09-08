@@ -1894,7 +1894,7 @@ where
     });
 
     // Drain the request body so an early response doesn't break HTTP/1.1
-    // keep-alive (see the streaming body-drop race notes).
+    // keep-alive (see `drain_request_body`).
     let deadline = deadline_from_headers(req.headers(), Protocol::Connect, path, deadline_policy);
     let (_parts, body) = req.into_parts();
     let _ = with_request_deadline(
@@ -2835,8 +2835,8 @@ const MAX_DRAIN_BYTES: usize = 1024 * 1024; // 1 MiB
 /// payloads a client-streaming or bidi handler consumes.
 ///
 /// Decoding happens inline, in whichever task polls the stream (the
-/// handler's), so a message costs no task hand-off on its way from the
-/// connection to the handler. The stream ends cleanly at body EOF or at an
+/// handler's), so a message costs no task hand-off beyond hyper's own on its
+/// way from the connection to the handler. The stream ends cleanly at body EOF or at an
 /// END_STREAM envelope, and yields exactly one `Err` for a decode failure or
 /// a transport-level body error, then ends.
 ///
@@ -2933,9 +2933,10 @@ where
                 return Poll::Ready(None);
             }
             let Some(body) = this.body.as_mut() else {
-                // The body has ended: flush complete messages still buffered;
-                // a partial one is an error. The body ending without
-                // END_STREAM is itself a valid end of stream.
+                // The body has ended. Complete messages were already decoded
+                // before each read, so at most a partial envelope is left,
+                // which `decode_eof` reports as an error; an empty buffer is a
+                // valid end of stream even without an END_STREAM envelope.
                 let item = match this.decoder.decode_eof(&mut this.buf) {
                     Ok(Some(data)) => Some(Ok(data)),
                     Ok(None) => None,
@@ -2963,13 +2964,7 @@ where
                 Some(Ok(frame)) => {
                     // Trailers carry nothing for the decoder.
                     if let Ok(data) = frame.into_data() {
-                        if this.buf.is_empty() {
-                            // Adopts the frame's buffer when it is uniquely
-                            // owned; otherwise the one copy `extend` would do.
-                            this.buf = BytesMut::from(data);
-                        } else {
-                            this.buf.extend_from_slice(&data);
-                        }
+                        this.buf.extend_from_slice(&data);
                     }
                 }
                 Some(Err(e)) => {
@@ -2998,7 +2993,11 @@ where
 /// The task is detached rather than tied to the response because it has to
 /// outlive it: hyper only reuses an HTTP/1.1 connection whose request body was
 /// read to the end, and abandoning the body part-way was found to race with
-/// hyper's end-of-body detection and close the connection.
+/// hyper's end-of-body detection and close the connection. It is spawned on
+/// the runtime the request stream is dropped in, normally the server's; a
+/// handler that moves its request stream to another runtime drains there, and
+/// one that drops it outside any runtime gives up connection reuse for that
+/// request.
 fn drain_request_body<B>(mut body: Pin<Box<B>>, mut warn_trailing: bool)
 where
     B: Body<Data = Bytes> + Send + 'static,
@@ -5282,8 +5281,9 @@ mod tests {
 
     /// Regression test: a client that sends a valid END_STREAM envelope and
     /// then keeps sending request body data must not cause unbounded
-    /// buffering. The reader must treat END_STREAM as terminal and switch to
-    /// bounded drain mode, stopping once `MAX_DRAIN_BYTES` is exceeded.
+    /// buffering. The reader must treat END_STREAM as terminal and hand the
+    /// rest of the body to the bounded background drain, which stops once
+    /// `MAX_DRAIN_BYTES` is exceeded.
     #[tokio::test]
     async fn test_body_reader_bounds_data_after_end_stream() {
         const CHUNK_SIZE: usize = 64 * 1024;
@@ -5322,7 +5322,7 @@ mod tests {
         // The rest of the body is drained (for HTTP/1.1 keep-alive) but only up
         // to the drain limit, instead of being buffered without bound.
         let pulled = pulled.load(std::sync::atomic::Ordering::Relaxed);
-        let max_expected = MAX_DRAIN_BYTES + CHUNK_SIZE + crate::envelope::HEADER_SIZE + 2;
+        let max_expected = MAX_DRAIN_BYTES + 2 * CHUNK_SIZE;
         assert!(
             pulled > MAX_DRAIN_BYTES && pulled <= max_expected,
             "reader pulled {pulled} bytes after END_STREAM (expected more than \
@@ -5409,9 +5409,85 @@ mod tests {
         assert!(request_stream.next().await.is_none());
     }
 
+    /// Test body that replays a fixed sequence of frames (data or trailers)
+    /// and can claim `is_end_stream()` from the start; records bytes pulled.
+    struct ScriptedBody {
+        frames: std::collections::VecDeque<Frame<Bytes>>,
+        claims_end_stream: bool,
+        pulled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Body for ScriptedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            let frame = this.frames.pop_front();
+            if let Some(data) = frame.as_ref().and_then(|f| f.data_ref()) {
+                this.pulled
+                    .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            Poll::Ready(frame.map(Ok))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.claims_end_stream
+        }
+    }
+
+    /// A trailers frame between the messages and the end of the body carries
+    /// nothing for the decoder and is skipped.
+    #[tokio::test]
+    async fn test_body_reader_skips_trailers_frames() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("abc"));
+        let body = ScriptedBody {
+            frames: [
+                Frame::data(Envelope::data(Bytes::from_static(b"hello")).encode()),
+                Frame::trailers(trailers),
+            ]
+            .into(),
+            claims_end_stream: false,
+            pulled: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let mut request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        assert_eq!(&request_stream.next().await.unwrap().unwrap()[..], b"hello");
+        assert!(request_stream.next().await.is_none());
+    }
+
+    /// A body that already reports end-of-stream when the handler drops the
+    /// request stream needs no drain task: it is released on the spot.
+    #[tokio::test]
+    async fn test_body_reader_drop_with_body_at_end_of_stream_spawns_nothing() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = ScriptedBody {
+            frames: [Frame::data(Bytes::from_static(b"never read"))].into(),
+            claims_end_stream: true,
+            pulled: Arc::clone(&pulled),
+        };
+        let request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        drop(request_stream);
+        assert_eq!(Arc::strong_count(&pulled), 1, "released synchronously");
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     /// Dropping an unread request stream outside a Tokio runtime (nothing can
-    /// be polling the connection either) releases the body without trying to
-    /// spawn a drain task.
+    /// be polling the connection either) releases the body instead of
+    /// panicking for want of a runtime to drain it on.
     #[test]
     fn test_body_reader_dropped_outside_a_runtime_does_not_panic() {
         let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
