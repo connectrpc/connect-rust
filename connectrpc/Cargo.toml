@@ -166,7 +166,7 @@ tls = ["server-tls", "client-tls"]
 axum = ["dep:axum"]
 
 # On wasm32 there is no tokio runtime, so the request-body
-# reader for client-streaming / bidi is dispatched via
+# drain task for client-streaming / bidi is dispatched via
 # `wasm_bindgen_futures::spawn_local` instead of `tokio::spawn`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
