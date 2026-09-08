@@ -21,7 +21,7 @@ from pathlib import Path
 # labels and a unary_large row that is kept out of the chart for scale.
 # Source: task bench:echo -- --multi-conn=8, task bench:log, task bench:cross
 # Machine: c7i.metal-24xl (Intel Xeon Platinum 8488C, bare metal, turbo off),
-# 2026-09-05; tonic 0.14.6, tonic-protobuf from grpc-rust @ 7053afcd.
+# 2026-09-08; tonic 0.14.6, tonic-protobuf from grpc-rust @ 7053afcd.
 
 BENCHMARKS = {
     # Echo: 64-byte string, pure framework overhead (8 h2 connections)
@@ -30,9 +30,9 @@ BENCHMARKS = {
         "unit": "requests/sec",
         "groups": ["c=16", "c=64", "c=256"],
         "series": {
-            "connectrpc-rs":  [191_000, 299_340, 270_112],
-            "tonic":          [192_695, 299_477, 265_847],
-            "tonic-protobuf": [192_867, 301_132, 267_648],
+            "connectrpc-rs":  [189_624, 299_826, 270_927],
+            "tonic":          [193_164, 301_387, 266_473],
+            "tonic-protobuf": [191_938, 299_864, 267_400],
         },
     },
     # Log-ingest: 50 records × ~22KB, decode-heavy (8 h2 connections)
@@ -41,9 +41,9 @@ BENCHMARKS = {
         "unit": "requests/sec",
         "groups": ["c=16", "c=64", "c=256"],
         "series": {
-            "connectrpc-rs":  [30_761, 75_866, 135_958],
-            "tonic":          [27_746, 72_325, 119_302],
-            "tonic-protobuf": [30_275, 78_578, 132_410],
+            "connectrpc-rs":  [30_660, 75_166, 134_741],
+            "tonic":          [27_488, 71_887, 119_628],
+            "tonic-protobuf": [30_246, 77_588, 131_365],
         },
     },
     # Single-request latency (criterion, no contention)
@@ -52,9 +52,9 @@ BENCHMARKS = {
         "unit": "microseconds (lower is better)",
         "groups": ["unary_small", "unary_logs_50", "client_stream", "server_stream"],
         "series": {
-            "connectrpc-rs":  [ 80.7, 219.5, 182.3, 108.8],
-            "tonic":          [ 79.4, 302.3, 167.7, 105.9],
-            "tonic-protobuf": [ 79.1, 251.6, 163.2, 110.6],
+            "connectrpc-rs":  [ 79.6, 211.8, 186.4, 107.5],
+            "tonic":          [ 79.7, 297.5, 170.4, 106.1],
+            "tonic-protobuf": [ 78.4, 247.3, 160.6, 110.5],
         },
     },
 }

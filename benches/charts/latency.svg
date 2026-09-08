@@ -19,42 +19,42 @@
   <line x1="140.0" y1="80" x2="140.0" y2="436" class="grid"/>
   <text x="140.0" y="451" text-anchor="middle" class="axis-label">0.0</text>
   <line x1="244.0" y1="80" x2="244.0" y2="436" class="grid"/>
-  <text x="244.0" y="451" text-anchor="middle" class="axis-label">80</text>
+  <text x="244.0" y="451" text-anchor="middle" class="axis-label">60</text>
   <line x1="348.0" y1="80" x2="348.0" y2="436" class="grid"/>
-  <text x="348.0" y="451" text-anchor="middle" class="axis-label">160</text>
+  <text x="348.0" y="451" text-anchor="middle" class="axis-label">120</text>
   <line x1="452.0" y1="80" x2="452.0" y2="436" class="grid"/>
-  <text x="452.0" y="451" text-anchor="middle" class="axis-label">240</text>
+  <text x="452.0" y="451" text-anchor="middle" class="axis-label">180</text>
   <line x1="556.0" y1="80" x2="556.0" y2="436" class="grid"/>
-  <text x="556.0" y="451" text-anchor="middle" class="axis-label">320</text>
+  <text x="556.0" y="451" text-anchor="middle" class="axis-label">240</text>
   <line x1="660.0" y1="80" x2="660.0" y2="436" class="grid"/>
-  <text x="660.0" y="451" text-anchor="middle" class="axis-label">400</text>
+  <text x="660.0" y="451" text-anchor="middle" class="axis-label">300</text>
   <text x="400.0" y="466" text-anchor="middle" class="axis-label">microseconds (lower is better)</text>
   <text x="130" y="121.0" text-anchor="end" class="label">unary_small</text>
-  <rect x="140" y="80.0" width="104.9" height="22" rx="2" fill="#4C78A8"/>
-  <text x="248.9" y="95.0" class="value">80.7</text>
-  <rect x="140" y="106.0" width="103.2" height="22" rx="2" fill="#F58518"/>
-  <text x="247.2" y="121.0" class="value">79.4</text>
-  <rect x="140" y="132.0" width="102.8" height="22" rx="2" fill="#54A24B"/>
-  <text x="246.8" y="147.0" class="value">79.1</text>
+  <rect x="140" y="80.0" width="138.0" height="22" rx="2" fill="#4C78A8"/>
+  <text x="282.0" y="95.0" class="value">79.6</text>
+  <rect x="140" y="106.0" width="138.1" height="22" rx="2" fill="#F58518"/>
+  <text x="282.1" y="121.0" class="value">79.7</text>
+  <rect x="140" y="132.0" width="135.9" height="22" rx="2" fill="#54A24B"/>
+  <text x="279.9" y="147.0" class="value">78.4</text>
   <text x="130" y="215.0" text-anchor="end" class="label">unary_logs_50</text>
-  <rect x="140" y="174.0" width="285.4" height="22" rx="2" fill="#4C78A8"/>
-  <text x="429.4" y="189.0" class="value">219.5</text>
-  <rect x="140" y="200.0" width="393.0" height="22" rx="2" fill="#F58518"/>
-  <text x="537.0" y="215.0" class="value">302.3</text>
-  <rect x="140" y="226.0" width="327.1" height="22" rx="2" fill="#54A24B"/>
-  <text x="471.1" y="241.0" class="value">251.6</text>
+  <rect x="140" y="174.0" width="367.1" height="22" rx="2" fill="#4C78A8"/>
+  <text x="511.1" y="189.0" class="value">211.8</text>
+  <rect x="140" y="200.0" width="515.7" height="22" rx="2" fill="#F58518"/>
+  <text x="659.7" y="215.0" class="value">297.5</text>
+  <rect x="140" y="226.0" width="428.7" height="22" rx="2" fill="#54A24B"/>
+  <text x="572.7" y="241.0" class="value">247.3</text>
   <text x="130" y="309.0" text-anchor="end" class="label">client_stream</text>
-  <rect x="140" y="268.0" width="237.0" height="22" rx="2" fill="#4C78A8"/>
-  <text x="381.0" y="283.0" class="value">182.3</text>
-  <rect x="140" y="294.0" width="218.0" height="22" rx="2" fill="#F58518"/>
-  <text x="362.0" y="309.0" class="value">167.7</text>
-  <rect x="140" y="320.0" width="212.2" height="22" rx="2" fill="#54A24B"/>
-  <text x="356.2" y="335.0" class="value">163.2</text>
+  <rect x="140" y="268.0" width="323.1" height="22" rx="2" fill="#4C78A8"/>
+  <text x="467.1" y="283.0" class="value">186.4</text>
+  <rect x="140" y="294.0" width="295.4" height="22" rx="2" fill="#F58518"/>
+  <text x="439.4" y="309.0" class="value">170.4</text>
+  <rect x="140" y="320.0" width="278.4" height="22" rx="2" fill="#54A24B"/>
+  <text x="422.4" y="335.0" class="value">160.6</text>
   <text x="130" y="403.0" text-anchor="end" class="label">server_stream</text>
-  <rect x="140" y="362.0" width="141.4" height="22" rx="2" fill="#4C78A8"/>
-  <text x="285.4" y="377.0" class="value">108.8</text>
-  <rect x="140" y="388.0" width="137.7" height="22" rx="2" fill="#F58518"/>
-  <text x="281.7" y="403.0" class="value">105.9</text>
-  <rect x="140" y="414.0" width="143.8" height="22" rx="2" fill="#54A24B"/>
-  <text x="287.8" y="429.0" class="value">110.6</text>
+  <rect x="140" y="362.0" width="186.3" height="22" rx="2" fill="#4C78A8"/>
+  <text x="330.3" y="377.0" class="value">107.5</text>
+  <rect x="140" y="388.0" width="183.9" height="22" rx="2" fill="#F58518"/>
+  <text x="327.9" y="403.0" class="value">106.1</text>
+  <rect x="140" y="414.0" width="191.5" height="22" rx="2" fill="#54A24B"/>
+  <text x="335.5" y="429.0" class="value">110.5</text>
 </svg>

@@ -30,24 +30,24 @@
   <text x="660.0" y="357" text-anchor="middle" class="axis-label">200k</text>
   <text x="400.0" y="372" text-anchor="middle" class="axis-label">requests/sec</text>
   <text x="130" y="121.0" text-anchor="end" class="label">c=16</text>
-  <rect x="140" y="80.0" width="80.0" height="22" rx="2" fill="#4C78A8"/>
-  <text x="224.0" y="95.0" class="value">30,761</text>
-  <rect x="140" y="106.0" width="72.1" height="22" rx="2" fill="#F58518"/>
-  <text x="216.1" y="121.0" class="value">27,746</text>
-  <rect x="140" y="132.0" width="78.7" height="22" rx="2" fill="#54A24B"/>
-  <text x="222.7" y="147.0" class="value">30,275</text>
+  <rect x="140" y="80.0" width="79.7" height="22" rx="2" fill="#4C78A8"/>
+  <text x="223.7" y="95.0" class="value">30,660</text>
+  <rect x="140" y="106.0" width="71.5" height="22" rx="2" fill="#F58518"/>
+  <text x="215.5" y="121.0" class="value">27,488</text>
+  <rect x="140" y="132.0" width="78.6" height="22" rx="2" fill="#54A24B"/>
+  <text x="222.6" y="147.0" class="value">30,246</text>
   <text x="130" y="215.0" text-anchor="end" class="label">c=64</text>
-  <rect x="140" y="174.0" width="197.3" height="22" rx="2" fill="#4C78A8"/>
-  <text x="341.3" y="189.0" class="value">75,866</text>
-  <rect x="140" y="200.0" width="188.0" height="22" rx="2" fill="#F58518"/>
-  <text x="332.0" y="215.0" class="value">72,325</text>
-  <rect x="140" y="226.0" width="204.3" height="22" rx="2" fill="#54A24B"/>
-  <text x="348.3" y="241.0" class="value">78,578</text>
+  <rect x="140" y="174.0" width="195.4" height="22" rx="2" fill="#4C78A8"/>
+  <text x="339.4" y="189.0" class="value">75,166</text>
+  <rect x="140" y="200.0" width="186.9" height="22" rx="2" fill="#F58518"/>
+  <text x="330.9" y="215.0" class="value">71,887</text>
+  <rect x="140" y="226.0" width="201.7" height="22" rx="2" fill="#54A24B"/>
+  <text x="345.7" y="241.0" class="value">77,588</text>
   <text x="130" y="309.0" text-anchor="end" class="label">c=256</text>
-  <rect x="140" y="268.0" width="353.5" height="22" rx="2" fill="#4C78A8"/>
-  <text x="497.5" y="283.0" class="value">135,958</text>
-  <rect x="140" y="294.0" width="310.2" height="22" rx="2" fill="#F58518"/>
-  <text x="454.2" y="309.0" class="value">119,302</text>
-  <rect x="140" y="320.0" width="344.3" height="22" rx="2" fill="#54A24B"/>
-  <text x="488.3" y="335.0" class="value">132,410</text>
+  <rect x="140" y="268.0" width="350.3" height="22" rx="2" fill="#4C78A8"/>
+  <text x="494.3" y="283.0" class="value">134,741</text>
+  <rect x="140" y="294.0" width="311.0" height="22" rx="2" fill="#F58518"/>
+  <text x="455.0" y="309.0" class="value">119,628</text>
+  <rect x="140" y="320.0" width="341.5" height="22" rx="2" fill="#54A24B"/>
+  <text x="485.5" y="335.0" class="value">131,365</text>
 </svg>
