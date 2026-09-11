@@ -48,7 +48,7 @@
 //! The bytes path needs only `emit_descriptor_set` — reflection codegen
 //! is **not** required — and answers with the compiler's original
 //! per-file descriptor bytes; the pool path re-encodes (semantically
-//! faithful, unknown fields preserved). See [`Reflector`] for the
+//! faithful — buffa's descriptor types preserve unknown fields). See [`Reflector`] for the
 //! trade-off.
 //!
 //! # Request limits
@@ -187,6 +187,14 @@ pub use connect::grpc::reflection::v1::ServerReflectionClient;
 /// constants. Everything a downstream crate needs to drive
 /// `ServerReflectionClient` (gated on the `client` feature) or inspect
 /// responses without regenerating the protos.
+///
+/// These messages do **not** retain unknown fields: anything on the wire
+/// that this crate's copy of `reflection.proto` does not define is skipped
+/// on decode and absent on re-encode — including from the `original_request`
+/// the service echoes back. The reflection service itself never reads
+/// unknown fields, so its generated types omit the bookkeeping for them.
+/// Descriptor payloads (`FileDescriptorResponse.file_descriptor_proto`) are
+/// opaque bytes and are unaffected.
 pub mod wire {
     /// `grpc.reflection.v1` wire types.
     pub mod v1 {

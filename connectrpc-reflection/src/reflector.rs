@@ -17,9 +17,9 @@
 //!   ([`from_descriptor_pool`](Reflector::from_descriptor_pool)), e.g. the
 //!   `descriptor_pool()` a buffa-generated package exposes when reflection
 //!   is enabled. Responses re-encode the pool's parsed
-//!   `FileDescriptorProto`s; buffa retains unknown fields, so the bytes
-//!   are semantically faithful but not guaranteed byte-identical to the
-//!   compiler's output.
+//!   `FileDescriptorProto`s; buffa's descriptor types retain unknown
+//!   fields, so the bytes are semantically faithful but not guaranteed
+//!   byte-identical to the compiler's output.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -205,9 +205,10 @@ impl Reflector {
     /// spans the whole codegen run.
     ///
     /// Response payloads are re-encoded from the pool's parsed
-    /// `FileDescriptorProto`s. buffa preserves unknown fields, so the
-    /// bytes are semantically faithful to the compiler's output but not
-    /// guaranteed byte-identical (field ordering is canonicalized). For
+    /// `FileDescriptorProto`s. buffa's descriptor types preserve unknown
+    /// fields, so the bytes are semantically faithful to the compiler's
+    /// output but not guaranteed byte-identical (field ordering is
+    /// canonicalized). For
     /// byte-exact responses, build from
     /// [`from_descriptor_set_bytes`](Self::from_descriptor_set_bytes).
     ///
