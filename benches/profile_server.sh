@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 #
-# CPU + allocator profiling harness for connectrpc-rs and tonic fortune servers.
+# CPU + allocator profiling harness for the connectrpc-rs, tonic (prost) and
+# tonic-protobuf (upb) bench servers.
 #
-# Usage: profile_server.sh [connectrpc|tonic] [duration_secs] [concurrency]
+# Usage: profile_server.sh <target> [duration_secs] [concurrency] [n_conns] [records]
+#   target: connectrpc | tonic | tonic-protobuf            (fortunes, needs docker)
+#           echo-{connectrpc,tonic,tonic-protobuf}
+#           log-{connectrpc,tonic,tonic-protobuf} | log-connectrpc-noutf8
 #
 # Produces:
 #   /tmp/connectrpc-profile/<target>/flamegraph.svg    — CPU flamegraph
@@ -28,6 +32,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # NEEDS_VALKEY marks targets whose server takes a valkey address as argv[1].
 NEEDS_VALKEY=0
+# The tonic-protobuf servers live in the out-of-workspace benches/rpc-grpc-rust
+# crate, which has its own manifest and target dir.
+GRPC_RUST_DIR="$ROOT_DIR/benches/rpc-grpc-rust"
+SERVER_PKG=""
+SERVER_MANIFEST=""
+SERVER_TARGET_DIR="$ROOT_DIR/target"
 case "$TARGET" in
   connectrpc)
     SERVER_PKG="rpc-bench"
@@ -39,6 +49,14 @@ case "$TARGET" in
   tonic)
     SERVER_PKG="rpc-bench-tonic"
     SERVER_BIN_NAME="fortune-server-tonic"
+    LOAD_BIN_NAME="fortune_load"
+    LOAD_ARGS="$DURATION $CONCURRENCY grpc"
+    NEEDS_VALKEY=1
+    ;;
+  tonic-protobuf)
+    SERVER_MANIFEST="$GRPC_RUST_DIR/Cargo.toml"
+    SERVER_TARGET_DIR="$GRPC_RUST_DIR/target"
+    SERVER_BIN_NAME="fortune-server-tonic-protobuf"
     LOAD_BIN_NAME="fortune_load"
     LOAD_ARGS="$DURATION $CONCURRENCY grpc"
     NEEDS_VALKEY=1
@@ -55,6 +73,13 @@ case "$TARGET" in
     LOAD_BIN_NAME="echo_load"
     LOAD_ARGS="$DURATION $CONCURRENCY $N_CONNS"
     ;;
+  echo-tonic-protobuf)
+    SERVER_MANIFEST="$GRPC_RUST_DIR/Cargo.toml"
+    SERVER_TARGET_DIR="$GRPC_RUST_DIR/target"
+    SERVER_BIN_NAME="echo-server-tonic-protobuf"
+    LOAD_BIN_NAME="echo_load"
+    LOAD_ARGS="$DURATION $CONCURRENCY $N_CONNS"
+    ;;
   log-connectrpc)
     SERVER_PKG="rpc-bench"
     SERVER_BIN_NAME="log_server"
@@ -67,6 +92,13 @@ case "$TARGET" in
     LOAD_BIN_NAME="log_load"
     LOAD_ARGS="$DURATION $CONCURRENCY $N_CONNS $RECORDS"
     ;;
+  log-tonic-protobuf)
+    SERVER_MANIFEST="$GRPC_RUST_DIR/Cargo.toml"
+    SERVER_TARGET_DIR="$GRPC_RUST_DIR/target"
+    SERVER_BIN_NAME="log-server-tonic-protobuf"
+    LOAD_BIN_NAME="log_load"
+    LOAD_ARGS="$DURATION $CONCURRENCY $N_CONNS $RECORDS"
+    ;;
   log-connectrpc-noutf8)
     SERVER_PKG="rpc-bench"
     SERVER_BIN_NAME="log_server_noutf8"
@@ -75,12 +107,12 @@ case "$TARGET" in
     ;;
   *)
     echo "Unknown target: $TARGET" >&2
-    echo "Expected: connectrpc | tonic | echo-{connectrpc,tonic} | log-{connectrpc,tonic} | log-connectrpc-noutf8" >&2
+    echo "Expected: connectrpc | tonic | tonic-protobuf | echo-{connectrpc,tonic,tonic-protobuf} | log-{connectrpc,tonic,tonic-protobuf} | log-connectrpc-noutf8" >&2
     exit 1
     ;;
 esac
 
-SERVER_BIN="$ROOT_DIR/target/release/$SERVER_BIN_NAME"
+SERVER_BIN="$SERVER_TARGET_DIR/release/$SERVER_BIN_NAME"
 LOAD_BIN="$ROOT_DIR/target/release/$LOAD_BIN_NAME"
 
 # ── Check prerequisites ─────────────────────────────────────────────
@@ -123,7 +155,17 @@ echo ""
 # ── Build ────────────────────────────────────────────────────────────
 
 echo "Building $TARGET server with debug info..."
-CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release -p "$SERVER_PKG" --bin "$SERVER_BIN_NAME"
+if [[ -n "$SERVER_MANIFEST" ]]; then
+  # Prebuilt protoc + plugin in GRPC_RUST_PROTOC_DIR skips the cmake toolchain
+  # build (see benches/rpc-grpc-rust/README.md).
+  GRPC_RUST_FEATURES=()
+  if [[ -n "${GRPC_RUST_PROTOC_DIR:-}" ]]; then
+    GRPC_RUST_FEATURES=(--no-default-features)
+  fi
+  CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release --manifest-path "$SERVER_MANIFEST" --target-dir "$SERVER_TARGET_DIR" --bin "$SERVER_BIN_NAME" "${GRPC_RUST_FEATURES[@]}"
+else
+  CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release -p "$SERVER_PKG" --bin "$SERVER_BIN_NAME"
+fi
 
 echo "Building load generator..."
 CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release -p rpc-bench --bin "$LOAD_BIN_NAME"

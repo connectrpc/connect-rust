@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="750" height="299" viewBox="0 0 750 299">
+<svg xmlns="http://www.w3.org/2000/svg" width="750" height="377" viewBox="0 0 750 377">
   <style>
     text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .title { font-size: 16px; font-weight: 600; fill: #24292f; }
@@ -14,32 +14,40 @@
   <text x="158" y="46" class="legend-text">connectrpc-rs</text>
   <rect x="269.5" y="35" width="14" height="14" rx="2" fill="#F58518"/>
   <text x="287.5" y="46" class="legend-text">tonic</text>
-  <line x1="140.0" y1="80" x2="140.0" y2="264" class="grid"/>
-  <text x="140.0" y="279" text-anchor="middle" class="axis-label">0.0</text>
-  <line x1="244.0" y1="80" x2="244.0" y2="264" class="grid"/>
-  <text x="244.0" y="279" text-anchor="middle" class="axis-label">40k</text>
-  <line x1="348.0" y1="80" x2="348.0" y2="264" class="grid"/>
-  <text x="348.0" y="279" text-anchor="middle" class="axis-label">80k</text>
-  <line x1="452.0" y1="80" x2="452.0" y2="264" class="grid"/>
-  <text x="452.0" y="279" text-anchor="middle" class="axis-label">120k</text>
-  <line x1="556.0" y1="80" x2="556.0" y2="264" class="grid"/>
-  <text x="556.0" y="279" text-anchor="middle" class="axis-label">160k</text>
-  <line x1="660.0" y1="80" x2="660.0" y2="264" class="grid"/>
-  <text x="660.0" y="279" text-anchor="middle" class="axis-label">200k</text>
-  <text x="400.0" y="294" text-anchor="middle" class="axis-label">requests/sec</text>
-  <text x="130" y="108.0" text-anchor="end" class="label">c=16</text>
-  <rect x="140" y="80.0" width="83.9" height="22" rx="2" fill="#4C78A8"/>
-  <text x="227.9" y="95.0" class="value">32,257</text>
-  <rect x="140" y="106.0" width="73.1" height="22" rx="2" fill="#F58518"/>
-  <text x="217.1" y="121.0" class="value">28,110</text>
-  <text x="130" y="176.0" text-anchor="end" class="label">c=64</text>
-  <rect x="140" y="148.0" width="190.6" height="22" rx="2" fill="#4C78A8"/>
-  <text x="334.6" y="163.0" class="value">73,313</text>
-  <rect x="140" y="174.0" width="178.6" height="22" rx="2" fill="#F58518"/>
-  <text x="322.6" y="189.0" class="value">68,690</text>
-  <text x="130" y="244.0" text-anchor="end" class="label">c=256</text>
-  <rect x="140" y="216.0" width="291.3" height="22" rx="2" fill="#4C78A8"/>
-  <text x="435.3" y="231.0" class="value">112,027</text>
-  <rect x="140" y="242.0" width="218.8" height="22" rx="2" fill="#F58518"/>
-  <text x="362.8" y="257.0" class="value">84,171</text>
+  <rect x="339.0" y="35" width="14" height="14" rx="2" fill="#54A24B"/>
+  <text x="357.0" y="46" class="legend-text">tonic-protobuf</text>
+  <line x1="140.0" y1="80" x2="140.0" y2="342" class="grid"/>
+  <text x="140.0" y="357" text-anchor="middle" class="axis-label">0.0</text>
+  <line x1="244.0" y1="80" x2="244.0" y2="342" class="grid"/>
+  <text x="244.0" y="357" text-anchor="middle" class="axis-label">40k</text>
+  <line x1="348.0" y1="80" x2="348.0" y2="342" class="grid"/>
+  <text x="348.0" y="357" text-anchor="middle" class="axis-label">80k</text>
+  <line x1="452.0" y1="80" x2="452.0" y2="342" class="grid"/>
+  <text x="452.0" y="357" text-anchor="middle" class="axis-label">120k</text>
+  <line x1="556.0" y1="80" x2="556.0" y2="342" class="grid"/>
+  <text x="556.0" y="357" text-anchor="middle" class="axis-label">160k</text>
+  <line x1="660.0" y1="80" x2="660.0" y2="342" class="grid"/>
+  <text x="660.0" y="357" text-anchor="middle" class="axis-label">200k</text>
+  <text x="400.0" y="372" text-anchor="middle" class="axis-label">requests/sec</text>
+  <text x="130" y="121.0" text-anchor="end" class="label">c=16</text>
+  <rect x="140" y="80.0" width="79.7" height="22" rx="2" fill="#4C78A8"/>
+  <text x="223.7" y="95.0" class="value">30,660</text>
+  <rect x="140" y="106.0" width="71.5" height="22" rx="2" fill="#F58518"/>
+  <text x="215.5" y="121.0" class="value">27,488</text>
+  <rect x="140" y="132.0" width="78.6" height="22" rx="2" fill="#54A24B"/>
+  <text x="222.6" y="147.0" class="value">30,246</text>
+  <text x="130" y="215.0" text-anchor="end" class="label">c=64</text>
+  <rect x="140" y="174.0" width="195.4" height="22" rx="2" fill="#4C78A8"/>
+  <text x="339.4" y="189.0" class="value">75,166</text>
+  <rect x="140" y="200.0" width="186.9" height="22" rx="2" fill="#F58518"/>
+  <text x="330.9" y="215.0" class="value">71,887</text>
+  <rect x="140" y="226.0" width="201.7" height="22" rx="2" fill="#54A24B"/>
+  <text x="345.7" y="241.0" class="value">77,588</text>
+  <text x="130" y="309.0" text-anchor="end" class="label">c=256</text>
+  <rect x="140" y="268.0" width="350.3" height="22" rx="2" fill="#4C78A8"/>
+  <text x="494.3" y="283.0" class="value">134,741</text>
+  <rect x="140" y="294.0" width="311.0" height="22" rx="2" fill="#F58518"/>
+  <text x="455.0" y="309.0" class="value">119,628</text>
+  <rect x="140" y="320.0" width="341.5" height="22" rx="2" fill="#54A24B"/>
+  <text x="485.5" y="335.0" class="value">131,365</text>
 </svg>

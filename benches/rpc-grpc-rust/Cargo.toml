@@ -1,0 +1,83 @@
+[package]
+name = "rpc-bench-grpc-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+# This crate is deliberately NOT a member of the connect-rust workspace (see
+# `exclude` in the root Cargo.toml). Building it needs the grpc-rust codegen
+# toolchain (protoc 35.1 + the C++ `protoc-gen-rust-grpc` plugin, built with
+# cmake by default), which CI and ordinary contributors should not have to
+# carry. The bench drivers in `benches/rpc` build it on demand with
+# `cargo build --manifest-path`.
+[workspace]
+
+[dependencies]
+# grpc-rust is pinned to a git revision rather than the crates.io 0.9.0
+# preview because `tonic-protobuf` (the server-side codec) is unpublished,
+# and mixing a crates.io `grpc` with a git `tonic-protobuf` would pull two
+# `protobuf` runtimes. Bump every grpc-rust git dependency together.
+grpc = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd" }
+grpc-protobuf = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd" }
+tonic = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd", features = ["gzip", "zstd"] }
+tonic-protobuf = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd" }
+# tonic + prost client for the client-stack bench; must be the same tonic as
+# above or the generated stubs and `ProstCodec` would name two different
+# `tonic` crates.
+tonic-prost = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd" }
+prost = "0.14"
+# Generated message code hardcodes `::protobuf`, so the runtime must be a
+# direct dependency at exactly the version grpc-protobuf-build generates for.
+protobuf = "=4.35.1-release"
+# The fortune server reuses rpc-bench's valkey pool, and the connectrpc-rs
+# arms of the client-stack bench reuse its checked-in generated stubs.
+rpc-bench = { path = "../rpc" }
+connectrpc = { path = "../../connectrpc", features = ["client"] }
+http = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+[build-dependencies]
+grpc-protobuf-build = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd", default-features = false }
+tonic-prost-build = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd" }
+# Only to locate the cmake-built protoc for tonic-prost-build; see build.rs.
+protoc-gen-rust-grpc = { git = "https://github.com/grpc/grpc-rust", rev = "7053afcd", optional = true }
+
+[features]
+# Builds protoc 35.1 and protoc-gen-rust-grpc from C++ source with cmake
+# (downloads protobuf + abseil). Disable with `--no-default-features` and set
+# GRPC_RUST_PROTOC_DIR to a directory containing both binaries instead.
+default = ["build-protoc-plugin"]
+build-protoc-plugin = ["grpc-protobuf-build/build-plugin", "dep:protoc-gen-rust-grpc"]
+
+[[bin]]
+name = "client_bench"
+
+[[bin]]
+name = "bench-server-tonic-protobuf"
+path = "src/bin/bench_server.rs"
+
+[[bin]]
+name = "echo-server-tonic-protobuf"
+path = "src/bin/echo_server.rs"
+
+[[bin]]
+name = "log-server-tonic-protobuf"
+path = "src/bin/log_server.rs"
+
+[[bin]]
+name = "fortune-server-tonic-protobuf"
+path = "src/bin/fortune_server.rs"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+uninlined_format_args = "warn"

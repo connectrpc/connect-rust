@@ -1,4 +1,5 @@
-//! Log-ingest benchmark: connectrpc-rs (buffa views) vs tonic (prost owned).
+//! Log-ingest benchmark: connectrpc-rs (buffa views) vs tonic (prost owned)
+//! vs tonic-protobuf (Google `protobuf` v4 on the upb arena).
 //!
 //! Decode-heavy workload: each request carries a batch of structured log
 //! records (50 by default, ~15 KB encoded). The handler iterates every
@@ -7,18 +8,20 @@
 //! This is where the proto library cost becomes visible:
 //!   - buffa/connectrpc-rs: zero-copy view decode, no string allocs
 //!   - prost/tonic: fully-materialized owned types, ~10 string allocs/record
+//!   - upb/tonic-protobuf: eager parse into a per-message arena; strings are
+//!     copied into the arena rather than heap-allocated one by one
 //!
 //! Per 50-record batch that's ~450 varints + ~400 string fields decoded.
 
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection};
+use rpc_bench::ServerProcess;
 use rpc_bench::connect::bench::v1::*;
 use rpc_bench::log_request;
 
@@ -30,40 +33,12 @@ const QUICK_MEASUREMENT: Duration = Duration::from_secs(3);
 const DEFAULT_RECORDS: usize = 50;
 const MAX_LATENCY_SAMPLES: usize = 500_000;
 
-// ── Server process management ────────────────────────────────────────
-
-struct ServerProcess {
-    child: Child,
-    addr: SocketAddr,
-}
-
-impl ServerProcess {
-    fn start(cmd: &str) -> Self {
-        let mut child = Command::new(cmd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to start {cmd}: {e}"));
-        let stdout = child.stdout.take().expect("no stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read addr");
-        let addr: SocketAddr = line.trim().parse().expect("parse addr");
-        std::thread::sleep(Duration::from_millis(50));
-        Self { child, addr }
-    }
-}
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 // ── Build helpers ────────────────────────────────────────────────────
 
 fn build_connectrpc_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("log_server") {
+        return path;
+    }
     eprintln!("  Building connectrpc-rs log server...");
     let output = Command::new("cargo")
         .args([
@@ -84,6 +59,9 @@ fn build_connectrpc_server() -> String {
 }
 
 fn build_tonic_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("log-server-tonic") {
+        return path;
+    }
     eprintln!("  Building tonic log server...");
     let output = Command::new("cargo")
         .args([
@@ -103,7 +81,14 @@ fn build_tonic_server() -> String {
     format!("{manifest_dir}/../../target/release/log-server-tonic")
 }
 
+fn build_tonic_protobuf_server() -> String {
+    rpc_bench::build_grpc_rust_bin("log-server-tonic-protobuf")
+}
+
 fn build_noutf8_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("log_server_noutf8") {
+        return path;
+    }
     eprintln!("  Building connectrpc-rs log server (no-utf8)...");
     let output = Command::new("cargo")
         .args([
@@ -190,7 +175,13 @@ async fn bench_server(
     }
 
     tokio::time::sleep(warmup).await;
-    count.store(0, Ordering::Relaxed);
+    // A server that rejects every call (e.g. an unimplemented method after a
+    // stub regen) would otherwise report 0 req/s instead of failing.
+    let warmed = count.swap(0, Ordering::Relaxed);
+    assert!(
+        warmed > 0,
+        "{impl_name}: no request succeeded during warmup"
+    );
     latencies.lock().await.clear();
     let measure_start = Instant::now();
 
@@ -338,7 +329,13 @@ async fn bench_server_noutf8(
     }
 
     tokio::time::sleep(warmup).await;
-    count.store(0, Ordering::Relaxed);
+    // A server that rejects every call (e.g. an unimplemented method after a
+    // stub regen) would otherwise report 0 req/s instead of failing.
+    let warmed = count.swap(0, Ordering::Relaxed);
+    assert!(
+        warmed > 0,
+        "{impl_name}: no request succeeded during warmup"
+    );
     latencies.lock().await.clear();
     let measure_start = Instant::now();
 
@@ -412,13 +409,18 @@ async fn main() {
     let connectrpc_bin = build_connectrpc_server();
     let noutf8_bin = build_noutf8_server();
     let tonic_bin = build_tonic_server();
+    let tonic_protobuf_bin = build_tonic_protobuf_server();
 
     let mut results = Vec::new();
 
-    // Benchmark utf8 servers (connectrpc-rs + tonic).
-    for (impl_name, bin) in [("connectrpc-rs", &connectrpc_bin), ("tonic", &tonic_bin)] {
+    // Benchmark utf8 servers (connectrpc-rs + tonic + tonic-protobuf).
+    for (impl_name, bin) in [
+        ("connectrpc-rs", &connectrpc_bin),
+        ("tonic", &tonic_bin),
+        ("tonic-protobuf", &tonic_protobuf_bin),
+    ] {
         for &concurrency in CONCURRENCY_LEVELS {
-            let server = ServerProcess::start(bin);
+            let server = ServerProcess::start(bin, &[]);
             eprintln!(
                 "  Benchmarking {impl_name} @ concurrency={concurrency} ({n_conns} conns, {records} records)..."
             );
@@ -446,7 +448,7 @@ async fn main() {
 
     // Benchmark noutf8 connectrpc-rs variant (separate bench fn, different types).
     for &concurrency in CONCURRENCY_LEVELS {
-        let server = ServerProcess::start(&noutf8_bin);
+        let server = ServerProcess::start(&noutf8_bin, &[]);
         let impl_name = "connectrpc-noutf8";
         eprintln!(
             "  Benchmarking {impl_name} @ concurrency={concurrency} ({n_conns} conns, {records} records)..."
