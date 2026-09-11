@@ -980,21 +980,21 @@ pub mod client_compat_request {
             &mut self.__buffa_unknown_fields
         }
     }
-    impl<'de> serde::Deserialize<'de> for Cancel {
-        fn deserialize<D: serde::Deserializer<'de>>(
+    impl<'de> ::serde::Deserialize<'de> for Cancel {
+        fn deserialize<D: ::serde::Deserializer<'de>>(
             d: D,
         ) -> ::core::result::Result<Self, D::Error> {
             struct _V;
-            impl<'de> serde::de::Visitor<'de> for _V {
+            impl<'de> ::serde::de::Visitor<'de> for _V {
                 type Value = Cancel;
                 fn expecting(
                     &self,
-                    f: &mut core::fmt::Formatter<'_>,
-                ) -> core::fmt::Result {
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.write_str("struct Cancel")
                 }
                 #[allow(clippy::field_reassign_with_default)]
-                fn visit_map<A: serde::de::MapAccess<'de>>(
+                fn visit_map<A: ::serde::de::MapAccess<'de>>(
                     self,
                     mut map: A,
                 ) -> ::core::result::Result<Cancel, A::Error> {
@@ -1019,7 +1019,7 @@ pub mod client_compat_request {
                                 if let Some(v) = v {
                                     if __oneof_cancel_timing.is_some() {
                                         return Err(
-                                            serde::de::Error::custom(
+                                            ::serde::de::Error::custom(
                                                 "multiple oneof fields set for 'cancel_timing'",
                                             ),
                                         );
@@ -1033,9 +1033,9 @@ pub mod client_compat_request {
                             }
                             "afterCloseSendMs" | "after_close_send_ms" => {
                                 struct _DeserSeed;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _DeserSeed {
                                     type Value = u32;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<u32, D::Error> {
@@ -1049,7 +1049,7 @@ pub mod client_compat_request {
                                 if let Some(v) = v {
                                     if __oneof_cancel_timing.is_some() {
                                         return Err(
-                                            serde::de::Error::custom(
+                                            ::serde::de::Error::custom(
                                                 "multiple oneof fields set for 'cancel_timing'",
                                             ),
                                         );
@@ -1063,9 +1063,9 @@ pub mod client_compat_request {
                             }
                             "afterNumResponses" | "after_num_responses" => {
                                 struct _DeserSeed;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _DeserSeed {
                                     type Value = u32;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<u32, D::Error> {
@@ -1079,7 +1079,7 @@ pub mod client_compat_request {
                                 if let Some(v) = v {
                                     if __oneof_cancel_timing.is_some() {
                                         return Err(
-                                            serde::de::Error::custom(
+                                            ::serde::de::Error::custom(
                                                 "multiple oneof fields set for 'cancel_timing'",
                                             ),
                                         );
@@ -1092,7 +1092,7 @@ pub mod client_compat_request {
                                 }
                             }
                             _ => {
-                                map.next_value::<serde::de::IgnoredAny>()?;
+                                map.next_value::<::serde::de::IgnoredAny>()?;
                             }
                         }
                     }
@@ -1335,18 +1335,21 @@ impl ::buffa::ExtensionSet for ClientCompatResponse {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for ClientCompatResponse {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for ClientCompatResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = ClientCompatResponse;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct ClientCompatResponse")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<ClientCompatResponse, A::Error> {
@@ -1361,9 +1364,9 @@ impl<'de> serde::Deserialize<'de> for ClientCompatResponse {
                         "testName" | "test_name" => {
                             __f_test_name = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::string::String;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -1388,7 +1391,7 @@ impl<'de> serde::Deserialize<'de> for ClientCompatResponse {
                             if let Some(v) = v {
                                 if __oneof_result.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'result'",
                                         ),
                                     );
@@ -1412,7 +1415,7 @@ impl<'de> serde::Deserialize<'de> for ClientCompatResponse {
                             if let Some(v) = v {
                                 if __oneof_result.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'result'",
                                         ),
                                     );
@@ -1425,7 +1428,7 @@ impl<'de> serde::Deserialize<'de> for ClientCompatResponse {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }

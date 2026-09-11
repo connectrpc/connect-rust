@@ -563,6 +563,7 @@ pub const __LOG_RECORD_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
 pub mod log_record {
     #[allow(unused_imports)]
     use super::*;
+    #[allow(non_camel_case_types)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     #[repr(i32)]
     pub enum Severity {

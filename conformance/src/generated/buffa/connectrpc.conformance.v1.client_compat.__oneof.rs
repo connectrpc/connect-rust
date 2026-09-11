@@ -26,16 +26,16 @@ pub mod client_compat_request {
                 Self::BeforeCloseSend(::buffa::alloc::boxed::Box::new(v))
             }
         }
-        impl serde::Serialize for CancelTiming {
-            fn serialize<S: serde::Serializer>(
+        impl ::serde::Serialize for CancelTiming {
+            fn serialize<S: ::serde::Serializer>(
                 &self,
                 s: S,
             ) -> ::core::result::Result<S::Ok, S::Error> {
-                use serde::ser::SerializeMap;
+                use ::serde::ser::SerializeMap;
                 let mut map = s.serialize_map(Some(1))?;
                 match self {
                     Self::BeforeCloseSend(v) => {
-                        map.serialize_entry("beforeCloseSend", v)?;
+                        map.serialize_entry("beforeCloseSend", &**v)?;
                     }
                     Self::AfterCloseSendMs(v) => {
                         map.serialize_entry(
@@ -95,19 +95,19 @@ pub mod client_compat_response {
             Self::Some(Result::from(v))
         }
     }
-    impl serde::Serialize for Result {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for Result {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::Response(v) => {
-                    map.serialize_entry("response", v)?;
+                    map.serialize_entry("response", &**v)?;
                 }
                 Self::Error(v) => {
-                    map.serialize_entry("error", v)?;
+                    map.serialize_entry("error", &**v)?;
                 }
             }
             map.end()

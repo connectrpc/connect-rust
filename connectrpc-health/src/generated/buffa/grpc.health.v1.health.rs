@@ -260,6 +260,7 @@ pub const __HEALTH_CHECK_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry
 pub mod health_check_response {
     #[allow(unused_imports)]
     use super::*;
+    #[allow(non_camel_case_types)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     #[repr(i32)]
     pub enum ServingStatus {

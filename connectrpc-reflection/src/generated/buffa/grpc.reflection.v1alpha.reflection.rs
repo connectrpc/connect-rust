@@ -248,18 +248,21 @@ impl ::buffa::ExtensionSet for ServerReflectionRequest {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for ServerReflectionRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = ServerReflectionRequest;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct ServerReflectionRequest")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<ServerReflectionRequest, A::Error> {
@@ -274,9 +277,9 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                         "host" => {
                             __f_host = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::string::String;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -303,7 +306,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                             if let Some(v) = v {
                                 if __oneof_message_request.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_request'",
                                         ),
                                     );
@@ -329,7 +332,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                             if let Some(v) = v {
                                 if __oneof_message_request.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_request'",
                                         ),
                                     );
@@ -353,7 +356,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                             if let Some(v) = v {
                                 if __oneof_message_request.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_request'",
                                         ),
                                     );
@@ -380,7 +383,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                             if let Some(v) = v {
                                 if __oneof_message_request.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_request'",
                                         ),
                                     );
@@ -406,7 +409,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                             if let Some(v) = v {
                                 if __oneof_message_request.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_request'",
                                         ),
                                     );
@@ -419,7 +422,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionRequest {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
@@ -949,18 +952,21 @@ impl ::buffa::ExtensionSet for ServerReflectionResponse {
         &mut self.__buffa_unknown_fields
     }
 }
-impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
-    fn deserialize<D: serde::Deserializer<'de>>(
+impl<'de> ::serde::Deserialize<'de> for ServerReflectionResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
         d: D,
     ) -> ::core::result::Result<Self, D::Error> {
         struct _V;
-        impl<'de> serde::de::Visitor<'de> for _V {
+        impl<'de> ::serde::de::Visitor<'de> for _V {
             type Value = ServerReflectionResponse;
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
                 f.write_str("struct ServerReflectionResponse")
             }
             #[allow(clippy::field_reassign_with_default)]
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> ::core::result::Result<ServerReflectionResponse, A::Error> {
@@ -981,9 +987,9 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
                         "validHost" | "valid_host" => {
                             __f_valid_host = Some({
                                 struct _S;
-                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
                                     type Value = ::buffa::alloc::string::String;
-                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
                                         self,
                                         d: D,
                                     ) -> ::core::result::Result<
@@ -1019,7 +1025,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
                             if let Some(v) = v {
                                 if __oneof_message_response.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_response'",
                                         ),
                                     );
@@ -1044,7 +1050,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
                             if let Some(v) = v {
                                 if __oneof_message_response.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_response'",
                                         ),
                                     );
@@ -1068,7 +1074,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
                             if let Some(v) = v {
                                 if __oneof_message_response.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_response'",
                                         ),
                                     );
@@ -1092,7 +1098,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
                             if let Some(v) = v {
                                 if __oneof_message_response.is_some() {
                                     return Err(
-                                        serde::de::Error::custom(
+                                        ::serde::de::Error::custom(
                                             "multiple oneof fields set for 'message_response'",
                                         ),
                                     );
@@ -1105,7 +1111,7 @@ impl<'de> serde::Deserialize<'de> for ServerReflectionResponse {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
