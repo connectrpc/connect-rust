@@ -152,12 +152,39 @@ impl Envelope {
         buf: &mut BytesMut,
         max_size: usize,
     ) -> Result<Option<Self>, ConnectError> {
-        if buf.len() < HEADER_SIZE {
+        Self::decode_contiguous(buf, max_size)
+    }
+
+    /// [`decode_with_limit`](Self::decode_with_limit) for a body already held
+    /// as immutable [`Bytes`] (e.g. from `Collected::to_bytes`): on success the
+    /// envelope is consumed from `buf` and its payload is a zero-copy slice of
+    /// it; if more data is needed `buf` is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceExhausted`](crate::ErrorCode::ResourceExhausted) if the
+    /// declared message size exceeds `max_size`.
+    pub fn decode_bytes_with_limit(
+        buf: &mut Bytes,
+        max_size: usize,
+    ) -> Result<Option<Self>, ConnectError> {
+        Self::decode_contiguous(buf, max_size)
+    }
+
+    /// Shared body for the contiguous buffers above (`chunk()` is the whole
+    /// unread region; `copy_to_bytes` splits without copying on both).
+    fn decode_contiguous<B: Buf>(
+        buf: &mut B,
+        max_size: usize,
+    ) -> Result<Option<Self>, ConnectError> {
+        let head = buf.chunk();
+        debug_assert_eq!(head.len(), buf.remaining(), "contiguous buffer");
+        if head.len() < HEADER_SIZE {
             return Ok(None);
         }
 
-        let flags = buf[0];
-        let length = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        let flags = head[0];
+        let length = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
 
         // Check size limit before waiting for more data
         if length > max_size {
@@ -171,12 +198,12 @@ impl Envelope {
         // in a debug build. Via `decode` (max_size = usize::MAX) the size check
         // above does not bound `length`, so saturate here. A saturated sum is
         // never <= buf.len(), so an over-large frame waits for more data.
-        if buf.len() < HEADER_SIZE.saturating_add(length) {
+        if head.len() < HEADER_SIZE.saturating_add(length) {
             return Ok(None);
         }
 
         buf.advance(HEADER_SIZE);
-        let data = buf.split_to(length).freeze();
+        let data = buf.copy_to_bytes(length);
 
         Ok(Some(Self { flags, data }))
     }
@@ -682,6 +709,37 @@ mod tests {
                 "{name}: must reassemble to the contiguous envelope"
             );
         }
+    }
+
+    /// De-framing an immutable `Bytes` body hands the payload over as a
+    /// slice of the input rather than a copy, and advances past the envelope.
+    #[test]
+    fn decode_bytes_with_limit_is_zero_copy() {
+        let mut wire = BytesMut::new();
+        write_envelope(flags::COMPRESSED, b"payload", &mut wire).unwrap();
+        wire.put_slice(b"next");
+        let wire = wire.freeze();
+
+        let mut buf = wire.clone();
+        let envelope = Envelope::decode_bytes_with_limit(&mut buf, 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.flags, flags::COMPRESSED);
+        assert_eq!(envelope.data, "payload");
+        assert!(std::ptr::eq(
+            envelope.data.as_ptr(),
+            wire[HEADER_SIZE..].as_ptr()
+        ));
+        assert_eq!(buf, "next");
+
+        let mut short = wire.slice(..HEADER_SIZE + 3);
+        assert!(
+            Envelope::decode_bytes_with_limit(&mut short, 64)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(short.len(), HEADER_SIZE + 3);
+        assert!(Envelope::decode_bytes_with_limit(&mut wire.clone(), 6).is_err());
     }
 
     #[test]

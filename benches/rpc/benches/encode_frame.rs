@@ -5,9 +5,9 @@
 //!   `connectrpc::__codegen::encode_view_body` — the path every generated
 //!   `impl Encodable<M> for MView` takes, which sizes its own buffer.
 //! - `deframe/*`: one gRPC request envelope (as `collect().to_bytes()` hands
-//!   it to a handler) -> payload `Bytes`, via `Envelope::decode_with_limit`
-//!   on a `BytesMut` copy of the body (what the gRPC unary / server-streaming
-//!   paths used to do) vs on the `Bytes` itself.
+//!   it to a handler) -> payload `Bytes`: `Envelope::decode_with_limit` on a
+//!   `BytesMut` copy of the body (what the gRPC unary / server-streaming paths
+//!   used to do) vs `Envelope::decode_bytes_with_limit` on the `Bytes` itself.
 //!
 //! Shapes: ~350 B mixed message, ~4 KB and ~270 KB of string/varint-heavy
 //! log records, and ~256 KB in four large strings (memcpy-bound control).
@@ -94,7 +94,7 @@ macro_rules! bench_shape {
         g.bench_function("bytes_in_place", |b| {
             b.iter(|| {
                 let mut buf = body.clone();
-                black_box(Envelope::decode_with_limit(&mut buf, usize::MAX).unwrap())
+                black_box(Envelope::decode_bytes_with_limit(&mut buf, usize::MAX).unwrap())
             })
         });
         g.finish();
