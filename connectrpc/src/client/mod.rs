@@ -276,6 +276,27 @@ fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
 /// HTTP requests with compatible body types.
 pub trait ClientTransport: Clone + Send + Sync + 'static {
     /// The response body type.
+    ///
+    /// The call functions and the generated clients additionally require
+    /// its [`Body::Error`] to convert into
+    /// `Box<dyn std::error::Error + Send + Sync>`, so a failure while
+    /// reading the body is retained as the surfaced [`ConnectError`]'s
+    /// [source](ConnectError::with_source) rather than only stringified
+    /// into its message. Any `std::error::Error + Send + Sync + 'static`
+    /// type qualifies, as does that boxed type itself: `hyper::body::Incoming`
+    /// (`hyper::Error`), `http_body_util`'s `Full` and `Empty`
+    /// (`Infallible`), `Limited` and `Either` (boxed), and `BoxBody` /
+    /// `MapErr` when their error parameter does. A `Display`-only error type
+    /// does not; implement `Error` for it or adapt the body with
+    /// `http_body_util::BodyExt::map_err`. `Send + Sync` is required because
+    /// `ConnectError` holds its source as `Arc<dyn Error + Send + Sync>`; a
+    /// body error holding a non-`Send` handle must be stringified first, as
+    /// `examples/wasm-client` does with `JsValue`.
+    ///
+    /// Unlike [`Error`](Self::Error), a `ConnectError` the body reports is
+    /// not surfaced verbatim: it is attached as the source of the
+    /// `internal` (or, past the deadline, `deadline_exceeded`) error the
+    /// call path builds for the read failure.
     type ResponseBody: Body<Data = Bytes> + Send + 'static;
     /// The error type.
     ///
@@ -336,7 +357,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
     S::Future: Send + 'static,
     ResBody: Body<Data = Bytes> + Send + 'static,
-    ResBody::Error: std::error::Error + Send + Sync + 'static,
+    ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     type ResponseBody = ResBody;
     type Error = S::Error;
@@ -1611,16 +1632,36 @@ fn deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
 ///
 /// `internal` is the wrong answer here because it attributes the failure to
 /// this client when the cause was a timeout the caller asked for.
+///
+/// Either way the read error is kept as the result's
+/// [source](ConnectError::with_source), the shape
+/// [`ConnectError::unavailable_from_transport`] gives send-time failures:
+/// its `Display` text goes in `message`, the typed error is retained for
+/// `downcast_ref`. Unlike [`map_transport_send_error`], a `ConnectError`
+/// found in the read error is not surfaced verbatim — the read failure is
+/// always reported as this client's, with that error as its cause. That
+/// holds for the `deadline_exceeded` arm too — the deadline only explains
+/// *why* the stream died, and the error that reported it (a reset, a closed
+/// connection) is still the most specific fact available. The deadline
+/// errors that stay source-less are those [`with_deadline`] synthesises
+/// when the local timer fires first; there is nothing to attach.
+///
+/// The bound is `Into<Box<dyn Error>>` rather than `Error` so that bodies
+/// whose error type is already the boxed form (`http_body_util::Limited`,
+/// `Either`, a `BoxBody<_, Box<dyn Error + Send + Sync>>`) qualify; the
+/// concrete type behind the box still downcasts.
 fn classify_body_read_error(
     context: &str,
-    error: &dyn std::fmt::Display,
+    error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     deadline: Option<std::time::Instant>,
 ) -> ConnectError {
+    let error = error.into();
     if deadline_elapsed(deadline) {
         ConnectError::deadline_exceeded(format!("{context} after the deadline elapsed: {error}"))
     } else {
         ConnectError::internal(format!("{context}: {error}"))
     }
+    .with_source(error)
 }
 
 /// Response from a unary RPC call.
@@ -1840,7 +1881,7 @@ pub async fn call_unary<T, Req, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -1975,7 +2016,7 @@ pub async fn call_unary_get<T, Req, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -2166,7 +2207,7 @@ async fn parse_connect_unary_response<B, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -2348,7 +2389,7 @@ async fn parse_grpc_unary_response<B, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -2424,7 +2465,7 @@ where
                 if status.is_success() {
                     return Err(classify_body_read_error(
                         "failed to read response body",
-                        &e,
+                        e,
                         deadline,
                     ));
                 }
@@ -2845,7 +2886,7 @@ impl<B, RespView> std::fmt::Debug for ServerStream<B, RespView> {
 impl<B, RespView> ServerStream<B, RespView>
 where
     B: Body<Data = Bytes> + Unpin,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -3181,7 +3222,7 @@ where
                 Some(Err(e)) => {
                     return Err(classify_body_read_error(
                         "failed to read response body",
-                        &e,
+                        e,
                         deadline,
                     ));
                 }
@@ -3270,7 +3311,7 @@ pub async fn call_server_stream<T, Req, RespView>(
 ) -> Result<ServerStream<T::ResponseBody, RespView>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -3364,7 +3405,7 @@ async fn make_server_stream<B, RespView>(
 ) -> Result<ServerStream<B, RespView>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -3809,7 +3850,7 @@ where
 impl<B, RespView> BidiRecvHalf<B, RespView>
 where
     B: Body<Data = Bytes> + Send + Unpin,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -4014,7 +4055,7 @@ impl<B, Req, RespView> BidiStream<B, Req, RespView> {
 impl<B, Req, RespView> BidiStream<B, Req, RespView>
 where
     B: Body<Data = Bytes> + Send + Unpin,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -4105,7 +4146,7 @@ pub async fn call_bidi_stream<T, Req, RespView>(
 ) -> Result<BidiStream<T::ResponseBody, Req, RespView>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -4247,7 +4288,7 @@ pub async fn call_client_stream<T, Req, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -4355,7 +4396,7 @@ async fn parse_connect_client_stream_response<B, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -4913,7 +4954,7 @@ async fn collect_body_bounded<B>(
 ) -> Result<Bytes, ConnectError>
 where
     B: Body<Data = Bytes>,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let mut buf = BytesMut::new();
     let mut stream = std::pin::pin!(body);
@@ -4936,7 +4977,7 @@ where
             Some(Err(e)) => {
                 return Err(classify_body_read_error(
                     "failed to read response body",
-                    &e,
+                    e,
                     deadline,
                 ));
             }
@@ -7006,6 +7047,239 @@ mod tests {
         assert_eq!(mapped.code, ErrorCode::Unavailable);
         let source = std::error::Error::source(&mapped).expect("source must be preserved");
         assert_eq!(source.to_string(), "connection reset by peer");
+    }
+
+    /// A response body whose first poll fails with a typed `std::io::Error`,
+    /// standing in for the reset a transport reports after the response
+    /// headers have arrived.
+    struct ResetOnFirstPollBody;
+
+    impl Body for ResetOnFirstPollBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+            std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ))))
+        }
+    }
+
+    /// Answers every request with the given status and content type and a
+    /// [`ResetOnFirstPollBody`].
+    #[derive(Clone)]
+    struct ResetBodyTransport {
+        status: http::StatusCode,
+        content_type: &'static str,
+    }
+
+    impl ClientTransport for ResetBodyTransport {
+        type ResponseBody = ResetOnFirstPollBody;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            let status = self.status;
+            let content_type = self.content_type;
+            Box::pin(async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .body(ResetOnFirstPollBody)
+                    .unwrap())
+            })
+        }
+    }
+
+    /// The typed cause a body-read failure must surface: the same
+    /// `io::Error` that `map_transport_send_error` keeps for a send-time
+    /// failure, so a caller can downcast to the `ErrorKind` either way.
+    fn assert_body_read_error_keeps_io_source(err: &ConnectError) {
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("connection reset by peer"),
+            "message must still carry the cause's text: {err:?}"
+        );
+        let source = std::error::Error::source(err)
+            .unwrap_or_else(|| panic!("body-read failure must retain its cause: {err:?}"));
+        let io = source
+            .downcast_ref::<std::io::Error>()
+            .unwrap_or_else(|| panic!("source must be the transport's io::Error: {source}"));
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A reset while reading a unary response must surface the transport's
+    /// typed error as `source()`, matching what `map_transport_send_error`
+    /// keeps for a send-time failure — otherwise it is the one transport
+    /// fault a caller cannot inspect.
+    #[tokio::test]
+    async fn call_unary_body_read_failure_keeps_the_io_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::OK,
+            content_type: "application/proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("the body read must fail the call");
+        assert_body_read_error_keeps_io_source(&err);
+    }
+
+    /// The streaming read path goes through `ServerStream::message` rather
+    /// than `collect_body_bounded`, so the source has to be attached there
+    /// as well.
+    #[tokio::test]
+    async fn server_stream_body_read_failure_keeps_the_io_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::OK,
+            content_type: "application/connect+proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        let mut stream = call_server_stream::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/ServerStream", StreamType::ServerStream),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("headers arrive before the body fails");
+        let err = stream
+            .message::<StringValue>()
+            .await
+            .expect_err("the first body poll must fail the read");
+        assert_body_read_error_keeps_io_source(&err);
+    }
+
+    /// The gRPC unary path reads the body in its own loop (it has to find a
+    /// `grpc-status` in trailers), so it is a third `classify_body_read_error`
+    /// site and must keep the source like the other two.
+    #[tokio::test]
+    async fn grpc_unary_body_read_failure_keeps_the_io_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::OK,
+            content_type: "application/grpc+proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap())
+            .with_protocol(Protocol::Grpc);
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("the body read must fail the call");
+        assert_body_read_error_keeps_io_source(&err);
+    }
+
+    /// On a non-2xx gRPC response the body is read only to look for a
+    /// `grpc-status`, and the HTTP status is what the caller is told about;
+    /// a read that dies part-way through must not displace it, so this one
+    /// error shape stays source-less by design.
+    #[tokio::test]
+    async fn grpc_unary_body_read_failure_on_http_error_reports_the_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            content_type: "application/grpc+proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap())
+            .with_protocol(Protocol::Grpc);
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("a 503 must fail the call");
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+        assert!(
+            err.message.as_deref().unwrap().contains("503"),
+            "the HTTP status must win over the read failure: {err:?}"
+        );
+        assert!(std::error::Error::source(&err).is_none(), "{err:?}");
+    }
+
+    /// The real transport, end to end: a server that sends the response head
+    /// and part of a chunked body, then closes the socket. `hyper` reports
+    /// that as a body-read error, and the caller must get it back as the
+    /// `hyper::Error` itself, not just its text.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_mid_body_close_keeps_the_hyper_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Consume the request head; the body is small enough to have
+            // arrived with it.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      content-type: application/proto\r\n\
+                      transfer-encoding: chunked\r\n\r\n\
+                      5\r\nhello\r\n",
+                )
+                .await
+                .unwrap();
+            // Drop without the terminating chunk: an incomplete message.
+        });
+
+        let config = ClientConfig::new(format!("http://{addr}").parse().unwrap());
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &HttpClient::plaintext(),
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("a body cut short must fail the call");
+        server.await.unwrap();
+
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        let source = std::error::Error::source(&err)
+            .unwrap_or_else(|| panic!("hyper's read error must be retained: {err:?}"));
+        assert!(
+            source.downcast_ref::<hyper::Error>().is_some(),
+            "source must be the transport's hyper::Error, got: {source}"
+        );
     }
 
     #[cfg(feature = "client")]
@@ -9140,12 +9414,30 @@ mod tests {
         assert_eq!(err.code, ErrorCode::DeadlineExceeded);
         // The transport cause survives the reclassification: a genuine
         // transport fault that merely happened after the deadline is still
-        // diagnosable.
+        // diagnosable, both in the message and as the typed source.
         assert!(
             err.message.as_deref().unwrap_or_default().contains("io"),
             "got {:?}",
             err.message
         );
+        let source = std::error::Error::source(&err).expect("read error must stay attached");
+        assert_eq!(
+            source.downcast_ref::<ConnectError>().map(|e| e.code),
+            Some(ErrorCode::Internal)
+        );
+    }
+
+    /// The contrast with the test above: a `deadline_exceeded` that the local
+    /// timer produced has no transport error behind it, so it must not grow
+    /// a source just because the body-read one did.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_fired_by_the_local_timer_has_no_source() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let err = with_deadline(Some(deadline), std::future::pending::<Result<(), _>>())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+        assert!(std::error::Error::source(&err).is_none(), "{err:?}");
     }
 
     /// The other half, and the reason this is a deadline check rather than a
