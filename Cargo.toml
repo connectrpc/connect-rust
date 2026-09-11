@@ -18,7 +18,7 @@ http-body-util = "0.1"
 bytes = { version = "1.6", features = ["serde"] }
 
 # Tower service abstraction
-tower = { version = "0.5", features = ["util", "buffer"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["catch-panic"] }
 
 # Async runtime

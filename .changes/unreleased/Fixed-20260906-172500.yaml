@@ -1,0 +1,15 @@
+kind: Fixed
+body: |-
+    **`SharedHttp2Connection` no longer fails the first request after a graceful
+    GOAWAY** ([#285]). A request made while another stream was still open on
+    the retiring connection failed with `h2 send failed: operation was
+    canceled` without reaching the wire. Readiness is now checked when the
+    request is made rather than ahead of time by a worker, so that request goes
+    out on a new connection, and a request that a closing connection hands back
+    before it reached the wire is resent on a fresh one. Relatedly, a request
+    abandoned while it was establishing the connection (for example at its
+    deadline) no longer leaves a half-finished attempt and its establishment
+    timeout to the next request: the attempt runs to completion on its own task.
+
+    [#285]: https://github.com/connectrpc/connect-rust/issues/285
+time: 2026-09-06T17:25:00.000000000+00:00
