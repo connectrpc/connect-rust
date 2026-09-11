@@ -1,0 +1,9 @@
+kind: Fixed
+body: |-
+    **Streams no longer keep a large message's allocation alive after handing
+    it over.** The server request reader and the client response stream slice
+    each message out of a shared read buffer, and the buffer kept a reference
+    to that allocation until the stream ended. A drained buffer larger than
+    64 KiB is now dropped, so the message is freed when the handler or caller
+    drops it and a stream of ordinary messages keeps reusing its buffer.
+time: 2026-09-11T12:00:00.000000000+00:00

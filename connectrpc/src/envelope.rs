@@ -32,6 +32,34 @@ pub mod flags {
 /// Size of the envelope header in bytes.
 pub const HEADER_SIZE: usize = 5;
 
+/// Largest drained read buffer a stream keeps for reuse between messages.
+///
+/// Well above h2's default 16 KiB `max_frame_size`, so a stream of ordinary
+/// messages keeps reusing one buffer. Above it, each message costs one
+/// buffer re-grow: a deliberate trade, since the alternative is a stream
+/// pinning a multi-MiB allocation until it ends. The threshold is fixed
+/// rather than a `Limits` knob because nothing so far has needed to tune it.
+pub(crate) const MAX_RETAINED_READ_BUF: usize = 64 * 1024;
+
+/// Drops a drained read buffer larger than [`MAX_RETAINED_READ_BUF`], so the
+/// messages sliced from it become the only owners of its allocation and it
+/// is freed with them rather than at the end of the stream.
+///
+/// Call it once per body frame, after decoding everything the buffer holds,
+/// with `len_before_decode` captured as `buf.len()` before the first decode:
+/// a lower bound on the allocation's size that still holds when a decode
+/// splits the whole buffer off and leaves `capacity()` at zero. The check is
+/// best-effort: a buffer that always carries a partial message keeps its
+/// allocation until it drains, and a large allocation whose remaining window
+/// is small is kept until `BytesMut::reserve` reclaims it, after which the
+/// `capacity()` term catches it. Compressed streams gain nothing from the
+/// release (decompression already copies) and pay only the re-grow.
+pub(crate) fn release_drained_buf(buf: &mut BytesMut, len_before_decode: usize) {
+    if buf.is_empty() && len_before_decode.max(buf.capacity()) > MAX_RETAINED_READ_BUF {
+        *buf = BytesMut::new();
+    }
+}
+
 /// Minimum payload size for chaining a payload as its own body frame
 /// instead of copying it into the contiguous framing buffer.
 ///
@@ -148,6 +176,11 @@ impl Envelope {
     ///
     /// This protects against malicious clients declaring very large message
     /// sizes in the envelope header.
+    ///
+    /// The returned `data` is a slice of `buf`'s allocation, not a copy, so
+    /// the allocation lives until both it and `buf` are dropped. A caller
+    /// that keeps `buf` across many messages should replace it once it is
+    /// drained if it has grown large, so the messages become its sole owners.
     pub fn decode_with_limit(
         buf: &mut BytesMut,
         max_size: usize,
@@ -463,6 +496,32 @@ mod tests {
             None,
             Arc::new(CompressionRegistry::default()),
         )
+    }
+
+    /// A drained buffer is released only once its allocation exceeds the
+    /// retained size, whether the buffered length or the capacity shows it.
+    #[test]
+    fn release_drained_buf_releases_only_large_drained_buffers() {
+        let mut buf = BytesMut::with_capacity(MAX_RETAINED_READ_BUF);
+        release_drained_buf(&mut buf, MAX_RETAINED_READ_BUF);
+        assert!(buf.capacity() > 0, "a buffer at the threshold is kept");
+
+        let mut buf = BytesMut::with_capacity(MAX_RETAINED_READ_BUF + 1);
+        release_drained_buf(&mut buf, 0);
+        assert_eq!(buf.capacity(), 0, "a large capacity alone releases");
+
+        let mut buf = BytesMut::new();
+        release_drained_buf(&mut buf, MAX_RETAINED_READ_BUF + 1);
+        assert_eq!(buf.capacity(), 0, "a large buffered length alone releases");
+    }
+
+    #[test]
+    fn release_drained_buf_keeps_buffers_holding_data() {
+        let mut buf = BytesMut::with_capacity(2 * MAX_RETAINED_READ_BUF);
+        buf.extend_from_slice(b"partial envelope");
+        release_drained_buf(&mut buf, 2 * MAX_RETAINED_READ_BUF);
+        assert_eq!(&buf[..], b"partial envelope");
+        assert!(buf.capacity() >= 2 * MAX_RETAINED_READ_BUF);
     }
 
     // ── Envelope tests ──────────────────────────────────────────────
