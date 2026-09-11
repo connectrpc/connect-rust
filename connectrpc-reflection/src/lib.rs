@@ -61,7 +61,14 @@
 //! profile; `ServerReflectionInfo` is a bidirectional stream, so the bound
 //! is per message rather than per call. A larger message ends the stream
 //! with `resource_exhausted`. The profile *replaces* the service-wide limits
-//! on these routes, whether those are looser or tighter.
+//! on these routes, whether those are looser or tighter; its decode budget
+//! is likewise charged per message. Within that ceiling, a lookup miss
+//! echoes at most 128 bytes of the queried name in
+//! its `ErrorResponse`, so the error text is bounded by a constant rather
+//! than by the size of the request. What remains is the protocol's own
+//! echo: every response carries `original_request` whole and repeats its
+//! `host` as `valid_host`, as grpc-go's does, so a response is at most about
+//! twice the request that produced it.
 //!
 //! * [`install`] applies [`request_limits`] for you, to both versions.
 //! * Registering a [`ReflectionService`] any other way — one version through
@@ -74,14 +81,15 @@
 //!   later call wins.
 //!
 //! ```no_run
-//! use connectrpc::{Limits, Router};
-//! use connectrpc_reflection::{Reflector, apply_request_limits, install};
+//! use connectrpc::Router;
+//! use connectrpc_reflection::{Reflector, apply_request_limits, install, request_limits};
 //!
 //! # fn descriptor_set_bytes() -> &'static [u8] { &[] }
 //! let reflector = Reflector::from_descriptor_set_bytes(descriptor_set_bytes()).unwrap();
 //! let router = install(Router::new(), reflector);
 //! // Optional: hold reflection messages to 1 KiB instead of the bundled 16 KiB.
-//! let router = apply_request_limits(router, Limits::default().with_max_message_size(1024));
+//! // Start from `request_limits()` so the rest of the profile carries over.
+//! let router = apply_request_limits(router, request_limits().with_max_message_size(1024));
 //! # drop(router);
 //! ```
 //!
