@@ -4503,13 +4503,13 @@ fn scan_connect_client_stream_envelopes(
     encoding: Option<&str>,
     max_msg_size: usize,
 ) -> Result<(Bytes, http::HeaderMap), ConnectError> {
-    let mut buf = BytesMut::from(body.as_ref());
+    let mut buf = body;
     let mut message: Option<Bytes> = None;
     let mut trailers = http::HeaderMap::new();
     let mut saw_end_stream = false;
 
     while !buf.is_empty() {
-        let envelope = match Envelope::decode_with_limit(&mut buf, max_msg_size)? {
+        let envelope = match Envelope::decode_bytes_with_limit(&mut buf, max_msg_size)? {
             Some(env) => env,
             None => break,
         };

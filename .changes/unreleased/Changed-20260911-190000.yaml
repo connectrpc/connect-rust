@@ -1,0 +1,11 @@
+kind: Changed
+body: |-
+    **Cheaper encode and framing buffers.** View-encoded response bodies are
+    written through a `Vec<u8>` instead of a `BytesMut` (the isolated encode
+    step is 3-4x faster on string/varint-heavy messages); gRPC unary and
+    server-streaming requests on the server, and the Connect client-streaming
+    response on the client, are de-framed in place with the new
+    `Envelope::decode_bytes_with_limit` instead of being copied into a
+    `BytesMut` first; and gzip compression no longer grows its pre-sized output
+    buffer before writing. Additive; no wire change.
+time: 2026-09-11T19:00:00.000000000+00:00
