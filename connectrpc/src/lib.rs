@@ -167,29 +167,29 @@
 
 /// Spawn a detached background future on the ambient executor.
 ///
-/// On native targets this dispatches via [`tokio::spawn`] and returns the join
-/// handle. On `wasm32` there is no tokio runtime, so the future is dispatched
-/// via [`wasm_bindgen_futures::spawn_local`] and `None` is returned (no
-/// joinable handle available).
+/// On native targets this dispatches via the current Tokio runtime, or drops
+/// the future when called outside one. On `wasm32` there is no tokio runtime,
+/// so the future is dispatched via [`wasm_bindgen_futures::spawn_local`].
 ///
 /// The `Send` bound is required on native (`tokio::spawn`) but relaxed on
 /// wasm32 (`spawn_local` is single-threaded).
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn spawn_detached<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
+pub(crate) fn spawn_detached<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    Some(tokio::spawn(future))
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        drop(runtime.spawn(future));
+    }
 }
 
 /// wasm32 variant — see non-wasm docs above.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn spawn_detached<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
+pub(crate) fn spawn_detached<F>(future: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
     wasm_bindgen_futures::spawn_local(future);
-    None
 }
 
 // Core modules (always available)

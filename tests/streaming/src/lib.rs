@@ -2062,4 +2062,106 @@ mod tests {
         assert!(server.lookup("test.echo.v1.EchoService/Nope").is_none());
         assert!(router.lookup("test.echo.v1.EchoService/Nope").is_none());
     }
+
+    // ====================================================================
+    // HTTP/1.1 connection reuse after an unread streaming request body
+    // ====================================================================
+
+    /// Write one HTTP/1.1 request on `stream` and read one complete response
+    /// (status line through the end of a content-length or chunked body).
+    /// Returns the status line and the raw body bytes (chunk framing
+    /// included). Fails the test if the peer closes the connection first.
+    async fn http1_round_trip(
+        stream: &mut tokio::net::TcpStream,
+        path: &str,
+        body: &[u8],
+    ) -> (String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nhost: test\r\ncontent-type: application/connect+proto\r\n\
+             connect-protocol-version: 1\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+
+        let mut buf = Vec::new();
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read_buf(&mut buf).await.unwrap();
+            assert!(n > 0, "server closed the connection before responding");
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let status = headers.lines().next().unwrap().to_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map(|v| v.trim().parse::<usize>().unwrap());
+        let complete = |body: &[u8]| match content_length {
+            Some(len) => body.len() >= len,
+            None => body.ends_with(b"0\r\n\r\n"),
+        };
+        while !complete(&buf[header_end..]) {
+            let n = stream.read_buf(&mut buf).await.unwrap();
+            assert!(n > 0, "server closed the connection mid-response");
+        }
+        (status, buf[header_end..].to_vec())
+    }
+
+    /// Connect envelope (flags, big-endian length, payload).
+    fn envelope(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![flags];
+        out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `EchoRequest { data }` on the wire: field 2, length-delimited.
+    fn echo_request(data: &str) -> Vec<u8> {
+        let mut out = vec![0x12, u8::try_from(data.len()).unwrap()];
+        out.extend_from_slice(data.as_bytes());
+        out
+    }
+
+    /// A client-streaming or bidi handler that is done with its request
+    /// stream before the client has finished sending (here: the first
+    /// envelope fails to decode, with 256 KiB still to come) must leave the
+    /// HTTP/1.1 connection reusable: the rest of the body is drained in the
+    /// background, so the next request on the same connection is served.
+    /// Over a raw socket so that "same connection" is literal.
+    #[tokio::test]
+    async fn http1_connection_survives_unread_streaming_request_body() {
+        let (addr, _server) = start_server().await;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Flag 0x01 = compressed, with no content-encoding negotiated: the
+        // server rejects the first envelope and never reads the junk after it.
+        let mut poisoned = envelope(0x01, b"abc");
+        poisoned.extend(std::iter::repeat_n(0xAA, 256 * 1024));
+        let valid = envelope(0x00, &echo_request("again"));
+
+        for path in [
+            "/test.echo.v1.EchoService/ClientStream",
+            "/test.echo.v1.EchoService/BidiStream",
+        ] {
+            let (status, body) = http1_round_trip(&mut conn, path, &poisoned).await;
+            assert!(status.starts_with("http/1.1 200"), "{path}: {status}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("\"code\":\"internal\""),
+                "{path}: the decode failure is reported in END_STREAM: {}",
+                String::from_utf8_lossy(&body)
+            );
+
+            // Same socket, next request: served, not reset.
+            let (status, body) = http1_round_trip(&mut conn, path, &valid).await;
+            assert!(status.starts_with("http/1.1 200"), "{path}: {status}");
+            assert!(
+                body.windows(5).any(|w| w == b"again"),
+                "{path}: the follow-up request on the reused connection is answered"
+            );
+        }
+    }
 }
