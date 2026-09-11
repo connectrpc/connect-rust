@@ -188,7 +188,9 @@ fn emit_service_files(
     // - OwnedFooView aliases keyed on (package, fqn) (else two files in
     //   the same package collide with E0428);
     // - colliding-alias detection (issue #75) needs full-batch visibility
-    //   because the stitcher mounts sibling files into one module.
+    //   because the stitcher mounts sibling files into one module;
+    // - module-scope service and method identifiers (issue #279), for the
+    //   same reason.
     let mut batch = BatchState {
         colliding_aliases: collect_alias_collisions(proto_file, file_to_generate),
         gate_client_feature: options.gate_client_feature,
@@ -268,9 +270,11 @@ fn emit_service_files(
 ///
 /// Returns an error if buffa-codegen fails (e.g. unsupported proto
 /// feature), if a method input/output type is absent from `proto_file`
-/// (an import missing from the descriptor set), or if the generated
-/// service binding Rust does not parse under `syn` (indicates a bug in
-/// this crate).
+/// (an import missing from the descriptor set), if two services of one
+/// package — or two of their methods — would generate the same Rust
+/// identifier (`XGet` and `X_Get`; `XGet.Foo` and `X.GetFoo`), or if the
+/// generated service binding Rust does not parse under `syn` (indicates a
+/// bug in this crate).
 pub fn generate_files(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -409,7 +413,9 @@ fn inline_companions_into_package_mods(
 /// # Errors
 ///
 /// Errors if any method input/output type is not covered by an extern_path
-/// mapping, or is absent from `proto_file` (missing import).
+/// mapping, or is absent from `proto_file` (missing import), or if two
+/// services of one package — or two of their methods — would generate the
+/// same Rust identifier (`XGet` and `X_Get`; `XGet.Foo` and `X.GetFoo`).
 pub fn generate_services(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -896,7 +902,6 @@ fn bare_type_name(proto_fqn: &str) -> &str {
 // ConnectRPC service code generation
 // ---------------------------------------------------------------------------
 
-/// Generate ConnectRPC service bindings for a file.
 /// Per-batch dedup state passed through the per-file emission loop.
 #[derive(Default)]
 struct BatchState {
@@ -920,6 +925,13 @@ struct BatchState {
     ///
     /// [#75]: https://github.com/anthropics/connect-rust/issues/75
     colliding_aliases: std::collections::BTreeSet<(String, String)>,
+    /// Per package, identifier → proto producer (`service pkg.Svc in
+    /// x.proto` or `method pkg.Svc.Method in x.proto`) for every
+    /// module-scope item a service stub has emitted so far. Filled and
+    /// consulted by [`check_module_collisions`]; keyed per package because
+    /// every service of a package lands in one Rust module. Message types
+    /// and `Owned*View` aliases share that module but are not tracked here.
+    module_idents: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// Mirrors [`Options::gate_client_feature`]. When `true`, prefix
     /// each emitted `FooClient<T>` struct + `impl` with
     /// `#[cfg(feature = "...")]`. Threaded here so it propagates
@@ -1299,16 +1311,17 @@ fn generate_all_message_encodable_impls(
     Ok(out)
 }
 
-/// Generate code for a single service.
-/// Reject RPC method sets whose generated Rust identifiers collide.
+/// Reject RPC method sets whose generated Rust identifiers collide within
+/// one service.
 ///
 /// Each proto method `Foo` produces `foo` and `foo_with_options` on the
 /// client and the module-scope constant `{SVC}_FOO_SPEC`. Two methods that
 /// normalize to the same snake_case name (e.g. `GetFoo` and `get_foo`), or
 /// one whose snake form equals another's plus a generated suffix (`Get` +
-/// `GetWithOptions`; `Get` + `GetSpec`), would emit duplicate definitions
+/// `GetWithOptions`), would emit duplicate definitions
 /// and fail to compile with an error pointing at generated code rather than
-/// the proto.
+/// the proto. Collisions between services sharing a module are
+/// [`check_module_collisions`]'s job.
 fn check_method_collisions(service_name: &str, service: &ServiceDescriptorProto) -> Result<()> {
     let mut seen: HashMap<String, String> = HashMap::new();
     for m in &service.method {
@@ -1330,11 +1343,134 @@ fn check_method_collisions(service_name: &str, service: &ServiceDescriptorProto)
     Ok(())
 }
 
+/// The module-scope items [`generate_service`] emits for one service,
+/// named in one place so the emission and the cross-service collision
+/// check ([`check_module_collisions`]) cannot drift apart. The per-method
+/// `{SERVICE}_{METHOD}_SPEC` constants come from
+/// [`method_spec_const_ident`] for the same reason.
+struct ServiceIdents {
+    trait_name: Ident,
+    ext_trait_name: Ident,
+    register_marker_name: Ident,
+    client_name: Ident,
+    server_name: Ident,
+    service_name_const: Ident,
+}
+
+impl ServiceIdents {
+    fn new(service_name: &str) -> Self {
+        let service_upper = service_name.to_upper_camel_case();
+        // `Self` is the only PascalCase Rust keyword, and cannot be a raw
+        // ident; suffix it so `service Self {}` (accepted by protoc)
+        // generates a valid trait. The suffixed derivatives below are
+        // already keyword-safe.
+        let trait_name = if service_upper == "Self" {
+            format_ident!("Self_")
+        } else {
+            format_ident!("{}", service_upper)
+        };
+        Self {
+            trait_name,
+            ext_trait_name: format_ident!("{}Ext", service_upper),
+            register_marker_name: format_ident!("{}RegisterMarker", service_upper),
+            client_name: format_ident!("{}Client", service_upper),
+            server_name: format_ident!("{}Server", service_upper),
+            service_name_const: format_ident!(
+                "{}_SERVICE_NAME",
+                service_name.to_snake_case().to_uppercase()
+            ),
+        }
+    }
+
+    /// Every module-scope identifier, trait first so a whole-service clash
+    /// (`XGet` / `X_Get`) is reported against the name the user recognizes.
+    fn iter(&self) -> impl Iterator<Item = &Ident> {
+        [
+            &self.trait_name,
+            &self.ext_trait_name,
+            &self.register_marker_name,
+            &self.client_name,
+            &self.server_name,
+            &self.service_name_const,
+        ]
+        .into_iter()
+    }
+}
+
+/// Reject a service whose module-scope items collide with one already
+/// claimed by another service of the same package (issue [#279]).
+///
+/// Each service emits its trait, `*Ext`, `*RegisterMarker`, `*Client`,
+/// `*Server`, `*_SERVICE_NAME`, and one `{SERVICE}_{METHOD}_SPEC` per
+/// method, all at module scope; every service in a package shares one
+/// module (the stitcher `include!`s each of the package's companions into
+/// it; `file_per_package` concatenates them). Two services that normalize
+/// to the same name (`XGet` and `X_Get`) duplicate every service-level
+/// item, and two `(service, method)` pairs that split the same words
+/// differently (`XGet.Foo` and `X.GetFoo`) duplicate a `*_SPEC` constant;
+/// [`check_method_collisions`] sees one service at a time and catches
+/// neither. Records this service's identifiers in
+/// [`BatchState::module_idents`] and fails on the first duplicate, naming
+/// both producers, so the error points at the proto rather than at E0428
+/// in generated code.
+///
+/// [#279]: https://github.com/connectrpc/connect-rust/issues/279
+fn check_module_collisions(
+    file: &FileDescriptorProto,
+    full_service_name: &str,
+    service: &ServiceDescriptorProto,
+    idents: &ServiceIdents,
+    batch: &mut BatchState,
+) -> Result<()> {
+    use std::collections::btree_map::Entry;
+
+    let file_name = file.name.as_deref().unwrap_or("");
+    let module = batch
+        .module_idents
+        .entry(file.package.clone().unwrap_or_default())
+        .or_default();
+    // Producers are rendered for the message up front, with their kind
+    // and file, so the user can find both sides without guessing whether
+    // `pkg.XGet.Foo` is a service or a method.
+    let service_items = idents.iter().map(|ident| {
+        (
+            ident.to_string(),
+            format!("service {full_service_name} in {file_name}"),
+        )
+    });
+    let method_items = service.method.iter().map(|m| {
+        let method_name = m.name.as_deref().unwrap_or("");
+        (
+            method_spec_const_ident(service, method_name).to_string(),
+            format!("method {full_service_name}.{method_name} in {file_name}"),
+        )
+    });
+    for (ident, producer) in service_items.chain(method_items) {
+        match module.entry(ident) {
+            Entry::Occupied(prev) if *prev.get() == producer => anyhow::bail!(
+                "{producer} was generated twice; is {file_name} listed more than \
+                 once in the files to generate?"
+            ),
+            Entry::Occupied(prev) => anyhow::bail!(
+                "{} and {producer} both generate Rust identifier `{}`; \
+                 rename one in the proto",
+                prev.get(),
+                prev.key()
+            ),
+            Entry::Vacant(slot) => {
+                slot.insert(producer);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Generate code for a single service.
 fn generate_service(
     file: &FileDescriptorProto,
     service: &ServiceDescriptorProto,
     resolver: &TypeResolver<'_>,
-    batch: &BatchState,
+    batch: &mut BatchState,
 ) -> Result<TokenStream> {
     let package = file.package.as_deref().unwrap_or("");
     let service_name = service.name.as_deref().unwrap_or("");
@@ -1346,23 +1482,16 @@ fn generate_service(
     } else {
         format!("{package}.{service_name}")
     };
-    let service_upper = service_name.to_upper_camel_case();
-    // `Self` is the only PascalCase Rust keyword, and cannot be a raw ident;
-    // suffix it so `service Self {}` (accepted by protoc) generates a valid
-    // trait. The suffixed derivatives below are already keyword-safe.
-    let trait_name = if service_upper == "Self" {
-        format_ident!("Self_")
-    } else {
-        format_ident!("{}", service_upper)
-    };
-    let ext_trait_name = format_ident!("{}Ext", service_upper);
-    let register_marker_name = format_ident!("{}RegisterMarker", service_upper);
-    let client_name = format_ident!("{}Client", service_upper);
-    let server_name = format_ident!("{}Server", service_upper);
-    let service_name_const = format_ident!(
-        "{}_SERVICE_NAME",
-        service_name.to_snake_case().to_uppercase()
-    );
+    let idents = ServiceIdents::new(service_name);
+    check_module_collisions(file, &full_service_name, service, &idents, batch)?;
+    let ServiceIdents {
+        trait_name,
+        ext_trait_name,
+        register_marker_name,
+        client_name,
+        server_name,
+        service_name_const,
+    } = idents;
 
     // Get service documentation and append async impl guidance
     let service_doc = get_service_comment(file, service).unwrap_or_default();
@@ -2589,11 +2718,11 @@ mod tests {
         let resolver = TypeResolver::new(files, &target_name, &config, require_extern);
         let file = &files[target_idx];
         let service = &file.service[0];
-        let batch = BatchState {
+        let mut batch = BatchState {
             colliding_aliases: collect_alias_collisions(files, &target_name),
             ..BatchState::default()
         };
-        Ok(generate_service(file, service, &resolver, &batch)?.to_string())
+        Ok(generate_service(file, service, &resolver, &mut batch)?.to_string())
     }
 
     /// Assert that `formatted` (a Rust source string) contains no `use`
@@ -3743,6 +3872,213 @@ mod tests {
         syn::parse_str::<syn::File>(&code).expect("generated code parses");
     }
 
+    /// Build a proto file holding several services, each with the given
+    /// method names, all typed `Empty` -> `Empty`. Used for the cross-service
+    /// collision tests, where the service and method *names* are what's
+    /// under test.
+    fn services_file(
+        name: &str,
+        package: &str,
+        services: &[(&str, &[&str])],
+    ) -> FileDescriptorProto {
+        let empty = format!(".{package}.Empty");
+        let service = services
+            .iter()
+            .map(|(service_name, method_names)| ServiceDescriptorProto {
+                name: Some((*service_name).into()),
+                method: method_names
+                    .iter()
+                    .map(|n| MethodDescriptorProto {
+                        name: Some((*n).into()),
+                        input_type: Some(empty.clone()),
+                        output_type: Some(empty.clone()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        FileDescriptorProto {
+            name: Some(name.into()),
+            package: Some(package.into()),
+            service,
+            message_type: vec![DescriptorProto {
+                name: Some("Empty".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Run `files` through the unified generation path exactly as the plugin
+    /// does, returning the error message for a batch that must be rejected.
+    fn generate_files_err(files: &[FileDescriptorProto]) -> String {
+        let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
+        generate_files(files, &targets, &Options::default())
+            .expect_err("a colliding batch must fail generation")
+            .to_string()
+    }
+
+    /// `XGet.Foo` and `X.GetFoo` are distinct (service, method) pairs whose
+    /// `{SERVICE}_{METHOD}_SPEC` constants coincide (issue #279); the
+    /// message must name both producers and the shared identifier.
+    #[test]
+    fn spec_const_collision_across_services_errors() {
+        let file = services_file(
+            "pkg.proto",
+            "pkg",
+            &[("XGet", &["Foo"]), ("X", &["GetFoo"])],
+        );
+        let msg = generate_files_err(std::slice::from_ref(&file));
+        assert_eq!(
+            msg,
+            "method pkg.XGet.Foo in pkg.proto and method pkg.X.GetFoo in pkg.proto both \
+             generate Rust identifier `X_GET_FOO_SPEC`; rename one in the proto"
+        );
+    }
+
+    /// `XGet` and `X_Get` are distinct proto service names that normalize to
+    /// the same Rust name, duplicating every service-level item; the error
+    /// names the trait, the identifier a user recognises as the service.
+    #[test]
+    fn service_name_collision_across_services_errors() {
+        let file = services_file(
+            "pkg.proto",
+            "pkg",
+            &[("XGet", &["Foo"]), ("X_Get", &["Bar"])],
+        );
+        let msg = generate_files_err(std::slice::from_ref(&file));
+        assert_eq!(
+            msg,
+            "service pkg.XGet in pkg.proto and service pkg.X_Get in pkg.proto both \
+             generate Rust identifier `XGet`; rename one in the proto"
+        );
+    }
+
+    /// The stitcher mounts every companion of a package into one module, so
+    /// the collision is just as real when the two services live in different
+    /// proto files — the check must be batch-wide, not per file.
+    #[test]
+    fn spec_const_collision_across_files_in_one_package_errors() {
+        let files = [
+            services_file("a.proto", "pkg", &[("XGet", &["Foo"])]),
+            // `b.proto` reuses `a.proto`'s `Empty` rather than redefining
+            // it, so the descriptor set is one protoc would accept.
+            FileDescriptorProto {
+                message_type: vec![],
+                dependency: vec!["a.proto".into()],
+                ..services_file("b.proto", "pkg", &[("X", &["GetFoo"])])
+            },
+        ];
+        let msg = generate_files_err(&files);
+        assert!(
+            msg.contains("in a.proto and method pkg.X.GetFoo in b.proto"),
+            "{msg}"
+        );
+    }
+
+    /// A proto listed twice in the files to generate is emitted twice into
+    /// the same module; that is not a naming collision, and the message
+    /// must say what to fix instead of telling the user to rename a service
+    /// that clashes with itself.
+    #[test]
+    fn file_listed_twice_is_reported_as_such() {
+        let file = services_file("pkg.proto", "pkg", &[("X", &["Foo"])]);
+        let targets = vec!["pkg.proto".to_string(), "pkg.proto".to_string()];
+        let msg = generate_files(std::slice::from_ref(&file), &targets, &Options::default())
+            .expect_err("a twice-listed proto must fail generation")
+            .to_string();
+        assert_eq!(
+            msg,
+            "service pkg.X in pkg.proto was generated twice; is pkg.proto listed more \
+             than once in the files to generate?"
+        );
+    }
+
+    /// A service named after another's generated item (`Foo` + `FooClient`)
+    /// is the likeliest real-world clash; the blame names the trait side so
+    /// the user sees which service owns the `FooClient` name.
+    #[test]
+    fn service_named_after_sibling_client_struct_errors() {
+        let file = services_file(
+            "pkg.proto",
+            "pkg",
+            &[("Foo", &["Ping"]), ("FooClient", &["Ping"])],
+        );
+        let msg = generate_files_err(std::slice::from_ref(&file));
+        assert_eq!(
+            msg,
+            "service pkg.Foo in pkg.proto and service pkg.FooClient in pkg.proto both \
+             generate Rust identifier `FooClient`; rename one in the proto"
+        );
+    }
+
+    /// The plugin path (`generate_services` under `file_per_package`) groups
+    /// stubs by package through its own code, not the stitcher; the check
+    /// must reject the same batch there.
+    #[test]
+    fn plugin_path_rejects_cross_service_collision() {
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,file_per_package".into()),
+            file_to_generate: vec!["a.proto".into(), "b.proto".into()],
+            proto_file: vec![
+                services_file("a.proto", "pkg", &[("XGet", &["Foo"])]),
+                FileDescriptorProto {
+                    message_type: vec![],
+                    dependency: vec!["a.proto".into()],
+                    ..services_file("b.proto", "pkg", &[("X", &["GetFoo"])])
+                },
+            ],
+            ..Default::default()
+        };
+        let msg = generate(&request)
+            .expect_err("the plugin must refuse a colliding batch")
+            .to_string();
+        assert!(msg.contains("`X_GET_FOO_SPEC`"), "{msg}");
+    }
+
+    /// Packages are separate Rust modules, so identical identifiers in two
+    /// packages are not a collision; the check must be keyed per package,
+    /// not across the whole batch.
+    #[test]
+    fn same_identifiers_in_different_packages_do_not_collide() {
+        let files = [
+            services_file("a.proto", "alpha", &[("XGet", &["Foo"])]),
+            services_file("b.proto", "beta", &[("X", &["GetFoo"])]),
+        ];
+        let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
+        let out = generate_files(&files, &targets, &Options::default())
+            .expect("distinct packages must not be reported as colliding");
+        let consts = out
+            .iter()
+            .filter(|f| f.kind == GeneratedFileKind::Companion)
+            .map(|f| f.content.matches("pub const X_GET_FOO_SPEC:").count())
+            .sum::<usize>();
+        assert_eq!(consts, 2, "one constant per package module");
+    }
+
+    /// Two services that merely share a prefix (`X` / `XGet`) produce
+    /// distinct identifiers throughout and must keep generating.
+    #[test]
+    fn shared_prefix_services_do_not_collide() {
+        let file = services_file("pkg.proto", "pkg", &[("X", &["Foo"]), ("XGet", &["Bar"])]);
+        let targets = vec!["pkg.proto".to_string()];
+        let out = generate_files(std::slice::from_ref(&file), &targets, &Options::default())
+            .expect("a shared prefix is not a collision");
+        let companion = out
+            .iter()
+            .find(|f| f.kind == GeneratedFileKind::Companion)
+            .expect("service file emitted");
+        for ident in [
+            "X_FOO_SPEC",
+            "X_GET_BAR_SPEC",
+            "pub trait X:",
+            "pub trait XGet:",
+        ] {
+            assert!(companion.content.contains(ident), "missing {ident}");
+        }
+    }
+
     #[test]
     fn options_default_buffa_config() {
         let cfg = Options::default().to_buffa_config();
@@ -3845,13 +4181,14 @@ mod tests {
         let target = file.name.clone().into_iter().collect::<Vec<_>>();
         let resolver = TypeResolver::new(std::slice::from_ref(&file), &target, &config, false);
         let service = &file.service[0];
-        let batch = BatchState {
+        let mut batch = BatchState {
             colliding_aliases: collect_alias_collisions(std::slice::from_ref(&file), &target),
             gate_client_feature,
             client_feature_name: client_feature_name.to_string(),
             ..BatchState::default()
         };
-        format_token_stream(&generate_service(&file, service, &resolver, &batch).unwrap()).unwrap()
+        format_token_stream(&generate_service(&file, service, &resolver, &mut batch).unwrap())
+            .unwrap()
     }
 
     #[test]
