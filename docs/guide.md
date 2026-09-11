@@ -751,7 +751,10 @@ The handler receives an `InboundStream<Req>` — a `ServiceStream` of
 `StreamMessage<Req>` items — and returns a single response. Each item
 owns its decoded buffer, is `Send + 'static` (so it can be buffered or
 moved into spawned tasks), and exposes zero-copy accessor methods per
-field:
+field. That buffer is a slice of the stream's read buffer, so a small
+item cut from a large read keeps the whole allocation alive while it is
+held; a handler that retains many items past the loop should keep
+`to_owned_message()` results rather than the items themselves:
 
 ```rust
 async fn sum(

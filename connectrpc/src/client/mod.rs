@@ -2971,11 +2971,14 @@ where
                 // so signal that more data is needed.
                 None
             } else {
-                Envelope::decode_with_limit(
+                let len_before_decode = self.buf.len();
+                let envelope = Envelope::decode_with_limit(
                     &mut self.buf,
                     self.max_message_size
                         .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE),
-                )?
+                )?;
+                crate::envelope::release_drained_buf(&mut self.buf, len_before_decode);
+                envelope
             };
 
             match envelope_result {
@@ -6129,6 +6132,145 @@ mod tests {
             .expect("raising the stream's budget must admit the same envelope")
             .expect("the envelope carries a data frame");
         assert_eq!(msg.view().values.len(), n);
+    }
+
+    /// A large streamed message is the sole owner of its allocation: the
+    /// stream keeps no reference to it.
+    #[tokio::test]
+    async fn server_stream_releases_buffer_after_large_message() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        const LEN: usize = 1024 * 1024;
+        let message = StringValue {
+            value: "x".repeat(LEN),
+            ..Default::default()
+        };
+        let wire = Envelope::data(message.encode_to_bytes()).encode();
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = wire
+            .chunks(16 * 1024)
+            .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
+            .collect();
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
+            headers: http::HeaderMap::new(),
+            body: StreamBody::new(futures::stream::iter(frames)),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(4 * LEN),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let msg = stream
+            .message()
+            .await
+            .expect("message should decode")
+            .expect("stream should yield the data envelope");
+        assert_eq!(msg.view().value.len(), LEN, "message must arrive intact");
+        assert_eq!(
+            stream.buf.capacity(),
+            0,
+            "stream still holds the large message's allocation"
+        );
+        assert!(
+            msg.bytes().is_unique(),
+            "stream still shares the allocation with the message"
+        );
+    }
+
+    /// A message that arrives in one frame leaves no spare capacity behind,
+    /// so only the buffered length can show that the allocation is large.
+    #[tokio::test]
+    async fn server_stream_releases_exactly_sized_buffer() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        const LEN: usize = 128 * 1024;
+        let message = StringValue {
+            value: "x".repeat(LEN),
+            ..Default::default()
+        };
+        let wire = Envelope::data(message.encode_to_bytes()).encode();
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
+            headers: http::HeaderMap::new(),
+            body: Full::new(wire),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: Some(4 * LEN),
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let msg = stream
+            .message()
+            .await
+            .expect("message should decode")
+            .expect("stream should yield the data envelope");
+        assert_eq!(msg.view().value.len(), LEN, "message must arrive intact");
+        assert!(
+            msg.bytes().is_unique(),
+            "stream still shares the allocation with the message"
+        );
+    }
+
+    /// A small read buffer is kept for reuse.
+    #[tokio::test]
+    async fn server_stream_keeps_small_buffer() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let message = StringValue {
+            value: "hello".to_owned(),
+            ..Default::default()
+        };
+        let wire = Envelope::data(message.encode_to_bytes()).encode();
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
+            headers: http::HeaderMap::new(),
+            body: Full::new(wire),
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: None,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let msg = stream
+            .message()
+            .await
+            .expect("message should decode")
+            .expect("stream should yield the data envelope");
+        assert_eq!(msg.view().value, "hello");
+        assert!(stream.buf.is_empty(), "the only message was handed over");
+        assert!(
+            !msg.bytes().is_unique(),
+            "a small read buffer should be kept for reuse"
+        );
     }
 
     #[tokio::test]

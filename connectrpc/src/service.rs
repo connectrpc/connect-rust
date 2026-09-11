@@ -2923,7 +2923,9 @@ impl BodyReader {
         match &mut self.mode {
             ReadMode::Decoding => {
                 self.buf.extend_from_slice(&data);
+                let len_before_decode = self.buf.len();
                 self.decode_available().await;
+                crate::envelope::release_drained_buf(&mut self.buf, len_before_decode);
                 ControlFlow::Continue(())
             }
             ReadMode::Draining {
@@ -5414,6 +5416,222 @@ mod tests {
             pulled <= max_expected,
             "reader pulled {pulled} bytes after END_STREAM (expected at most \
              {max_expected}); trailing data is being buffered without bound"
+        );
+    }
+
+    /// A large message handed to the handler is the sole owner of its
+    /// allocation: the reader keeps no reference to it.
+    #[tokio::test]
+    async fn test_body_reader_releases_buffer_after_large_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+
+        let payload = Bytes::from(vec![0x42_u8; 1024 * 1024]);
+        let wire = Envelope::data(payload.clone()).encode();
+        for chunk in wire.chunks(16 * 1024) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue(),
+                "reader must keep reading while decoding"
+            );
+        }
+
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert_eq!(msg, payload, "message must arrive intact");
+        assert_eq!(
+            reader.buf.capacity(),
+            0,
+            "reader still holds the large message's allocation"
+        );
+        assert!(
+            msg.is_unique(),
+            "reader still shares the allocation with the message"
+        );
+    }
+
+    /// A message that arrives in one frame leaves no spare capacity behind,
+    /// so only the buffered length can show that the allocation is large.
+    #[tokio::test]
+    async fn test_body_reader_releases_exactly_sized_buffer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+
+        let payload = Bytes::from(vec![0x42_u8; 128 * 1024]);
+        let wire = Envelope::data(payload.clone()).encode();
+        assert!(
+            reader.on_data(wire).await.is_continue(),
+            "reader must keep reading while decoding"
+        );
+
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert_eq!(msg, payload, "message must arrive intact");
+        assert!(
+            msg.is_unique(),
+            "reader still shares the allocation with the message"
+        );
+    }
+
+    /// When the frame that completes a large message also carries the start
+    /// of the next one, both arrive in order and the buffer is released once
+    /// the second message has drained it.
+    #[tokio::test]
+    async fn test_body_reader_releases_buffer_after_trailing_partial_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+
+        let large = Bytes::from(vec![0x42_u8; 1024 * 1024]);
+        let small = Bytes::from(vec![0x43_u8; 100]);
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(large.clone()).encode());
+        wire.extend_from_slice(&Envelope::data(small.clone()).encode());
+        let rest = wire.split_off(wire.len() - 50);
+
+        for chunk in wire.chunks(16 * 1024) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue(),
+                "reader must keep reading while decoding"
+            );
+        }
+        let first = rx.recv().await.expect("first message").expect("decodes");
+        assert_eq!(first, large, "large message must arrive first and intact");
+        assert!(
+            !reader.buf.is_empty(),
+            "start of the second message must stay buffered"
+        );
+
+        assert!(
+            reader.on_data(rest.freeze()).await.is_continue(),
+            "reader must keep reading while decoding"
+        );
+        let second = rx.recv().await.expect("second message").expect("decodes");
+        assert_eq!(second, small, "small message must arrive second and intact");
+        assert_eq!(
+            reader.buf.capacity(),
+            0,
+            "reader still holds the large message's allocation"
+        );
+        drop(second);
+        assert!(
+            first.is_unique(),
+            "reader still shares the allocation with the messages"
+        );
+    }
+
+    /// When a large message leaves its allocation almost full and the next
+    /// message is already partly buffered, the allocation stays until the
+    /// reader reclaims it; the drain after that releases it.
+    #[tokio::test]
+    async fn test_body_reader_releases_reclaimed_buffer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+
+        // The large envelope plus the first 10 bytes of the next one fill a
+        // 1 MiB allocation to within 30 bytes.
+        let large = Bytes::from(vec![0x41_u8; 1024 * 1024 - 45]);
+        let small = Bytes::from(vec![0x42_u8; 15]);
+        let last = Bytes::from(vec![0x43_u8; 100]);
+        let small_wire = Envelope::data(small.clone()).encode();
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(large.clone()).encode());
+        wire.extend_from_slice(&small_wire[..10]);
+
+        for chunk in wire.chunks(16 * 1024) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue(),
+                "reader must keep reading while decoding"
+            );
+        }
+        let first = rx.recv().await.expect("first message").expect("decodes");
+        assert_eq!(first, large, "large message must arrive first and intact");
+        assert_eq!(
+            reader.buf.len(),
+            10,
+            "start of the second message must stay buffered"
+        );
+
+        assert!(
+            reader.on_data(small_wire.slice(10..)).await.is_continue(),
+            "reader must keep reading while decoding"
+        );
+        let second = rx.recv().await.expect("second message").expect("decodes");
+        assert_eq!(second, small, "small message must arrive second and intact");
+        drop(second);
+        assert!(
+            !first.is_unique(),
+            "a drained buffer with a small tail is kept until it is reclaimed"
+        );
+
+        drop(first);
+        assert!(
+            reader
+                .on_data(Envelope::data(last.clone()).encode())
+                .await
+                .is_continue(),
+            "reader must keep reading while decoding"
+        );
+        let third = rx.recv().await.expect("third message").expect("decodes");
+        assert_eq!(third, last, "last message must arrive intact");
+        assert_eq!(
+            reader.buf.capacity(),
+            0,
+            "reader still holds the reclaimed allocation"
+        );
+        assert!(
+            third.is_unique(),
+            "reader still shares the allocation with the message"
+        );
+    }
+
+    /// A small read buffer is kept for reuse.
+    #[tokio::test]
+    async fn test_body_reader_keeps_small_buffer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+
+        let wire = Envelope::data(Bytes::from_static(b"hello")).encode();
+        assert!(
+            reader.on_data(wire).await.is_continue(),
+            "reader must keep reading while decoding"
+        );
+
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert!(reader.buf.is_empty(), "the only message was handed over");
+        assert!(
+            !msg.is_unique(),
+            "a small read buffer should be kept for reuse"
         );
     }
 
