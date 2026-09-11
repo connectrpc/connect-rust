@@ -76,5 +76,9 @@ harness = false
 name = "view_rope_encode"
 harness = false
 
+[[bench]]
+name = "encode_frame"
+harness = false
+
 [lints]
 workspace = true
