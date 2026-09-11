@@ -148,9 +148,6 @@ fn parse_get_query_params(query: Option<&str>) -> Result<GetQueryParams, Connect
 struct RequestMetadata {
     /// The Content-Type header value.
     content_type: Option<String>,
-    /// The detected protocol. Used for protocol-specific behavior in handlers.
-    #[allow(dead_code)]
-    protocol: Protocol,
     /// The timeout parsed from the protocol's timeout header.
     timeout: Option<Duration>,
     /// Compression encoding for unary requests (from Content-Encoding header).
@@ -164,23 +161,22 @@ struct RequestMetadata {
     /// The Connect protocol version from connect-protocol-version header.
     /// Only meaningful for the Connect protocol.
     protocol_version: Option<String>,
-    /// The original request headers (for passing to handlers).
+    /// The original request headers, handed on to the handler's
+    /// `RequestContext`.
     headers: http::HeaderMap,
 }
 
 impl RequestMetadata {
-    /// Extract metadata from request headers, using the detected protocol to
-    /// determine which header names to read.
-    fn from_headers(headers: &http::HeaderMap, protocol: Protocol) -> Self {
+    /// Extract metadata from the request's headers, using the detected
+    /// protocol to determine which header names to read, and keep the map for
+    /// the handler.
+    fn from_headers(headers: http::HeaderMap, protocol: Protocol) -> Self {
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
 
-        let timeout = headers
-            .get(protocol.timeout_header())
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| parse_timeout(s, protocol));
+        let timeout = timeout_from_headers(&headers, protocol);
 
         let unary_encoding = headers
             .get(header::CONTENT_ENCODING)
@@ -209,14 +205,13 @@ impl RequestMetadata {
 
         Self {
             content_type,
-            protocol,
             timeout,
             unary_encoding,
             streaming_encoding,
             unary_accept_encoding,
             streaming_accept_encoding,
             protocol_version,
-            headers: headers.clone(),
+            headers,
         }
     }
 }
@@ -329,13 +324,25 @@ fn absolute_deadline(timeout: Option<Duration>) -> Option<std::time::Instant> {
     timeout.and_then(|t| std::time::Instant::now().checked_add(t))
 }
 
+/// The client-requested timeout from the protocol's timeout header, if
+/// present and well-formed.
+fn timeout_from_headers(headers: &http::HeaderMap, protocol: Protocol) -> Option<Duration> {
+    headers
+        .get(protocol.timeout_header())
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_timeout(s, protocol))
+}
+
+/// The request deadline for paths that never build a [`RequestMetadata`]
+/// (early rejections that still drain the body under the client's timeout):
+/// the same timeout `RequestMetadata` would parse, moderated by the policy.
 fn deadline_from_headers(
     headers: &http::HeaderMap,
     protocol: Protocol,
     path: &str,
     deadline_policy: &DeadlinePolicy,
 ) -> Option<std::time::Instant> {
-    let timeout = RequestMetadata::from_headers(headers, protocol).timeout;
+    let timeout = timeout_from_headers(headers, protocol);
     absolute_deadline(deadline_policy.moderate(timeout, path))
 }
 
@@ -827,7 +834,7 @@ fn connect_streaming_error_response(
 
     let response = Response::builder().status(StatusCode::OK).header(
         header::CONTENT_TYPE,
-        Protocol::Connect.response_content_type(codec_format, true),
+        http::HeaderValue::from_static(Protocol::Connect.response_content_type(codec_format, true)),
     );
 
     let response = echo_error_headers(response, err);
@@ -877,7 +884,7 @@ fn grpc_error_response(
 
     let mut response = Response::builder().status(StatusCode::OK).header(
         header::CONTENT_TYPE,
-        protocol.response_content_type(codec_format, true),
+        http::HeaderValue::from_static(protocol.response_content_type(codec_format, true)),
     );
 
     // For trailers-only gRPC responses, also include grpc-status in headers
@@ -1967,17 +1974,14 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let query_string = req.uri().query().map(|s| s.to_owned());
-    let method = req.method().clone();
+    let (parts, body) = req.into_parts();
+    let method = parts.method;
+    let extensions = parts.extensions;
 
     // Extract metadata from headers using the Connect protocol (unary is always Connect)
-    let mut metadata = RequestMetadata::from_headers(req.headers(), Protocol::Connect);
+    let mut metadata = RequestMetadata::from_headers(parts.headers, Protocol::Connect);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
     let deadline = absolute_deadline(metadata.timeout);
-
-    // Split request to consume the body
-    let (parts, body) = req.into_parts();
-    let extensions = parts.extensions;
 
     // IMPORTANT: Read the full request body BEFORE returning any errors.
     // For HTTP/1.1, returning an error without reading the body causes
@@ -2008,7 +2012,7 @@ where
         }
 
         // Parse query parameters for GET request
-        let params = parse_get_query_params(query_string.as_deref())?;
+        let params = parse_get_query_params(parts.uri.query())?;
 
         // Validate connect version from query param
         if let Some(ref version) = params.connect_version
@@ -2088,7 +2092,7 @@ where
         // The leading slash was stripped for the Dispatcher::lookup key;
         // restore it so RequestContext::path() matches http::Uri::path()
         // and Spec::procedure.
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
@@ -2128,19 +2132,13 @@ where
     };
 
     // Build response with the same content type as the request
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, codec_format.content_type());
-
-    if let Some(encoding) = content_encoding {
-        response = response.header(header::CONTENT_ENCODING, encoding);
-    }
-
-    // Advertise what encodings we accept (optional per spec, informational)
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(header::ACCEPT_ENCODING, accept);
-    }
+    let mut response = response_head(
+        codec_format.content_type(),
+        &header::CONTENT_ENCODING,
+        content_encoding,
+        &header::ACCEPT_ENCODING,
+        &compression,
+    );
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -2153,6 +2151,32 @@ where
     response
         .body(Full::new(final_body))
         .map_err(|e| ConnectError::internal(format!("failed to build response: {e}")))
+}
+
+/// Start a `200 OK` response carrying the negotiated content type, the
+/// response encoding when one was applied, and the accept-encoding
+/// advertisement (optional per spec, informational). Every value is a static
+/// or registry-cached `HeaderValue`, so none is allocated per response.
+fn response_head(
+    content_type: &'static str,
+    encoding_header: &header::HeaderName,
+    encoding: Option<&'static str>,
+    accept_encoding_header: &header::HeaderName,
+    compression: &CompressionRegistry,
+) -> http::response::Builder {
+    let mut response = Response::builder().status(StatusCode::OK).header(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static(content_type),
+    );
+    if let Some(encoding) = encoding {
+        // Encoding names are validated as HTTP tokens by
+        // `CompressionRegistry::register`, which is what `from_static` needs.
+        response = response.header(encoding_header, http::HeaderValue::from_static(encoding));
+    }
+    if let Some(accept) = compression.accept_encoding_value() {
+        response = response.header(accept_encoding_header, accept.clone());
+    }
+    response
 }
 
 /// Handle a gRPC/gRPC-Web unary request via the fast path.
@@ -2179,8 +2203,11 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Extract metadata before any body reads, including error-path drains.
-    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
+    // Take the request apart first: the headers move into the metadata (and
+    // from there into the handler context), the body is read below.
+    let (parts, body) = req.into_parts();
+    let extensions = parts.extensions;
+    let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
     let deadline = absolute_deadline(metadata.timeout);
 
@@ -2196,7 +2223,7 @@ where
         };
         let mut response = Response::builder().status(StatusCode::OK).header(
             header::CONTENT_TYPE,
-            protocol.response_content_type(codec_format, true),
+            http::HeaderValue::from_static(protocol.response_content_type(codec_format, true)),
         );
         // For trailers-only gRPC responses, include grpc-status in headers
         if protocol == Protocol::Grpc {
@@ -2226,10 +2253,9 @@ where
 
     // gRPC requires POST. Backstop: `handle_request` already rejects non-GET/
     // POST verbs upstream, and GET never routes here, so this is defensive.
-    if req.method() != Method::POST {
-        let err = ConnectError::internal(format!("invalid method for gRPC: {}", req.method()));
+    if parts.method != Method::POST {
+        let err = ConnectError::internal(format!("invalid method for gRPC: {}", parts.method));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let _ = with_request_deadline(
             deadline,
             collect_body_limited(body, limits.max_request_body_size),
@@ -2245,7 +2271,6 @@ where
     {
         let err = ConnectError::unimplemented(format!("unsupported compression: {encoding}"));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let _ = with_request_deadline(
             deadline,
             collect_body_limited(body, limits.max_request_body_size),
@@ -2256,8 +2281,6 @@ where
 
     // Read the full body. collect_body_limited bounds allocation during the
     // read, so an oversized body is rejected before it is fully buffered.
-    let (parts, body) = req.into_parts();
-    let extensions = parts.extensions;
     let post_body = match with_request_deadline(
         deadline,
         collect_body_limited(body, limits.max_request_body_size),
@@ -2274,18 +2297,19 @@ where
         let err = ConnectError::unimplemented("request body is empty: expected a message");
         return grpc_unary_error(&err);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
-        let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
-            Ok(Some(env)) => env,
-            Ok(None) => {
-                let err = ConnectError::invalid_argument("incomplete request envelope");
-                return grpc_unary_error(&err);
-            }
-            Err(e) => return grpc_unary_error(&e),
-        };
+        let mut post_body = post_body;
+        let envelope =
+            match Envelope::decode_from_bytes_with_limit(&mut post_body, limits.max_message_size) {
+                Ok(Some(env)) => env,
+                Ok(None) => {
+                    let err = ConnectError::invalid_argument("incomplete request envelope");
+                    return grpc_unary_error(&err);
+                }
+                Err(e) => return grpc_unary_error(&e),
+            };
 
-        // Reject multiple envelopes in a unary request
-        if !buf.is_empty() {
+        // Reject anything after the one envelope of a unary request
+        if !post_body.is_empty() {
             let err = ConnectError::unimplemented("unary request must have exactly one message");
             return grpc_unary_error(&err);
         }
@@ -2321,7 +2345,7 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with the same deadline used while receiving the body.
@@ -2385,19 +2409,13 @@ where
     };
 
     // Build response headers
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -2453,16 +2471,18 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Extract metadata before any body reads, including error-path drains.
-    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
+    // Take the request apart first: the headers move into the metadata (and
+    // from there into the handler context), the body is read or streamed below.
+    let (parts, body) = req.into_parts();
+    let extensions = parts.extensions;
+    let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
     // gRPC and gRPC-Web require POST method. Backstop: non-GET/POST verbs are
     // already rejected upstream in `handle_request`, and GET never routes here.
-    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) && req.method() != Method::POST {
-        let err = ConnectError::internal(format!("invalid method for gRPC: {}", req.method()));
+    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) && parts.method != Method::POST {
+        let err = ConnectError::internal(format!("invalid method for gRPC: {}", parts.method));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let deadline = absolute_deadline(metadata.timeout);
         let _ = with_request_deadline(
             deadline,
@@ -2479,7 +2499,6 @@ where
     {
         let err = ConnectError::unimplemented(format!("unsupported compression: {encoding}"));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let deadline = absolute_deadline(metadata.timeout);
         let _ = with_request_deadline(
             deadline,
@@ -2488,10 +2507,6 @@ where
         .await;
         return streaming_error_response(&err, protocol, codec_format);
     }
-
-    // Split request to consume the body
-    let (parts, body) = req.into_parts();
-    let extensions = parts.extensions;
 
     // For bidi streaming, pass the raw body stream directly (no buffering)
     if matches!(method_desc, Some(d) if d.kind == MethodKind::BidiStreaming) {
@@ -2578,20 +2593,21 @@ where
         let err = ConnectError::unimplemented("server streaming request requires a message");
         return streaming_error_response(&err, protocol, codec_format);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
-        let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
-            Ok(Some(env)) => env,
-            Ok(None) => {
-                let err = ConnectError::invalid_argument("incomplete request envelope");
-                return streaming_error_response(&err, protocol, codec_format);
-            }
-            Err(e) => {
-                return streaming_error_response(&e, protocol, codec_format);
-            }
-        };
+        let mut post_body = post_body;
+        let envelope =
+            match Envelope::decode_from_bytes_with_limit(&mut post_body, limits.max_message_size) {
+                Ok(Some(env)) => env,
+                Ok(None) => {
+                    let err = ConnectError::invalid_argument("incomplete request envelope");
+                    return streaming_error_response(&err, protocol, codec_format);
+                }
+                Err(e) => {
+                    return streaming_error_response(&e, protocol, codec_format);
+                }
+            };
 
         // Check for multiple request envelopes (server streaming only allows one)
-        if !buf.is_empty() {
+        if !post_body.is_empty() {
             let err = ConnectError::unimplemented(
                 "server streaming request must have exactly one message",
             );
@@ -2632,7 +2648,7 @@ where
         .with_extensions(extensions)
         .with_spec(method_desc.and_then(|d| d.spec))
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
@@ -2679,20 +2695,13 @@ where
     );
 
     // Build streaming response
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    // Advertise what encodings we accept (optional per spec, informational)
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -2772,7 +2781,7 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler. On error paths, the reader task is left running
@@ -2827,19 +2836,13 @@ where
     );
 
     // Build streaming response with a single data envelope + END_STREAM
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -3177,7 +3180,7 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with timeout if configured
@@ -3229,20 +3232,13 @@ where
     );
 
     // Build streaming response
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    // Advertise what encodings we accept (optional per spec, informational)
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -6277,6 +6273,193 @@ mod tests {
             .err()
             .expect("miss");
             assert_eq!(err.code, crate::ErrorCode::Unimplemented);
+        }
+    }
+
+    /// The request's header map is moved into the handler's `RequestContext`
+    /// on every dispatch path. Each path takes the request apart at a
+    /// different point, so each is driven separately; client- and
+    /// bidi-streaming receive the parsed metadata from
+    /// `handle_streaming_request` rather than the request itself.
+    mod request_headers_reach_handler {
+        use super::*;
+        use buffa_types::google::protobuf::StringValue;
+        use std::sync::Mutex;
+
+        const PROBE: &str = "x-probe";
+
+        type Seen = Arc<Mutex<Vec<Option<String>>>>;
+
+        fn record(seen: &Seen, ctx: &RequestContext) {
+            seen.lock().unwrap().push(
+                ctx.header(PROBE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+            );
+        }
+
+        fn router(seen: &Seen) -> Arc<Router> {
+            let unary = {
+                let seen = Arc::clone(seen);
+                crate::handler_fn(move |ctx: RequestContext, req: StringValue| {
+                    record(&seen, &ctx);
+                    async move { crate::Response::ok(req) }
+                })
+            };
+            let unary_get = {
+                let seen = Arc::clone(seen);
+                crate::handler_fn(move |ctx: RequestContext, req: StringValue| {
+                    record(&seen, &ctx);
+                    async move { crate::Response::ok(req) }
+                })
+            };
+            let server_stream = {
+                let seen = Arc::clone(seen);
+                crate::handler::streaming_handler_fn(
+                    move |ctx: RequestContext, req: StringValue| {
+                        record(&seen, &ctx);
+                        async move { crate::Response::stream_ok(futures::stream::iter([Ok(req)])) }
+                    },
+                )
+            };
+            let client_stream = {
+                let seen = Arc::clone(seen);
+                crate::handler::client_streaming_handler_fn(
+                    move |ctx: RequestContext, _reqs: crate::ServiceStream<StringValue>| {
+                        record(&seen, &ctx);
+                        async move { crate::Response::ok(StringValue::default()) }
+                    },
+                )
+            };
+            let bidi = {
+                let seen = Arc::clone(seen);
+                crate::handler::bidi_streaming_handler_fn(
+                    move |ctx: RequestContext, reqs: crate::ServiceStream<StringValue>| {
+                        record(&seen, &ctx);
+                        async move { crate::Response::stream_ok(reqs) }
+                    },
+                )
+            };
+            Arc::new(
+                Router::new()
+                    .route("svc", "Unary", unary)
+                    .route_idempotent("svc", "Get", unary_get)
+                    .route_server_stream("svc", "ServerStream", server_stream)
+                    .route_client_stream("svc", "ClientStream", client_stream)
+                    .route_bidi_stream("svc", "Bidi", bidi),
+            )
+        }
+
+        fn message() -> Bytes {
+            crate::codec::encode_proto(&StringValue {
+                value: "v".into(),
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        fn post(path: &str, content_type: &str, body: Bytes, probe: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(PROBE, probe)
+                .body(Full::new(body))
+                .unwrap()
+        }
+
+        async fn call(router: &Arc<Router>, req: Request<Full<Bytes>>) {
+            let resp = handle_request(
+                Arc::clone(router),
+                req,
+                Limits::default(),
+                Arc::new(CompressionRegistry::new()),
+                &CompressionPolicy::default(),
+                &DeadlinePolicy::new(),
+                &[],
+            )
+            .await
+            .expect("dispatch succeeds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Drive the body so streaming handlers run to completion.
+            let _ = resp.into_body().collect().await;
+        }
+
+        #[tokio::test]
+        async fn on_every_dispatch_path() {
+            use base64::Engine as _;
+            let seen: Seen = Arc::default();
+            let router = router(&seen);
+            let enveloped = Envelope::data(message()).encode();
+
+            call(
+                &router,
+                post(
+                    "/svc/Unary",
+                    "application/proto",
+                    message(),
+                    "connect-unary",
+                ),
+            )
+            .await;
+            let get = Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/svc/Get?encoding=proto&base64=1&connect=v1&message={}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message())
+                ))
+                .header(PROBE, "connect-get")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            call(&router, get).await;
+            call(
+                &router,
+                post(
+                    "/svc/Unary",
+                    "application/grpc",
+                    enveloped.clone(),
+                    "grpc-unary",
+                ),
+            )
+            .await;
+            call(
+                &router,
+                post(
+                    "/svc/ServerStream",
+                    "application/grpc",
+                    enveloped.clone(),
+                    "server-stream",
+                ),
+            )
+            .await;
+            call(
+                &router,
+                post(
+                    "/svc/ClientStream",
+                    "application/grpc",
+                    enveloped.clone(),
+                    "client-stream",
+                ),
+            )
+            .await;
+            call(
+                &router,
+                post("/svc/Bidi", "application/grpc", enveloped, "bidi"),
+            )
+            .await;
+
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    "connect-unary",
+                    "connect-get",
+                    "grpc-unary",
+                    "server-stream",
+                    "client-stream",
+                    "bidi"
+                ]
+                .map(|s| Some(s.to_owned())),
+            );
         }
     }
 }

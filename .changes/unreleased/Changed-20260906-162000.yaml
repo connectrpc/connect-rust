@@ -1,0 +1,10 @@
+kind: Changed
+body: |-
+    `CompressionRegistry::register` now panics when the provider's `name()` is
+    not an RFC 9110 token (empty, or containing anything outside
+    ``A-Za-z0-9!#$%&'*+-.^_`|~``). Only custom `CompressionProvider`
+    implementations can be affected; the built-in providers are unchanged. Such
+    a name could never be carried in `content-encoding` / `accept-encoding`, so
+    it previously produced failed responses at request time instead. If a
+    provider name is computed, validate it before building the registry.
+time: 2026-09-06T16:20:00.000000000+00:00

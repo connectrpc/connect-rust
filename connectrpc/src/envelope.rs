@@ -148,10 +148,50 @@ impl Envelope {
     ///
     /// This protects against malicious clients declaring very large message
     /// sizes in the envelope header.
+    ///
+    /// Use this on a read buffer that is still being filled; for a body
+    /// already collected into a [`Bytes`], see
+    /// [`decode_from_bytes_with_limit`](Self::decode_from_bytes_with_limit).
     pub fn decode_with_limit(
         buf: &mut BytesMut,
         max_size: usize,
     ) -> Result<Option<Self>, ConnectError> {
+        let Some((flags, length)) = Self::complete_header(buf, max_size)? else {
+            return Ok(None);
+        };
+        buf.advance(HEADER_SIZE);
+        let data = buf.split_to(length).freeze();
+        Ok(Some(Self { flags, data }))
+    }
+
+    /// [`decode_with_limit`](Self::decode_with_limit) for a body that is
+    /// already an immutable [`Bytes`] (for example the result of collecting
+    /// an HTTP body): the payload is split off by reference count rather than
+    /// copied, and whatever follows the envelope is left in `buf`.
+    ///
+    /// # Errors
+    ///
+    /// `ResourceExhausted` when the declared message size exceeds `max_size`.
+    pub fn decode_from_bytes_with_limit(
+        buf: &mut Bytes,
+        max_size: usize,
+    ) -> Result<Option<Self>, ConnectError> {
+        let Some((flags, length)) = Self::complete_header(buf, max_size)? else {
+            return Ok(None);
+        };
+        buf.advance(HEADER_SIZE);
+        let data = buf.split_to(length);
+        Ok(Some(Self { flags, data }))
+    }
+
+    /// The `(flags, length)` of the envelope at the front of `buf` when the
+    /// whole envelope is present, `None` when more bytes are needed.
+    ///
+    /// # Errors
+    ///
+    /// `ResourceExhausted` when the declared length exceeds `max_size`; this
+    /// is checked before waiting for the payload to arrive.
+    fn complete_header(buf: &[u8], max_size: usize) -> Result<Option<(u8, usize)>, ConnectError> {
         if buf.len() < HEADER_SIZE {
             return Ok(None);
         }
@@ -174,11 +214,7 @@ impl Envelope {
         if buf.len() < HEADER_SIZE.saturating_add(length) {
             return Ok(None);
         }
-
-        buf.advance(HEADER_SIZE);
-        let data = buf.split_to(length).freeze();
-
-        Ok(Some(Self { flags, data }))
+        Ok(Some((flags, length)))
     }
 }
 
@@ -727,6 +763,92 @@ mod tests {
         let result = Envelope::decode_with_limit(&mut buf, 1024 * 1024);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn decode_from_bytes_with_limit_splits_payload_without_copying() {
+        let mut payload = Envelope::data(Bytes::from_static(b"small"))
+            .encode()
+            .to_vec();
+        payload.extend_from_slice(b"trailing");
+        let mut buf = Bytes::from(payload);
+        let base = buf.as_ptr();
+
+        let env = Envelope::decode_from_bytes_with_limit(&mut buf, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&env.data[..], b"small");
+        assert!(!env.is_compressed());
+        // The payload is a view into the original buffer, not a copy.
+        assert_eq!(env.data.as_ptr(), base.wrapping_add(HEADER_SIZE));
+        // What follows the envelope stays in the buffer for the caller to reject.
+        assert_eq!(&buf[..], b"trailing");
+    }
+
+    #[test]
+    fn decode_from_bytes_with_limit_waits_and_bounds_like_decode_with_limit() {
+        let mut short = Bytes::from_static(&[0, 0, 0, 0]);
+        assert!(
+            Envelope::decode_from_bytes_with_limit(&mut short, 1024)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut truncated = Bytes::from_static(&[0, 0, 0, 0, 9, b'x']);
+        assert!(
+            Envelope::decode_from_bytes_with_limit(&mut truncated, 1024)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(truncated.len(), 6, "an incomplete envelope is left intact");
+
+        let mut too_big = Bytes::from_static(&[0, 0, 0x10, 0, 0]);
+        let err = Envelope::decode_from_bytes_with_limit(&mut too_big, 512 * 1024).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+    }
+
+    /// The `Bytes` and `BytesMut` decoders agree on every input: same
+    /// outcome, same envelope, same remainder left in the buffer.
+    #[test]
+    fn decode_bytes_and_decode_with_limit_agree() {
+        fn frame(flags: u8, payload: &[u8], trailing: &[u8]) -> Vec<u8> {
+            let mut v = vec![flags];
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v.extend_from_slice(trailing);
+            v
+        }
+        const LIMIT: usize = 8;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("exact fit", frame(0, b"12345", b"")),
+            ("zero-length payload", frame(0, b"", b"")),
+            ("end-stream flag", frame(flags::END_STREAM, b"{}", b"")),
+            ("compressed flag", frame(flags::COMPRESSED, b"zz", b"")),
+            ("trailing bytes", frame(0, b"abc", b"next")),
+            ("length == limit", frame(0, &[7; LIMIT], b"")),
+            ("length == limit + 1", frame(0, &[7; LIMIT + 1], b"")),
+            ("short header", vec![0, 0, 0]),
+            ("truncated payload", vec![0, 0, 0, 0, 4, 1, 2]),
+            ("empty", vec![]),
+        ];
+        for (name, input) in cases {
+            let mut as_mut = BytesMut::from(&input[..]);
+            let mut as_bytes = Bytes::from(input.clone());
+            let from_mut = Envelope::decode_with_limit(&mut as_mut, LIMIT);
+            let from_bytes = Envelope::decode_from_bytes_with_limit(&mut as_bytes, LIMIT);
+            match (from_mut, from_bytes) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(
+                        a.as_ref().map(|e| (e.flags, e.data.clone())),
+                        b.as_ref().map(|e| (e.flags, e.data.clone())),
+                        "{name}: envelope"
+                    );
+                }
+                (Err(a), Err(b)) => assert_eq!(a.code, b.code, "{name}: error code"),
+                (a, b) => panic!("{name}: {a:?} vs {b:?}"),
+            }
+            assert_eq!(&as_mut[..], &as_bytes[..], "{name}: remainder");
+        }
     }
 
     #[test]

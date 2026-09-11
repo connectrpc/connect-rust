@@ -67,6 +67,15 @@ fn malformed_compressed_payload(message: impl Into<String>) -> ConnectError {
     ConnectError::invalid_argument(message)
 }
 
+/// Whether `s` is an RFC 9110 `token`: one or more `tchar`s. Encoding names
+/// have to be tokens to appear in `content-encoding` / `accept-encoding`
+/// headers, and a token is always a valid `HeaderValue`.
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// Trait for compression algorithm implementations.
 ///
 /// Implement this trait to provide custom compression support. The only
@@ -82,8 +91,10 @@ fn malformed_compressed_payload(message: impl Into<String>) -> ConnectError {
 pub trait CompressionProvider: Send + Sync + 'static {
     /// The encoding name for this algorithm.
     ///
-    /// This should match the value used in Content-Encoding headers
-    /// (e.g., "gzip", "zstd", "br").
+    /// This is the value used in Content-Encoding headers (e.g., "gzip",
+    /// "zstd", "br") and must be an HTTP token: non-empty ASCII without
+    /// whitespace, quotes or separators. [`CompressionRegistry::register`]
+    /// panics on a name that is not one.
     fn name(&self) -> &'static str;
 
     /// Compress the given data.
@@ -146,10 +157,10 @@ pub trait CompressionProvider: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct CompressionRegistry {
     providers: Arc<HashMap<&'static str, Arc<dyn CompressionProvider>>>,
-    /// Cached, sorted, comma-joined list of supported encodings for
-    /// Accept-Encoding headers. Recomputed when providers are registered
-    /// (rather than on every request).
-    accept_encoding: Arc<str>,
+    /// Sorted, comma-joined list of supported encodings as an
+    /// `accept-encoding` header value, rebuilt when providers are registered
+    /// rather than on every request; `None` while no providers are registered.
+    accept_encoding: Option<http::HeaderValue>,
 }
 
 impl std::fmt::Debug for CompressionRegistry {
@@ -168,20 +179,46 @@ impl CompressionRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(HashMap::new()),
-            accept_encoding: Arc::from(""),
+            accept_encoding: None,
         }
     }
 
-    /// Recompute the cached accept-encoding string from the current provider set.
+    /// Recompute the cached accept-encoding value from the current provider set.
     fn rebuild_accept_encoding(&mut self) {
         let mut encodings: Vec<_> = self.providers.keys().copied().collect();
         encodings.sort_unstable();
-        self.accept_encoding = Arc::from(encodings.join(", "));
+        self.accept_encoding = if encodings.is_empty() {
+            None
+        } else {
+            // `register` only admits token names, so the joined list is always
+            // a valid header value.
+            http::HeaderValue::from_str(&encodings.join(", ")).ok()
+        };
+    }
+
+    /// The supported encodings as a ready-made `accept-encoding` /
+    /// `grpc-accept-encoding` header value (sorted, comma-separated), or
+    /// `None` when no providers are registered. Built once when providers
+    /// are registered, so attaching it to a request costs no allocation.
+    #[must_use]
+    pub fn accept_encoding_value(&self) -> Option<&http::HeaderValue> {
+        self.accept_encoding.as_ref()
     }
 
     /// Register a compression provider.
     ///
-    /// Returns self for method chaining.
+    /// Returns self for method chaining. Registering a provider whose
+    /// `name()` matches an existing entry replaces it, so
+    /// `CompressionRegistry::default().register(MyGzip)` overrides the
+    /// built-in gzip.
+    ///
+    /// # Panics
+    ///
+    /// If [`provider.name()`](CompressionProvider::name) is empty or contains
+    /// any byte outside the RFC 9110 `tchar` set (ASCII alphanumerics and
+    /// ``!#$%&'*+-.^_`|~``). Such a name could never be negotiated or carried
+    /// in an encoding header, so it is rejected when the registry is built
+    /// rather than on each request.
     ///
     /// # Example
     ///
@@ -197,8 +234,16 @@ impl CompressionRegistry {
     /// ```
     #[must_use]
     pub fn register<P: CompressionProvider>(mut self, provider: P) -> Self {
+        let name = provider.name();
+        assert!(
+            is_http_token(name),
+            "CompressionProvider::name() returned {name:?} for {}: an encoding name must be a \
+             non-empty HTTP token (ASCII alphanumerics and !#$%&'*+-.^_`|~), because it is sent \
+             in content-encoding and accept-encoding headers",
+            std::any::type_name::<P>()
+        );
         let providers = Arc::make_mut(&mut self.providers);
-        providers.insert(provider.name(), Arc::new(provider));
+        providers.insert(name, Arc::new(provider));
         self.rebuild_accept_encoding();
         self
     }
@@ -223,10 +268,15 @@ impl CompressionRegistry {
 
     /// Get a comma-separated string of supported encodings.
     ///
-    /// Useful for Accept-Encoding headers. The string is computed once when
-    /// providers are registered and cached, so this is a cheap lookup.
+    /// The string form of [`accept_encoding_value`](Self::accept_encoding_value):
+    /// computed once when providers are registered, so this is a cheap
+    /// lookup; empty when no providers are registered. To set a header, use
+    /// `accept_encoding_value`, which needs no re-parse.
     pub fn accept_encoding_header(&self) -> &str {
-        &self.accept_encoding
+        self.accept_encoding
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
     }
 
     /// Negotiate a response encoding based on the client's accept-encoding header.
@@ -1652,6 +1702,69 @@ mod tests {
             let registry = CompressionRegistry::new().register(GzipProvider::default());
             assert_eq!(registry.accept_encoding_header(), "gzip");
         }
+    }
+
+    #[test]
+    fn accept_encoding_value_is_none_for_an_empty_registry() {
+        assert!(CompressionRegistry::new().accept_encoding_value().is_none());
+    }
+
+    /// A provider whose only interesting property is its name.
+    struct Named(&'static str);
+
+    impl CompressionProvider for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> {
+            Ok(Bytes::copy_from_slice(data))
+        }
+        fn decompressor<'a>(
+            &self,
+            data: &'a [u8],
+        ) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
+            Ok(Box::new(data))
+        }
+    }
+
+    #[test]
+    fn register_accepts_token_names_and_advertises_them_sorted() {
+        let registry = CompressionRegistry::new()
+            .register(Named("x-snappy"))
+            .register(Named("br"));
+        assert_eq!(registry.accept_encoding_header(), "br, x-snappy");
+        assert_eq!(registry.accept_encoding_value().unwrap(), "br, x-snappy");
+    }
+
+    #[test]
+    fn http_token_rule_matches_rfc9110_tchar() {
+        for good in ["gzip", "br", "x-snappy", "zstd", "A1!#$%&'*+-.^_`|~"] {
+            assert!(is_http_token(good), "{good:?} is a token");
+        }
+        for bad in [
+            "", "my algo", "gzip\n", "gzíp", "a,b", "\"q\"", "a/b", "gzip;q=1",
+        ] {
+            assert!(!is_http_token(bad), "{bad:?} is not a token");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a non-empty HTTP token")]
+    fn register_rejects_a_name_that_is_not_an_http_token() {
+        let _ = CompressionRegistry::new().register(Named("my algo"));
+    }
+
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    #[test]
+    fn accept_encoding_value_tracks_the_header_string() {
+        let registry = CompressionRegistry::new()
+            .register(GzipProvider::default())
+            .register(ZstdProvider::default());
+        assert_eq!(
+            registry.accept_encoding_value().unwrap(),
+            registry.accept_encoding_header()
+        );
+        assert_eq!(registry.accept_encoding_value().unwrap(), "gzip, zstd");
     }
 
     #[cfg(all(feature = "gzip", feature = "zstd"))]

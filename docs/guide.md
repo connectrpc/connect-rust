@@ -1983,6 +1983,8 @@ use bytes::Bytes;
 struct MyCompression;
 
 impl CompressionProvider for MyCompression {
+    // Sent in content-encoding / accept-encoding, so it must be an HTTP
+    // token; `register` panics on anything else.
     fn name(&self) -> &'static str { "my-algo" }
 
     fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> {
