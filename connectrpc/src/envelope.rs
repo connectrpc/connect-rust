@@ -43,6 +43,21 @@ pub const HEADER_SIZE: usize = 5;
 /// transport splits the payload into multiple DATA frames anyway.
 pub(crate) const MIN_CHAIN_SIZE: usize = 16 * 1024;
 
+/// Size of the per-stream slab that small streamed payloads are copied into
+/// (see [`EnvelopeAssembler`]). 8 KiB is the read block hyper and h2 use
+/// themselves (`tokio_util::codec::FramedRead`, hyper's h1 `INIT_BUFFER_SIZE`).
+/// It bounds what a held small message can keep alive and what an idle
+/// stream retains; it does not decide correctness.
+pub(crate) const READ_SLAB_SIZE: usize = 8 * 1024;
+
+// A shared, exhausted slab is replaced by `BytesMut::reserve` with a block of
+// its *original* capacity, which `bytes` records only as a power-of-two bucket
+// between 1 KiB and 64 KiB; outside that range a rolled slab would not be
+// READ_SLAB_SIZE again.
+const _: () = assert!(
+    READ_SLAB_SIZE.is_power_of_two() && READ_SLAB_SIZE >= 1024 && READ_SLAB_SIZE <= 64 * 1024
+);
+
 /// An envelope-framed message.
 #[derive(Debug, Clone)]
 pub struct Envelope {
@@ -209,20 +224,184 @@ impl Envelope {
     }
 }
 
-/// Decoder for Connect envelope-framed messages on a streaming request.
+/// Incremental envelope decoder fed one transport body frame at a time.
 ///
-/// Implements [`tokio_util::codec::Decoder`] so it can be used with
-/// [`FramedRead`](tokio_util::codec::FramedRead) to turn a raw byte stream
-/// into a stream of decoded (and optionally decompressed) message payloads.
-///
-/// Returns `Ok(None)` when more data is needed — `FramedRead` handles the
-/// async waiting automatically, eliminating manual buffer/loop management.
-pub(crate) struct EnvelopeDecoder {
+/// Unlike [`Envelope::decode_with_limit`], which needs the whole envelope in
+/// one contiguous buffer, this carries at most the 5 header bytes between
+/// frames and checks the declared length against the limit before anything
+/// is allocated. Payloads larger than half of [`READ_SLAB_SIZE`] are
+/// assembled into their own exactly-sized allocation (at most
+/// `min(declared length, 2 × bytes received)` while in flight), so the
+/// emitted [`data`](field@Envelope::data) is the sole owner of its memory
+/// (`Bytes::is_unique`). Smaller payloads are copied into a per-stream slab
+/// of [`READ_SLAB_SIZE`] bytes and split off its front, so the common small
+/// message costs no allocation of its own; a handler that keeps one alive
+/// keeps at most that slab alive, never a large message or the transport's
+/// read buffer, and an idle stream retains at most one slab.
+pub(crate) struct EnvelopeAssembler {
     max_message_size: usize,
+    /// Limit for frames flagged [`flags::GRPC_WEB_TRAILER`], which carry a
+    /// trailer block rather than a message. `None` applies `max_message_size`
+    /// to them like any other envelope (server side, plain gRPC).
+    grpc_web_trailer_limit: Option<usize>,
+    header: [u8; HEADER_SIZE],
+    /// `< HEADER_SIZE` while collecting the header; `== HEADER_SIZE` while
+    /// filling `slab` or `body` up to `expected`.
+    header_len: usize,
+    expected: usize,
+    /// Assembly buffer for a payload too large for the slab.
+    body: Vec<u8>,
+    /// Small payloads are assembled here and split off the front; allocated
+    /// on the first one.
+    slab: Option<BytesMut>,
+}
+
+impl EnvelopeAssembler {
+    pub(crate) fn new(max_message_size: usize) -> Self {
+        Self {
+            max_message_size,
+            grpc_web_trailer_limit: None,
+            header: [0; HEADER_SIZE],
+            header_len: 0,
+            expected: 0,
+            body: Vec::new(),
+            slab: None,
+        }
+    }
+
+    /// Accept gRPC-Web trailer frames up to `limit` bytes regardless of
+    /// `max_message_size` (trailers are metadata, not a message).
+    pub(crate) fn with_grpc_web_trailer_limit(mut self, limit: usize) -> Self {
+        self.grpc_web_trailer_limit = Some(limit);
+        self
+    }
+
+    /// Whether an envelope has started (at least one header byte) and not
+    /// yet been emitted.
+    pub(crate) fn has_partial(&self) -> bool {
+        self.header_len > 0
+    }
+
+    /// Consume bytes from the front of `frame` until one envelope completes
+    /// (`Ok(Some)`; `frame` keeps any bytes after it, so call again) or the
+    /// frame is exhausted (`Ok(None)`). An exhausted `frame` is replaced with
+    /// an empty `Bytes` so the caller's slot never keeps a consumed transport
+    /// frame alive.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceExhausted`](crate::ErrorCode::ResourceExhausted) as soon as a
+    /// header declares more than the limit, before anything is allocated for
+    /// it. Framing is lost at that point; the stream must be abandoned.
+    pub(crate) fn feed(&mut self, frame: &mut Bytes) -> Result<Option<Envelope>, ConnectError> {
+        if self.header_len < HEADER_SIZE {
+            let take = (HEADER_SIZE - self.header_len).min(frame.len());
+            self.header[self.header_len..self.header_len + take].copy_from_slice(&frame[..take]);
+            frame.advance(take);
+            self.header_len += take;
+            if self.header_len < HEADER_SIZE {
+                *frame = Bytes::new(); // exhausted mid-header
+                return Ok(None);
+            }
+            let [flag_byte, len @ ..] = self.header;
+            let length = u32::from_be_bytes(len) as usize;
+            let (what, limit) = match self.grpc_web_trailer_limit {
+                Some(limit) if flag_byte & flags::GRPC_WEB_TRAILER != 0 => {
+                    ("grpc-web trailer", limit)
+                }
+                _ => ("message", self.max_message_size),
+            };
+            if length > limit {
+                return Err(ConnectError::resource_exhausted(format!(
+                    "{what} size {length} exceeds limit {limit}"
+                )));
+            }
+            self.expected = length;
+        }
+
+        let data = if self.expected == 0 {
+            Some(Bytes::new())
+        } else if self.expected <= READ_SLAB_SIZE / 2 {
+            self.fill_slab(frame)
+        } else {
+            self.fill_body(frame)
+        };
+        if frame.is_empty() {
+            *frame = Bytes::new();
+        }
+        Ok(data.map(|data| {
+            self.header_len = 0;
+            Envelope {
+                flags: self.header[0],
+                data,
+            }
+        }))
+    }
+
+    /// Copy a small payload into the slab; split it off once complete.
+    fn fill_slab(&mut self, frame: &mut Bytes) -> Option<Bytes> {
+        let slab = self
+            .slab
+            .get_or_insert_with(|| BytesMut::with_capacity(READ_SLAB_SIZE));
+        if slab.is_empty() {
+            // Start of a payload. A no-op while the slab has room; once it is
+            // used up this reuses it in place if every message cut from it
+            // has been dropped, and otherwise leaves it to those messages and
+            // allocates a fresh block of the original READ_SLAB_SIZE.
+            slab.reserve(self.expected);
+        }
+        let take = (self.expected - slab.len()).min(frame.len());
+        slab.extend_from_slice(&frame[..take]);
+        frame.advance(take);
+        (slab.len() == self.expected).then(|| slab.split_to(self.expected).freeze())
+    }
+
+    /// Assemble a larger payload into its own exact allocation.
+    fn fill_body(&mut self, frame: &mut Bytes) -> Option<Bytes> {
+        let take = (self.expected - self.body.len()).min(frame.len());
+        if self.body.capacity() - self.body.len() < take {
+            // Reserving the declared length up front would let a peer
+            // allocate `max_message_size` with 5 bytes; doubling from
+            // what has arrived keeps the allocation within 2x of bytes
+            // received, and capping at the declared length makes the
+            // final allocation exact.
+            let target = self.expected.min(
+                self.body
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(self.body.len() + take),
+            );
+            self.body.reserve_exact(target - self.body.len());
+        }
+        self.body.extend_from_slice(&frame[..take]);
+        frame.advance(take);
+        if self.body.len() < self.expected {
+            return None;
+        }
+        // Capacity was capped at `expected` and std's `RawVec` reserves
+        // exactly what is asked, so `len == capacity` here and `Bytes::from`
+        // takes its no-copy, no-`Shared` path; an allocator-aware `Vec` that
+        // over-provided would only cost a `Shared` header, still no copy.
+        Some(Bytes::from(std::mem::take(&mut self.body)))
+    }
+}
+
+/// One item decoded from a streaming request body.
+#[derive(Debug)]
+pub(crate) enum Decoded {
+    Message(Bytes),
+    /// The END_STREAM envelope: terminal. Any further body data is trailing
+    /// garbage to drain (bounded) or reject, never to decode.
+    EndStream,
+}
+
+/// Decoder for Connect envelope-framed messages on a streaming request:
+/// an [`EnvelopeAssembler`] plus END_STREAM detection and per-message
+/// decompression.
+pub(crate) struct EnvelopeDecoder {
+    assembler: EnvelopeAssembler,
     streaming_encoding: Option<String>,
     compression: Arc<CompressionRegistry>,
-    /// Set to `true` once we receive an end-stream envelope; signals EOF.
-    done: bool,
 }
 
 impl EnvelopeDecoder {
@@ -232,43 +411,23 @@ impl EnvelopeDecoder {
         compression: Arc<CompressionRegistry>,
     ) -> Self {
         Self {
-            max_message_size,
+            assembler: EnvelopeAssembler::new(max_message_size),
             streaming_encoding,
             compression,
-            done: false,
         }
     }
 
-    /// Returns `true` once an end-stream envelope has been decoded.
-    ///
-    /// After this point [`decode`](tokio_util::codec::Decoder::decode) always
-    /// returns `Ok(None)` — the decoder will never produce another message.
-    /// Callers must treat this as a terminal state and stop buffering body
-    /// bytes for the decoder; any further data is trailing garbage that
-    /// should be drained (bounded) or rejected, never accumulated.
-    pub(crate) fn is_done(&self) -> bool {
-        self.done
-    }
-}
-
-impl tokio_util::codec::Decoder for EnvelopeDecoder {
-    type Item = Bytes;
-    type Error = ConnectError;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Bytes>, ConnectError> {
-        if self.done {
-            return Ok(None);
-        }
-
-        let envelope = match Envelope::decode_with_limit(buf, self.max_message_size)? {
-            Some(envelope) => envelope,
-            None => return Ok(None), // need more data
+    /// Consume bytes from `frame` until one message or END_STREAM is decoded
+    /// (`Ok(Some)`; call again for the rest of the frame, which after
+    /// END_STREAM is trailing bytes) or the frame is exhausted (`Ok(None)`).
+    pub(crate) fn decode(&mut self, frame: &mut Bytes) -> Result<Option<Decoded>, ConnectError> {
+        let Some(envelope) = self.assembler.feed(frame)? else {
+            return Ok(None); // need more data
         };
 
         if envelope.is_end_stream() {
             tracing::trace!("client stream: received end-stream envelope");
-            self.done = true;
-            return Ok(None);
+            return Ok(Some(Decoded::EndStream));
         }
 
         // Decompress if needed
@@ -284,7 +443,7 @@ impl tokio_util::codec::Decoder for EnvelopeDecoder {
             self.compression.decompress_with_limit(
                 encoding,
                 envelope.data,
-                self.max_message_size,
+                self.assembler.max_message_size,
             )?
         } else {
             envelope.data
@@ -295,30 +454,20 @@ impl tokio_util::codec::Decoder for EnvelopeDecoder {
             "client stream: dispatching message to handler"
         );
 
-        Ok(Some(data))
+        Ok(Some(Decoded::Message(data)))
     }
 
-    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Bytes>, ConnectError> {
-        // Try to decode any remaining complete envelope in the buffer.
-        match self.decode(buf)? {
-            some @ Some(_) => Ok(some),
-            None => {
-                // Body ended. A client may close the HTTP body without sending
-                // an END_STREAM envelope — the body ending is itself the
-                // end-of-stream signal. Leftover bytes mean a truncated envelope.
-                if !buf.is_empty() {
-                    tracing::debug!(
-                        remaining_bytes = buf.len(),
-                        "client stream: body ended with incomplete envelope"
-                    );
-                    Err(ConnectError::invalid_argument(
-                        "incomplete request envelope",
-                    ))
-                } else {
-                    Ok(None)
-                }
-            }
+    /// The body ended. A client may close the HTTP body without sending an
+    /// END_STREAM envelope — the body ending is itself the end-of-stream
+    /// signal — but ending part-way through an envelope is an error.
+    pub(crate) fn finish(&self) -> Result<(), ConnectError> {
+        if self.assembler.has_partial() {
+            tracing::debug!("client stream: body ended with incomplete envelope");
+            return Err(ConnectError::invalid_argument(
+                "incomplete request envelope",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -480,7 +629,7 @@ fn put_envelope_header(flag: u8, len: u32, dst: &mut BytesMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::codec::{Decoder, Encoder};
+    use tokio_util::codec::Encoder;
 
     /// Helper: create a decoder with no compression support, suitable for
     /// testing uncompressed envelope framing.
@@ -490,6 +639,14 @@ mod tests {
             None,
             Arc::new(CompressionRegistry::default()),
         )
+    }
+
+    /// Helper: decode the next item and expect it to be a message.
+    fn message(dec: &mut EnvelopeDecoder, frame: &mut Bytes) -> Bytes {
+        match dec.decode(frame).unwrap() {
+            Some(Decoded::Message(data)) => data,
+            other => panic!("expected a message, got {other:?}"),
+        }
     }
 
     // ── Envelope tests ──────────────────────────────────────────────
@@ -549,7 +706,7 @@ mod tests {
         let mut wire = dst;
         wire.put_slice(chained);
         let mut dec = EnvelopeDecoder::new(1024 * 1024, Some("gzip".to_owned()), registry);
-        let decoded = Decoder::decode(&mut dec, &mut wire).unwrap().unwrap();
+        let decoded = message(&mut dec, &mut wire.freeze());
         assert_eq!(decoded.len(), 64 * 1024);
     }
 
@@ -634,7 +791,7 @@ mod tests {
         assert_eq!(wire[0], flags::COMPRESSED);
 
         let mut dec = EnvelopeDecoder::new(1024 * 1024, Some("gzip".to_owned()), registry);
-        let decoded = Decoder::decode(&mut dec, &mut wire).unwrap().unwrap();
+        let decoded = message(&mut dec, &mut wire.freeze());
         assert_eq!(decoded, expected);
     }
 
@@ -800,27 +957,365 @@ mod tests {
         assert!(matches!(result, Ok(None)));
     }
 
+    // ── EnvelopeAssembler tests ─────────────────────────────────────
+
+    /// Feed `frames` in order and collect every envelope, asserting after
+    /// each frame that the in-flight allocation stays within
+    /// `min(declared, 2 × received)`.
+    fn assemble_all(asm: &mut EnvelopeAssembler, frames: &[&[u8]]) -> Vec<Envelope> {
+        let mut out = Vec::new();
+        for f in frames {
+            let mut frame = Bytes::copy_from_slice(f);
+            while let Some(env) = asm.feed(&mut frame).unwrap() {
+                out.push(env);
+            }
+            assert!(
+                frame.is_empty(),
+                "feed returns None only once the frame is consumed"
+            );
+            assert!(
+                asm.body.capacity() <= asm.expected.min(2 * asm.body.len().max(1)),
+                "cap {} len {} expected {}",
+                asm.body.capacity(),
+                asm.body.len(),
+                asm.expected
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn assembler_partial_header_is_partial() {
+        let mut asm = EnvelopeAssembler::new(1024);
+        assert!(!asm.has_partial());
+        assert!(assemble_all(&mut asm, &[&[0u8, 0, 0]]).is_empty());
+        assert!(asm.has_partial());
+    }
+
+    #[test]
+    fn assembler_multiple_envelopes_in_one_frame() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(Bytes::from_static(b"first")).encode());
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        wire.extend_from_slice(&Envelope::data(Bytes::new()).encode());
+        wire.extend_from_slice(&Envelope::data(Bytes::from_static(b"last")).encode()[..3]);
+        let mut asm = EnvelopeAssembler::new(1024);
+        let out = assemble_all(&mut asm, &[&wire]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].data, Bytes::from_static(b"first"));
+        assert!(out[1].is_end_stream());
+        assert_eq!(out[1].data, Bytes::from_static(b"{}"));
+        assert!(
+            out[2].data.is_empty(),
+            "zero-length payload is a valid envelope"
+        );
+        assert!(asm.has_partial(), "head of the next envelope is carried");
+    }
+
+    /// A large payload split across many transport frames comes out as one
+    /// exactly-sized, uniquely-owned `Bytes`; the assembler keeps nothing.
+    #[test]
+    fn assembler_payload_split_across_many_frames() {
+        const LEN: usize = 1024 * 1024 + 3;
+        let payload: Vec<u8> = (0..LEN).map(|i| i as u8).collect();
+        let wire = Envelope::data(Bytes::from(payload.clone())).encode();
+        let frames: Vec<&[u8]> = wire.chunks(16 * 1024).collect();
+        let mut asm = EnvelopeAssembler::new(LEN);
+        let out = assemble_all(&mut asm, &frames);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data.len(), LEN);
+        assert_eq!(&out[0].data[..], &payload[..]);
+        assert!(out[0].data.is_unique(), "message must own its allocation");
+        assert!(!asm.has_partial());
+        assert_eq!(asm.body.capacity(), 0, "assembler retains nothing");
+    }
+
+    /// Small payloads are cut from a per-stream slab: they do not reference
+    /// the transport frame, a held one shares at most its own slab, and the
+    /// assembler keeps no reference to a slab it has moved past.
+    #[test]
+    fn assembler_small_messages_come_from_a_bounded_slab() {
+        let envelope = Envelope::data(Bytes::from(vec![7u8; 100])).encode();
+        let per_slab = READ_SLAB_SIZE / 100;
+        let mut wire = BytesMut::new();
+        for _ in 0..2 * per_slab {
+            wire.extend_from_slice(&envelope);
+        }
+        let mut frame = wire.freeze();
+        let backing = frame.clone();
+        let mut asm = EnvelopeAssembler::new(1024);
+        let mut out = Vec::new();
+        while let Some(env) = asm.feed(&mut frame).unwrap() {
+            out.push(env.data);
+        }
+        assert_eq!(out.len(), 2 * per_slab);
+        drop(frame);
+        assert!(backing.is_unique(), "no message references the frame");
+        let held = out.swap_remove(0);
+        assert!(!held.is_unique(), "neighbours share the first slab");
+        drop(out);
+        assert!(held.is_unique(), "assembler moved past the first slab");
+        assert_eq!(&held[..], &[7u8; 100][..]);
+    }
+
+    /// The slab/own-allocation threshold is half the slab: a 4096-byte
+    /// payload is cut from the slab (and shares it with its neighbour), a
+    /// 4097-byte payload is its own allocation.
+    #[test]
+    fn assembler_slab_threshold() {
+        let at = vec![3u8; READ_SLAB_SIZE / 2];
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(Bytes::from(at.clone())).encode());
+        wire.extend_from_slice(&Envelope::data(Bytes::from(at.clone())).encode());
+        let mut asm = EnvelopeAssembler::new(READ_SLAB_SIZE);
+        let out = assemble_all(&mut asm, &[&wire]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[0].data[..], &at[..]);
+        assert!(
+            !out[0].data.is_unique(),
+            "slab-cut, shared with its neighbour"
+        );
+        assert_eq!(
+            out[1].data.as_ptr() as usize,
+            out[0].data.as_ptr() as usize + at.len(),
+            "both halves of one slab"
+        );
+        assert_eq!(asm.body.capacity(), 0);
+
+        let over = vec![4u8; READ_SLAB_SIZE / 2 + 1];
+        let wire = Envelope::data(Bytes::from(over.clone())).encode();
+        let mut asm = EnvelopeAssembler::new(READ_SLAB_SIZE);
+        let out = assemble_all(&mut asm, &[&wire]);
+        assert_eq!(&out[0].data[..], &over[..]);
+        assert!(out[0].data.is_unique(), "own exact allocation");
+        assert!(asm.slab.is_none(), "large path never touches the slab");
+        assert_eq!(asm.body.capacity(), 0);
+    }
+
+    /// A large payload between two small ones goes around the slab: the
+    /// second small message is cut from the same slab, right after the first.
+    /// The frames that start and complete the large payload also carry the
+    /// small ones (straddling), and every envelope is still delivered.
+    #[test]
+    fn assembler_large_payload_bypasses_the_slab() {
+        let big = vec![1u8; 100 * 1024];
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(Bytes::from_static(b"one")).encode());
+        wire.extend_from_slice(&Envelope::data(Bytes::from(big.clone())).encode());
+        wire.extend_from_slice(&Envelope::data(Bytes::from_static(b"two")).encode());
+        let frames: Vec<&[u8]> = wire.chunks(16 * 1024).collect();
+        let mut asm = EnvelopeAssembler::new(1024 * 1024);
+        let out = assemble_all(&mut asm, &frames);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].data, Bytes::from_static(b"one"));
+        assert_eq!(&out[1].data[..], &big[..]);
+        assert_eq!(out[2].data, Bytes::from_static(b"two"));
+        assert!(out[1].data.is_unique(), "large payload owns its allocation");
+        assert_eq!(
+            out[2].data.as_ptr() as usize,
+            out[0].data.as_ptr() as usize + 3,
+            "second small message continues the first slab"
+        );
+    }
+
+    /// A small payload split across frames whose first fragment arrives when
+    /// the slab is nearly full is still assembled contiguously: the slab is
+    /// rolled to exactly one fresh READ_SLAB_SIZE block (messages held) or
+    /// reclaimed in place at its original size (messages dropped) at the
+    /// start of the payload, never part-way through it.
+    #[test]
+    fn assembler_split_small_payload_at_slab_roll() {
+        let filler = Envelope::data(Bytes::from(vec![7u8; 100])).encode();
+        let per_slab = READ_SLAB_SIZE / 100;
+        let payload: Vec<u8> = (0..READ_SLAB_SIZE / 2).map(|i| i as u8).collect();
+        let wire = Envelope::data(Bytes::from(payload.clone())).encode();
+        let third = wire.len() / 3;
+        for hold in [true, false] {
+            let mut asm = EnvelopeAssembler::new(READ_SLAB_SIZE);
+            let mut fill = BytesMut::new();
+            for _ in 0..per_slab {
+                fill.extend_from_slice(&filler);
+            }
+            let held = assemble_all(&mut asm, &[&fill]);
+            assert_eq!(held.len(), per_slab);
+            let first = held[0].data.as_ptr() as usize;
+            assert!(asm.slab.as_ref().unwrap().capacity() < payload.len());
+            let held = hold.then_some(held);
+            let out = assemble_all(
+                &mut asm,
+                &[&wire[..third], &wire[third..2 * third], &wire[2 * third..]],
+            );
+            assert_eq!(out.len(), 1);
+            assert_eq!(&out[0].data[..], &payload[..], "hold={hold}");
+            let at = out[0].data.as_ptr() as usize;
+            if hold {
+                assert!(
+                    !(first..first + READ_SLAB_SIZE).contains(&at),
+                    "rolled to a fresh slab"
+                );
+            } else {
+                assert_eq!(at, first, "reclaimed the released slab in place");
+            }
+            assert_eq!(
+                asm.slab.as_ref().unwrap().capacity(),
+                READ_SLAB_SIZE - payload.len(),
+                "rolled or reclaimed slab has the original READ_SLAB_SIZE (hold={hold})"
+            );
+            drop(held);
+        }
+    }
+
+    /// A zero-length payload allocates nothing: no slab, no body.
+    #[test]
+    fn assembler_empty_payload_allocates_nothing() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(Bytes::new()).encode());
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::new()).encode());
+        let mut asm = EnvelopeAssembler::new(1024);
+        let out = assemble_all(&mut asm, &[&wire]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].data.is_empty() && out[1].data.is_empty());
+        assert!(out[1].is_end_stream());
+        assert!(asm.slab.is_none());
+        assert_eq!(asm.body.capacity(), 0);
+    }
+
+    /// An over-limit length is rejected on the header, before any payload
+    /// byte is buffered or allocated for.
+    #[test]
+    fn assembler_rejects_over_limit_before_allocating() {
+        let mut wire = vec![0u8; HEADER_SIZE];
+        wire[1..].copy_from_slice(&4096u32.to_be_bytes());
+        wire.extend_from_slice(&[0xAA; 4096]);
+        let mut asm = EnvelopeAssembler::new(1024);
+        let mut frame = Bytes::from(wire);
+        let err = asm.feed(&mut frame).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("message size 4096 exceeds limit 1024")
+        );
+        assert_eq!(asm.body.capacity(), 0, "nothing allocated for it");
+        assert_eq!(frame.len(), 4096, "payload left unread");
+    }
+
+    #[test]
+    fn assembler_grpc_web_trailer_limit() {
+        let block = vec![b'x'; 2000];
+        let trailer = Envelope {
+            flags: flags::GRPC_WEB_TRAILER,
+            data: Bytes::from(block.clone()),
+        }
+        .encode();
+        // Without the allowance the trailer frame is just an envelope.
+        let mut asm = EnvelopeAssembler::new(1024);
+        let err = asm.feed(&mut trailer.clone()).unwrap_err();
+        assert_eq!(
+            err.message.as_deref(),
+            Some("message size 2000 exceeds limit 1024")
+        );
+        // With it, trailer frames get their own limit; data frames do not.
+        let mut asm = EnvelopeAssembler::new(1024).with_grpc_web_trailer_limit(4096);
+        let out = assemble_all(&mut asm, &[&trailer]);
+        assert_eq!(out[0].flags, flags::GRPC_WEB_TRAILER);
+        assert_eq!(&out[0].data[..], &block[..]);
+        let data = Envelope::data(Bytes::from(block)).encode();
+        assert!(asm.feed(&mut data.clone()).is_err());
+        // A trailer frame over its own limit says so.
+        let mut asm = EnvelopeAssembler::new(1024).with_grpc_web_trailer_limit(1500);
+        let err = asm.feed(&mut trailer.clone()).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("grpc-web trailer size 2000 exceeds limit 1500")
+        );
+    }
+
+    /// Whatever the frame boundaries, the assembler yields exactly what
+    /// `Envelope::decode` yields over the contiguous wire.
+    #[test]
+    fn assembler_matches_contiguous_decode_at_every_split() {
+        let mut wire = BytesMut::new();
+        for env in [
+            Envelope::data(Bytes::new()),
+            Envelope::data(Bytes::from_static(b"x")),
+            Envelope::data(Bytes::from(vec![9u8; 3000])),
+            Envelope::end_stream(Bytes::from_static(b"{}")),
+            Envelope {
+                flags: flags::GRPC_WEB_TRAILER,
+                data: Bytes::from_static(b"grpc-status: 0\r\n"),
+            },
+            Envelope::data(Bytes::from_static(b"tail")),
+        ] {
+            wire.extend_from_slice(&env.encode());
+        }
+        let mut contiguous = wire.clone();
+        let mut expected = Vec::new();
+        while let Some(env) = Envelope::decode(&mut contiguous).unwrap() {
+            expected.push((env.flags, env.data));
+        }
+        assert_eq!(expected.len(), 6);
+
+        let irregular: Vec<usize> = [0, 1, 6, 7, 13, 2900, 3016, 3017, 3030, wire.len()].into();
+        let mut splits: Vec<Vec<&[u8]>> = [1, 3, HEADER_SIZE, 7, 4096]
+            .iter()
+            .map(|&n| wire.chunks(n).collect())
+            .collect();
+        splits.push(irregular.windows(2).map(|w| &wire[w[0]..w[1]]).collect());
+        for frames in splits {
+            let mut asm = EnvelopeAssembler::new(4096);
+            let got: Vec<_> = assemble_all(&mut asm, &frames)
+                .into_iter()
+                .map(|e| (e.flags, e.data))
+                .collect();
+            assert_eq!(
+                got,
+                expected,
+                "frames of {:?}",
+                frames.first().map(|f| f.len())
+            );
+            assert!(!asm.has_partial());
+        }
+    }
+
+    /// `feed` never leaves an exhausted transport frame alive in the caller's
+    /// slot, whether it stopped mid-header or mid-payload.
+    #[test]
+    fn assembler_releases_exhausted_frame() {
+        let wire = Envelope::data(Bytes::from(vec![7u8; 64])).encode();
+        for end in [3, 40] {
+            let mut asm = EnvelopeAssembler::new(1024);
+            let mut slot = Bytes::copy_from_slice(&wire[..end]);
+            let backing = slot.clone();
+            assert!(asm.feed(&mut slot).unwrap().is_none());
+            assert!(slot.is_empty());
+            assert!(
+                backing.is_unique(),
+                "exhausted frame still referenced from the slot (end={end})"
+            );
+        }
+    }
+
     // ── EnvelopeDecoder tests ───────────────────────────────────────
 
     #[test]
     fn test_decoder_complete_message() {
         let mut dec = decoder(1024);
-        let envelope = Envelope::data(Bytes::from_static(b"hello"));
-        let mut buf = BytesMut::from(&envelope.encode()[..]);
+        let mut frame = Envelope::data(Bytes::from_static(b"hello")).encode();
 
-        let result = dec.decode(&mut buf).unwrap();
-        assert_eq!(result.unwrap(), Bytes::from_static(b"hello"));
-        assert!(buf.is_empty());
+        assert_eq!(message(&mut dec, &mut frame), Bytes::from_static(b"hello"));
+        assert!(frame.is_empty());
+        assert!(dec.finish().is_ok());
     }
 
     #[test]
     fn test_decoder_incomplete_header() {
         let mut dec = decoder(1024);
         // Only 3 bytes — not enough for the 5-byte header
-        let mut buf = BytesMut::from(&[0u8, 0, 0][..]);
+        let mut frame = Bytes::from_static(&[0u8, 0, 0]);
 
-        assert!(dec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(buf.len(), 3, "buffer should be untouched");
+        assert!(dec.decode(&mut frame).unwrap().is_none());
+        assert!(frame.is_empty(), "frame is consumed into the header carry");
     }
 
     #[test]
@@ -831,47 +1326,59 @@ mod tests {
         buf.put_u8(flags::DATA);
         buf.put_u32(10);
         buf.put_slice(&[1, 2, 3]);
+        let mut frame = buf.freeze();
 
-        assert!(dec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(buf.len(), 8, "buffer should be untouched");
+        assert!(dec.decode(&mut frame).unwrap().is_none());
+        assert!(frame.is_empty());
+        // The rest arrives in a later frame.
+        let mut rest = Bytes::from_static(&[4, 5, 6, 7, 8, 9, 10]);
+        let msg = message(&mut dec, &mut rest);
+        assert_eq!(&msg[..], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
     fn test_decoder_end_stream_signals_eof() {
         let mut dec = decoder(1024);
-        let envelope = Envelope::end_stream(Bytes::from_static(b"{}"));
-        let mut buf = BytesMut::from(&envelope.encode()[..]);
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        wire.extend_from_slice(b"trailing");
+        let mut frame = wire.freeze();
 
-        // End-stream envelope yields None (EOF signal)
-        assert!(dec.decode(&mut buf).unwrap().is_none());
-        // Subsequent calls also yield None
-        assert!(dec.decode(&mut buf).unwrap().is_none());
+        // End-stream is terminal and leaves the trailing bytes in the frame
+        // for the caller to account for.
+        assert!(matches!(
+            dec.decode(&mut frame).unwrap(),
+            Some(Decoded::EndStream)
+        ));
+        assert_eq!(&frame[..], b"trailing");
+        assert!(dec.finish().is_ok());
     }
 
     #[test]
     fn test_decoder_message_exceeds_size_limit() {
         let mut dec = decoder(4); // max 4 bytes per message
-        let envelope = Envelope::data(Bytes::from_static(b"too long"));
-        let mut buf = BytesMut::from(&envelope.encode()[..]);
+        let mut frame = Envelope::data(Bytes::from_static(b"too long")).encode();
 
-        let err = dec.decode(&mut buf).unwrap_err();
+        let err = dec.decode(&mut frame).unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
     }
 
     #[test]
-    fn test_decoder_multiple_envelopes_in_buffer() {
+    fn test_decoder_multiple_envelopes_in_frame() {
         let mut dec = decoder(1024);
         let e1 = Envelope::data(Bytes::from_static(b"first"));
         let e2 = Envelope::data(Bytes::from_static(b"second"));
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&e1.encode());
         buf.extend_from_slice(&e2.encode());
+        let mut frame = buf.freeze();
 
-        let r1 = dec.decode(&mut buf).unwrap().unwrap();
+        let r1 = message(&mut dec, &mut frame);
         assert_eq!(r1, Bytes::from_static(b"first"));
-        let r2 = dec.decode(&mut buf).unwrap().unwrap();
+        let r2 = message(&mut dec, &mut frame);
         assert_eq!(r2, Bytes::from_static(b"second"));
-        assert!(buf.is_empty());
+        assert!(dec.decode(&mut frame).unwrap().is_none());
+        assert!(frame.is_empty());
     }
 
     #[test]
@@ -882,38 +1389,46 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&data_env.encode());
         buf.extend_from_slice(&end_env.encode());
+        let mut frame = buf.freeze();
 
-        let r1 = dec.decode(&mut buf).unwrap().unwrap();
+        let r1 = message(&mut dec, &mut frame);
         assert_eq!(r1, Bytes::from_static(b"msg"));
-        // End-stream yields None
-        assert!(dec.decode(&mut buf).unwrap().is_none());
+        assert!(matches!(
+            dec.decode(&mut frame).unwrap(),
+            Some(Decoded::EndStream)
+        ));
+        assert!(frame.is_empty());
     }
 
     #[test]
-    fn test_decode_eof_empty_buffer() {
-        let mut dec = decoder(1024);
-        let mut buf = BytesMut::new();
-        // Empty buffer at EOF is fine — clean end of stream
-        assert!(dec.decode_eof(&mut buf).unwrap().is_none());
+    fn test_finish_without_data() {
+        let dec = decoder(1024);
+        // Body ending before any envelope is a clean end of stream
+        assert!(dec.finish().is_ok());
     }
 
     #[test]
-    fn test_decode_eof_with_complete_envelope() {
-        let mut dec = decoder(1024);
-        let envelope = Envelope::data(Bytes::from_static(b"final"));
-        let mut buf = BytesMut::from(&envelope.encode()[..]);
-
-        let result = dec.decode_eof(&mut buf).unwrap();
-        assert_eq!(result.unwrap(), Bytes::from_static(b"final"));
-    }
-
-    #[test]
-    fn test_decode_eof_with_leftover_bytes() {
+    fn test_finish_with_partial_header() {
         let mut dec = decoder(1024);
         // Partial header — body ended with incomplete envelope
-        let mut buf = BytesMut::from(&[0u8, 0, 0][..]);
+        assert!(
+            dec.decode(&mut Bytes::from_static(&[0u8, 0, 0]))
+                .unwrap()
+                .is_none()
+        );
 
-        let err = dec.decode_eof(&mut buf).unwrap_err();
+        let err = dec.finish().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
+        assert_eq!(err.message.as_deref(), Some("incomplete request envelope"));
+    }
+
+    #[test]
+    fn test_finish_with_partial_payload() {
+        let mut dec = decoder(1024);
+        let wire = Envelope::data(Bytes::from_static(b"hello")).encode();
+        assert!(dec.decode(&mut wire.slice(..7)).unwrap().is_none());
+
+        let err = dec.finish().unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
@@ -921,10 +1436,9 @@ mod tests {
     fn test_decoder_compressed_without_encoding_header() {
         let mut dec = decoder(1024);
         // Compressed flag set but decoder has no streaming_encoding
-        let envelope = Envelope::compressed(Bytes::from_static(b"data"));
-        let mut buf = BytesMut::from(&envelope.encode()[..]);
+        let mut frame = Envelope::compressed(Bytes::from_static(b"data")).encode();
 
-        let err = dec.decode(&mut buf).unwrap_err();
+        let err = dec.decode(&mut frame).unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Internal);
     }
 
@@ -999,10 +1513,11 @@ mod tests {
         let original = Bytes::from_static(b"roundtrip test data");
         let mut buf = BytesMut::new();
         enc.encode(original.clone(), &mut buf).unwrap();
+        let mut frame = buf.freeze();
 
-        let decoded = dec.decode(&mut buf).unwrap().unwrap();
+        let decoded = message(&mut dec, &mut frame);
         assert_eq!(decoded, original);
-        assert!(buf.is_empty());
+        assert!(frame.is_empty());
     }
 
     #[test]
@@ -1017,10 +1532,11 @@ mod tests {
 
         // Decode both with a decoder
         let mut dec = decoder(1024);
-        let r1 = dec.decode(&mut buf).unwrap().unwrap();
+        let mut frame = buf.freeze();
+        let r1 = message(&mut dec, &mut frame);
         assert_eq!(r1, Bytes::from_static(b"one"));
-        let r2 = dec.decode(&mut buf).unwrap().unwrap();
+        let r2 = message(&mut dec, &mut frame);
         assert_eq!(r2, Bytes::from_static(b"two"));
-        assert!(buf.is_empty());
+        assert!(frame.is_empty());
     }
 }

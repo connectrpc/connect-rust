@@ -1,0 +1,18 @@
+kind: Fixed
+body: |-
+    **Streams no longer keep a large message's allocation alive after handing
+    it over.** The server request reader and the client response stream used
+    to slice each message out of a per-stream read buffer that grew to the
+    largest message and was kept until the stream ended, so a long-lived
+    stream that once carried a multi-MiB message pinned that memory even after
+    the handler dropped it. Messages are now assembled straight from transport
+    frames: a message larger than 4 KiB gets its own exactly-sized buffer that
+    it solely owns, and the size limit is still checked before anything is
+    allocated. Messages of 4 KiB or less are copied out of a small reusable
+    per-stream buffer, so steady-state small messages do not allocate; an idle
+    stream retains at most 8 KiB. No API or wire change. The client-side
+    "response buffer exceeds limit" error is gone (memory is now bounded per
+    envelope, whose over-limit header reports "message size N exceeds limit M"
+    as before), and a gRPC-Web trailer frame larger than 1 MiB now fails the
+    stream with `resource_exhausted`.
+time: 2026-09-12T00:00:00.000000000+00:00
