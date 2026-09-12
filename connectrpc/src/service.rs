@@ -41,7 +41,6 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use futures::{Stream, StreamExt};
 use http::Method;
 use http::Request;
@@ -53,7 +52,6 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use serde::Serialize;
-use tokio_util::codec::Decoder as _;
 use tracing::Instrument;
 
 use crate::codec::CodecFormat;
@@ -63,6 +61,7 @@ use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
 use crate::deadline::DeadlinePolicy;
 use crate::dispatcher::{Dispatcher, MethodDescriptor};
+use crate::envelope::Decoded;
 use crate::envelope::Envelope;
 use crate::envelope::EnvelopeDecoder;
 use crate::error::ConnectError;
@@ -2895,7 +2894,6 @@ enum ReadMode {
 /// rest of the body (bounded) once the decoder is finished.
 struct BodyReader {
     decoder: EnvelopeDecoder,
-    buf: BytesMut,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
     mode: ReadMode,
 }
@@ -2909,7 +2907,6 @@ impl BodyReader {
     ) -> Self {
         Self {
             decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
-            buf: BytesMut::new(),
             tx,
             mode: ReadMode::Decoding,
         }
@@ -2919,17 +2916,17 @@ impl BodyReader {
     ///
     /// Returns [`ControlFlow::Break`] when the reader should stop reading the
     /// body because the post-decoder drain limit was exceeded.
-    async fn on_data(&mut self, data: Bytes) -> ControlFlow<()> {
+    async fn on_data(&mut self, mut data: Bytes) -> ControlFlow<()> {
+        if matches!(self.mode, ReadMode::Decoding) {
+            // May switch to draining; what is left of `data` (bytes after
+            // END_STREAM or a decode error) is drained below with the frame.
+            self.decode_available(&mut data).await;
+        }
         match &mut self.mode {
-            ReadMode::Decoding => {
-                self.buf.extend_from_slice(&data);
-                self.decode_available().await;
-                ControlFlow::Continue(())
-            }
             ReadMode::Draining {
                 drained,
                 pending_trailing_data_warn,
-            } => {
+            } if !data.is_empty() => {
                 if *pending_trailing_data_warn {
                     tracing::warn!(
                         trailing_bytes = data.len(),
@@ -2947,42 +2944,29 @@ impl BodyReader {
                 }
                 ControlFlow::Continue(())
             }
+            _ => ControlFlow::Continue(()),
         }
     }
 
-    /// Handle the end of the request body: flush any remaining complete
-    /// messages out of the decoder. A client may end the body without an
+    /// Handle the end of the request body. Every complete message has already
+    /// been forwarded frame by frame; a client may end the body without an
     /// END_STREAM envelope — the body ending is itself the end-of-stream
-    /// signal.
+    /// signal — but not part-way through an envelope.
     async fn on_eof(&mut self) {
         if !matches!(self.mode, ReadMode::Decoding) {
             return;
         }
-        loop {
-            match self.decoder.decode_eof(&mut self.buf) {
-                Ok(Some(data)) => {
-                    // A send failure (handler dropped the stream) just ends
-                    // the flush early — the caller breaks out of the read
-                    // loop right after `on_eof`, so no mode change is needed.
-                    if self.tx.send(Ok(data)).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => return,
-                Err(e) => {
-                    let _ = self.tx.send(Err(e)).await;
-                    return;
-                }
-            }
+        if let Err(e) = self.decoder.finish() {
+            let _ = self.tx.send(Err(e)).await;
         }
     }
 
-    /// Decode and forward every complete message currently buffered,
-    /// switching to drain mode if the decoder finishes.
-    async fn decode_available(&mut self) {
+    /// Decode and forward every complete message in `frame`, switching to
+    /// drain mode if the decoder finishes.
+    async fn decode_available(&mut self, frame: &mut Bytes) {
         loop {
-            match self.decoder.decode(&mut self.buf) {
-                Ok(Some(data)) => {
+            match self.decoder.decode(frame) {
+                Ok(Some(Decoded::Message(data))) => {
                     if self.tx.send(Ok(data)).await.is_err() {
                         // The handler dropped the request stream; the rest of
                         // the body is drained without inspection.
@@ -2990,10 +2974,9 @@ impl BodyReader {
                         return;
                     }
                 }
-                Ok(None) if self.decoder.is_done() => {
-                    // The END_STREAM envelope was decoded — the stream is
-                    // finished, and any further request data is a protocol
-                    // violation by the client.
+                Ok(Some(Decoded::EndStream)) => {
+                    // The stream is finished; any further request data is a
+                    // protocol violation by the client.
                     self.enter_drain_mode(true);
                     return;
                 }
@@ -3007,23 +2990,12 @@ impl BodyReader {
         }
     }
 
-    /// Switch to bounded drain mode, releasing any bytes the decoder still
-    /// holds (e.g. trailing data that arrived in the same body frame as
-    /// END_STREAM, or an undecoded partial envelope after a decode error)
-    /// instead of keeping them resident for the duration of the drain.
+    /// Switch to bounded drain mode; `end_stream` arms the one-time warning
+    /// for request data after END_STREAM.
     fn enter_drain_mode(&mut self, end_stream: bool) {
-        let mut pending_trailing_data_warn = end_stream;
-        if pending_trailing_data_warn && !self.buf.is_empty() {
-            tracing::warn!(
-                trailing_bytes = self.buf.len(),
-                "client sent request data after the END_STREAM envelope; discarding"
-            );
-            pending_trailing_data_warn = false;
-        }
-        self.buf = BytesMut::new();
         self.mode = ReadMode::Draining {
             drained: 0,
-            pending_trailing_data_warn,
+            pending_trailing_data_warn: end_stream,
         };
     }
 
@@ -5415,6 +5387,107 @@ mod tests {
             "reader pulled {pulled} bytes after END_STREAM (expected at most \
              {max_expected}); trailing data is being buffered without bound"
         );
+    }
+
+    fn test_reader() -> (
+        BodyReader,
+        tokio::sync::mpsc::Receiver<Result<Bytes, ConnectError>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+        (reader, rx)
+    }
+
+    /// A large message that arrives over many transport frames reaches the
+    /// handler as the sole owner of its allocation: the reader keeps no
+    /// buffer that shares it, and nothing is left buffered once it is out.
+    #[tokio::test]
+    async fn test_body_reader_large_message_owns_its_allocation() {
+        let (mut reader, mut rx) = test_reader();
+        let payload = Bytes::from(vec![0x42_u8; 1024 * 1024]);
+        let wire = Envelope::data(payload.clone()).encode();
+        for chunk in wire.chunks(16 * 1024) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue()
+            );
+        }
+
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert_eq!(msg, payload, "message must arrive intact");
+        assert!(msg.is_unique(), "reader shares the message's allocation");
+        assert!(reader.decoder.finish().is_ok(), "nothing left buffered");
+    }
+
+    /// A compressed envelope split across frames is reassembled and
+    /// decompressed.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn test_body_reader_compressed_message_across_frames() {
+        let registry = Arc::new(CompressionRegistry::default());
+        let payload = Bytes::from(vec![b'z'; 64 * 1024]);
+        let compressed = registry
+            .compress("gzip", &payload)
+            .expect("gzip compresses");
+        let wire = Envelope::compressed(compressed).encode();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Some("gzip".to_owned()),
+            registry,
+            tx,
+        );
+        for chunk in wire.chunks(7) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue()
+            );
+        }
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert_eq!(msg, payload);
+    }
+
+    /// A body that ends part-way through an envelope surfaces
+    /// `invalid_argument` to the handler rather than a clean end of stream.
+    #[tokio::test]
+    async fn test_body_reader_incomplete_envelope_at_eof() {
+        let wire = Envelope::data(Bytes::from_static(b"hello world")).encode();
+        let mut frames = std::collections::VecDeque::new();
+        frames.push_back(wire.slice(..3));
+        frames.push_back(wire.slice(3..9));
+        let body = CountingBody {
+            frames,
+            pulled: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let (mut request_stream, reader_task) = spawn_body_reader(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        let err = request_stream
+            .next()
+            .await
+            .expect("an item must be delivered")
+            .expect_err("a truncated envelope is an error");
+        assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
+        assert_eq!(err.message.as_deref(), Some("incomplete request envelope"));
+        assert!(request_stream.next().await.is_none());
+        reader_task
+            .expect("tests run inside a tokio runtime")
+            .await
+            .expect("reader task must not panic");
     }
 
     /// An END_STREAM envelope with no preceding messages (the typical
