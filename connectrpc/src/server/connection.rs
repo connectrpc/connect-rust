@@ -15,13 +15,10 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::task::Context;
-use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -33,7 +30,6 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use hyper_util::server::graceful::GracefulConnection;
 use tokio::sync::watch;
 use tower::ServiceExt;
 use tower_http::catch_panic::CatchPanic;
@@ -103,10 +99,8 @@ where
 {
     async move {
         let remote_addr = info.peer_addr();
-        tracing::trace!(
-            remote_addr = remote_addr.map(tracing::field::display),
-            "Serving connection"
-        );
+        let peer = remote_addr.map(tracing::field::display);
+        tracing::trace!(remote_addr = peer, "Serving connection");
 
         let service = CatchPanic::custom(service, InternalErrorForPanic);
 
@@ -122,7 +116,7 @@ where
         let (request_counter, requests_exhausted) = match config.max_requests_per_connection() {
             Some(max) => {
                 let (tx, rx) = watch::channel(false);
-                (Some(RequestCounter::new(max, tx)), Some(latched(rx)))
+                (Some(RequestCounter::new(max, tx)), Some(rx))
             }
             None => (None, None),
         };
@@ -171,26 +165,76 @@ where
             let sample = std::hash::RandomState::new().hash_one(remote_addr);
             jitter_connection_age(age, sample)
         });
+        let idle = config.max_connection_idle().zip(activity);
+        let grace = config.max_connection_age_grace();
 
-        ConnectionLifecycle {
-            conn: Box::pin(conn),
-            remote_addr,
-            shutdown: Box::pin(shutdown),
-            grace: config.max_connection_age_grace(),
-            age: max_age.map(|age| Box::pin(tokio::time::sleep(age))),
-            idle: config
-                .max_connection_idle()
-                .zip(activity)
-                .map(|(idle, activity)| IdleTracker {
-                    idle,
-                    armed_epoch: activity.snapshot().1,
-                    activity,
-                    timer: Box::pin(tokio::time::sleep(idle)),
-                }),
-            requests_exhausted,
-            state: ConnectionLifecycleState::Serving,
+        let mut conn = std::pin::pin!(conn);
+        let mut shutdown = std::pin::pin!(shutdown);
+
+        // Serve until the peer closes, the loop asks us to stop, or a
+        // retirement trigger fires. `biased` keeps the connection polled first.
+        let trigger = tokio::select! {
+            biased;
+            result = conn.as_mut() => return log_connection_result(remote_addr, result),
+            () = shutdown.as_mut() => None,
+            trigger = retirement(max_age, idle, requests_exhausted) => Some(trigger),
+        };
+        conn.as_mut().graceful_shutdown();
+
+        // Whole-server shutdown drains for as long as in-flight requests need.
+        // A retired connection drains for at most `grace`, unless shutdown
+        // arrives meanwhile and lifts the cap.
+        if let Some(trigger) = trigger {
+            tracing::trace!(
+                remote_addr = peer,
+                trigger,
+                ?grace,
+                "Retiring connection; starting graceful shutdown"
+            );
+            tokio::select! {
+                biased;
+                result = conn.as_mut() => return log_connection_result(remote_addr, result),
+                () = shutdown.as_mut() => {}
+                () = tokio::time::sleep(grace) => {
+                    tracing::trace!(remote_addr = peer, ?grace, "Connection retirement grace expired; closing connection");
+                    return;
+                }
+            }
         }
-        .await;
+        log_connection_result(remote_addr, conn.await);
+    }
+}
+
+/// Resolves with the name of the first retirement trigger to fire; pending
+/// forever when none is configured. Polled in the order age, idle, requests.
+async fn retirement(
+    max_age: Option<Duration>,
+    idle: Option<(Duration, Arc<ConnectionActivity>)>,
+    requests_exhausted: Option<watch::Receiver<bool>>,
+) -> &'static str {
+    let age = async {
+        match max_age {
+            Some(age) => tokio::time::sleep(age).await,
+            None => std::future::pending().await,
+        }
+    };
+    let idle = async {
+        match idle {
+            Some((window, activity)) => activity.quiet_for(window).await,
+            None => std::future::pending().await,
+        }
+    };
+    let requests = async {
+        match requests_exhausted {
+            Some(rx) => latched(rx).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = age => "max age",
+        () = idle => "idle",
+        () = requests => "max requests",
     }
 }
 
@@ -229,10 +273,8 @@ fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: &Connection
 /// Resolves when the watch flips to `true` or its sender is dropped. Both mean
 /// "begin graceful shutdown", so a connection drains rather than hangs when
 /// whoever owned the sender goes away.
-pub(super) fn latched(mut rx: watch::Receiver<bool>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async move {
-        let _ = rx.wait_for(|fired| *fired).await;
-    })
+pub(super) async fn latched(mut rx: watch::Receiver<bool>) {
+    let _ = rx.wait_for(|fired| *fired).await;
 }
 
 /// Shared in-flight request accounting for one connection.
@@ -280,6 +322,22 @@ impl ConnectionActivity {
             self.in_flight.load(Ordering::SeqCst),
             self.epoch.load(Ordering::SeqCst),
         )
+    }
+
+    /// Resolves once a whole `window` passes with no request in flight at its
+    /// end and no request started or finished during it. Evaluated lazily —
+    /// checked when the window elapses rather than re-armed per request — so
+    /// it fires between one and two windows after the last activity.
+    async fn quiet_for(&self, window: Duration) {
+        let mut armed_epoch = self.snapshot().1;
+        loop {
+            tokio::time::sleep(window).await;
+            let (in_flight, epoch) = self.snapshot();
+            if in_flight == 0 && epoch == armed_epoch {
+                return;
+            }
+            armed_epoch = epoch;
+        }
     }
 }
 
@@ -334,151 +392,6 @@ impl RequestCounter {
             // `send` only errs if the receiver was dropped (the connection is
             // already gone), in which case there is nothing left to retire.
             let _ = self.exhausted.send(true);
-        }
-    }
-}
-
-/// Drives one hyper connection to completion while enforcing shutdown and the
-/// three retirement triggers.
-struct ConnectionLifecycle<C: GracefulConnection> {
-    conn: Pin<Box<C>>,
-    remote_addr: Option<SocketAddr>,
-    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-    /// Drain window after any retirement trigger fires; never applied to
-    /// `shutdown`.
-    grace: Duration,
-    /// Fires at the (jittered) maximum age.
-    age: Option<Pin<Box<tokio::time::Sleep>>>,
-    idle: Option<IdleTracker>,
-    /// Resolves when the per-connection request count reaches its limit.
-    requests_exhausted: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    state: ConnectionLifecycleState,
-}
-
-/// Per-connection idle-timer state held by [`ConnectionLifecycle`].
-struct IdleTracker {
-    /// How long a connection may have zero in-flight requests before it is
-    /// retired.
-    idle: Duration,
-    activity: Arc<ConnectionActivity>,
-    /// Fires when the current idle window elapses.
-    timer: Pin<Box<tokio::time::Sleep>>,
-    /// Activity epoch observed when the current window was armed. If it is
-    /// unchanged and there are no in-flight requests when the timer fires, the
-    /// connection has been idle for the whole window.
-    armed_epoch: u64,
-}
-
-enum ConnectionLifecycleState {
-    Serving,
-    /// `shutdown` resolved: graceful shutdown has been issued and the
-    /// connection drains for as long as in-flight requests need.
-    Draining,
-    /// A retirement trigger (max age, max idle, or max requests) fired:
-    /// graceful shutdown has been issued and the connection is force-closed
-    /// when `deadline` elapses, unless `shutdown` resolves first and lifts the
-    /// cap.
-    Retiring {
-        deadline: Pin<Box<tokio::time::Sleep>>,
-    },
-}
-
-impl<C> ConnectionLifecycle<C>
-where
-    C: GracefulConnection,
-{
-    /// Issue graceful shutdown and start the retirement grace window.
-    fn retire(&mut self, trigger: &'static str) {
-        tracing::trace!(
-            remote_addr = self.remote_addr.map(tracing::field::display),
-            trigger,
-            grace = ?self.grace,
-            "Retiring connection; starting graceful shutdown",
-        );
-        self.conn.as_mut().graceful_shutdown();
-        self.state = ConnectionLifecycleState::Retiring {
-            deadline: Box::pin(tokio::time::sleep(self.grace)),
-        };
-    }
-}
-
-impl<C> Future for ConnectionLifecycle<C>
-where
-    C: GracefulConnection,
-    C::Error: std::fmt::Display,
-{
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-
-        loop {
-            if let Poll::Ready(result) = this.conn.as_mut().poll(cx) {
-                log_connection_result(this.remote_addr, result);
-                return Poll::Ready(());
-            }
-
-            match &mut this.state {
-                ConnectionLifecycleState::Serving => {
-                    if this.shutdown.as_mut().poll(cx).is_ready() {
-                        this.conn.as_mut().graceful_shutdown();
-                        this.state = ConnectionLifecycleState::Draining;
-                        continue;
-                    }
-
-                    if let Some(timer) = &mut this.age
-                        && timer.as_mut().poll(cx).is_ready()
-                    {
-                        this.retire("max age");
-                        continue;
-                    }
-
-                    if let Some(idle) = &mut this.idle
-                        && idle.timer.as_mut().poll(cx).is_ready()
-                    {
-                        let (in_flight, epoch) = idle.activity.snapshot();
-                        if in_flight == 0 && epoch == idle.armed_epoch {
-                            this.retire("idle");
-                            continue;
-                        }
-                        // A request is in flight, or activity occurred during
-                        // the window: re-arm, reusing the `Sleep` allocation.
-                        idle.armed_epoch = epoch;
-                        let next = tokio::time::Instant::now() + idle.idle;
-                        idle.timer.as_mut().reset(next);
-                        continue;
-                    }
-
-                    if let Some(exhausted) = &mut this.requests_exhausted
-                        && exhausted.as_mut().poll(cx).is_ready()
-                    {
-                        this.retire("max requests");
-                        continue;
-                    }
-
-                    return Poll::Pending;
-                }
-                ConnectionLifecycleState::Draining => return Poll::Pending,
-                ConnectionLifecycleState::Retiring { deadline } => {
-                    // Whole-server shutdown waits for in-flight requests
-                    // indefinitely, so it lifts the retirement deadline.
-                    if this.shutdown.as_mut().poll(cx).is_ready() {
-                        this.state = ConnectionLifecycleState::Draining;
-                        continue;
-                    }
-
-                    if deadline.as_mut().poll(cx).is_ready() {
-                        tracing::trace!(
-                            remote_addr = this.remote_addr.map(tracing::field::display),
-                            grace = ?this.grace,
-                            "Connection retirement grace expired; closing connection",
-                        );
-                        return Poll::Ready(());
-                    }
-
-                    return Poll::Pending;
-                }
-            }
         }
     }
 }
@@ -681,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn latched_resolves_on_signal() {
         let (tx, rx) = watch::channel(false);
-        let mut fut = latched(rx);
+        let mut fut = std::pin::pin!(latched(rx));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut fut)
                 .await
