@@ -88,22 +88,6 @@ async fn http2_adaptive_window_default_serves_request() {
     h2_task.await.expect("h2 connection task panicked").ok();
 }
 
-/// `configure_http2` leaves keepalive untouched when no interval is set, so
-/// hyper's default (keepalive disabled) is preserved unless the user opts
-/// in. There is no public getter on the builder, so this guards the opt-in
-/// contract at the call boundary by exercising the default path without
-/// panicking.
-#[test]
-fn configure_http2_default_leaves_keepalive_disabled() {
-    assert!(
-        ConnectionConfig::default()
-            .http2_keepalive_interval()
-            .is_none()
-    );
-    let mut builder = AutoBuilder::new(TokioExecutor::new());
-    configure_http2(&mut builder, &ConnectionConfig::default());
-}
-
 /// A configured keepalive interval must reach hyper's HTTP/2 builder: once
 /// a peer with an active stream stops acknowledging PING frames, the server
 /// closes the connection after the keepalive timeout rather than leaving it

@@ -1,10 +1,11 @@
 //! Per-connection and accept-time settings as plain values.
 //!
-//! [`ConnectionConfig`] is everything the server applies to one accepted
-//! connection; [`AcceptConfig`] is everything it applies between `accept(2)`
-//! and handing over an authenticated stream. Both have a `Default`, so
-//! `Server` and `BoundServer` are configured from the same value and cannot
-//! drift.
+//! [`ConnectionConfig`] is everything the connection driver
+//! ([`serve_connection`](super::serve_connection)) applies to one connection;
+//! [`AcceptConfig`] is everything the [`Acceptor`](super::Acceptor) applies
+//! between `accept(2)` and handing over an authenticated stream. Both have a
+//! `Default`, so `Server`, `BoundServer` and custom accept loops are configured
+//! from the same value and cannot drift.
 
 use std::num::NonZeroU64;
 #[cfg(feature = "server-tls")]
@@ -74,10 +75,11 @@ pub(crate) const DEFAULT_MAX_CONNECTION_AGE_GRACE: Duration = Duration::from_sec
 /// period.
 ///
 /// A plain value with a [`Default`]; build one and hand it to
-/// [`Server::with_connection_config`](super::Server::with_connection_config) or
-/// [`BoundServer::with_connection_config`](super::BoundServer::with_connection_config).
-/// The `with_*` setters of the same names on `Server` / `BoundServer` are
-/// shorthand for editing this value in place.
+/// [`Server::with_connection_config`](super::Server::with_connection_config),
+/// [`BoundServer::with_connection_config`](super::BoundServer::with_connection_config),
+/// or [`serve_connection`](super::serve_connection) directly. The `with_*`
+/// setters of the same names on `Server` / `BoundServer` are shorthand for
+/// editing this value in place.
 ///
 /// HTTP/2 adaptive window sizing and the explicit window sizes are mutually
 /// exclusive in hyper; the setters keep them consistent (supplying a size
@@ -521,7 +523,8 @@ impl ConnectionConfig {
     }
 
     /// Log (at debug) settings that are present but inert because the setting
-    /// they qualify is absent. Called once per accept loop, not per connection.
+    /// they qualify is absent. Called once by the built-in accept loop, not per
+    /// connection, so loops that call `serve_connection` directly skip it.
     pub(crate) fn lint(&self) {
         if self.max_connection_age.is_none()
             && self.max_connection_idle.is_none()
@@ -545,9 +548,9 @@ impl ConnectionConfig {
     }
 }
 
-/// Everything the accept loop applies between `accept(2)` and handing over an
-/// authenticated stream: whether to terminate TLS, and how long a handshake
-/// may take.
+/// Everything the [`Acceptor`](super::Acceptor) applies between `accept(2)`
+/// and handing over an authenticated stream: whether to terminate TLS, and how
+/// long a handshake may take.
 ///
 /// `TCP_NODELAY` is always set and has no knob. Without the `server-tls`
 /// feature this struct has no settings.

@@ -25,7 +25,9 @@ use super::ConnectionInfo;
 ///
 /// Owns `accept(2)`, transient-error retry, `TCP_NODELAY`, and — through
 /// [`Accepted::handshake`] — TLS termination with its timeout and the capture
-/// of peer facts into [`ConnectionInfo`]. TCP only.
+/// of peer facts into [`ConnectionInfo`]. TCP only: other transports (Unix
+/// sockets, in-memory streams) skip this layer and hand their streams to
+/// [`serve_connection`](super::serve_connection) directly.
 #[derive(Debug)]
 pub struct Acceptor {
     listener: TcpListener,
@@ -187,7 +189,7 @@ impl Accepted {
 }
 
 /// The byte stream of an accepted (and, if configured, TLS-terminated)
-/// connection.
+/// connection, ready for [`serve_connection`](super::serve_connection).
 ///
 /// Opaque so the TLS implementation is not part of this crate's API.
 #[derive(Debug)]

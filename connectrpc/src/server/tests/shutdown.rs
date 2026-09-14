@@ -212,34 +212,3 @@ async fn test_graceful_shutdown_sends_h2_goaway() {
     // close before the server gets a chance to GOAWAY.
     drop(send_request);
 }
-
-#[tokio::test]
-async fn global_shutdown_future_resolves_on_signal() {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let mut fut = global_shutdown_future(rx);
-    // Stays pending until the accept loop signals shutdown.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut fut)
-            .await
-            .is_err(),
-        "shutdown future resolved before any signal",
-    );
-    tx.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), fut)
-        .await
-        .expect("shutdown future must resolve after send(true)");
-}
-
-#[tokio::test]
-async fn global_shutdown_future_resolves_when_sender_dropped() {
-    // On a fatal accept error the accept loop drops the sender without
-    // sending; connections must still observe shutdown and drain rather
-    // than hang. `wait_for` returns `Err` on a closed channel, which the
-    // helper treats as shutdown.
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let fut = global_shutdown_future(rx);
-    drop(tx);
-    tokio::time::timeout(Duration::from_secs(1), fut)
-        .await
-        .expect("shutdown future must resolve when the sender is dropped");
-}

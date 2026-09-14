@@ -1,0 +1,25 @@
+kind: Added
+body: |-
+    **`server::serve_connection` and `server::Acceptor`: the connection driver
+    and the accept step as public layers, for custom accept loops.**
+    `serve_connection(io, info, service, config, shutdown)` — or
+    `Server::serve_connection(io, info, shutdown)` with the server's own
+    service and config — serves one already-accepted stream with everything
+    `Server::serve` gives a connection (HTTP/1.1 / HTTP/2 settings, keepalive,
+    header-read timeout, max age / idle / request retirement, graceful GOAWAY
+    on `shutdown`, panic isolation, `PeerAddr` / `PeerCerts`) on whichever
+    runtime polls it; `Acceptor::accept()` → `Accepted::handshake()` →
+    `(ServerIo, ConnectionInfo)` is the TCP + TLS half. The new public
+    `ConnectionInfo` (also at the crate root) is what one side hands the
+    other: `peer_addr()`, `peer_certs()`, and connection-scoped
+    `extensions_mut()` that the loop fills once — a parsed client-certificate
+    identity, say — and the driver clones into every request on the
+    connection. A loop that admits connections by client identity, caps them per
+    tenant, or places them on different runtimes is a few dozen lines over the
+    two and keeps every guarantee of the built-in server ([#191], [#49]); see
+    `examples/custom-accept-loop` and the guide's "Custom accept loops".
+    `Server::service()` exposes the configured service for such loops.
+
+    [#191]: https://github.com/connectrpc/connect-rust/issues/191
+    [#49]: https://github.com/connectrpc/connect-rust/issues/49
+time: 2026-09-14T19:01:00.000000000+00:00

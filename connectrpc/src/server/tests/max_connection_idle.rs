@@ -2,27 +2,6 @@
 
 use super::*;
 
-#[test]
-fn connection_activity_tracks_in_flight_and_epoch() {
-    let activity = ConnectionActivity::default();
-    assert_eq!(activity.snapshot(), (0, 0));
-
-    let guard = ActiveRequestGuard::new(Arc::new(ConnectionActivity::default()));
-    // The guard owns its own activity; exercise the shared-Arc path too.
-    drop(guard);
-
-    let shared = Arc::new(ConnectionActivity::default());
-    let g1 = ActiveRequestGuard::new(Arc::clone(&shared));
-    let g2 = ActiveRequestGuard::new(Arc::clone(&shared));
-    // Two starts: in_flight == 2, epoch bumped twice.
-    assert_eq!(shared.snapshot(), (2, 2));
-    drop(g1);
-    // One completion: in_flight back to 1, epoch bumped again.
-    assert_eq!(shared.snapshot(), (1, 3));
-    drop(g2);
-    assert_eq!(shared.snapshot(), (0, 4));
-}
-
 #[tokio::test(start_paused = true)]
 async fn max_connection_idle_reaps_quiet_connection() {
     let bound = Server::bind("127.0.0.1:0")

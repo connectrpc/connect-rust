@@ -2,57 +2,6 @@
 
 use super::*;
 
-#[test]
-fn max_connection_age_jitter_stays_within_bounds() {
-    let samples = [0, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX];
-    let ages = [
-        Duration::ZERO,
-        Duration::from_nanos(1),
-        Duration::from_secs(10),
-        Duration::MAX,
-    ];
-
-    assert_eq!(
-        jitter_connection_age(Duration::from_secs(10), 0),
-        Duration::from_secs(9)
-    );
-    assert_eq!(
-        jitter_connection_age(Duration::from_secs(10), u64::MAX),
-        Duration::from_secs(11)
-    );
-
-    for age in ages {
-        for sample in samples {
-            let jittered = jitter_connection_age(age, sample);
-            if age.is_zero() {
-                assert_eq!(jittered, Duration::ZERO);
-                continue;
-            }
-
-            assert!(
-                jittered
-                    .as_nanos()
-                    .saturating_mul(MAX_CONNECTION_AGE_JITTER_BASIS_POINTS)
-                    >= age.as_nanos().saturating_mul(
-                        MAX_CONNECTION_AGE_JITTER_BASIS_POINTS
-                            - MAX_CONNECTION_AGE_JITTER_SPREAD_BASIS_POINTS
-                    ),
-                "{jittered:?} was below the 90% jitter bound for {age:?}"
-            );
-            assert!(
-                jittered
-                    .as_nanos()
-                    .saturating_mul(MAX_CONNECTION_AGE_JITTER_BASIS_POINTS)
-                    <= age.as_nanos().saturating_mul(
-                        MAX_CONNECTION_AGE_JITTER_BASIS_POINTS
-                            + MAX_CONNECTION_AGE_JITTER_SPREAD_BASIS_POINTS
-                    ),
-                "{jittered:?} was above the 110% jitter bound for {age:?}"
-            );
-        }
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn max_connection_age_sends_h2_goaway_without_global_shutdown() {
     let bound = Server::bind("127.0.0.1:0")

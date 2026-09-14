@@ -1,11 +1,15 @@
 use super::*;
 use std::sync::Mutex;
 use std::time::Duration;
+
+use bytes::Bytes;
+use http::header;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 mod acceptor;
 mod builders;
+mod connection;
 mod header_read_timeout;
 mod http2;
 mod max_connection_age;
@@ -13,6 +17,74 @@ mod max_connection_idle;
 mod max_requests;
 mod peer;
 mod shutdown;
+
+/// The public types keep their auto traits, and the serving futures are
+/// `Send` so they can be spawned. Constructing the futures needs no runtime.
+#[test]
+fn public_types_are_send_and_futures_spawnable() {
+    fn send<T: Send>(_: &T) {}
+    fn sync<T: Sync>(_: &T) {}
+    fn unpin<T: Unpin>(_: &T) {}
+    fn error<T: std::error::Error + Send + Sync + 'static>() {}
+
+    let server = Server::new(Router::new());
+    send(&server);
+    sync(&server);
+    send(&ConnectionConfig::new());
+    sync(&ConnectionConfig::new());
+    send(&AcceptConfig::new());
+    sync(&AcceptConfig::new());
+    send(&ConnectionInfo::new());
+    sync(&ConnectionInfo::new());
+    error::<HandshakeError>();
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = {
+        let _guard = runtime.enter();
+        TcpListener::from_std(std_listener).unwrap()
+    };
+    let acceptor = Acceptor::new(listener, AcceptConfig::new());
+    send(&acceptor);
+    sync(&acceptor);
+    let accept = acceptor.accept();
+    send(&accept);
+    // Type-checks without a value: an `Accepted` only exists once a peer has
+    // connected, so assert over a parameter instead of constructing one.
+    fn handshake_is_send(accepted: Accepted) {
+        fn send<T: Send>(_: &T) {}
+        send(&accepted);
+        let handshake = accepted.handshake();
+        send(&handshake);
+    }
+    let _ = handshake_is_send;
+    fn server_io_is_send_unpin(io: &ServerIo) {
+        fn send<T: Send>(_: &T) {}
+        fn unpin<T: Unpin>(_: &T) {}
+        send(io);
+        unpin(io);
+    }
+    let _ = server_io_is_send_unpin;
+
+    let (io, _) = tokio::io::duplex(1);
+    let connection = serve_connection(
+        io,
+        ConnectionInfo::new(),
+        ConnectRpcService::new(Router::new()),
+        ConnectionConfig::new(),
+        std::future::pending(),
+    );
+    send(&connection);
+    let (io, _) = tokio::io::duplex(1);
+    let connection = server.serve_connection(io, ConnectionInfo::new(), std::future::ready(()));
+    send(&connection);
+    drop(server); // the future does not borrow the `Server`
+    unpin(&Box::pin(connection));
+}
 
 /// Hand-crafted Connect unary request (`POST /svc/Echo`, empty proto
 /// body, `Connection: close`). Used by the peer-info tests to probe the
@@ -88,7 +160,7 @@ async fn drain_h2_body(mut resp: http::Response<h2::RecvStream>) {
     }
 }
 
-async fn read_http1_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+async fn read_http1_response(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
     let mut resp = Vec::new();
     let mut buf = [0; 1024];
     loop {
