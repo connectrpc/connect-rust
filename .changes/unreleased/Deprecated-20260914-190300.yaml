@@ -1,0 +1,5 @@
+kind: Deprecated
+body: |-
+    **`connectrpc::axum::ServeTls`** is now an alias of `connectrpc::axum::Serve`,
+    which both `serve` and `serve_tls` return; use `Serve`.
+time: 2026-09-14T19:03:00.000000000+00:00

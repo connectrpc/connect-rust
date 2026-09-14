@@ -95,6 +95,8 @@ jobs:
       # The server's acceptor and connection driver are public without TLS;
       # lint that feature shape too, not just the union.
       - run: cargo clippy -p connectrpc --no-default-features --features server --all-targets -- -D warnings
+      # ...and the axum adapter without `server-tls`.
+      - run: cargo clippy -p connectrpc --no-default-features --features axum,server --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -305,3 +307,4 @@ jobs:
       - run: cargo check -p connectrpc --no-default-features
       - run: cargo test -p connectrpc --no-default-features
       - run: cargo check -p connectrpc --no-default-features --features server
+      - run: cargo check -p connectrpc --no-default-features --features axum,server

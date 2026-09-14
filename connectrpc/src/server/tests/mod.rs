@@ -203,7 +203,7 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 /// requires a verified client certificate and the client presents one.
 /// Returns (server_config, client_config, client_cert_der).
 #[cfg(feature = "server-tls")]
-fn pki() -> (
+pub(crate) fn pki() -> (
     Arc<rustls::ServerConfig>,
     Arc<rustls::ClientConfig>,
     rustls::pki_types::CertificateDer<'static>,

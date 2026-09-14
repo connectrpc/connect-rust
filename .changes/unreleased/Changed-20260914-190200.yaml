@@ -1,0 +1,18 @@
+kind: Changed
+body: |-
+    **`connectrpc::axum::serve_tls` runs on the same acceptor and connection
+    driver as `Server`,** so it now honours every `ConnectionConfig` setting
+    (max connection age / idle / requests, HTTP/2 keepalive and max concurrent
+    streams) instead of a hand-maintained subset. Three behaviours change as a
+    result: a panicking handler yields a `500` with a Connect-JSON `internal`
+    body and the connection survives, where previously the connection task died
+    (taking every stream on an HTTP/2 connection with it); HTTP/2 adaptive
+    flow-control windows are on by default, as on `Server`; and connection tasks
+    are owned by the `Serve` future and aborted when it is dropped, instead of
+    running detached (a fatal `accept` error now tells them to drain rather
+    than leaving them be). The module is available with `axum` + `server`
+    (previously `axum` + `server-tls`). On both paths connections are now served
+    with hyper-util's `serve_connection_with_upgrades`, so a service that answers
+    `101 Switching Protocols` gets its upgrade on the standalone `Server` too;
+    services that never upgrade see no difference on the wire.
+time: 2026-09-14T19:02:00.000000000+00:00

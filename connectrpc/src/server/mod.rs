@@ -103,7 +103,7 @@
 //! [`ConnectRpcService`](crate::ConnectRpcService) directly from a hyper accept loop. The crate guide's
 //! "Advanced transport configuration" section shows the `hyper_util` pattern.
 
-mod accept_loop;
+pub(crate) mod accept_loop;
 mod acceptor;
 mod config;
 mod connection;
@@ -114,8 +114,6 @@ pub use acceptor::Accepted;
 pub use acceptor::Acceptor;
 pub use acceptor::HandshakeError;
 pub use acceptor::ServerIo;
-#[cfg(all(feature = "axum", feature = "server-tls"))]
-pub(crate) use acceptor::is_transient_accept_error;
 pub use config::AcceptConfig;
 pub use config::ConnectionConfig;
 pub use config::DEFAULT_HEADER_READ_TIMEOUT;
@@ -132,4 +130,4 @@ pub use standalone::BoundServer;
 pub use standalone::Server;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

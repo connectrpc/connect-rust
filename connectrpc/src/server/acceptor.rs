@@ -320,7 +320,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// Whether an `accept(2)` error is transient and the listener still usable:
 /// `EMFILE`/`ENFILE` (descriptor exhaustion), `ECONNABORTED`, `EINTR`,
 /// `EAGAIN`, and resets.
-pub(crate) fn is_transient_accept_error(err: &io::Error) -> bool {
+fn is_transient_accept_error(err: &io::Error) -> bool {
     use std::io::ErrorKind;
 
     matches!(

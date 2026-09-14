@@ -1,0 +1,9 @@
+kind: Added
+body: |-
+    **`connectrpc::axum::serve(listener, router)`**, the plaintext counterpart
+    of `serve_tls` (features `axum` + `server`): an `axum::Router` served on
+    the built-in server's acceptor and connection driver, so plaintext axum
+    apps get `PeerAddr`, every `ConnectionConfig` setting
+    (`Serve::with_connection_config`), graceful GOAWAY on shutdown and panic
+    isolation. Both functions return `Serve`.
+time: 2026-09-14T19:01:30.000000000+00:00
