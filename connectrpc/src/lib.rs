@@ -39,15 +39,14 @@
 //!     .fallback_service(connect.into_axum_service());
 //!
 //! axum::serve(listener, app).await?;
+//! // or, with the `server` feature, on connectrpc's connection driver
+//! // (TLS, PeerAddr/PeerCerts, max connection age, graceful GOAWAY, ...):
+//! connectrpc::axum::serve(listener, app).await?;
 //! ```
-//!
-//! ## With Raw Hyper
-//!
-//! Use `ConnectRpcService` directly with hyper's service machinery.
 //!
 //! ## Standalone Server
 //!
-//! For simple cases, enable the `server` feature for a built-in hyper server:
+//! Enable the `server` feature for a built-in hyper server:
 //!
 //! ```rust,ignore
 //! use connectrpc::{Router, Server};
@@ -57,6 +56,23 @@
 //!
 //! Server::new(router).serve(addr).await?;
 //! ```
+//!
+//! ## Custom accept loops
+//!
+//! The built-in server is layered ([`server`] module docs): the
+//! [`Acceptor`](server::Acceptor) turns a listener into authenticated streams,
+//! and [`serve_connection`](server::serve_connection) /
+//! [`Server::serve_connection`] serves one of them with the full connection
+//! lifecycle. A loop of your own over those two — to admit connections by
+//! client identity, cap them per tenant, or serve them on different runtimes
+//! — is a few dozen lines and keeps every timeout, retirement and drain
+//! guarantee of `Server::serve`. `examples/custom-accept-loop` shows one.
+//!
+//! ## With Raw Hyper
+//!
+//! `ConnectRpcService` is an ordinary tower/hyper service; drive it from any
+//! hyper connection builder when you need hyper settings the layers above do
+//! not expose (and none of their lifecycle).
 //!
 //! # Modules
 //!
@@ -77,7 +93,7 @@
 //! - [`deadline`] - Server-side deadline moderation ([`DeadlinePolicy`])
 //! - [`protocol`] - Protocol detection ([`Protocol`]: Connect, gRPC, gRPC-Web)
 //! - [`client`] - Tower-based HTTP client utilities (transports require the `client` feature)
-//! - [`server`] - Standalone hyper-based server (requires `server` feature)
+//! - [`server`] - Standalone hyper-based server and its public layers: connection driver, acceptor, config (requires `server` feature)
 //!
 //! # Protocol Support
 //!
@@ -159,7 +175,7 @@
 //! | `server` | ✗ | Standalone hyper-based server |
 //! | `server-tls` | ✗ | TLS for the built-in server |
 //! | `tls` | ✗ | Convenience: `server-tls` + `client-tls` |
-//! | `axum` | ✗ | Axum framework integration |
+//! | `axum` | ✗ | Axum framework integration (`connectrpc::axum::serve` also needs `server`) |
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

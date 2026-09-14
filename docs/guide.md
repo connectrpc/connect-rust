@@ -1288,6 +1288,17 @@ its concurrent-stream budget, and reject before touching
 
 ## Hosting
 
+The server side is layered, and each layer is public:
+
+| Layer | You use | It owns |
+|---|---|---|
+| Protocol | `ConnectRpcService` (a tower `Service`) | RPC semantics; nothing about sockets |
+| Connection | `server::serve_connection` + `ConnectionConfig` | One connection's HTTP/1.1 / HTTP/2 lifecycle: settings, keepalive, timeouts, max age / idle / requests, GOAWAY on shutdown, panic isolation, `PeerAddr` / `PeerCerts` / connection extensions |
+| Acceptor | `server::Acceptor` + `AcceptConfig` | accept, `TCP_NODELAY`, TLS handshake and timeout, `ConnectionInfo` |
+| Loop | `Server` / `BoundServer`, `connectrpc::axum::serve` | Spawn, track, signal, drain |
+
+Pick the highest layer that does what you need.
+
 ### With axum (recommended)
 
 `Router::into_axum_service()` returns a tower service you mount via
@@ -1306,6 +1317,25 @@ let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 axum::serve(listener, app).await?;
 ```
 
+With the `server` feature, `connectrpc::axum::serve(listener, app)` hosts
+the same app on connectrpc's acceptor and connection driver instead of
+`axum::serve`'s, which adds what the standalone `Server` has: `PeerAddr`
+on every request, every `ConnectionConfig` setting, graceful GOAWAY on
+shutdown, and a Connect `internal` response instead of a dropped
+connection when a handler panics. `connectrpc::axum::serve_tls` (below)
+is the same plus TLS.
+
+```rust
+connectrpc::axum::serve(listener, app)
+    .with_connection_config(
+        ConnectionConfig::new()
+            .with_max_connection_age(Duration::from_secs(600))
+            .with_http2_keepalive_interval(Duration::from_secs(30)),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await?;
+```
+
 ### Standalone server
 
 Enable the `server` feature for a built-in hyper-based server. This
@@ -1322,71 +1352,93 @@ Server::new(connect_router)
 ```
 
 The standalone `Server` handles HTTP/1.1, HTTP/2 with prior knowledge,
-and graceful shutdown. It's a single dispatcher with no per-route
-configuration, so add things like health endpoints either as RPC
-methods or by mounting the Connect service in axum.
+and graceful shutdown (`Server::bind(..).await?.serve_with_graceful_shutdown(router, signal)`).
+It's a single dispatcher with no per-route configuration, so add things
+like health endpoints either as RPC methods or by mounting the Connect
+service in axum.
 
-For connection and HTTP/2 settings that `Server` does not expose, drop
-down to raw hyper instead.
+Per-connection settings are one value, `ConnectionConfig` (re-exported at
+the crate root), with a `Default`: HTTP/1.1 keep-alive and header-read
+timeout, HTTP/2 adaptive/explicit windows, max concurrent streams and
+keepalive PINGs, and max connection age / idle / requests with their
+shared grace period. Build one and pass it to `Server`, `BoundServer` or
+`connectrpc::axum::Serve` with `with_connection_config`; the individual
+`with_max_connection_age`-style setters on `Server` / `BoundServer` edit
+the same value. TLS and the handshake timeout are `server::AcceptConfig`
+(`with_tls`, `with_tls_handshake_timeout`).
 
-### Advanced transport configuration
+### Custom accept loops
 
-The built-in `Server` exposes the common connection knobs, but it does
-not try to mirror every hyper option. For long-tail transport tuning —
-flow-control windows, HPACK table size, frame size, or exact keepalive
-behavior — drive the Connect service from your own hyper accept loop.
-
-Add `hyper-util` as a direct dependency with the `server-auto`,
-`service`, and `tokio` features enabled. Then wrap `ConnectRpcService`
-with `TowerToHyperService` before handing each connection to hyper's
-auto builder:
+When you need a policy at accept time or per connection that the built-in
+loop does not have — admit or refuse by client certificate or source
+address, cap connections per tenant, shed load before HTTP is spoken,
+serve some clients on a different runtime, listen on a Unix socket — write
+the loop yourself over the two layers underneath `Server`. You decide
+which connections are served and where; the connection driver still gives
+each one the full lifecycle (settings, timeouts, retirement, GOAWAY on
+shutdown, panic isolation, `PeerAddr` / `PeerCerts` / extensions).
 
 ```rust,ignore
-use connectrpc::{ConnectRpcService, Router};
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder as AutoBuilder,
-    service::TowerToHyperService,
-};
+use connectrpc::server::{AcceptConfig, Acceptor};
 
-let connect_router = Router::new().add_service(greeter_service);
-let connect_service = ConnectRpcService::new(connect_router);
-
-let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-let mut builder = AutoBuilder::new(TokioExecutor::new());
-builder
-    .http2()
-    .max_concurrent_streams(1_000)
-    .max_frame_size(1 << 20)
-    .adaptive_window(true);
+let server = Arc::new(Server::new(router).with_max_connection_age(Duration::from_secs(600)));
+let acceptor = Acceptor::bind("0.0.0.0:8443", AcceptConfig::new().with_tls(tls)).await?;
+let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+let mut connections = tokio::task::JoinSet::new();
+let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
 loop {
-    let (stream, _peer_addr) = listener.accept().await?;
-    let conn = builder
-        .serve_connection(
-            TokioIo::new(stream),
-            TowerToHyperService::new(connect_service.clone()),
-        )
-        .into_owned();
-
-    tokio::spawn(async move {
-        if let Err(err) = conn.await {
-            eprintln!("connection ended with error: {err}");
-        }
+    let accepted = tokio::select! {
+        biased; // a pending shutdown wins over one more accept
+        _ = &mut shutdown => break,
+        Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        accepted = acceptor.accept() => accepted?, // retries transient errors itself; on a fatal one the example detaches live connections instead of `?`
+    };
+    let (server, mut drain) = (Arc::clone(&server), drain_rx.clone());
+    connections.spawn(async move {
+        // TLS handshake on the connection's task, not the loop's.
+        let Ok((io, mut info)) = accepted.handshake().await else { return };
+        // Your policy: admission, and anything handlers should see.
+        let Some(identity) = Identity::from_connection(&info) else { return };
+        info.extensions_mut().insert(identity);
+        // Everything Server::serve does for a connection, on this task.
+        server
+            .serve_connection(io, info, async move { let _ = drain.wait_for(|d| *d).await; })
+            .await;
     });
 }
+drop(acceptor);                   // refuse new connections
+let _ = drain_tx.send(true);      // GOAWAY every live one
+while connections.join_next().await.is_some() {}   // wait for them
 ```
 
-This is the escape hatch for connection- and protocol-level settings.
-Axum remains the better fit for routing, health checks, ordinary HTTP
-endpoints, and request-level Tower middleware such as auth, timeouts,
-or rate limiting.
+Two rules are the loop's to keep, because the library cannot: the loop
+must outlive what it spawned (track the tasks and drain them before
+returning, as above), and the runtime that accepted a socket must outlive
+the connection served on it — the socket stays registered there even if
+you spawn `serve_connection`'s future onto another runtime, which is
+otherwise all it takes to serve a connection elsewhere (the future binds
+timers, hyper's per-stream tasks and every handler to whichever runtime
+polls it). [`examples/custom-accept-loop`](../examples/custom-accept-loop)
+routes `batch-*` client identities to a separate runtime this way.
 
-Unlike the built-in `Server` and `connectrpc::axum::serve_tls`, a raw
-hyper loop does not automatically insert `PeerAddr` or `PeerCerts` into
-request extensions. If handlers call `ctx.peer_addr()` or
-`ctx.peer_certs()`, insert those extensions in your own Tower layer or
-service wrapper before the request reaches `ConnectRpcService`.
+`serve_connection` is not tied to `Acceptor`: it takes any
+`AsyncRead + AsyncWrite` stream plus a `ConnectionInfo` you construct
+(`ConnectionInfo::new().with_peer_addr(..)`), and any tower HTTP service
+(`ConnectRpcService`, an `axum::Router`, or your stack around either), so a
+Unix-socket or in-memory listener needs only its own ten-line acceptor.
+
+### Raw hyper
+
+For hyper connection-builder settings none of the above expose (HPACK
+table size, max frame size, ...), `ConnectRpcService` is an ordinary
+tower service: wrap it in `hyper_util::service::TowerToHyperService` and
+hand it to `hyper_util::server::conn::auto::Builder` yourself. You then
+own the whole connection lifecycle — none of the timeouts, retirement,
+graceful shutdown, panic isolation or `PeerAddr` / `PeerCerts` stamping
+described above happens unless you re-implement it — so prefer a custom
+accept loop over `serve_connection` unless it is specifically a hyper
+knob you are missing.
 
 ### TLS
 
@@ -1406,12 +1458,11 @@ Server::new(connect_router)
     .await?;
 ```
 
-For the axum path, `connectrpc::axum::serve_tls` (requires both the
-`axum` and `server-tls` features) is a drop-in replacement for
-`axum::serve` that owns the rustls accept loop and stamps `PeerAddr` /
-`PeerCerts` into request extensions exactly as the standalone `Server`
-does, so handler code that reads `ctx.peer_certs()` is portable across
-both hosting paths:
+For the axum path, `connectrpc::axum::serve_tls` (requires the `axum`
+and `server-tls` features) is a drop-in replacement for `axum::serve`
+that terminates TLS and stamps `PeerAddr` / `PeerCerts` into request
+extensions exactly as the standalone `Server` does, so handler code
+that reads `ctx.peer_certs()` is portable across both hosting paths:
 
 ```rust
 let app = axum::Router::new()
@@ -2011,6 +2062,7 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 | [`streaming-tour/`](../examples/streaming-tour) | All four RPC types (unary, server stream, client stream, bidi) on a trivial NumberService. Smallest demo of handler signatures and client invocation patterns. |
 | [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions()`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
 | [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
+| [`custom-accept-loop/`](../examples/custom-accept-loop) | A custom accept loop over `server::Acceptor` + `Server::serve_connection` that refuses connections without a known client-certificate identity and serves `batch-*` workloads on a separate tokio runtime, inheriting every timeout, retirement and drain guarantee of `Server::serve`. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
 | [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage, and server reflection mounted from both descriptor sources (`REFLECTION_SOURCE=fds\|pool`; see `reflection-demo.sh`). |
 | [`wasm-client/`](../examples/wasm-client) | Browser fetch transport: same generated client used from `wasm32-unknown-unknown` with a custom `ClientTransport` backed by `web-sys::fetch`. |

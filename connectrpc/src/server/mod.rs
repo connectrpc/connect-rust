@@ -1,12 +1,27 @@
-//! Hyper-based HTTP server for ConnectRPC.
+//! Hyper-based HTTP server for ConnectRPC, in four layers you can also use
+//! one at a time.
 //!
-//! This module provides the HTTP server implementation that handles incoming
-//! ConnectRPC requests and routes them to the appropriate handlers.
+//! | Layer | Item | Owns |
+//! |---|---|---|
+//! | 1. protocol | [`ConnectRpcService`](crate::ConnectRpcService) | RPC semantics: codecs, envelopes, compression, deadlines, limits, interceptors. A tower `Service`; knows nothing about sockets. |
+//! | 2. connection | [`serve_connection`] + [`ConnectionConfig`] | One connection's HTTP lifecycle: HTTP/1.1 and HTTP/2 settings, keepalive, header-read timeout, max age / idle / request retirement, GOAWAY on shutdown, panic isolation, [`PeerAddr`] / `PeerCerts` / connection extensions on every request. A future; runs wherever it is polled. |
+//! | 3. acceptor | [`Acceptor`] + [`AcceptConfig`] → [`ConnectionInfo`] | Turning a TCP listener into authenticated streams: accept, `TCP_NODELAY`, TLS handshake with its timeout, capture of peer facts. No HTTP. |
+//! | 4. loop | [`Server`] / [`BoundServer`] (and `connectrpc::axum::serve`) | Placement and drain: hand each accepted stream (3) to the driver (2) on the ambient runtime, fan out the shutdown signal, wait. |
+//!
+//! Most services use layer 4 and never look further. The layers below are
+//! public so that an accept-time or per-connection policy the built-in loop
+//! does not have — admit or shed by client identity or address, cap
+//! connections per tenant, serve different clients on different runtimes,
+//! listen on something other than TCP — is a short loop of your own over
+//! [`Acceptor`] and [`Server::serve_connection`] that keeps every guarantee of
+//! layer 2, rather than a feature request or a from-scratch hyper server. See
+//! `examples/custom-accept-loop`.
 //!
 //! # TLS Support
 //!
-//! When the `tls` feature is enabled, the server can be configured with a
-//! [`rustls::ServerConfig`] to serve requests over TLS:
+//! With the `server-tls` feature, pass a `rustls::ServerConfig` to serve
+//! over TLS; a verified client certificate chain reaches handlers as
+//! `PeerCerts`:
 //!
 //! ```rust,ignore
 //! let tls_config = Arc::new(rustls::ServerConfig::builder()
@@ -33,59 +48,36 @@
 //!     .await?;
 //! ```
 //!
-//! # Connection Retirement
+//! # Connection Settings
 //!
-//! Retire long-lived connections proactively — recommended behind load
-//! balancers so clients reconnect periodically and traffic redistributes
-//! across restarts. Two independent triggers are available, and either, both,
-//! or neither may be set:
+//! Every per-connection setting lives on [`ConnectionConfig`], a plain value
+//! with a `Default` that `Server`, `BoundServer`, `connectrpc::axum::Serve`
+//! and [`serve_connection`] all accept (`with_connection_config`); the
+//! `with_*` setters on `Server` / `BoundServer` are shorthand for editing it.
 //!
-//! - [`Server::with_max_connection_age`] (or the [`BoundServer`] equivalent)
-//!   retires by age: a connection is sent a GOAWAY once it reaches the
-//!   configured age (with a ±10% jitter).
-//! - [`Server::with_max_requests_per_connection`] retires by request count: a
-//!   connection is sent a GOAWAY once it has dispatched the configured number
-//!   of requests.
-//!
-//! When both are set, whichever trigger fires first retires the connection.
-//! After a trigger fires the connection is force-closed once the shared grace
-//! period ([`with_max_connection_age_grace`](BoundServer::with_max_connection_age_grace))
-//! elapses. Retirement is independent of whole-server graceful shutdown, which
-//! still drains in-flight requests indefinitely even while a connection is in
-//! its grace window.
-//!
-//! # Maximum Concurrent Streams
-//!
-//! Use [`Server::with_max_concurrent_streams`] (or the [`BoundServer`]
-//! equivalent) to bound the number of concurrent HTTP/2 streams (in-flight
-//! requests) a single connection may have open. This maps to hyper's
-//! `SETTINGS_MAX_CONCURRENT_STREAMS`; it is left at hyper's default (200)
-//! when unset. Raise it for high-fan-in internal services, or lower it as a
-//! cheap hardening measure against less-trusted clients.
-//!
-//! # HTTP/2 Keepalive
-//!
-//! Use [`Server::with_http2_keepalive_interval`] (or the [`BoundServer`]
-//! equivalent) to make the server send HTTP/2 keepalive PING frames and
-//! reclaim dead or half-open peers. Disabled by default. Once an interval is
-//! set, an unacknowledged PING after
-//! [`with_http2_keepalive_timeout`](BoundServer::with_http2_keepalive_timeout)
-//! (20 seconds by default) closes the connection. This detects long-lived
-//! server-streaming or bidirectional connections that have gone silent (NAT
-//! timeout, client crash, network partition) instead of leaving them
-//! half-open until the OS TCP timeout.
-//!
-//! # Maximum Connection Idle
-//!
-//! Use [`Server::with_max_connection_idle`] (or the [`BoundServer`] equivalent)
-//! to reclaim connections that have gone quiet. A connection is idle when it
-//! has no in-flight requests; once it stays idle for the configured duration it
-//! is retired through the same GOAWAY-then-grace path as maximum age, draining
-//! over the same grace period set by `with_max_connection_age_grace`. The idle
-//! timer resets on activity, so a connection with steady traffic is never
-//! retired. The window is evaluated lazily, so retirement happens between one
-//! and two times the configured duration after the last activity. When both
-//! limits are configured, whichever fires first wins.
+//! - **Retirement.** Behind a load balancer, retire long-lived connections so
+//!   clients reconnect and traffic redistributes across restarts. Three
+//!   independent triggers —
+//!   [`with_max_connection_age`](ConnectionConfig::with_max_connection_age)
+//!   (±10% jitter),
+//!   [`with_max_connection_idle`](ConnectionConfig::with_max_connection_idle)
+//!   (no in-flight requests for the duration; evaluated lazily, so retirement
+//!   lands between one and two windows after the last activity) and
+//!   [`with_max_requests_per_connection`](ConnectionConfig::with_max_requests_per_connection)
+//!   — each send a GOAWAY and then force-close after the shared
+//!   [`with_max_connection_age_grace`](ConnectionConfig::with_max_connection_age_grace);
+//!   whichever fires first wins. Whole-server graceful shutdown still drains
+//!   in-flight requests indefinitely, even inside a grace window.
+//! - **HTTP/2.** [`with_max_concurrent_streams`](ConnectionConfig::with_max_concurrent_streams)
+//!   bounds in-flight requests per connection (hyper's default is 200);
+//!   [`with_http2_keepalive_interval`](ConnectionConfig::with_http2_keepalive_interval)
+//!   / [`with_http2_keepalive_timeout`](ConnectionConfig::with_http2_keepalive_timeout)
+//!   send PINGs and reclaim dead or half-open peers on long-lived streams;
+//!   adaptive flow-control windows are on by default
+//!   ([`DEFAULT_HTTP2_ADAPTIVE_WINDOW`]).
+//! - **HTTP/1.1.** The header-read timeout ([`DEFAULT_HEADER_READ_TIMEOUT`])
+//!   bounds slow or stalled request heads, including between keep-alive
+//!   requests.
 //!
 //! # Connection-Scoped Extensions
 //!
@@ -99,9 +91,14 @@
 //! loop before [`serve_connection`] is called, and is cloned into each
 //! request's extensions to be read with `ctx.extensions().get::<T>()`.
 //!
-//! For transport and HTTP/2 knobs that [`Server`] does not expose, drive
-//! [`ConnectRpcService`](crate::ConnectRpcService) directly from a hyper accept loop. The crate guide's
-//! "Advanced transport configuration" section shows the `hyper_util` pattern.
+//! # Runtimes
+//!
+//! The connection driver is tokio-based (timers, IO traits, and hyper's
+//! per-stream tasks use the runtime that polls the connection future); it
+//! takes no executor parameter. A loop that wants a connection served on a
+//! particular runtime spawns [`serve_connection`]'s future there. The runtime
+//! that *accepted* a socket must outlive the connection, since that is where
+//! the socket's IO is registered.
 
 pub(crate) mod accept_loop;
 mod acceptor;

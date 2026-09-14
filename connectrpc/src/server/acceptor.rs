@@ -267,9 +267,8 @@ impl AsyncWrite for ServerIo {
 }
 
 /// Why [`Accepted::handshake`] gave up on a connection: the TLS handshake
-/// failed, or did not finish within
-/// [`AcceptConfig::with_tls_handshake_timeout`] (the source is then of kind
-/// [`io::ErrorKind::TimedOut`]). A plaintext handshake cannot fail.
+/// failed, or did not finish within the configured handshake timeout (see
+/// [`is_timeout`](Self::is_timeout)). A plaintext handshake cannot fail.
 #[derive(Debug)]
 pub struct HandshakeError {
     peer_addr: SocketAddr,

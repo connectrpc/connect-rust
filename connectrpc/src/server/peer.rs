@@ -53,9 +53,6 @@ pub struct PeerCerts(pub Arc<[rustls::pki_types::CertificateDer<'static>]>);
 /// before serving. The connection driver then stamps every request with those
 /// extensions plus [`PeerAddr`] / `PeerCerts`, mirroring
 /// [`RequestContext`](crate::RequestContext) at connection scope.
-///
-/// Further handshake facts (negotiated ALPN protocol, SNI name) may be added as
-/// accessors later.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct ConnectionInfo {
