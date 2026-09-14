@@ -28,8 +28,8 @@ fn test_server_dispatch_config_proxies() {
         .with_compression_policy(CompressionPolicy::default().with_min_size(8192))
         .with_http1_keep_alive(false);
 
-    assert_eq!(server.service.limits().max_request_body_size(), 1024);
-    assert_eq!(server.service.limits().max_message_size(), 512);
+    assert_eq!(server.service().limits().max_request_body_size(), 1024);
+    assert_eq!(server.service().limits().max_message_size(), 512);
     assert!(!server.connection_config().http1_keep_alive());
 }
 
@@ -183,4 +183,36 @@ async fn setters_forward_to_the_configs_and_configs_cross_between_server_and_bou
             Duration::from_secs(7)
         );
     }
+}
+
+/// `Server::serve_connection` serves the caller's stream with the server's
+/// own service and stamps requests from the `ConnectionInfo` it was handed.
+#[tokio::test]
+async fn server_serve_connection_uses_the_servers_service() {
+    let captured: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&captured);
+    let router = Router::new().route(
+        "svc",
+        "Echo",
+        crate::handler_fn(
+            move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock().unwrap() = ctx.peer_addr().map(|peer| peer.port());
+                    crate::Response::ok(buffa_types::Empty::default())
+                }
+            },
+        ),
+    );
+    let server = Server::new(router);
+
+    let (mut client_io, server_io) = tokio::io::duplex(64 << 10);
+    let info = ConnectionInfo::new().with_peer_addr("127.0.0.1:4242".parse().unwrap());
+    let conn = tokio::spawn(server.serve_connection(server_io, info, std::future::pending()));
+    client_io.write_all(ECHO_REQ).await.unwrap();
+    let resp = read_http1_response(&mut client_io).await;
+    assert!(resp.starts_with(b"HTTP/1.1 200"));
+    drop(client_io);
+    conn.await.unwrap();
+    assert_eq!(captured.lock().unwrap().take(), Some(4242));
 }

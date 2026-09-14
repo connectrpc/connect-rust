@@ -212,3 +212,41 @@ async fn test_graceful_shutdown_sends_h2_goaway() {
     // close before the server gets a chance to GOAWAY.
     drop(send_request);
 }
+
+/// Connections are owned by the serving future: dropping it (here, aborting
+/// the task that runs it) closes them, in-flight request or not, rather than
+/// leaving them running detached.
+#[tokio::test]
+async fn dropping_the_server_future_aborts_live_connections() {
+    let (router, entered_rx, _release_tx) = slow_router();
+    let bound = Server::bind("127.0.0.1:0").await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    let serve = tokio::spawn(async move { bound.serve(router).await });
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+    let h2_task = tokio::spawn(h2_conn);
+    let req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("http://{addr}/svc/Slow"))
+        .header(header::CONTENT_TYPE, "application/proto")
+        .body(())
+        .unwrap();
+    let (resp, _) = send_request.send_request(req, true).unwrap();
+    let resp = tokio::spawn(resp);
+    entered_rx.await.expect("handler entered");
+
+    serve.abort();
+    let _ = serve.await;
+
+    let conn = tokio::time::timeout(Duration::from_secs(5), h2_task)
+        .await
+        .expect("client connection outlived the dropped server")
+        .unwrap();
+    assert!(conn.is_err(), "connection was closed abruptly, not drained");
+    let resp = tokio::time::timeout(Duration::from_secs(5), resp)
+        .await
+        .expect("in-flight request outlived the dropped server")
+        .unwrap();
+    assert!(resp.is_err(), "in-flight request was cut off");
+}
