@@ -1,0 +1,21 @@
+edition = "2023";
+
+package anthropic.connectrpc.custom_accept_loop.v1;
+
+// PlacementService reports where the server chose to run the caller's
+// connection. The server is a custom accept loop over connectrpc's Acceptor
+// and connection driver that routes each connection to a tokio runtime by
+// the identity in its client certificate.
+service PlacementService {
+  // Echo the caller's identity and the thread its request was handled on.
+  rpc WhereAmI(WhereAmIRequest) returns (WhereAmIResponse);
+}
+
+message WhereAmIRequest {}
+
+message WhereAmIResponse {
+  // Workload identity parsed from the client certificate, e.g. "batch-indexer".
+  string identity = 1;
+  // Name of the runtime worker thread that ran the handler, e.g. "bulk".
+  string thread = 2;
+}
