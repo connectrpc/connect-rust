@@ -2,128 +2,6 @@
 
 use super::*;
 
-#[test]
-fn http2_config_default_enables_adaptive_window() {
-    let config = Http2Config::default();
-    assert!(config.adaptive_window);
-    assert_eq!(config.adaptive_window, DEFAULT_HTTP2_ADAPTIVE_WINDOW);
-    assert_eq!(config.initial_stream_window_size, None);
-    assert_eq!(config.initial_connection_window_size, None);
-}
-
-#[test]
-fn server_http2_builder_defaults_match_adaptive_on() {
-    let server = Server::new(Router::new());
-    assert!(server.http2.adaptive_window);
-    assert_eq!(server.http2.initial_stream_window_size, None);
-    assert_eq!(server.http2.initial_connection_window_size, None);
-
-    // `from_service` must seed the same defaults as `new`.
-    let from_service = Server::from_service(ConnectRpcService::new(Router::new()));
-    assert!(from_service.http2.adaptive_window);
-}
-
-#[tokio::test]
-async fn bound_server_http2_builder_defaults_match_adaptive_on() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert!(bound.http2.adaptive_window);
-    assert_eq!(bound.http2.initial_stream_window_size, None);
-    assert_eq!(bound.http2.initial_connection_window_size, None);
-
-    let bound = Server::bind("127.0.0.1:0").await.unwrap();
-    assert!(bound.http2.adaptive_window);
-}
-
-#[test]
-fn with_http2_adaptive_window_toggles_flag() {
-    let server = Server::new(Router::new()).with_http2_adaptive_window(false);
-    assert!(!server.http2.adaptive_window);
-
-    let server = server.with_http2_adaptive_window(true);
-    assert!(server.http2.adaptive_window);
-}
-
-#[test]
-fn explicit_stream_window_disables_adaptive() {
-    let server = Server::new(Router::new()).with_http2_initial_stream_window_size(1 << 20);
-    assert_eq!(server.http2.initial_stream_window_size, Some(1 << 20));
-    assert!(
-        !server.http2.adaptive_window,
-        "an explicit stream window must turn adaptive sizing off"
-    );
-}
-
-#[test]
-fn explicit_connection_window_disables_adaptive() {
-    let server = Server::new(Router::new()).with_http2_initial_connection_window_size(2 << 20);
-    assert_eq!(server.http2.initial_connection_window_size, Some(2 << 20));
-    assert!(
-        !server.http2.adaptive_window,
-        "an explicit connection window must turn adaptive sizing off"
-    );
-}
-
-#[test]
-fn clearing_window_with_none_keeps_adaptive_flag() {
-    // Passing `None` must not flip the adaptive flag in either direction.
-    let server = Server::new(Router::new())
-        .with_http2_initial_stream_window_size(None)
-        .with_http2_initial_connection_window_size(None);
-    assert!(server.http2.adaptive_window);
-    assert_eq!(server.http2.initial_stream_window_size, None);
-    assert_eq!(server.http2.initial_connection_window_size, None);
-}
-
-#[test]
-fn re_enabling_adaptive_after_explicit_window_wins() {
-    // The setters are last-write-wins: re-enabling adaptive after setting a
-    // window leaves the window stored but turns adaptive back on, matching
-    // the documented precedence (and hyper, where adaptive overrides the
-    // explicit window).
-    let server = Server::new(Router::new())
-        .with_http2_initial_stream_window_size(1 << 20)
-        .with_http2_adaptive_window(true);
-    assert!(server.http2.adaptive_window);
-    assert_eq!(server.http2.initial_stream_window_size, Some(1 << 20));
-    // ...and the stored window must not reach hyper while adaptive is on.
-    assert_eq!(server.http2.effective_windows(), (None, None));
-}
-
-#[test]
-fn effective_windows_resolves_adaptive_precedence() {
-    // Default (adaptive on): no explicit window reaches hyper.
-    assert_eq!(Http2Config::default().effective_windows(), (None, None));
-
-    // Adaptive explicitly off but no sizes set: still nothing to apply.
-    let off = Server::new(Router::new()).with_http2_adaptive_window(false);
-    assert_eq!(off.http2.effective_windows(), (None, None));
-
-    // Adaptive off with explicit sizes: both windows are applied.
-    let fixed = Server::new(Router::new())
-        .with_http2_initial_stream_window_size(1 << 20)
-        .with_http2_initial_connection_window_size(2 << 20);
-    assert!(!fixed.http2.adaptive_window);
-    assert_eq!(
-        fixed.http2.effective_windows(),
-        (Some(1 << 20), Some(2 << 20))
-    );
-}
-
-#[tokio::test]
-async fn bound_server_http2_window_setters_thread_through() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener)
-        .with_http2_initial_stream_window_size(512 * 1024)
-        .with_http2_initial_connection_window_size(1024 * 1024);
-    assert_eq!(bound.http2.initial_stream_window_size, Some(512 * 1024));
-    assert_eq!(
-        bound.http2.initial_connection_window_size,
-        Some(1024 * 1024)
-    );
-    assert!(!bound.http2.adaptive_window);
-}
-
 /// End-to-end check that explicit window knobs reach hyper's builder
 /// (`configure_http2`) without breaking the connection: a server with
 /// custom stream/connection windows still completes an HTTP/2 request.
@@ -174,7 +52,7 @@ async fn http2_explicit_windows_serve_request() {
 #[tokio::test]
 async fn http2_adaptive_window_default_serves_request() {
     let bound = Server::bind("127.0.0.1:0").await.unwrap();
-    assert!(bound.http2.adaptive_window);
+    assert!(bound.connection_config().http2_adaptive_window());
     let addr = bound.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let serve = tokio::spawn(async move {
@@ -210,60 +88,6 @@ async fn http2_adaptive_window_default_serves_request() {
     h2_task.await.expect("h2 connection task panicked").ok();
 }
 
-#[tokio::test]
-async fn http2_keepalive_builder_defaults_and_overrides() {
-    // BoundServer: disabled by default, default timeout.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert_eq!(bound.http2.keepalive_interval, None);
-    assert_eq!(
-        bound.http2.keepalive_timeout,
-        DEFAULT_HTTP2_KEEPALIVE_TIMEOUT
-    );
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener)
-        .with_http2_keepalive_interval(Duration::from_secs(30))
-        .with_http2_keepalive_timeout(Duration::from_secs(5));
-    assert_eq!(
-        bound.http2.keepalive_interval,
-        Some(Duration::from_secs(30))
-    );
-    assert_eq!(bound.http2.keepalive_timeout, Duration::from_secs(5));
-
-    // Setting only the timeout leaves keepalive disabled (no interval).
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound =
-        Server::from_listener(listener).with_http2_keepalive_timeout(Duration::from_secs(1));
-    assert_eq!(bound.http2.keepalive_interval, None);
-    assert_eq!(bound.http2.keepalive_timeout, Duration::from_secs(1));
-}
-
-#[test]
-fn server_http2_keepalive_builder_threads_through() {
-    let server = Server::new(Router::new());
-    assert_eq!(server.http2.keepalive_interval, None);
-    assert_eq!(
-        server.http2.keepalive_timeout,
-        DEFAULT_HTTP2_KEEPALIVE_TIMEOUT
-    );
-
-    let server = Server::new(Router::new())
-        .with_http2_keepalive_interval(Duration::from_millis(500))
-        .with_http2_keepalive_timeout(Duration::from_millis(250));
-    assert_eq!(
-        server.http2.keepalive_interval,
-        Some(Duration::from_millis(500))
-    );
-    assert_eq!(server.http2.keepalive_timeout, Duration::from_millis(250));
-}
-
-#[test]
-#[should_panic(expected = "non-zero duration")]
-fn with_http2_keepalive_interval_rejects_zero() {
-    let _ = Server::new(Router::new()).with_http2_keepalive_interval(Duration::ZERO);
-}
-
 /// `configure_http2` leaves keepalive untouched when no interval is set, so
 /// hyper's default (keepalive disabled) is preserved unless the user opts
 /// in. There is no public getter on the builder, so this guards the opt-in
@@ -271,9 +95,13 @@ fn with_http2_keepalive_interval_rejects_zero() {
 /// panicking.
 #[test]
 fn configure_http2_default_leaves_keepalive_disabled() {
-    assert!(Http2Config::default().keepalive_interval.is_none());
+    assert!(
+        ConnectionConfig::default()
+            .http2_keepalive_interval()
+            .is_none()
+    );
     let mut builder = AutoBuilder::new(TokioExecutor::new());
-    configure_http2(&mut builder, Http2Config::default());
+    configure_http2(&mut builder, &ConnectionConfig::default());
 }
 
 /// A configured keepalive interval must reach hyper's HTTP/2 builder: once
@@ -340,26 +168,6 @@ async fn http2_keepalive_closes_unresponsive_peer() {
         .expect("server did not shut down")
         .expect("join error");
     assert!(result.is_ok(), "serve returned error: {result:?}");
-}
-
-#[tokio::test]
-async fn max_concurrent_streams_builder_defaults_and_overrides() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert_eq!(bound.http2.max_concurrent_streams, None);
-    let bound = bound.with_max_concurrent_streams(64);
-    assert_eq!(bound.http2.max_concurrent_streams, Some(64));
-
-    let server = Server::new(Router::new());
-    assert_eq!(server.http2.max_concurrent_streams, None);
-    let server = server.with_max_concurrent_streams(64);
-    assert_eq!(server.http2.max_concurrent_streams, Some(64));
-}
-
-#[test]
-#[should_panic(expected = "non-zero value")]
-fn with_max_concurrent_streams_rejects_zero() {
-    let _ = Server::new(Router::new()).with_max_concurrent_streams(0);
 }
 
 #[tokio::test]

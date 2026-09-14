@@ -2,41 +2,6 @@
 
 use super::*;
 
-#[tokio::test]
-async fn max_requests_per_connection_builder_defaults_and_threads_through() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert_eq!(bound.max_requests_per_connection, None);
-    assert_eq!(bound.request_retirement_config(), None);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener)
-        .with_max_requests_per_connection(NonZeroU64::new(100).unwrap())
-        .with_max_connection_age_grace(Duration::from_secs(3));
-    assert_eq!(bound.max_requests_per_connection, NonZeroU64::new(100));
-    assert_eq!(
-        bound.request_retirement_config(),
-        Some(RequestRetirementConfig {
-            max: NonZeroU64::new(100).unwrap(),
-            grace: Duration::from_secs(3),
-        })
-    );
-
-    // `Server` mirrors the `BoundServer` knob and uses the default grace.
-    let server = Server::new(Router::new());
-    assert_eq!(server.max_requests_per_connection, None);
-    assert_eq!(server.request_retirement_config(), None);
-    let server =
-        Server::new(Router::new()).with_max_requests_per_connection(NonZeroU64::new(5).unwrap());
-    assert_eq!(
-        server.request_retirement_config(),
-        Some(RequestRetirementConfig {
-            max: NonZeroU64::new(5).unwrap(),
-            grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
-        })
-    );
-}
-
 #[tokio::test(start_paused = true)]
 async fn max_requests_per_connection_retires_h2_after_limit() {
     let bound = Server::bind("127.0.0.1:0")

@@ -23,49 +23,6 @@ fn connection_activity_tracks_in_flight_and_epoch() {
     assert_eq!(shared.snapshot(), (0, 4));
 }
 
-#[tokio::test]
-async fn max_connection_idle_builder_defaults_and_overrides() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert_eq!(bound.max_connection_idle, None);
-    assert_eq!(bound.connection_idle_config(), None);
-
-    let bound = bound.with_max_connection_idle(Duration::from_secs(30));
-    assert_eq!(bound.max_connection_idle, Some(Duration::from_secs(30)));
-    assert_eq!(
-        bound.connection_idle_config(),
-        Some(IdleConfig {
-            idle: Duration::from_secs(30),
-            grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
-        })
-    );
-}
-
-#[test]
-fn server_max_connection_idle_builder_threads_through() {
-    let server = Server::new(Router::new());
-    assert_eq!(server.max_connection_idle, None);
-    assert_eq!(server.connection_idle_config(), None);
-
-    // Idle reaping reuses the max-age grace period for its drain window.
-    let server = Server::new(Router::new())
-        .with_max_connection_idle(Duration::from_secs(30))
-        .with_max_connection_age_grace(Duration::from_secs(2));
-    assert_eq!(
-        server.connection_idle_config(),
-        Some(IdleConfig {
-            idle: Duration::from_secs(30),
-            grace: Duration::from_secs(2),
-        })
-    );
-}
-
-#[test]
-#[should_panic(expected = "non-zero duration")]
-fn with_max_connection_idle_rejects_zero() {
-    let _ = Server::new(Router::new()).with_max_connection_idle(Duration::ZERO);
-}
-
 #[tokio::test(start_paused = true)]
 async fn max_connection_idle_reaps_quiet_connection() {
     let bound = Server::bind("127.0.0.1:0")

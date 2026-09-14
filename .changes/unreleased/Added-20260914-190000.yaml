@@ -1,0 +1,15 @@
+kind: Added
+body: |-
+    **`ConnectionConfig` and `AcceptConfig`: the built-in server's settings as
+    plain values.** Every per-connection setting (HTTP/1.1 keep-alive and
+    header-read timeout, HTTP/2 windows / max concurrent streams / keepalive,
+    max connection age / idle / requests and their grace period) is one
+    `#[non_exhaustive]` `ConnectionConfig` with a `Default`; TLS and the
+    handshake timeout are `AcceptConfig`. `Server` and `BoundServer` each take
+    one via `with_connection_config` / `with_accept_config` (with matching
+    accessors), so a configuration built once applies to either ([#250]); the
+    existing `with_*` setters are unchanged and edit the same value.
+    `ConnectionConfig` is also re-exported at the crate root.
+
+    [#250]: https://github.com/connectrpc/connect-rust/issues/250
+time: 2026-09-14T19:00:00.000000000+00:00

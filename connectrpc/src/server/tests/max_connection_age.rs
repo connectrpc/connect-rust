@@ -53,53 +53,6 @@ fn max_connection_age_jitter_stays_within_bounds() {
     }
 }
 
-#[tokio::test]
-async fn max_connection_age_builder_defaults_and_overrides() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert_eq!(bound.max_connection_age, None);
-    assert_eq!(
-        bound.max_connection_age_grace,
-        DEFAULT_MAX_CONNECTION_AGE_GRACE
-    );
-
-    let bound = bound
-        .with_max_connection_age(Duration::from_secs(30))
-        .with_max_connection_age_grace(Duration::ZERO);
-    assert_eq!(bound.max_connection_age, Some(Duration::from_secs(30)));
-    assert_eq!(bound.max_connection_age_grace, Duration::ZERO);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound =
-        Server::from_listener(listener).with_max_connection_age_grace(Duration::from_secs(2));
-    assert_eq!(bound.max_connection_age, None);
-    assert_eq!(bound.max_connection_age_grace, Duration::from_secs(2));
-}
-
-#[test]
-fn server_max_connection_age_builder_threads_through() {
-    let server = Server::new(Router::new());
-    assert_eq!(server.max_connection_age, None);
-    assert_eq!(server.connection_age_config(), None);
-
-    let server = Server::new(Router::new())
-        .with_max_connection_age(Duration::from_secs(30))
-        .with_max_connection_age_grace(Duration::from_secs(2));
-    assert_eq!(
-        server.connection_age_config(),
-        Some(ConnectionAgeConfig {
-            max_age: Duration::from_secs(30),
-            grace: Duration::from_secs(2),
-        })
-    );
-}
-
-#[test]
-#[should_panic(expected = "non-zero duration")]
-fn with_max_connection_age_rejects_zero() {
-    let _ = Server::new(Router::new()).with_max_connection_age(Duration::ZERO);
-}
-
 #[tokio::test(start_paused = true)]
 async fn max_connection_age_sends_h2_goaway_without_global_shutdown() {
     let bound = Server::bind("127.0.0.1:0")

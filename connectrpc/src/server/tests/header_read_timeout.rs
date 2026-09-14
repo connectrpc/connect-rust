@@ -2,38 +2,6 @@
 
 use super::*;
 
-#[test]
-fn header_read_timeout_builder_defaults_and_overrides() {
-    // Default is on at DEFAULT_HEADER_READ_TIMEOUT.
-    let server = Server::new(Router::new());
-    assert_eq!(
-        server.header_read_timeout,
-        Some(DEFAULT_HEADER_READ_TIMEOUT)
-    );
-
-    // An explicit value overrides the default.
-    let server = Server::new(Router::new()).with_header_read_timeout(Some(Duration::from_secs(5)));
-    assert_eq!(server.header_read_timeout, Some(Duration::from_secs(5)));
-
-    // `None` disables it.
-    let server = Server::new(Router::new()).with_header_read_timeout(None::<Duration>);
-    assert_eq!(server.header_read_timeout, None);
-}
-
-#[tokio::test]
-async fn bound_server_header_read_timeout_builder_defaults_and_overrides() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener);
-    assert_eq!(bound.header_read_timeout, Some(DEFAULT_HEADER_READ_TIMEOUT));
-
-    let bound = bound.with_header_read_timeout(Some(Duration::from_secs(2)));
-    assert_eq!(bound.header_read_timeout, Some(Duration::from_secs(2)));
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bound = Server::from_listener(listener).with_header_read_timeout(None::<Duration>);
-    assert_eq!(bound.header_read_timeout, None);
-}
-
 /// A peer that opens a connection and sends an incomplete header block must
 /// be disconnected once the header read timeout elapses, rather than
 /// holding the connection (and its task and file descriptor) open forever.

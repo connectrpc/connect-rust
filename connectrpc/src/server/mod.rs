@@ -130,6 +130,16 @@ use crate::error::ErrorCode;
 use crate::router::Router;
 use crate::service::ConnectRpcService;
 
+mod config;
+
+pub use config::AcceptConfig;
+pub use config::ConnectionConfig;
+pub use config::DEFAULT_HEADER_READ_TIMEOUT;
+pub use config::DEFAULT_HTTP2_ADAPTIVE_WINDOW;
+pub use config::DEFAULT_HTTP2_KEEPALIVE_TIMEOUT;
+#[cfg(feature = "server-tls")]
+pub use config::DEFAULT_TLS_HANDSHAKE_TIMEOUT;
+
 /// Remote socket address of the connected peer.
 ///
 /// Inserted into every request's extensions by the built-in [`Server`]'s
@@ -182,185 +192,72 @@ impl PeerInfo {
     }
 }
 
-/// Default TLS handshake timeout.
-///
-/// Bounds how long the server waits after TCP accept for a client to complete
-/// the TLS handshake. Prevents slowloris-style connection-exhaustion attacks
-/// where a client opens a TCP connection and stalls the handshake indefinitely,
-/// holding a task and file descriptor per connection.
-///
-/// Override via [`Server::with_tls_handshake_timeout`] or
-/// [`BoundServer::with_tls_handshake_timeout`].
-#[cfg(feature = "server-tls")]
-#[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
-pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Default HTTP/1.1 header read timeout.
-///
-/// Bounds how long the server waits to receive a complete set of request
-/// headers, measured from the point hyper begins reading a new request on the
-/// connection. On a keep-alive connection this also bounds the idle wait
-/// between requests, so a peer that opens a connection (or finishes one
-/// request) and then stalls without sending the next request's headers is
-/// disconnected rather than holding a task and file descriptor open
-/// indefinitely. This mitigates slowloris-style connection-exhaustion attacks.
-///
-/// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-/// connections — use `with_max_connection_age` to retire those by age.
-///
-/// This default is applied to every accepted connection. Earlier releases
-/// installed no connection timer, so the header read timeout never took
-/// effect; it is active by default as of the release that introduced
-/// [`Server::with_header_read_timeout`].
-///
-/// Override via [`Server::with_header_read_timeout`] or
-/// [`BoundServer::with_header_read_timeout`]; pass `None` to disable.
-pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-const DEFAULT_MAX_CONNECTION_AGE_GRACE: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_AGE_JITTER_BASIS_POINTS: u128 = 10_000;
 const MAX_CONNECTION_AGE_JITTER_SPREAD_BASIS_POINTS: u128 = 1_000;
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
-/// Default timeout for an HTTP/2 keepalive PING acknowledgement.
-///
-/// Once an HTTP/2 keepalive interval is set via
-/// [`Server::with_http2_keepalive_interval`] (or the [`BoundServer`]
-/// equivalent), the server waits this long for the peer to acknowledge a PING
-/// before treating the connection as dead and closing it. Matches the
-/// 20-second default used by grpc-go, grpc-java, and tonic. Override with
-/// [`Server::with_http2_keepalive_timeout`].
-pub const DEFAULT_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Default for HTTP/2 adaptive (BDP-based) flow-control window sizing.
-///
-/// Enabled by default so connections over high bandwidth-delay-product links
-/// (cross-region, high-throughput streaming) are not throttled by hyper's
-/// fixed 64 KiB stream/connection windows. hyper grows the window based on the
-/// measured bandwidth-delay product, matching grpc-go and grpc-java, which both
-/// autotune by default. The trade-off is slightly higher per-connection memory
-/// under load.
-///
-/// Disable with [`Server::with_http2_adaptive_window`] /
-/// [`BoundServer::with_http2_adaptive_window`], or override the windows
-/// explicitly with the `with_http2_initial_*_window_size` setters (which turn
-/// adaptive sizing off).
-pub const DEFAULT_HTTP2_ADAPTIVE_WINDOW: bool = true;
-
-/// HTTP/2 protocol configuration applied to every accepted connection's
-/// hyper builder via [`configure_http2`].
-///
-/// `adaptive_window` and the explicit window sizes are mutually exclusive in
-/// hyper: enabling adaptive sizing overrides any explicit window size. The
-/// public setters keep them consistent by clearing the adaptive flag whenever
-/// an explicit size is supplied.
-///
-/// Keepalive PING is disabled unless `keepalive_interval` is set;
-/// `keepalive_timeout` is only consulted by hyper once an interval is active.
-#[derive(Clone, Copy, Debug)]
-struct Http2Config {
-    adaptive_window: bool,
-    initial_stream_window_size: Option<u32>,
-    initial_connection_window_size: Option<u32>,
-    max_concurrent_streams: Option<u32>,
-    keepalive_interval: Option<Duration>,
-    keepalive_timeout: Duration,
-}
-
-impl Default for Http2Config {
-    fn default() -> Self {
-        Self {
-            adaptive_window: DEFAULT_HTTP2_ADAPTIVE_WINDOW,
-            initial_stream_window_size: None,
-            initial_connection_window_size: None,
-            max_concurrent_streams: None,
-            keepalive_interval: None,
-            keepalive_timeout: DEFAULT_HTTP2_KEEPALIVE_TIMEOUT,
-        }
-    }
-}
-
-impl Http2Config {
-    /// The `(stream, connection)` explicit window sizes that should actually be
-    /// applied to hyper's builder.
-    ///
-    /// Adaptive sizing takes precedence: when it is on, no explicit window is
-    /// applied, so the two never reach hyper at once regardless of the order
-    /// the builder methods were called in. The public setters already clear the
-    /// adaptive flag when a size is supplied, but a later
-    /// `with_http2_adaptive_window(true)` can leave both set; this resolves that
-    /// case deterministically in favour of adaptive sizing.
-    fn effective_windows(self) -> (Option<u32>, Option<u32>) {
-        if self.adaptive_window {
-            (None, None)
-        } else {
-            (
-                self.initial_stream_window_size,
-                self.initial_connection_window_size,
-            )
-        }
-    }
-}
-
-/// ConnectRPC server built on hyper.
+/// ConnectRPC server built on hyper: a [`ConnectRpcService`] plus the
+/// [`ConnectionConfig`] and [`AcceptConfig`] every accepted connection is
+/// served with.
 pub struct Server {
     service: ConnectRpcService,
-    http1_keep_alive: bool,
-    #[cfg(feature = "server-tls")]
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    #[cfg(feature = "server-tls")]
-    tls_handshake_timeout: std::time::Duration,
-    header_read_timeout: Option<Duration>,
-    max_connection_age: Option<Duration>,
-    max_connection_age_grace: Duration,
-    max_connection_idle: Option<Duration>,
-    http2: Http2Config,
-    max_requests_per_connection: Option<NonZeroU64>,
+    connection: ConnectionConfig,
+    accept: AcceptConfig,
 }
 
 impl Server {
     /// Create a new server with the given router.
     pub fn new(router: Router) -> Self {
-        Self {
-            service: ConnectRpcService::new(router),
-            http1_keep_alive: true,
-            #[cfg(feature = "server-tls")]
-            tls_config: None,
-            #[cfg(feature = "server-tls")]
-            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
-            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
-            max_connection_age: None,
-            max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
-            max_connection_idle: None,
-            http2: Http2Config::default(),
-            max_requests_per_connection: None,
-        }
+        Self::from_service(ConnectRpcService::new(router))
     }
 
     /// Create a new server from an existing [`ConnectRpcService`].
     pub fn from_service(service: ConnectRpcService) -> Self {
         Self {
             service,
-            http1_keep_alive: true,
-            #[cfg(feature = "server-tls")]
-            tls_config: None,
-            #[cfg(feature = "server-tls")]
-            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
-            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
-            max_connection_age: None,
-            max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
-            max_connection_idle: None,
-            http2: Http2Config::default(),
-            max_requests_per_connection: None,
+            connection: ConnectionConfig::default(),
+            accept: AcceptConfig::default(),
         }
+    }
+
+    /// Replace the per-connection settings wholesale.
+    ///
+    /// [`ConnectionConfig`] is a plain value, so one configuration can be
+    /// built once and applied to a `Server`, a [`BoundServer`], or
+    /// `connectrpc::axum::Serve` alike. The individual `with_*` setters below
+    /// edit the same value in place.
+    #[must_use]
+    pub fn with_connection_config(mut self, config: ConnectionConfig) -> Self {
+        self.connection = config;
+        self
+    }
+
+    /// The per-connection settings accepted connections are served with.
+    #[must_use]
+    pub fn connection_config(&self) -> &ConnectionConfig {
+        &self.connection
+    }
+
+    /// Replace the accept-time settings (TLS, handshake timeout) wholesale.
+    #[must_use]
+    pub fn with_accept_config(mut self, config: AcceptConfig) -> Self {
+        self.accept = config;
+        self
+    }
+
+    /// The accept-time settings.
+    #[must_use]
+    pub fn accept_config(&self) -> &AcceptConfig {
+        &self.accept
     }
 
     /// Enable TLS with the given rustls server configuration.
     ///
-    /// The configuration controls all TLS behavior including certificate
-    /// selection, client authentication, and protocol versions. For dynamic
-    /// certificate rotation, use a [`rustls::server::ResolvesServerCert`]
-    /// implementation in the config.
+    /// Shorthand for [`AcceptConfig::with_tls`]. The configuration controls
+    /// all TLS behavior including certificate selection, client
+    /// authentication, and protocol versions. For dynamic certificate
+    /// rotation, use a [`rustls::server::ResolvesServerCert`] implementation
+    /// in the config.
     ///
     /// # Example
     ///
@@ -379,52 +276,34 @@ impl Server {
     #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
-        self.tls_config = Some(config);
+        self.accept = self.accept.with_tls(config);
         self
     }
 
-    /// Set the TLS handshake timeout.
-    ///
-    /// Defaults to [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] (10 seconds). A client
-    /// that connects via TCP but does not complete the TLS handshake within
-    /// this duration is disconnected.
+    /// Set the TLS handshake timeout (default [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`],
+    /// 10 seconds). Shorthand for [`AcceptConfig::with_tls_handshake_timeout`].
     #[cfg(feature = "server-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
-    pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.tls_handshake_timeout = timeout;
+    pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.accept = self.accept.with_tls_handshake_timeout(timeout);
         self
     }
 
-    /// Set the HTTP/1.1 header read timeout.
-    ///
-    /// Defaults to [`DEFAULT_HEADER_READ_TIMEOUT`] (30 seconds). Bounds how
-    /// long the server waits to read a complete set of request headers,
-    /// measured from when hyper begins reading a new request; on a keep-alive
-    /// connection this also bounds the idle wait between requests. A peer that
-    /// connects (or finishes a request) and then stalls without sending the
-    /// next request's headers is disconnected, which mitigates slowloris-style
-    /// connection-exhaustion attacks. Pass `None` to disable.
-    ///
-    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-    /// connections — use `with_max_connection_age` to retire those by age.
+    /// Set the HTTP/1.1 header read timeout (default
+    /// [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` disables). Shorthand for
+    /// [`ConnectionConfig::with_header_read_timeout`].
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
-        self.header_read_timeout = timeout.into();
+        self.connection = self.connection.with_header_read_timeout(timeout);
         self
     }
 
-    /// Enable or disable HTTP/1.1 keep-alive (default: enabled).
-    ///
-    /// When disabled, the server sends `Connection: close` and handles
-    /// only one request per TCP connection. This avoids stale-connection
-    /// races where the server closes an idle connection at the same time
-    /// the client sends a new request on it.
-    ///
-    /// HTTP/2 multiplexing is unaffected.
+    /// Enable or disable HTTP/1.1 keep-alive (default: enabled). Shorthand for
+    /// [`ConnectionConfig::with_http1_keep_alive`].
     #[must_use]
     pub fn with_http1_keep_alive(mut self, enabled: bool) -> Self {
-        self.http1_keep_alive = enabled;
+        self.connection = self.connection.with_http1_keep_alive(enabled);
         self
     }
 
@@ -507,191 +386,113 @@ impl Server {
         self
     }
 
-    /// Set a maximum age for each accepted HTTP connection.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_max_connection_age`]; see it for full behaviour
-    /// (±10% jitter, GOAWAY, grace period). Disabled by default.
+    /// Retire each connection once it reaches `max_age` (±10% jitter, then
+    /// GOAWAY and a grace period). Shorthand for
+    /// [`ConnectionConfig::with_max_connection_age`].
     ///
     /// # Panics
     ///
     /// Panics if `max_age` is zero.
     #[must_use]
     pub fn with_max_connection_age(mut self, max_age: Duration) -> Self {
-        assert!(
-            !max_age.is_zero(),
-            "with_max_connection_age requires a non-zero duration",
-        );
-        self.max_connection_age = Some(max_age);
+        self.connection = self.connection.with_max_connection_age(max_age);
         self
     }
 
-    /// Set the grace period used after a retired connection begins shutdown.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_max_connection_age_grace`]. Defaults to five
-    /// seconds. This single grace period is shared by all three retirement
-    /// triggers ([`with_max_connection_age`](Self::with_max_connection_age),
-    /// [`with_max_connection_idle`](Self::with_max_connection_idle), and
-    /// [`with_max_requests_per_connection`](Self::with_max_requests_per_connection));
-    /// it has no effect unless at least one of them is set.
+    /// Set the drain window shared by the three retirement triggers (default
+    /// five seconds). Shorthand for
+    /// [`ConnectionConfig::with_max_connection_age_grace`].
     #[must_use]
     pub fn with_max_connection_age_grace(mut self, grace: Duration) -> Self {
-        self.max_connection_age_grace = grace;
+        self.connection = self.connection.with_max_connection_age_grace(grace);
         self
     }
 
     /// Retire a connection that has had no in-flight requests for `duration`.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_max_connection_idle`]; see it for full behaviour
-    /// (GOAWAY then grace-period drain). Disabled by default.
+    /// Shorthand for [`ConnectionConfig::with_max_connection_idle`].
     ///
     /// # Panics
     ///
     /// Panics if `duration` is zero.
     #[must_use]
     pub fn with_max_connection_idle(mut self, duration: Duration) -> Self {
-        assert!(
-            !duration.is_zero(),
-            "with_max_connection_idle requires a non-zero duration",
-        );
-        self.max_connection_idle = Some(duration);
+        self.connection = self.connection.with_max_connection_idle(duration);
         self
     }
 
-    /// Enable or disable HTTP/2 adaptive flow-control window sizing.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_http2_adaptive_window`]; see it for full behaviour.
-    /// Enabled by default ([`DEFAULT_HTTP2_ADAPTIVE_WINDOW`]).
+    /// Enable or disable HTTP/2 adaptive flow-control window sizing (default
+    /// [`DEFAULT_HTTP2_ADAPTIVE_WINDOW`]). Shorthand for
+    /// [`ConnectionConfig::with_http2_adaptive_window`].
     #[must_use]
     pub fn with_http2_adaptive_window(mut self, enabled: bool) -> Self {
-        self.http2.adaptive_window = enabled;
+        self.connection = self.connection.with_http2_adaptive_window(enabled);
         self
     }
 
-    /// Set the HTTP/2 initial stream-level flow-control window size, in bytes.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_http2_initial_stream_window_size`]; see it for full
-    /// behaviour. Supplying a size turns adaptive sizing off.
+    /// Set the HTTP/2 initial stream window, in bytes; supplying a size turns
+    /// adaptive sizing off. Shorthand for
+    /// [`ConnectionConfig::with_http2_initial_stream_window_size`].
     #[must_use]
     pub fn with_http2_initial_stream_window_size(mut self, size: impl Into<Option<u32>>) -> Self {
-        self.http2.initial_stream_window_size = size.into();
-        if self.http2.initial_stream_window_size.is_some() {
-            self.http2.adaptive_window = false;
-        }
+        self.connection = self.connection.with_http2_initial_stream_window_size(size);
         self
     }
 
-    /// Set the HTTP/2 initial connection-level flow-control window size, in bytes.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_http2_initial_connection_window_size`]; see it for
-    /// full behaviour. Supplying a size turns adaptive sizing off.
+    /// Set the HTTP/2 initial connection window, in bytes; supplying a size
+    /// turns adaptive sizing off. Shorthand for
+    /// [`ConnectionConfig::with_http2_initial_connection_window_size`].
     #[must_use]
     pub fn with_http2_initial_connection_window_size(
         mut self,
         size: impl Into<Option<u32>>,
     ) -> Self {
-        self.http2.initial_connection_window_size = size.into();
-        if self.http2.initial_connection_window_size.is_some() {
-            self.http2.adaptive_window = false;
-        }
+        self.connection = self
+            .connection
+            .with_http2_initial_connection_window_size(size);
         self
     }
 
-    /// Set the maximum number of concurrent HTTP/2 streams per connection.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_max_concurrent_streams`]; see it for full
-    /// behaviour. Left at hyper's default (200) when unset.
+    /// Set the advertised HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` (hyper's
+    /// default, 200, when unset). Shorthand for
+    /// [`ConnectionConfig::with_max_concurrent_streams`].
     ///
     /// # Panics
     ///
-    /// Panics if `max_streams` is zero; see
-    /// [`BoundServer::with_max_concurrent_streams`].
+    /// Panics if `max_streams` is zero.
     #[must_use]
     pub fn with_max_concurrent_streams(mut self, max_streams: u32) -> Self {
-        assert!(
-            max_streams != 0,
-            "with_max_concurrent_streams requires a non-zero value",
-        );
-        self.http2.max_concurrent_streams = Some(max_streams);
+        self.connection = self.connection.with_max_concurrent_streams(max_streams);
         self
     }
 
-    /// Retire each accepted connection after it has dispatched `max` requests.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_max_requests_per_connection`]; see it for full
-    /// behaviour (GOAWAY, shared grace period, and why `max` is a
-    /// [`NonZeroU64`]). Disabled by default.
+    /// Retire each connection after it has dispatched `max` requests.
+    /// Shorthand for [`ConnectionConfig::with_max_requests_per_connection`].
     #[must_use]
     pub fn with_max_requests_per_connection(mut self, max: NonZeroU64) -> Self {
-        self.max_requests_per_connection = Some(max);
+        self.connection = self.connection.with_max_requests_per_connection(max);
         self
     }
 
-    /// Set the interval between HTTP/2 keepalive PING frames.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_http2_keepalive_interval`]; see it for full
-    /// behaviour. Disabled by default.
+    /// Send HTTP/2 keepalive PINGs every `interval` on idle connections
+    /// (disabled by default). Shorthand for
+    /// [`ConnectionConfig::with_http2_keepalive_interval`].
     ///
     /// # Panics
     ///
     /// Panics if `interval` is zero.
     #[must_use]
     pub fn with_http2_keepalive_interval(mut self, interval: Duration) -> Self {
-        assert!(
-            !interval.is_zero(),
-            "with_http2_keepalive_interval requires a non-zero duration",
-        );
-        self.http2.keepalive_interval = Some(interval);
+        self.connection = self.connection.with_http2_keepalive_interval(interval);
         self
     }
 
-    /// Set how long to wait for an HTTP/2 keepalive PING acknowledgement.
-    ///
-    /// The one-step counterpart of
-    /// [`BoundServer::with_http2_keepalive_timeout`]. Defaults to
-    /// [`DEFAULT_HTTP2_KEEPALIVE_TIMEOUT`] (20 seconds) and has no effect
-    /// unless [`with_http2_keepalive_interval`](Self::with_http2_keepalive_interval)
-    /// is also set.
+    /// Set how long an HTTP/2 keepalive PING may go unacknowledged (default
+    /// [`DEFAULT_HTTP2_KEEPALIVE_TIMEOUT`]). Shorthand for
+    /// [`ConnectionConfig::with_http2_keepalive_timeout`].
     #[must_use]
     pub fn with_http2_keepalive_timeout(mut self, timeout: Duration) -> Self {
-        self.http2.keepalive_timeout = timeout;
+        self.connection = self.connection.with_http2_keepalive_timeout(timeout);
         self
-    }
-
-    fn connection_age_config(&self) -> Option<ConnectionAgeConfig> {
-        build_connection_age_config(
-            self.max_connection_age,
-            self.max_connection_idle,
-            self.max_connection_age_grace,
-            self.max_requests_per_connection.is_some(),
-        )
-    }
-
-    fn connection_idle_config(&self) -> Option<IdleConfig> {
-        build_connection_idle_config(self.max_connection_idle, self.max_connection_age_grace)
-    }
-
-    fn request_retirement_config(&self) -> Option<RequestRetirementConfig> {
-        build_request_retirement_config(
-            self.max_requests_per_connection,
-            self.max_connection_age_grace,
-        )
-    }
-
-    fn retirement_config(&self) -> RetirementConfig {
-        RetirementConfig {
-            age: self.connection_age_config(),
-            idle: self.connection_idle_config(),
-            requests: self.request_retirement_config(),
-        }
     }
 
     /// Get a reference to the underlying router.
@@ -708,32 +509,29 @@ impl Server {
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(addr).await?;
-        let retirement = self.retirement_config();
-        #[cfg(feature = "server-tls")]
-        let tls_acceptor = self.tls_config.map(tokio_rustls::TlsAcceptor::from);
-        #[cfg(not(feature = "server-tls"))]
-        let tls_acceptor: Option<()> = None;
-
-        let scheme = if tls_acceptor.is_some() {
+        let scheme = if self.accept.is_tls() {
             "https"
         } else {
             "http"
         };
         tracing::info!("ConnectRPC server listening on {scheme}://{addr}");
 
-        serve_with_listener(
+        serve_with_listener(listener, self.service, self.accept, self.connection, None).await
+    }
+
+    /// Wrap a pre-bound [`TcpListener`].
+    ///
+    /// Use this instead of [`Server::bind`] when you need to configure
+    /// socket options before binding — e.g. `IPV6_V6ONLY=false` for
+    /// dual-stack listening, `SO_REUSEPORT` for multi-process accept,
+    /// or binding to a listener inherited from a parent process.
+    #[must_use]
+    pub fn from_listener(listener: TcpListener) -> BoundServer {
+        BoundServer {
             listener,
-            self.service,
-            tls_acceptor,
-            self.http1_keep_alive,
-            self.header_read_timeout,
-            #[cfg(feature = "server-tls")]
-            self.tls_handshake_timeout,
-            None,
-            retirement,
-            self.http2,
-        )
-        .await
+            connection: ConnectionConfig::default(),
+            accept: AcceptConfig::default(),
+        }
     }
 
     /// Bind to the given address and return a [`BoundServer`].
@@ -746,67 +544,21 @@ impl Server {
     ///   via IPv4-mapped addresses by default)
     /// - `"localhost:8080"` — resolves via DNS/hosts (may yield v4, v6, or both)
     ///
-    /// Wrap a pre-bound [`TcpListener`].
-    ///
-    /// Use this instead of [`Server::bind`] when you need to configure
-    /// socket options before binding — e.g. `IPV6_V6ONLY=false` for
-    /// dual-stack listening, `SO_REUSEPORT` for multi-process accept,
-    /// or binding to a listener inherited from a parent process.
-    #[must_use]
-    pub fn from_listener(listener: TcpListener) -> BoundServer {
-        BoundServer {
-            listener,
-            http1_keep_alive: true,
-            #[cfg(feature = "server-tls")]
-            tls_config: None,
-            #[cfg(feature = "server-tls")]
-            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
-            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
-            max_connection_age: None,
-            max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
-            max_connection_idle: None,
-            http2: Http2Config::default(),
-            max_requests_per_connection: None,
-        }
-    }
-
     /// When multiple addresses are returned (e.g. `localhost` resolving to
     /// both `::1` and `127.0.0.1`), the first that successfully binds is used.
     pub async fn bind(
         addr: impl tokio::net::ToSocketAddrs,
     ) -> Result<BoundServer, Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(addr).await?;
-        Ok(BoundServer {
-            listener,
-            http1_keep_alive: true,
-            #[cfg(feature = "server-tls")]
-            tls_config: None,
-            #[cfg(feature = "server-tls")]
-            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
-            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
-            max_connection_age: None,
-            max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
-            max_connection_idle: None,
-            http2: Http2Config::default(),
-            max_requests_per_connection: None,
-        })
+        Ok(Self::from_listener(TcpListener::bind(addr).await?))
     }
 }
 
-/// A server that has been bound to an address but not yet started.
+/// A listener plus the settings its connections will be served with; the
+/// service is supplied when serving starts.
 pub struct BoundServer {
     listener: TcpListener,
-    http1_keep_alive: bool,
-    #[cfg(feature = "server-tls")]
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    #[cfg(feature = "server-tls")]
-    tls_handshake_timeout: std::time::Duration,
-    header_read_timeout: Option<Duration>,
-    max_connection_age: Option<Duration>,
-    max_connection_age_grace: Duration,
-    max_connection_idle: Option<Duration>,
-    http2: Http2Config,
-    max_requests_per_connection: Option<NonZeroU64>,
+    connection: ConnectionConfig,
+    accept: AcceptConfig,
 }
 
 impl BoundServer {
@@ -815,317 +567,176 @@ impl BoundServer {
         self.listener.local_addr()
     }
 
-    /// Enable TLS with the given rustls server configuration.
+    /// Replace the per-connection settings wholesale; see
+    /// [`Server::with_connection_config`].
+    #[must_use]
+    pub fn with_connection_config(mut self, config: ConnectionConfig) -> Self {
+        self.connection = config;
+        self
+    }
+
+    /// The per-connection settings accepted connections are served with.
+    #[must_use]
+    pub fn connection_config(&self) -> &ConnectionConfig {
+        &self.connection
+    }
+
+    /// Replace the accept-time settings (TLS, handshake timeout) wholesale.
+    #[must_use]
+    pub fn with_accept_config(mut self, config: AcceptConfig) -> Self {
+        self.accept = config;
+        self
+    }
+
+    /// The accept-time settings.
+    #[must_use]
+    pub fn accept_config(&self) -> &AcceptConfig {
+        &self.accept
+    }
+
+    /// Enable TLS with the given rustls server configuration. Shorthand for
+    /// [`AcceptConfig::with_tls`].
     #[cfg(feature = "server-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
-        self.tls_config = Some(config);
+        self.accept = self.accept.with_tls(config);
         self
     }
 
-    /// Set the TLS handshake timeout.
-    ///
-    /// Defaults to [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] (10 seconds).
+    /// Set the TLS handshake timeout (default [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`],
+    /// 10 seconds). Shorthand for [`AcceptConfig::with_tls_handshake_timeout`].
     #[cfg(feature = "server-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
     #[must_use]
-    pub fn with_tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.tls_handshake_timeout = timeout;
+    pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.accept = self.accept.with_tls_handshake_timeout(timeout);
         self
     }
 
-    /// Set the HTTP/1.1 header read timeout.
-    ///
-    /// Defaults to [`DEFAULT_HEADER_READ_TIMEOUT`] (30 seconds). Bounds how
-    /// long the server waits to read a complete set of request headers,
-    /// measured from when hyper begins reading a new request; on a keep-alive
-    /// connection this also bounds the idle wait between requests. A peer that
-    /// connects (or finishes a request) and then stalls without sending the
-    /// next request's headers is disconnected, which mitigates slowloris-style
-    /// connection-exhaustion attacks. Pass `None` to disable.
-    ///
-    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-    /// connections — use `with_max_connection_age` to retire those by age.
+    /// Set the HTTP/1.1 header read timeout (default
+    /// [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` disables). Shorthand for
+    /// [`ConnectionConfig::with_header_read_timeout`].
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
-        self.header_read_timeout = timeout.into();
+        self.connection = self.connection.with_header_read_timeout(timeout);
         self
     }
 
-    /// Enable or disable HTTP/1.1 keep-alive.
-    ///
-    /// When disabled, the server sends `Connection: close` and handles
-    /// only one request per TCP connection. This avoids stale-connection
-    /// races where the server closes an idle connection at the same time
-    /// the client sends a new request on it.
-    ///
-    /// HTTP/2 multiplexing is unaffected.
+    /// Enable or disable HTTP/1.1 keep-alive (default: enabled). Shorthand for
+    /// [`ConnectionConfig::with_http1_keep_alive`].
     #[must_use]
     pub fn with_http1_keep_alive(mut self, enabled: bool) -> Self {
-        self.http1_keep_alive = enabled;
+        self.connection = self.connection.with_http1_keep_alive(enabled);
         self
     }
 
-    /// Set a maximum age for each accepted HTTP connection.
-    ///
-    /// Disabled by default. When enabled, the age is measured from the start
-    /// of HTTP serving (after any TLS handshake) and each connection gets a
-    /// symmetric ±10% jitter to avoid reconnect bursts. Once the age expires,
-    /// the server begins graceful shutdown for that connection — HTTP/2
-    /// connections receive a GOAWAY, HTTP/1.1 connections have keep-alive
-    /// disabled — then waits up to
-    /// [`with_max_connection_age_grace`](Self::with_max_connection_age_grace)
-    /// for in-flight requests before force-closing it.
+    /// Retire each connection once it reaches `max_age` (±10% jitter, then
+    /// GOAWAY and a grace period). Shorthand for
+    /// [`ConnectionConfig::with_max_connection_age`].
     ///
     /// # Panics
     ///
-    /// Panics if `max_age` is zero — a zero age is rejected rather than
-    /// silently retiring every connection the instant it starts serving.
+    /// Panics if `max_age` is zero.
     #[must_use]
     pub fn with_max_connection_age(mut self, max_age: Duration) -> Self {
-        assert!(
-            !max_age.is_zero(),
-            "with_max_connection_age requires a non-zero duration",
-        );
-        self.max_connection_age = Some(max_age);
+        self.connection = self.connection.with_max_connection_age(max_age);
         self
     }
 
-    /// Set the grace period used after a retired connection begins shutdown.
-    ///
-    /// Defaults to five seconds. This single grace period is shared by all
-    /// three retirement triggers —
-    /// [`with_max_connection_age`](Self::with_max_connection_age),
-    /// [`with_max_connection_idle`](Self::with_max_connection_idle), and
-    /// [`with_max_requests_per_connection`](Self::with_max_requests_per_connection)
-    /// — and applies to whichever one fires. Setting it without enabling any
-    /// trigger has no effect, and the three cannot be tuned independently.
-    /// Whole-server graceful shutdown still waits indefinitely for in-flight
-    /// requests.
+    /// Set the drain window shared by the three retirement triggers (default
+    /// five seconds). Shorthand for
+    /// [`ConnectionConfig::with_max_connection_age_grace`].
     #[must_use]
     pub fn with_max_connection_age_grace(mut self, grace: Duration) -> Self {
-        self.max_connection_age_grace = grace;
+        self.connection = self.connection.with_max_connection_age_grace(grace);
         self
     }
 
     /// Retire a connection that has had no in-flight requests for `duration`.
-    ///
-    /// Disabled by default. This complements
-    /// [`with_max_connection_age`](Self::with_max_connection_age): age caps a
-    /// connection's total lifetime regardless of use, while idle reclaims
-    /// connections that have gone quiet (clients behind NAT, bursty workloads,
-    /// pooled clients holding connections they no longer need).
-    ///
-    /// A connection is idle when it has zero in-flight requests. The idle
-    /// timer resets on activity: any request that starts, or completes, during
-    /// an idle window keeps the connection alive. Once a connection stays idle
-    /// for the full `duration`, the server begins graceful shutdown for it —
-    /// HTTP/2 connections receive a GOAWAY, HTTP/1.1 connections have
-    /// keep-alive disabled — then waits up to
-    /// [`with_max_connection_age_grace`](Self::with_max_connection_age_grace)
-    /// (a grace period shared with maximum age) for any straggling request
-    /// before force-closing it.
-    ///
-    /// The idle window is evaluated lazily — it is re-checked when the timer
-    /// expires rather than re-armed at the instant of each request — so a
-    /// connection is retired between one and two times `duration` after its
-    /// last activity. Size `duration` against that upper bound. Unlike maximum
-    /// age, idle reaping applies no jitter.
-    ///
-    /// When both an idle timeout and a
-    /// [`max age`](Self::with_max_connection_age) are configured, whichever
-    /// fires first retires the connection. Whole-server graceful shutdown still
-    /// waits indefinitely for in-flight requests, and is never capped by the
-    /// idle grace period.
+    /// Shorthand for [`ConnectionConfig::with_max_connection_idle`].
     ///
     /// # Panics
     ///
-    /// Panics if `duration` is zero — a zero idle timeout is rejected rather
-    /// than silently retiring every connection the instant it falls idle.
+    /// Panics if `duration` is zero.
     #[must_use]
     pub fn with_max_connection_idle(mut self, duration: Duration) -> Self {
-        assert!(
-            !duration.is_zero(),
-            "with_max_connection_idle requires a non-zero duration",
-        );
-        self.max_connection_idle = Some(duration);
+        self.connection = self.connection.with_max_connection_idle(duration);
         self
     }
 
-    /// Enable or disable HTTP/2 adaptive flow-control window sizing.
-    ///
-    /// Enabled by default ([`DEFAULT_HTTP2_ADAPTIVE_WINDOW`]). When enabled,
-    /// hyper grows the stream and connection flow-control windows based on the
-    /// measured bandwidth-delay product, which improves throughput on
-    /// high-latency, high-bandwidth links at the cost of slightly higher
-    /// per-connection memory under load.
-    ///
-    /// Adaptive sizing and an explicit window size are mutually exclusive:
-    /// enabling adaptive sizing overrides any window set via
-    /// [`with_http2_initial_stream_window_size`](Self::with_http2_initial_stream_window_size)
-    /// or
-    /// [`with_http2_initial_connection_window_size`](Self::with_http2_initial_connection_window_size).
-    /// Whichever is set last wins.
+    /// Enable or disable HTTP/2 adaptive flow-control window sizing (default
+    /// [`DEFAULT_HTTP2_ADAPTIVE_WINDOW`]). Shorthand for
+    /// [`ConnectionConfig::with_http2_adaptive_window`].
     #[must_use]
     pub fn with_http2_adaptive_window(mut self, enabled: bool) -> Self {
-        self.http2.adaptive_window = enabled;
+        self.connection = self.connection.with_http2_adaptive_window(enabled);
         self
     }
 
-    /// Set the HTTP/2 initial stream-level flow-control window size, in bytes.
-    ///
-    /// Controls the per-stream `SETTINGS_INITIAL_WINDOW_SIZE` advertised to
-    /// clients. Supplying a size turns
-    /// [adaptive sizing](Self::with_http2_adaptive_window) off, mirroring
-    /// grpc-go semantics; passing `None` leaves hyper's default in place and
-    /// does not change the adaptive flag. The window can be raised above
-    /// hyper's 64 KiB default to improve throughput when adaptive sizing is
-    /// not wanted.
-    ///
-    /// The adaptive toggle and the explicit window are last-write-wins: a later
-    /// [`with_http2_adaptive_window(true)`](Self::with_http2_adaptive_window)
-    /// re-enables autotuning and the explicit window is ignored. Per HTTP/2,
-    /// the window must not exceed `2^31 - 1`; larger values are a protocol error.
+    /// Set the HTTP/2 initial stream window, in bytes; supplying a size turns
+    /// adaptive sizing off. Shorthand for
+    /// [`ConnectionConfig::with_http2_initial_stream_window_size`].
     #[must_use]
     pub fn with_http2_initial_stream_window_size(mut self, size: impl Into<Option<u32>>) -> Self {
-        self.http2.initial_stream_window_size = size.into();
-        if self.http2.initial_stream_window_size.is_some() {
-            self.http2.adaptive_window = false;
-        }
+        self.connection = self.connection.with_http2_initial_stream_window_size(size);
         self
     }
 
-    /// Set the HTTP/2 initial connection-level flow-control window size, in bytes.
-    ///
-    /// Controls the whole-connection flow-control window, which bounds the
-    /// total unacknowledged data across all streams on the connection.
-    /// Supplying a size turns
-    /// [adaptive sizing](Self::with_http2_adaptive_window) off, mirroring
-    /// grpc-go semantics; passing `None` leaves hyper's default in place and
-    /// does not change the adaptive flag.
-    ///
-    /// The adaptive toggle and the explicit window are last-write-wins: a later
-    /// [`with_http2_adaptive_window(true)`](Self::with_http2_adaptive_window)
-    /// re-enables autotuning and the explicit window is ignored. Per HTTP/2,
-    /// the window must not exceed `2^31 - 1`; larger values are a protocol error.
+    /// Set the HTTP/2 initial connection window, in bytes; supplying a size
+    /// turns adaptive sizing off. Shorthand for
+    /// [`ConnectionConfig::with_http2_initial_connection_window_size`].
     #[must_use]
     pub fn with_http2_initial_connection_window_size(
         mut self,
         size: impl Into<Option<u32>>,
     ) -> Self {
-        self.http2.initial_connection_window_size = size.into();
-        if self.http2.initial_connection_window_size.is_some() {
-            self.http2.adaptive_window = false;
-        }
+        self.connection = self
+            .connection
+            .with_http2_initial_connection_window_size(size);
         self
     }
 
-    /// Set the maximum number of concurrent HTTP/2 streams per connection.
-    ///
-    /// This maps to hyper's HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`, which
-    /// the server advertises to each peer. A client may have at most this
-    /// many in-flight requests (streams) open at once on a single connection;
-    /// attempts to exceed it are refused with a `REFUSED_STREAM` error and
-    /// can be safely retried. The setting has no effect on HTTP/1.1
-    /// connections, which are not multiplexed.
-    ///
-    /// Left at hyper's default (200) when unset. Raise it for high-fan-in
-    /// internal services that multiplex many concurrent RPCs over one
-    /// connection, or lower it as an additional hardening measure when
-    /// serving less-trusted clients.
+    /// Set the advertised HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` (hyper's
+    /// default, 200, when unset). Shorthand for
+    /// [`ConnectionConfig::with_max_concurrent_streams`].
     ///
     /// # Panics
     ///
-    /// Panics if `max_streams` is zero — advertising a limit of zero refuses
-    /// every stream, leaving a server that accepts connections but rejects
-    /// all requests. It is rejected at configuration time rather than
-    /// silently producing a dead server.
+    /// Panics if `max_streams` is zero.
     #[must_use]
     pub fn with_max_concurrent_streams(mut self, max_streams: u32) -> Self {
-        assert!(
-            max_streams != 0,
-            "with_max_concurrent_streams requires a non-zero value",
-        );
-        self.http2.max_concurrent_streams = Some(max_streams);
+        self.connection = self.connection.with_max_concurrent_streams(max_streams);
         self
     }
 
-    /// Retire each accepted connection after it has dispatched `max` requests.
-    ///
-    /// Disabled by default. The request count is per-connection: every
-    /// inbound request (each HTTP/2 stream, or each HTTP/1.1 request) is
-    /// counted, and once the `max`th request has been dispatched the server
-    /// begins graceful shutdown for that connection — HTTP/2 connections
-    /// receive a GOAWAY, HTTP/1.1 connections have keep-alive disabled — then
-    /// waits up to
-    /// [`with_max_connection_age_grace`](Self::with_max_connection_age_grace)
-    /// for in-flight requests before force-closing it. The `max`th request
-    /// itself still completes; subsequent requests are turned away.
-    ///
-    /// `max` is a soft floor rather than an exact cap: under HTTP/2 a client
-    /// may open several streams concurrently before the GOAWAY takes effect, so
-    /// the connection is retired at or after the `max`th request, not strictly
-    /// at it.
-    ///
-    /// This is the count-based complement of
-    /// [`with_max_connection_age`](Self::with_max_connection_age); both may be
-    /// set at once, in which case whichever trigger fires first retires the
-    /// connection. Whole-server graceful shutdown still drains in-flight
-    /// requests indefinitely.
-    ///
-    /// `max` is a [`NonZeroU64`] so that "retire after zero requests" — which
-    /// would refuse every connection before it served anything — is
-    /// unrepresentable. (This differs from
-    /// [`with_max_connection_age`](Self::with_max_connection_age), which takes a
-    /// plain [`Duration`] and panics on a zero value.)
+    /// Retire each connection after it has dispatched `max` requests.
+    /// Shorthand for [`ConnectionConfig::with_max_requests_per_connection`].
     #[must_use]
     pub fn with_max_requests_per_connection(mut self, max: NonZeroU64) -> Self {
-        self.max_requests_per_connection = Some(max);
+        self.connection = self.connection.with_max_requests_per_connection(max);
         self
     }
 
-    /// Set the interval between HTTP/2 keepalive PING frames sent on an
-    /// otherwise idle connection.
-    ///
-    /// Disabled by default. When set, the server sends a PING after the
-    /// connection has been idle for `interval` and, if the peer fails to
-    /// acknowledge it within
-    /// [`with_http2_keepalive_timeout`](Self::with_http2_keepalive_timeout),
-    /// closes the connection. This detects dead or half-open peers (NAT
-    /// timeout, client crash, network partition) on long-lived
-    /// server-streaming or bidirectional connections that would otherwise sit
-    /// half-open until the OS TCP timeout, holding a task and file descriptor.
-    ///
-    /// Affects HTTP/2 connections only; HTTP/1.1 is unaffected. Note the
-    /// spelling difference from the HTTP/1.1 toggle
-    /// [`with_http1_keep_alive`](Self::with_http1_keep_alive) (`keep_alive`):
-    /// these HTTP/2 knobs use `keepalive` as a single word.
+    /// Send HTTP/2 keepalive PINGs every `interval` on idle connections
+    /// (disabled by default). Shorthand for
+    /// [`ConnectionConfig::with_http2_keepalive_interval`].
     ///
     /// # Panics
     ///
-    /// Panics if `interval` is zero — a zero interval would request an
-    /// unbounded PING flood rather than periodic keepalives.
+    /// Panics if `interval` is zero.
     #[must_use]
     pub fn with_http2_keepalive_interval(mut self, interval: Duration) -> Self {
-        assert!(
-            !interval.is_zero(),
-            "with_http2_keepalive_interval requires a non-zero duration",
-        );
-        self.http2.keepalive_interval = Some(interval);
+        self.connection = self.connection.with_http2_keepalive_interval(interval);
         self
     }
 
-    /// Set how long to wait for an HTTP/2 keepalive PING acknowledgement
-    /// before closing the connection.
-    ///
-    /// Defaults to [`DEFAULT_HTTP2_KEEPALIVE_TIMEOUT`] (20 seconds). This only
-    /// takes effect once
-    /// [`with_http2_keepalive_interval`](Self::with_http2_keepalive_interval)
-    /// is set — setting it without an interval has no effect.
+    /// Set how long an HTTP/2 keepalive PING may go unacknowledged (default
+    /// [`DEFAULT_HTTP2_KEEPALIVE_TIMEOUT`]). Shorthand for
+    /// [`ConnectionConfig::with_http2_keepalive_timeout`].
     #[must_use]
     pub fn with_http2_keepalive_timeout(mut self, timeout: Duration) -> Self {
-        self.http2.keepalive_timeout = timeout;
+        self.connection = self.connection.with_http2_keepalive_timeout(timeout);
         self
     }
 
@@ -1195,26 +806,7 @@ impl BoundServer {
         self,
         service: ConnectRpcService<D>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let retirement = self.retirement_config();
-
-        #[cfg(feature = "server-tls")]
-        let tls_acceptor = self.tls_config.map(tokio_rustls::TlsAcceptor::from);
-        #[cfg(not(feature = "server-tls"))]
-        let tls_acceptor: Option<()> = None;
-
-        serve_with_listener(
-            self.listener,
-            service,
-            tls_acceptor,
-            self.http1_keep_alive,
-            self.header_read_timeout,
-            #[cfg(feature = "server-tls")]
-            self.tls_handshake_timeout,
-            None,
-            retirement,
-            self.http2,
-        )
-        .await
+        serve_with_listener(self.listener, service, self.accept, self.connection, None).await
     }
 
     /// Start serving requests with the given service, with graceful shutdown.
@@ -1230,101 +822,15 @@ impl BoundServer {
         D: Dispatcher,
         F: Future<Output = ()> + Send + 'static,
     {
-        let retirement = self.retirement_config();
-
-        #[cfg(feature = "server-tls")]
-        let tls_acceptor = self.tls_config.map(tokio_rustls::TlsAcceptor::from);
-        #[cfg(not(feature = "server-tls"))]
-        let tls_acceptor: Option<()> = None;
-
         serve_with_listener(
             self.listener,
             service,
-            tls_acceptor,
-            self.http1_keep_alive,
-            self.header_read_timeout,
-            #[cfg(feature = "server-tls")]
-            self.tls_handshake_timeout,
+            self.accept,
+            self.connection,
             Some(Box::pin(signal)),
-            retirement,
-            self.http2,
         )
         .await
     }
-
-    fn connection_age_config(&self) -> Option<ConnectionAgeConfig> {
-        build_connection_age_config(
-            self.max_connection_age,
-            self.max_connection_idle,
-            self.max_connection_age_grace,
-            self.max_requests_per_connection.is_some(),
-        )
-    }
-
-    fn connection_idle_config(&self) -> Option<IdleConfig> {
-        build_connection_idle_config(self.max_connection_idle, self.max_connection_age_grace)
-    }
-
-    fn request_retirement_config(&self) -> Option<RequestRetirementConfig> {
-        build_request_retirement_config(
-            self.max_requests_per_connection,
-            self.max_connection_age_grace,
-        )
-    }
-
-    fn retirement_config(&self) -> RetirementConfig {
-        RetirementConfig {
-            age: self.connection_age_config(),
-            idle: self.connection_idle_config(),
-            requests: self.request_retirement_config(),
-        }
-    }
-}
-
-/// Build the per-connection age config, warning if a grace was configured
-/// without anything that uses it (in which case the grace has no effect). The
-/// grace period is shared with idle reaping and request-count retirement, so it
-/// is only inert when none of max age, max idle, or max requests is set.
-///
-/// `request_retirement_active` suppresses the warning when
-/// [`with_max_requests_per_connection`](BoundServer::with_max_requests_per_connection)
-/// is also set, since that knob shares the same grace period and so the grace
-/// does have an effect even without a max age.
-fn build_connection_age_config(
-    max_age: Option<Duration>,
-    max_idle: Option<Duration>,
-    grace: Duration,
-    request_retirement_active: bool,
-) -> Option<ConnectionAgeConfig> {
-    let Some(max_age) = max_age else {
-        if max_idle.is_none()
-            && !request_retirement_active
-            && grace != DEFAULT_MAX_CONNECTION_AGE_GRACE
-        {
-            tracing::debug!(
-                "max_connection_age_grace is set but none of max_connection_age, \
-                 max_connection_idle, or max_requests_per_connection are; the \
-                 grace period has no effect",
-            );
-        }
-        return None;
-    };
-    Some(ConnectionAgeConfig { max_age, grace })
-}
-
-/// Build the per-connection idle config. Idle reaping reuses the
-/// max-connection-age grace period for its post-GOAWAY drain.
-fn build_connection_idle_config(max_idle: Option<Duration>, grace: Duration) -> Option<IdleConfig> {
-    max_idle.map(|idle| IdleConfig { idle, grace })
-}
-
-/// Build the per-connection request-count retirement config. The grace period
-/// is shared with [`with_max_connection_age_grace`](BoundServer::with_max_connection_age_grace).
-fn build_request_retirement_config(
-    max_requests: Option<NonZeroU64>,
-    grace: Duration,
-) -> Option<RequestRetirementConfig> {
-    max_requests.map(|max| RequestRetirementConfig { max, grace })
 }
 
 /// Type alias for the panic-catching wrapper around ConnectRpcService, used
@@ -1334,7 +840,7 @@ type WrappedService<D> = tower_http::catch_panic::CatchPanic<
     fn(Box<dyn Any + Send>) -> Response<Full<Bytes>>,
 >;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct ConnectionAgeConfig {
     max_age: Duration,
     grace: Duration,
@@ -1350,7 +856,7 @@ impl ConnectionAgeConfig {
 }
 
 /// Per-connection idle-reaping configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct IdleConfig {
     /// How long a connection may have zero in-flight requests before it is
     /// retired.
@@ -1364,11 +870,30 @@ struct IdleConfig {
 /// max-request-count limits that the connection lifecycle enforces. Bundled so
 /// the accept loop and the per-connection task pass a single value rather than
 /// three parallel options.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct RetirementConfig {
     age: Option<ConnectionAgeConfig>,
     idle: Option<IdleConfig>,
     requests: Option<RequestRetirementConfig>,
+}
+
+impl RetirementConfig {
+    /// The retirement triggers configured in `config`, before per-connection
+    /// jitter. All three share one grace period.
+    fn new(config: &ConnectionConfig) -> Self {
+        let grace = config.max_connection_age_grace();
+        Self {
+            age: config
+                .max_connection_age()
+                .map(|max_age| ConnectionAgeConfig { max_age, grace }),
+            idle: config
+                .max_connection_idle()
+                .map(|idle| IdleConfig { idle, grace }),
+            requests: config
+                .max_requests_per_connection()
+                .map(|max| RequestRetirementConfig { max, grace }),
+        }
+    }
 }
 
 /// Shared in-flight request accounting for one connection.
@@ -1443,7 +968,7 @@ impl Drop for ActiveRequestGuard {
 /// `max` is the number of requests a connection may serve before it is retired
 /// via graceful shutdown; `grace` is how long in-flight requests are allowed to
 /// finish afterwards (shared with the max-age grace period).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct RequestRetirementConfig {
     max: NonZeroU64,
     grace: Duration,
@@ -1454,21 +979,16 @@ struct RequestRetirementConfig {
 /// Generic over the IO type so it works for both plain TCP and TLS streams.
 /// Logs connection outcome at trace level.
 ///
-/// `peer` is inserted into every request's extensions so handlers can read
-/// the remote address (and TLS client cert chain, if any) via
-/// `ctx.peer_addr()` / `ctx.peer_certs()`.
-// Each accepted-connection knob is forwarded verbatim from the accept loop;
-// see the matching allow on `serve_with_listener`.
-#[allow(clippy::too_many_arguments)]
+/// `peer` describes the connection; its address (and TLS client cert
+/// chain, if any) is inserted into every request's extensions so handlers
+/// can read them via `ctx.peer_addr()` / `ctx.peer_certs()`.
 async fn serve_accepted_stream<D, S>(
     io: S,
     peer: PeerInfo,
     service: Arc<WrappedService<D>>,
-    http1_keep_alive: bool,
-    header_read_timeout: Option<Duration>,
+    config: ConnectionConfig,
     global_shutdown: watch::Receiver<bool>,
     retirement: RetirementConfig,
-    http2: Http2Config,
 ) where
     D: Dispatcher,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1526,9 +1046,9 @@ async fn serve_accepted_stream<D, S>(
     builder
         .http1()
         .timer(TokioTimer::new())
-        .keep_alive(http1_keep_alive)
-        .header_read_timeout(header_read_timeout);
-    configure_http2(&mut builder, http2);
+        .keep_alive(config.http1_keep_alive())
+        .header_read_timeout(config.header_read_timeout());
+    configure_http2(&mut builder, &config);
 
     let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
     serve_connection_with_lifecycle(
@@ -1575,29 +1095,30 @@ impl RequestCounter {
 /// `adaptive_window` is always set explicitly so the default tracks
 /// [`DEFAULT_HTTP2_ADAPTIVE_WINDOW`] regardless of hyper's own default. Explicit
 /// window sizes are applied only when adaptive sizing is off (see
-/// [`Http2Config::effective_windows`]), so the two never reach hyper at once and
-/// the precedence does not depend on hyper's internal call ordering.
-fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: Http2Config) {
+/// [`ConnectionConfig::effective_http2_windows`]), so the two never reach hyper
+/// at once and the precedence does not depend on hyper's internal call
+/// ordering.
+fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: &ConnectionConfig) {
     let mut http2 = builder.http2();
-    http2.adaptive_window(config.adaptive_window);
-    let (stream_window, connection_window) = config.effective_windows();
+    http2.adaptive_window(config.http2_adaptive_window());
+    let (stream_window, connection_window) = config.effective_http2_windows();
     if let Some(size) = stream_window {
         http2.initial_stream_window_size(size);
     }
     if let Some(size) = connection_window {
         http2.initial_connection_window_size(size);
     }
-    if let Some(max) = config.max_concurrent_streams {
+    if let Some(max) = config.max_concurrent_streams() {
         http2.max_concurrent_streams(max);
     }
     // Keepalive is opt-in: when no interval is set, leave hyper's default
     // (disabled) untouched. When enabled, a timer must be installed — hyper's
     // HTTP/2 keepalive requires one and panics the connection task without it.
-    if let Some(interval) = config.keepalive_interval {
+    if let Some(interval) = config.http2_keepalive_interval() {
         http2
             .timer(TokioTimer::new())
             .keep_alive_interval(interval)
-            .keep_alive_timeout(config.keepalive_timeout);
+            .keep_alive_timeout(config.http2_keepalive_timeout());
     }
 }
 
@@ -1855,46 +1376,23 @@ fn duration_from_nanos(nanos: u128) -> Duration {
     )
 }
 
-/// Internal function to serve connections using the given listener and service.
-///
-/// A single implementation shared between TLS and non-TLS builds. The only
-/// conditional code is the optional TLS handshake in the per-connection task;
-/// the accept loop, nodelay handling, panic wrapping, and error logging are
-/// identical.
-#[cfg(feature = "server-tls")]
-type MaybeTlsAcceptor = Option<tokio_rustls::TlsAcceptor>;
-#[cfg(not(feature = "server-tls"))]
-type MaybeTlsAcceptor = Option<()>;
-
 /// Optional boxed shutdown-signal future.
 type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>>;
 
-// This internal accept loop carries one parameter per connection-level config
-// knob (TLS, keep-alive, connection age, HTTP/2 flow control, ...), so it
-// exceeds clippy's default argument count. The parameters are all plumbing for
-// the same call; grouping them into a struct would not improve clarity here.
-#[allow(clippy::too_many_arguments)]
+/// Serve connections from `listener` with `service` until `shutdown` resolves,
+/// then drain them.
+///
+/// A single implementation shared between TLS and non-TLS builds: the only
+/// conditional code is the optional TLS handshake in the per-connection task.
 async fn serve_with_listener<D: Dispatcher>(
     listener: TcpListener,
     service: ConnectRpcService<D>,
-    tls_acceptor: MaybeTlsAcceptor,
-    http1_keep_alive: bool,
-    header_read_timeout: Option<Duration>,
-    #[cfg(feature = "server-tls")] tls_handshake_timeout: std::time::Duration,
+    accept: AcceptConfig,
+    connection: ConnectionConfig,
     shutdown: ShutdownSignal,
-    retirement: RetirementConfig,
-    http2: Http2Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Mirror the connection-age diagnostic: a timeout without an interval is a
-    // configuration mistake (keepalive stays disabled), so surface it.
-    if http2.keepalive_interval.is_none()
-        && http2.keepalive_timeout != DEFAULT_HTTP2_KEEPALIVE_TIMEOUT
-    {
-        tracing::debug!(
-            "http2_keepalive_timeout is set but http2_keepalive_interval is not; \
-             HTTP/2 keepalive stays disabled and the timeout has no effect",
-        );
-    }
+    connection.lint();
+    let retirement = RetirementConfig::new(&connection);
 
     // Wrap the service with panic handling to convert panics to 500 responses
     let service: WrappedService<D> = ServiceBuilder::new()
@@ -1903,9 +1401,14 @@ async fn serve_with_listener<D: Dispatcher>(
     let service = Arc::new(service);
 
     #[cfg(feature = "server-tls")]
-    let tls_acceptor = tls_acceptor.map(Arc::new);
+    let tls_handshake_timeout = accept.tls_handshake_timeout();
+    #[cfg(feature = "server-tls")]
+    let tls_acceptor = accept
+        .tls()
+        .cloned()
+        .map(|config| Arc::new(tokio_rustls::TlsAcceptor::from(config)));
     #[cfg(not(feature = "server-tls"))]
-    let _ = tls_acceptor; // always None; silence unused warning
+    let _ = accept; // carries no settings without TLS
 
     // Pin the shutdown future so we can poll it in select!. If no shutdown
     // signal was provided, use a never-resolving pending() future.
@@ -1964,6 +1467,7 @@ async fn serve_with_listener<D: Dispatcher>(
 
         #[cfg(feature = "server-tls")]
         let tls_acceptor = tls_acceptor.clone();
+        let config = connection.clone();
 
         connections.spawn(async move {
             #[cfg(feature = "server-tls")]
@@ -1991,11 +1495,9 @@ async fn serve_with_listener<D: Dispatcher>(
                             tls_stream,
                             peer,
                             service,
-                            http1_keep_alive,
-                            header_read_timeout,
+                            config,
                             global_shutdown,
                             retirement,
-                            http2,
                         )
                         .await;
                     }
@@ -2022,17 +1524,7 @@ async fn serve_with_listener<D: Dispatcher>(
                 #[cfg(feature = "server-tls")]
                 certs: None,
             };
-            serve_accepted_stream(
-                stream,
-                peer,
-                service,
-                http1_keep_alive,
-                header_read_timeout,
-                global_shutdown,
-                retirement,
-                http2,
-            )
-            .await;
+            serve_accepted_stream(stream, peer, service, config, global_shutdown, retirement).await;
         });
     }
 

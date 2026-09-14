@@ -68,58 +68,6 @@ async fn peer_addr_reaches_handler() {
 #[cfg(feature = "server-tls")]
 #[tokio::test]
 async fn peer_certs_reach_handler() {
-    // Inline minimal mTLS PKI: one CA → one server leaf + one client leaf.
-    // Returns (server_config, client_config, client_cert_der).
-    fn pki() -> (
-        Arc<rustls::ServerConfig>,
-        Arc<rustls::ClientConfig>,
-        rustls::pki_types::CertificateDer<'static>,
-    ) {
-        use rcgen::CertificateParams;
-        use rcgen::KeyPair;
-        use rcgen::SanType;
-        use rustls::pki_types::CertificateDer;
-        use rustls::pki_types::PrivatePkcs8KeyDer;
-
-        // Idempotent; err = already installed (tests share process state).
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
-
-        let issue = |sans: &[SanType]| {
-            let k = KeyPair::generate().unwrap();
-            let mut p = CertificateParams::default();
-            p.subject_alt_names = sans.to_vec();
-            let c = p.signed_by(&k, &ca).unwrap();
-            (
-                CertificateDer::from(c.der().to_vec()),
-                PrivatePkcs8KeyDer::from(k.serialized_der().to_vec()).into(),
-            )
-        };
-
-        let (srv_cert, srv_key) = issue(&[SanType::DnsName("localhost".try_into().unwrap())]);
-        let (cli_cert, cli_key) = issue(&[]);
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
-        let roots = Arc::new(roots);
-
-        let cv = rustls::server::WebPkiClientVerifier::builder(Arc::clone(&roots))
-            .build()
-            .unwrap();
-        let server = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(cv)
-            .with_single_cert(vec![srv_cert], srv_key)
-            .unwrap();
-        let client = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![cli_cert.clone()], cli_key)
-            .unwrap();
-        (Arc::new(server), Arc::new(client), cli_cert)
-    }
-
     let (server_cfg, client_cfg, expected_client_der) = pki();
 
     type CapturedCerts = Vec<rustls::pki_types::CertificateDer<'static>>;
