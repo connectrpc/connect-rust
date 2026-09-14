@@ -92,6 +92,9 @@ jobs:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      # The server's acceptor and connection driver are public without TLS;
+      # lint that feature shape too, not just the union.
+      - run: cargo clippy -p connectrpc --no-default-features --features server --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -301,3 +304,4 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (sha-pinned)
       - run: cargo check -p connectrpc --no-default-features
       - run: cargo test -p connectrpc --no-default-features
+      - run: cargo check -p connectrpc --no-default-features --features server

@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+mod acceptor;
 mod builders;
 mod header_read_timeout;
 mod http2;
@@ -119,13 +120,34 @@ fn content_length(headers: &[u8]) -> Option<usize> {
     })
 }
 
-/// Minimal mTLS PKI: one CA → one server leaf + one client leaf.
+/// Minimal mTLS PKI: one CA → one server leaf + one client leaf. The server
+/// requires a verified client certificate and the client presents one.
 /// Returns (server_config, client_config, client_cert_der).
 #[cfg(feature = "server-tls")]
 fn pki() -> (
     Arc<rustls::ServerConfig>,
     Arc<rustls::ClientConfig>,
     rustls::pki_types::CertificateDer<'static>,
+) {
+    let (server, client, client_cert) = make_pki(true);
+    (server, client, client_cert.expect("client cert issued"))
+}
+
+/// As [`pki`], but client authentication is optional on the server and the
+/// client presents no certificate.
+#[cfg(feature = "server-tls")]
+fn pki_without_client_cert() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+    let (server, client, _) = make_pki(false);
+    (server, client)
+}
+
+#[cfg(feature = "server-tls")]
+fn make_pki(
+    client_cert: bool,
+) -> (
+    Arc<rustls::ServerConfig>,
+    Arc<rustls::ClientConfig>,
+    Option<rustls::pki_types::CertificateDer<'static>>,
 ) {
     use rcgen::CertificateParams;
     use rcgen::KeyPair;
@@ -153,21 +175,29 @@ fn pki() -> (
     };
 
     let (srv_cert, srv_key) = issue(&[SanType::DnsName("localhost".try_into().unwrap())]);
-    let (cli_cert, cli_key) = issue(&[]);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
     let roots = Arc::new(roots);
 
-    let cv = rustls::server::WebPkiClientVerifier::builder(Arc::clone(&roots))
-        .build()
-        .unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::clone(&roots));
+    let verifier = if client_cert {
+        verifier
+    } else {
+        verifier.allow_unauthenticated()
+    };
     let server = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(cv)
+        .with_client_cert_verifier(verifier.build().unwrap())
         .with_single_cert(vec![srv_cert], srv_key)
         .unwrap();
-    let client = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(vec![cli_cert.clone()], cli_key)
-        .unwrap();
+    let client = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let (client, cli_cert) = if client_cert {
+        let (cli_cert, cli_key) = issue(&[]);
+        let client = client
+            .with_client_auth_cert(vec![cli_cert.clone()], cli_key)
+            .unwrap();
+        (client, Some(cli_cert))
+    } else {
+        (client.with_no_client_auth(), None)
+    };
     (Arc::new(server), Arc::new(client), cli_cert)
 }

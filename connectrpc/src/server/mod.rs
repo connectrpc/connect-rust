@@ -87,6 +87,14 @@
 //! and two times the configured duration after the last activity. When both
 //! limits are configured, whichever fires first wins.
 //!
+//! # Peer Information
+//!
+//! Every request carries the peer's address ([`PeerAddr`]) and, over mTLS,
+//! its verified certificate chain (`PeerCerts`) in its extensions; handlers
+//! read them with `ctx.peer_addr()` / `ctx.peer_certs()`. Both come from the
+//! [`ConnectionInfo`] the acceptor produced for the connection and always
+//! reflect what the transport observed.
+//!
 //! For transport and HTTP/2 knobs that [`Server`] does not expose, drive
 //! [`ConnectRpcService`] directly from a hyper accept loop. The crate guide's
 //! "Advanced transport configuration" section shows the `hyper_util` pattern.
@@ -130,8 +138,16 @@ use crate::error::ErrorCode;
 use crate::router::Router;
 use crate::service::ConnectRpcService;
 
+mod acceptor;
 mod config;
+mod peer;
 
+pub use acceptor::Accepted;
+pub use acceptor::Acceptor;
+pub use acceptor::HandshakeError;
+pub use acceptor::ServerIo;
+#[cfg(all(feature = "axum", feature = "server-tls"))]
+pub(crate) use acceptor::is_transient_accept_error;
 pub use config::AcceptConfig;
 pub use config::ConnectionConfig;
 pub use config::DEFAULT_HEADER_READ_TIMEOUT;
@@ -139,58 +155,10 @@ pub use config::DEFAULT_HTTP2_ADAPTIVE_WINDOW;
 pub use config::DEFAULT_HTTP2_KEEPALIVE_TIMEOUT;
 #[cfg(feature = "server-tls")]
 pub use config::DEFAULT_TLS_HANDSHAKE_TIMEOUT;
-
-/// Remote socket address of the connected peer.
-///
-/// Inserted into every request's extensions by the built-in [`Server`]'s
-/// accept loop and by `connectrpc::axum::serve_tls`. Handlers read it via
-/// [`RequestContext::peer_addr`](crate::RequestContext::peer_addr) (or
-/// `ctx.extensions().get::<PeerAddr>()`).
-///
-/// Callers using a different HTTP stack (axum, raw hyper) in front of
-/// [`ConnectRpcService`] can insert this same type
-/// from a tower layer so handlers stay agnostic to the transport.
-#[derive(Clone, Debug)]
-pub struct PeerAddr(pub SocketAddr);
-
-/// TLS client certificate chain presented by the peer (leaf first).
-///
-/// Inserted by the built-in [`Server`]'s TLS accept loop and by
-/// `connectrpc::axum::serve_tls` when the [`rustls::ServerConfig`] requests
-/// client authentication and the peer presents a valid chain. Absent on
-/// plaintext connections or when the client presents no certificate.
-/// Handlers read it via
-/// [`RequestContext::peer_certs`](crate::RequestContext::peer_certs) (or
-/// `ctx.extensions().get::<PeerCerts>()`).
-///
-/// The `Arc` makes per-request insertion cheap: all requests on a
-/// connection share one chain, so this is a refcount bump, not a copy.
+pub use peer::ConnectionInfo;
+pub use peer::PeerAddr;
 #[cfg(feature = "server-tls")]
-#[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
-#[derive(Clone, Debug)]
-pub struct PeerCerts(pub Arc<[rustls::pki_types::CertificateDer<'static>]>);
-
-/// Connection-scoped peer info captured once per accepted stream and
-/// inserted into every request's extensions by [`PeerInfo::insert_into`].
-#[derive(Clone, Debug)]
-struct PeerInfo {
-    addr: SocketAddr,
-    #[cfg(feature = "server-tls")]
-    certs: Option<Arc<[rustls::pki_types::CertificateDer<'static>]>>,
-}
-
-impl PeerInfo {
-    /// Insert this connection's peer info as public extension types
-    /// ([`PeerAddr`], [`PeerCerts`]) so handlers can read them via
-    /// `ctx.peer_addr()` / `ctx.peer_certs()`.
-    fn insert_into(&self, ext: &mut http::Extensions) {
-        ext.insert(PeerAddr(self.addr));
-        #[cfg(feature = "server-tls")]
-        if let Some(certs) = &self.certs {
-            ext.insert(PeerCerts(Arc::clone(certs)));
-        }
-    }
-}
+pub use peer::PeerCerts;
 
 const MAX_CONNECTION_AGE_JITTER_BASIS_POINTS: u128 = 10_000;
 const MAX_CONNECTION_AGE_JITTER_SPREAD_BASIS_POINTS: u128 = 1_000;
@@ -508,15 +476,15 @@ impl Server {
         self,
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(addr).await?;
         let scheme = if self.accept.is_tls() {
             "https"
         } else {
             "http"
         };
+        let acceptor = Acceptor::bind(addr, self.accept).await?;
         tracing::info!("ConnectRPC server listening on {scheme}://{addr}");
 
-        serve_with_listener(listener, self.service, self.accept, self.connection, None).await
+        serve_with_listener(acceptor, self.service, self.connection, None).await
     }
 
     /// Wrap a pre-bound [`TcpListener`].
@@ -806,7 +774,13 @@ impl BoundServer {
         self,
         service: ConnectRpcService<D>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serve_with_listener(self.listener, service, self.accept, self.connection, None).await
+        serve_with_listener(
+            Acceptor::new(self.listener, self.accept),
+            service,
+            self.connection,
+            None,
+        )
+        .await
     }
 
     /// Start serving requests with the given service, with graceful shutdown.
@@ -823,9 +797,8 @@ impl BoundServer {
         F: Future<Output = ()> + Send + 'static,
     {
         serve_with_listener(
-            self.listener,
+            Acceptor::new(self.listener, self.accept),
             service,
-            self.accept,
             self.connection,
             Some(Box::pin(signal)),
         )
@@ -979,12 +952,13 @@ struct RequestRetirementConfig {
 /// Generic over the IO type so it works for both plain TCP and TLS streams.
 /// Logs connection outcome at trace level.
 ///
-/// `peer` describes the connection; its address (and TLS client cert
-/// chain, if any) is inserted into every request's extensions so handlers
-/// can read them via `ctx.peer_addr()` / `ctx.peer_certs()`.
+/// `connection` describes the peer; its address (and TLS client cert chain,
+/// if any), plus its connection-scoped extensions, is inserted into every
+/// request's extensions so handlers can read them via `ctx.peer_addr()` /
+/// `ctx.peer_certs()` / `ctx.extensions()`.
 async fn serve_accepted_stream<D, S>(
     io: S,
-    peer: PeerInfo,
+    connection: ConnectionInfo,
     service: Arc<WrappedService<D>>,
     config: ConnectionConfig,
     global_shutdown: watch::Receiver<bool>,
@@ -993,7 +967,8 @@ async fn serve_accepted_stream<D, S>(
     D: Dispatcher,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::trace!(remote_addr = %peer.addr, "Accepted new connection");
+    let remote_addr = connection.peer_addr();
+    tracing::trace!(remote_addr = ?remote_addr, "Accepted new connection");
 
     // In-flight accounting is only needed when idle reaping is enabled; when it
     // is off there is no per-request bookkeeping overhead.
@@ -1020,10 +995,12 @@ async fn serve_accepted_stream<D, S>(
         None => (None, None),
     };
 
-    let peer_for_requests = peer.clone();
+    // Computed once here, before hyper reads the first request; cloned into
+    // each request below.
+    let request_extensions = connection.request_extensions();
     let activity_for_requests = activity.clone();
-    let svc = hyper::service::service_fn(move |mut req| {
-        peer_for_requests.insert_into(req.extensions_mut());
+    let svc = hyper::service::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
+        req.extensions_mut().extend(request_extensions.clone());
         if let Some(counter) = &request_counter {
             counter.record_request();
         }
@@ -1053,7 +1030,7 @@ async fn serve_accepted_stream<D, S>(
     let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
     serve_connection_with_lifecycle(
         conn,
-        peer.addr,
+        remote_addr,
         global_shutdown,
         retirement.age,
         retirement.idle.zip(activity),
@@ -1124,7 +1101,7 @@ fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: &Connection
 
 fn serve_connection_with_lifecycle<C>(
     conn: C,
-    remote_addr: SocketAddr,
+    remote_addr: Option<SocketAddr>,
     global_shutdown: watch::Receiver<bool>,
     connection_age: Option<ConnectionAgeConfig>,
     connection_idle: Option<(IdleConfig, Arc<ConnectionActivity>)>,
@@ -1176,7 +1153,7 @@ type RetirementSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 struct ConnectionLifecycle<C: GracefulConnection> {
     conn: Pin<Box<C>>,
-    remote_addr: SocketAddr,
+    remote_addr: Option<SocketAddr>,
     global_shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
     age: Option<(Pin<Box<tokio::time::Sleep>>, ConnectionAgeConfig)>,
     idle: Option<IdleTracker>,
@@ -1239,7 +1216,7 @@ where
                         && age.as_mut().poll(cx).is_ready()
                     {
                         tracing::trace!(
-                            remote_addr = %this.remote_addr,
+                            remote_addr = ?this.remote_addr,
                             max_age = ?config.max_age,
                             grace = ?config.grace,
                             "Connection reached maximum age; starting graceful shutdown",
@@ -1258,7 +1235,7 @@ where
                         let (in_flight, epoch) = idle.activity.snapshot();
                         if in_flight == 0 && epoch == idle.armed_epoch {
                             tracing::trace!(
-                                remote_addr = %this.remote_addr,
+                                remote_addr = ?this.remote_addr,
                                 idle = ?idle.config.idle,
                                 grace = ?idle.config.grace,
                                 "Connection idle; starting graceful shutdown",
@@ -1285,7 +1262,7 @@ where
                     {
                         let grace = *grace;
                         tracing::trace!(
-                            remote_addr = %this.remote_addr,
+                            remote_addr = ?this.remote_addr,
                             grace = ?grace,
                             "Connection reached maximum requests; starting graceful shutdown",
                         );
@@ -1319,7 +1296,7 @@ where
 
                     if grace.as_mut().poll(cx).is_ready() {
                         tracing::trace!(
-                            remote_addr = %this.remote_addr,
+                            remote_addr = ?this.remote_addr,
                             grace = ?duration,
                             "Connection retirement grace expired; closing connection",
                         );
@@ -1333,14 +1310,17 @@ where
     }
 }
 
-fn log_connection_result<E: std::fmt::Display>(remote_addr: SocketAddr, result: Result<(), E>) {
+fn log_connection_result<E: std::fmt::Display>(
+    remote_addr: Option<SocketAddr>,
+    result: Result<(), E>,
+) {
     match result {
         Ok(()) => {
-            tracing::trace!(remote_addr = %remote_addr, "Connection completed normally");
+            tracing::trace!(remote_addr = ?remote_addr, "Connection completed normally");
         }
         Err(err) => {
             tracing::trace!(
-                remote_addr = %remote_addr,
+                remote_addr = ?remote_addr,
                 error = %err,
                 "Connection ended with error",
             );
@@ -1379,15 +1359,11 @@ fn duration_from_nanos(nanos: u128) -> Duration {
 /// Optional boxed shutdown-signal future.
 type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>>;
 
-/// Serve connections from `listener` with `service` until `shutdown` resolves,
-/// then drain them.
-///
-/// A single implementation shared between TLS and non-TLS builds: the only
-/// conditional code is the optional TLS handshake in the per-connection task.
+/// Serve connections from `acceptor` with `service` until `shutdown`
+/// resolves, then drain them.
 async fn serve_with_listener<D: Dispatcher>(
-    listener: TcpListener,
+    acceptor: Acceptor,
     service: ConnectRpcService<D>,
-    accept: AcceptConfig,
     connection: ConnectionConfig,
     shutdown: ShutdownSignal,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1399,16 +1375,6 @@ async fn serve_with_listener<D: Dispatcher>(
         .layer(CatchPanicLayer::custom(panic_handler as fn(_) -> _))
         .service(service);
     let service = Arc::new(service);
-
-    #[cfg(feature = "server-tls")]
-    let tls_handshake_timeout = accept.tls_handshake_timeout();
-    #[cfg(feature = "server-tls")]
-    let tls_acceptor = accept
-        .tls()
-        .cloned()
-        .map(|config| Arc::new(tokio_rustls::TlsAcceptor::from(config)));
-    #[cfg(not(feature = "server-tls"))]
-    let _ = accept; // carries no settings without TLS
 
     // Pin the shutdown future so we can poll it in select!. If no shutdown
     // signal was provided, use a never-resolving pending() future.
@@ -1422,7 +1388,7 @@ async fn serve_with_listener<D: Dispatcher>(
     let mut connection_sequence = 0u64;
 
     loop {
-        let (stream, remote_addr) = tokio::select! {
+        let accepted = tokio::select! {
             biased; // check shutdown first so we don't accept one more after signal
 
             _ = &mut shutdown => {
@@ -1433,25 +1399,14 @@ async fn serve_with_listener<D: Dispatcher>(
                 log_connection_task_result(result);
                 continue;
             }
-            accept_result = listener.accept() => match accept_result {
-                Ok(conn) => conn,
+            accepted = acceptor.accept() => match accepted {
+                Ok(accepted) => accepted,
                 Err(err) => {
-                    if is_transient_accept_error(&err) {
-                        tracing::warn!("Transient accept error (continuing): {}", err);
-                        continue;
-                    }
                     connections.detach_all();
                     return Err(err.into());
                 }
             },
         };
-
-        // Disable Nagle's algorithm to avoid latency from the interaction
-        // between Nagle buffering and delayed ACKs, which is especially
-        // problematic for HTTP/2's small control frames.
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::warn!("failed to set TCP_NODELAY: {e}");
-        }
 
         let service = Arc::clone(&service);
         let global_shutdown = global_shutdown_rx.clone();
@@ -1459,77 +1414,27 @@ async fn serve_with_listener<D: Dispatcher>(
         // Max age gets per-connection jitter; idle reaping and request-count
         // retirement are reactive and need none.
         let retirement = RetirementConfig {
-            age: retirement.age.map(|config| {
-                config.with_jitter(jitter_state.hash_one((remote_addr, connection_sequence)))
-            }),
+            age: retirement
+                .age
+                .map(|config| config.with_jitter(jitter_state.hash_one(connection_sequence))),
             ..retirement
         };
-
-        #[cfg(feature = "server-tls")]
-        let tls_acceptor = tls_acceptor.clone();
         let config = connection.clone();
 
         connections.spawn(async move {
-            #[cfg(feature = "server-tls")]
-            if let Some(acceptor) = tls_acceptor {
-                // Apply a timeout to the TLS handshake to prevent connection
-                // exhaustion attacks where clients stall the handshake
-                // indefinitely, holding a task and file descriptor per connection.
-                match tokio::time::timeout(tls_handshake_timeout, acceptor.accept(stream)).await {
-                    Ok(Ok(tls_stream)) => {
-                        // Extract the client cert chain now — once hyper owns
-                        // the stream for I/O we can't borrow it again.
-                        // `into_owned()` detaches from the session's lifetime
-                        // so the Arc can outlive the TlsStream (which it must,
-                        // since we move the stream into hyper but need the certs
-                        // for every request on this connection).
-                        let (_, conn) = tls_stream.get_ref();
-                        let certs = conn.peer_certificates().map(|chain| -> Arc<[_]> {
-                            chain.iter().map(|c| c.clone().into_owned()).collect()
-                        });
-                        let peer = PeerInfo {
-                            addr: remote_addr,
-                            certs,
-                        };
-                        serve_accepted_stream(
-                            tls_stream,
-                            peer,
-                            service,
-                            config,
-                            global_shutdown,
-                            retirement,
-                        )
-                        .await;
-                    }
-                    Ok(Err(err)) => {
-                        tracing::debug!(
-                            remote_addr = %remote_addr,
-                            error = ?err,
-                            "TLS handshake failed: {err}",
-                        );
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            remote_addr = %remote_addr,
-                            "TLS handshake timed out after {tls_handshake_timeout:?}",
-                        );
-                    }
+            let (io, info) = match accepted.handshake().await {
+                Ok(ready) => ready,
+                Err(err) => {
+                    log_handshake_error(&err);
+                    return;
                 }
-                return;
-            }
-
-            // Plain TCP (no TLS or TLS not configured)
-            let peer = PeerInfo {
-                addr: remote_addr,
-                #[cfg(feature = "server-tls")]
-                certs: None,
             };
-            serve_accepted_stream(stream, peer, service, config, global_shutdown, retirement).await;
+            serve_accepted_stream(io, info, service, config, global_shutdown, retirement).await;
         });
     }
 
     // Drop the listener (refuse new conns), then signal & drain existing ones.
-    drop(listener);
+    drop(acceptor);
     // Errors only if every connection already finished (no receivers left),
     // in which case there is nothing to drain.
     let _ = global_shutdown_tx.send(true);
@@ -1539,6 +1444,17 @@ async fn serve_with_listener<D: Dispatcher>(
     tracing::info!("All connections drained; shutdown complete");
 
     Ok(())
+}
+
+/// Timeouts at `warn` (a slowloris signal worth surfacing); everything else
+/// at `debug` (port scanners and plaintext clients are routine).
+fn log_handshake_error(err: &HandshakeError) {
+    let source = std::error::Error::source(err);
+    if err.is_timeout() {
+        tracing::warn!(error = ?source, "{err}");
+    } else {
+        tracing::debug!(error = ?source, "{err}");
+    }
 }
 
 fn log_connection_task_result(result: Result<(), tokio::task::JoinError>) {
@@ -1592,33 +1508,6 @@ fn panic_handler(err: Box<dyn Any + Send + 'static>) -> Response<Full<Bytes>> {
                 .body(Full::new(Bytes::new()))
                 .unwrap()
         })
-}
-
-/// Check if an accept error is transient and can be recovered from.
-///
-/// Transient errors include:
-/// - `EMFILE` / `ENFILE`: Too many open files (file descriptor exhaustion)
-/// - `ECONNABORTED`: Connection was aborted before accept completed
-/// - `EINTR`: Interrupted system call
-pub(crate) fn is_transient_accept_error(err: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-
-    matches!(
-        err.kind(),
-        // Resource temporarily unavailable
-        ErrorKind::WouldBlock |
-        // Interrupted system call
-        ErrorKind::Interrupted |
-        // Connection aborted
-        ErrorKind::ConnectionAborted |
-        // Connection reset by peer
-        ErrorKind::ConnectionReset
-    ) || {
-        // Check for EMFILE/ENFILE (too many open files)
-        // These are mapped to Other on some platforms
-        err.raw_os_error()
-            .is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE)
-    }
 }
 
 #[cfg(test)]
