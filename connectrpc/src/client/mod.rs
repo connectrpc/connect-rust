@@ -173,6 +173,7 @@ use crate::codec::header as connect_header;
 use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
 use crate::envelope::Envelope;
+use crate::envelope::EnvelopeAssembler;
 use crate::error::ConnectError;
 use crate::error::ErrorCode;
 use crate::error::ErrorDetail;
@@ -243,6 +244,23 @@ where
 /// generous: the gRPC best-practices guide recommends keeping metadata
 /// under 8 KiB per header set.
 const RESPONSE_BUFFER_TRAILER_SLACK: usize = 64 * 1024;
+
+/// Largest gRPC-Web trailer frame payload the client accepts. Caps what a
+/// malicious server can make the client allocate for trailer metadata; 1 MiB
+/// is generous for a trailer block. Distinct from
+/// [`RESPONSE_BUFFER_TRAILER_SLACK`], which only sizes the unary buffer.
+const MAX_GRPC_WEB_TRAILER_SIZE: usize = 1024 * 1024;
+
+/// The envelope assembler for a streaming response body.
+fn response_assembler(protocol: Protocol, max_message_size: usize) -> EnvelopeAssembler {
+    let assembler = EnvelopeAssembler::new(max_message_size);
+    match protocol {
+        // The trailer frame is metadata, bounded by the trailer parser's own
+        // limit rather than the message size.
+        Protocol::GrpcWeb => assembler.with_grpc_web_trailer_limit(MAX_GRPC_WEB_TRAILER_SIZE),
+        _ => assembler,
+    }
+}
 
 /// Return the end offset of a complete gRPC-Web trailer frame, if present.
 fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
@@ -2760,8 +2778,8 @@ impl From<ConnectError> for StreamEnd {
 
 /// What one body poll produced.
 enum BodyPoll {
-    /// A DATA frame was appended to the decode buffer.
-    Data,
+    /// A DATA frame.
+    Data(Bytes),
     /// HTTP/2 (or HTTP/1.1 chunked) trailers — the body's final frame.
     Trailers(http::HeaderMap),
     /// Body exhausted.
@@ -2791,12 +2809,16 @@ enum BodyPoll {
 pub struct ServerStream<B, RespView> {
     headers: http::HeaderMap,
     body: B,
-    buf: BytesMut,
+    /// Unconsumed remainder of the current body DATA frame. When one frame
+    /// carries several envelopes this keeps the transport's read block alive
+    /// between `message()` calls, until the next poll or drop.
+    frame: Bytes,
+    assembler: EnvelopeAssembler,
     encoding: Option<String>,
     compression: CompressionRegistry,
     codec_format: CodecFormat,
     protocol: Protocol,
-    max_message_size: Option<usize>,
+    max_message_size: usize,
     element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
     /// The terminal record; `Some` once the stream has ended, by any cause.
@@ -2820,7 +2842,7 @@ impl<B, RespView> ServerStream<B, RespView> {
 }
 
 // Manual impl: the body type `B` (typically `hyper::body::Incoming`) isn't
-// `Debug`, and we don't want to dump the partially-consumed `buf` anyway.
+// `Debug`, and we don't want to dump the partially-consumed frame anyway.
 // Print the stream's observable state for test diagnostics.
 impl<B, RespView> std::fmt::Debug for ServerStream<B, RespView> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2837,7 +2859,7 @@ impl<B, RespView> std::fmt::Debug for ServerStream<B, RespView> {
                 "has_trailers",
                 &self.end.as_ref().is_some_and(|e| e.trailers.is_some()),
             )
-            .field("buffered_bytes", &self.buf.len())
+            .field("frame_bytes", &self.frame.len())
             .finish_non_exhaustive()
     }
 }
@@ -2930,84 +2952,13 @@ where
     /// producing the terminal record.
     async fn next_message_or_end(&mut self) -> Result<OwnedView<RespView>, StreamEnd> {
         loop {
-            // For gRPC-Web, check for a complete trailer frame (flag 0x80)
-            // before attempting envelope decode (which would treat 0x80 as
-            // a data envelope flag rather than the gRPC-Web trailer sentinel).
-            if matches!(self.protocol, Protocol::GrpcWeb)
-                && self.buf.len() >= 5
-                && self.buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0
-            {
-                let trailer_len =
-                    u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
-                        as usize;
-                // `saturating_add`: `trailer_len` is a server-controlled u32, so
-                // on a 32-bit target (e.g. the supported `wasm32` gRPC-Web
-                // client) `5 + trailer_len` can overflow `usize` and panic in a
-                // debug build. Matches the sibling framing sites, which already
-                // saturate. A saturated sum is never `<= buf.len()`, so an
-                // over-large prefix simply waits for bytes that never arrive.
-                if self.buf.len() >= trailer_len.saturating_add(5) {
-                    // Complete trailer frame — parse and classify. An
-                    // unparseable frame classifies as `None` (no usable
-                    // termination metadata).
-                    let decompression =
-                        self.encoding.as_deref().map(|enc| (&self.compression, enc));
-                    let parsed =
-                        parse_grpc_web_trailer_frame_with_compression(&self.buf, decompression);
-                    return Err(self.classify_grpc_end(parsed));
-                }
-                // Incomplete trailer frame — need more data, fall through
-                // to poll_body below
-            }
-
-            // Try to decode a complete envelope from the buffer.
-            // Skip this for gRPC-Web when the buffer starts with 0x80 (trailer
-            // flag) to avoid misinterpreting the trailer frame as a data message.
-            let envelope_result = if matches!(self.protocol, Protocol::GrpcWeb)
-                && !self.buf.is_empty()
-                && self.buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0
-            {
-                // We know the trailer frame is incomplete (checked above),
-                // so signal that more data is needed.
-                None
-            } else {
-                Envelope::decode_with_limit(
-                    &mut self.buf,
-                    self.max_message_size
-                        .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE),
-                )?
-            };
-
-            match envelope_result {
-                Some(envelope) => {
-                    if envelope.is_end_stream() {
-                        // Connect protocol end-of-stream envelope
-                        return Err(self.process_end_stream(envelope));
-                    }
-
-                    // Data envelope — decompress and decode
-                    let data = self.decompress_envelope(envelope)?;
-
-                    // Check message size limit
-                    if let Some(max_size) = self.max_message_size
-                        && data.len() > max_size
-                    {
-                        return Err(ConnectError::new(
-                            ErrorCode::ResourceExhausted,
-                            format!("message size {} exceeds limit {}", data.len(), max_size),
-                        )
-                        .into());
-                    }
-
-                    let msg = decode_response_view::<RespView>(
-                        data,
-                        self.codec_format,
-                        &self.decode_options(),
-                    )?;
-                    return Ok(msg);
-                }
-                None => match self.poll_body().await? {
-                    BodyPoll::Data => {} // loop back to try decoding again
+            let Some(envelope) = self.assembler.feed(&mut self.frame)? else {
+                debug_assert!(
+                    self.frame.is_empty(),
+                    "feed returns None only on an empty frame"
+                );
+                match self.poll_body().await? {
+                    BodyPoll::Data(data) => self.frame = data,
                     BodyPoll::Trailers(trailers) => {
                         return Err(self.classify_grpc_end(Some(trailers)));
                     }
@@ -3023,28 +2974,41 @@ where
                             )
                             .into());
                         }
-                        // gRPC-Web: preserved verbatim from the
-                        // pre-refactor shape, and provably dead — the
-                        // loop-top completeness check consumes any complete
-                        // trailer frame before poll_body runs, and EOF
-                        // appends nothing, so the remnant here is absent or
-                        // incomplete and the parse returns `None`. Removal
-                        // is a follow-up; either way classification sees
-                        // "no usable termination metadata".
-                        let parsed = if matches!(self.protocol, Protocol::GrpcWeb)
-                            && !self.buf.is_empty()
-                            && self.buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0
-                        {
-                            let decompression =
-                                self.encoding.as_deref().map(|enc| (&self.compression, enc));
-                            parse_grpc_web_trailer_frame_with_compression(&self.buf, decompression)
-                        } else {
-                            None
-                        };
-                        return Err(self.classify_grpc_end(parsed));
+                        // gRPC / gRPC-Web with no HTTP trailers and no complete
+                        // trailer frame: no usable termination metadata.
+                        return Err(self.classify_grpc_end(None));
                     }
-                },
+                }
+                continue;
+            };
+
+            // gRPC-Web carries its trailers as a final 0x80-flagged frame in
+            // the body. (Plain gRPC does not define the bit; the streaming
+            // path ignores unknown flag bits, as it always has.)
+            if matches!(self.protocol, Protocol::GrpcWeb)
+                && envelope.flags & crate::envelope::flags::GRPC_WEB_TRAILER != 0
+            {
+                // An unparseable frame classifies as `None` (no usable
+                // termination metadata).
+                let decompression = self.encoding.as_deref().map(|enc| (&self.compression, enc));
+                let parsed = parse_grpc_web_trailer_payload(
+                    envelope.is_compressed(),
+                    &envelope.data,
+                    decompression,
+                );
+                return Err(self.classify_grpc_end(parsed));
             }
+
+            if envelope.is_end_stream() {
+                // Connect protocol end-of-stream envelope
+                return Err(self.process_end_stream(envelope));
+            }
+
+            // Data envelope — decompress (also bounded by `max_message_size`) and decode.
+            let data = self.decompress_envelope(envelope)?;
+            let msg =
+                decode_response_view::<RespView>(data, self.codec_format, &self.decode_options())?;
+            return Ok(msg);
         }
     }
 
@@ -3119,23 +3083,10 @@ where
     }
 
     /// Poll the body for the next frame. A pure transport reader: it
-    /// buffers data, returns trailers as a value, and never touches the
-    /// terminal record.
-    ///
-    /// Buffer growth is bounded: if the accumulated bytes exceed the expected
-    /// maximum in-flight envelope size, return `ResourceExhausted` rather than
-    /// continuing to buffer. This prevents a malicious server from trickling
-    /// bytes indefinitely without ever completing an envelope.
+    /// returns data and trailers as values and never touches the terminal
+    /// record. Memory is bounded by the assembler, which checks each
+    /// envelope's declared length before allocating for it.
     async fn poll_body(&mut self) -> Result<BodyPoll, ConnectError> {
-        // Enough for one complete envelope at the max message size, plus
-        // one header's worth of slack (next envelope's header may arrive in
-        // the same TCP frame), plus 64 KiB for gRPC-Web trailer frames.
-        let max_buf_size = self
-            .max_message_size
-            .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE)
-            .saturating_add(2 * crate::envelope::HEADER_SIZE)
-            .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
-
         loop {
             // The whole-call deadline bounds each frame poll. The
             // equivalence with bounding the entire decode loop rests on
@@ -3160,13 +3111,7 @@ where
                             if !data.is_empty() {
                                 self.saw_body_data = true;
                             }
-                            if self.buf.len().saturating_add(data.len()) > max_buf_size {
-                                return Err(ConnectError::resource_exhausted(format!(
-                                    "response buffer exceeds limit {max_buf_size}"
-                                )));
-                            }
-                            self.buf.extend_from_slice(&data);
-                            return Ok(BodyPoll::Data);
+                            return Ok(BodyPoll::Data(data));
                         }
                     } else if frame.is_trailers()
                         && let Ok(trailers) = frame.into_trailers()
@@ -3197,11 +3142,8 @@ where
                     "received compressed message without content-encoding header",
                 )
             })?;
-            let max_size = self
-                .max_message_size
-                .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
             self.compression
-                .decompress_with_limit(encoding, envelope.data, max_size)
+                .decompress_with_limit(encoding, envelope.data, self.max_message_size)
                 .map_err(map_response_decompression_error)
         } else {
             Ok(envelope.data)
@@ -3368,6 +3310,7 @@ where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    let max_message_size = max_message_size.unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
     let response_headers = response.headers().clone();
     let status = response.status();
 
@@ -3390,17 +3333,14 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_owned());
 
-            let stream_max_err_size =
-                max_message_size.unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
-
             let body =
-                collect_body_bounded(response.into_body(), stream_max_err_size, deadline).await?;
+                collect_body_bounded(response.into_body(), max_message_size, deadline).await?;
 
             // Decompress if the server set Content-Encoding. On failure,
             // fall through to the generic HTTP-status error below.
             let body = match error_encoding {
                 Some(encoding) => {
-                    match compression.decompress_with_limit(&encoding, body, stream_max_err_size) {
+                    match compression.decompress_with_limit(&encoding, body, max_message_size) {
                         Ok(decompressed) => Some(decompressed),
                         Err(e) => {
                             tracing::debug!(
@@ -3444,7 +3384,8 @@ where
         element_memory_limit,
         headers: response_headers,
         body: response.into_body(),
-        buf: BytesMut::new(),
+        frame: Bytes::new(),
+        assembler: response_assembler(protocol, max_message_size),
         encoding,
         compression: compression.clone(),
         codec_format,
@@ -4967,14 +4908,19 @@ fn parse_grpc_web_trailer_frame_with_compression(
     }
     let is_compressed = data[0] & crate::envelope::flags::COMPRESSED != 0;
     let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-    // Cap trailer frame size to prevent a malicious server from forcing
-    // unbounded memory allocation. 1 MB is generous for trailer metadata.
-    const MAX_TRAILER_SIZE: usize = 1024 * 1024;
-    if len > MAX_TRAILER_SIZE || data.len() < 5 + len {
+    if len > MAX_GRPC_WEB_TRAILER_SIZE || data.len() < len.saturating_add(5) {
         return None;
     }
-    let raw_payload = &data[5..5 + len];
+    parse_grpc_web_trailer_payload(is_compressed, &data[5..5 + len], decompression)
+}
 
+/// Parse the payload of a gRPC-Web trailer frame (the bytes after its 5-byte
+/// header) into a header map.
+fn parse_grpc_web_trailer_payload(
+    is_compressed: bool,
+    raw_payload: &[u8],
+    decompression: Option<(&CompressionRegistry, &str)>,
+) -> Option<http::HeaderMap> {
     // Decompress if the compressed flag is set
     let payload_bytes;
     let payload = if is_compressed {
@@ -4983,7 +4929,7 @@ fn parse_grpc_web_trailer_frame_with_compression(
                 .decompress_with_limit(
                     encoding,
                     Bytes::copy_from_slice(raw_payload),
-                    MAX_TRAILER_SIZE,
+                    MAX_GRPC_WEB_TRAILER_SIZE,
                 )
                 .ok()?;
             std::str::from_utf8(&payload_bytes).ok()?
@@ -5012,7 +4958,7 @@ fn parse_grpc_web_trailer_frame_with_compression(
             // `append` once the number of stored entries would exceed its
             // hard ceiling (`MAX_SIZE = 1 << 15`). A hostile server can pack
             // tens of thousands of short trailer lines into a payload that
-            // stays under `MAX_TRAILER_SIZE` (bytes, not entries), so the
+            // stays under `MAX_GRPC_WEB_TRAILER_SIZE` (bytes, not entries), so the
             // byte cap alone does not prevent the panic. Stop accumulating at
             // the ceiling rather than crashing the RPC task.
             if headers.try_append(name, val).is_err() {
@@ -6105,12 +6051,13 @@ mod tests {
             element_memory_limit,
             headers: http::HeaderMap::new(),
             body: Full::new(envelope.clone()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(64 * 1024 * 1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(64 * 1024 * 1024),
+            max_message_size: 64 * 1024 * 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6131,6 +6078,213 @@ mod tests {
         assert_eq!(msg.view().values.len(), n);
     }
 
+    type FramesBody = http_body_util::StreamBody<
+        futures::stream::Iter<
+            std::vec::IntoIter<Result<http_body::Frame<Bytes>, std::convert::Infallible>>,
+        >,
+    >;
+
+    /// A `ServerStream` over the given body frames, as the call path builds it.
+    fn frames_stream<V>(
+        protocol: Protocol,
+        encoding: Option<&str>,
+        frames: Vec<Bytes>,
+    ) -> ServerStream<FramesBody, V> {
+        let frames: Vec<_> = frames
+            .into_iter()
+            .map(|b| Ok(http_body::Frame::data(b)))
+            .collect();
+        ServerStream {
+            element_memory_limit: None,
+            headers: http::HeaderMap::new(),
+            body: http_body_util::StreamBody::new(futures::stream::iter(frames)),
+            frame: Bytes::new(),
+            assembler: response_assembler(protocol, 1024 * 1024),
+            encoding: encoding.map(str::to_owned),
+            compression: CompressionRegistry::default(),
+            codec_format: CodecFormat::Proto,
+            protocol,
+            max_message_size: 1024 * 1024,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// A large streamed message split across transport frames arrives as
+    /// the sole owner of its allocation; the stream keeps no buffer that
+    /// shares it.
+    #[tokio::test]
+    async fn server_stream_large_message_owns_its_allocation() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        const LEN: usize = 512 * 1024;
+        let wire =
+            Envelope::data(StringValue::from("x".repeat(LEN).as_str()).encode_to_bytes()).encode();
+        let frames = wire.chunks(16 * 1024).map(Bytes::copy_from_slice).collect();
+        let mut stream = frames_stream::<StringValueView<'static>>(Protocol::Connect, None, frames);
+
+        let msg = stream.message().await.unwrap().expect("data envelope");
+        assert_eq!(msg.view().value.len(), LEN);
+        assert!(
+            msg.bytes().is_unique(),
+            "stream shares the message's allocation"
+        );
+        assert!(stream.frame.is_empty());
+    }
+
+    /// Several messages in one body frame are each their own allocation, and
+    /// the stream releases the transport frame once it is consumed.
+    #[tokio::test]
+    async fn server_stream_messages_in_one_frame_are_independent() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut wire = BytesMut::new();
+        for v in ["one", "two"] {
+            wire.extend_from_slice(
+                &Envelope::data(StringValue::from(v).encode_to_bytes()).encode(),
+            );
+        }
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let body_frame = wire.freeze();
+        let backing = body_frame.clone();
+        let mut stream =
+            frames_stream::<StringValueView<'static>>(Protocol::Connect, None, vec![body_frame]);
+
+        let one = stream.message().await.unwrap().expect("first");
+        let two = stream.message().await.unwrap().expect("second");
+        assert_eq!((one.view().value, two.view().value), ("one", "two"));
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "clean END_STREAM"
+        );
+        assert!(backing.is_unique(), "consumed transport frame is released");
+    }
+
+    /// gRPC-Web trailers arrive as a 0x80-flagged frame in the body; split
+    /// across transport frames at arbitrary points it still ends the stream
+    /// cleanly with the trailers exposed.
+    #[tokio::test]
+    async fn grpc_web_server_stream_trailer_frame_split_across_frames() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(StringValue::from("hi").encode_to_bytes()).encode());
+        let trailer = Envelope {
+            flags: crate::envelope::flags::GRPC_WEB_TRAILER,
+            data: Bytes::from_static(b"grpc-status: 0\r\nx-custom: yes\r\n"),
+        };
+        wire.extend_from_slice(&trailer.encode());
+        // Split inside the data payload, inside the trailer header, and
+        // inside the trailer block.
+        let frames = [0, 8, 12, 25, wire.len()]
+            .windows(2)
+            .map(|w| Bytes::copy_from_slice(&wire[w[0]..w[1]]))
+            .collect();
+        let mut stream = frames_stream::<StringValueView<'static>>(Protocol::GrpcWeb, None, frames);
+
+        let msg = stream.message().await.unwrap().expect("data message");
+        assert_eq!(msg.view().value, "hi");
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "grpc-status 0 is a clean end"
+        );
+        assert_eq!(stream.trailers().unwrap()["x-custom"], "yes");
+    }
+
+    /// A gRPC-Web trailer frame carrying an error status fails the stream
+    /// with that status; a compressed trailer block is decompressed first.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn grpc_web_server_stream_compressed_error_trailer() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let registry = CompressionRegistry::default();
+        let block = registry
+            .compress("gzip", b"grpc-status: 8\r\ngrpc-message: slow%20down\r\n")
+            .unwrap();
+        let trailer = Envelope {
+            flags: crate::envelope::flags::GRPC_WEB_TRAILER | crate::envelope::flags::COMPRESSED,
+            data: block,
+        };
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            Some("gzip"),
+            vec![trailer.encode()],
+        );
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("error status ends the stream");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+        assert_eq!(err.message.as_deref(), Some("slow down"));
+        assert!(stream.trailers().is_some());
+    }
+
+    /// The trailer frame is metadata, not a message: it is accepted past
+    /// `max_message_size` (within the slack), while a data envelope of the
+    /// same size is rejected on its header.
+    #[tokio::test]
+    async fn grpc_web_server_stream_trailer_not_bound_by_message_limit() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let mut block = b"grpc-status: 0\r\n".to_vec();
+        block.extend(std::iter::repeat_n(b'\n', 2000));
+        let trailer = Envelope {
+            flags: crate::envelope::flags::GRPC_WEB_TRAILER,
+            data: Bytes::from(block.clone()),
+        };
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            None,
+            vec![trailer.encode()],
+        );
+        stream.assembler = response_assembler(Protocol::GrpcWeb, 1024);
+        stream.max_message_size = 1024;
+        assert!(stream.message().await.unwrap().is_none(), "clean end");
+
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            None,
+            vec![Envelope::data(Bytes::from(block)).encode()],
+        );
+        stream.assembler = response_assembler(Protocol::GrpcWeb, 1024);
+        stream.max_message_size = 1024;
+        let err = stream
+            .message()
+            .await
+            .expect_err("over-limit data envelope");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+
+        // A trailer frame larger than the trailer parser accepts is rejected
+        // on its header, as a trailer, not against the message limit.
+        let mut header = vec![crate::envelope::flags::GRPC_WEB_TRAILER];
+        header.extend_from_slice(&(MAX_GRPC_WEB_TRAILER_SIZE as u32 + 1).to_be_bytes());
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            None,
+            vec![Bytes::from(header)],
+        );
+        stream.assembler = response_assembler(Protocol::GrpcWeb, 1024);
+        stream.max_message_size = 1024;
+        let err = stream.message().await.expect_err("over-limit trailer");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+        assert!(
+            err.message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("grpc-web trailer size")),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn connect_server_stream_truncated_after_data_errors() {
         use buffa::Message;
@@ -6142,12 +6296,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6193,12 +6348,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6247,12 +6403,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body: Full::new(body.freeze()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6315,12 +6472,13 @@ mod tests {
             element_memory_limit: None,
             headers,
             body: Full::new(body.freeze()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6381,12 +6539,13 @@ mod tests {
             element_memory_limit: None,
             headers,
             body: Full::new(body.freeze()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6449,12 +6608,13 @@ mod tests {
             element_memory_limit: None,
             headers,
             body: StreamBody::new(futures::stream::iter(frames)),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6509,12 +6669,13 @@ mod tests {
             element_memory_limit: None,
             headers,
             body: StreamBody::new(futures::stream::iter(frames)),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6599,12 +6760,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6657,12 +6819,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: Some(std::time::Instant::now() + Duration::from_secs(5)),
             end: None,
             saw_body_data: false,
@@ -6685,12 +6848,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body: Full::new(Bytes::new()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6731,12 +6895,13 @@ mod tests {
             element_memory_limit: None,
             headers,
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6771,12 +6936,13 @@ mod tests {
             element_memory_limit: None,
             headers,
             body: Full::new(Bytes::new()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6808,12 +6974,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -6873,12 +7040,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
             end: None,
             saw_body_data: false,
@@ -6928,12 +7096,13 @@ mod tests {
             element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
