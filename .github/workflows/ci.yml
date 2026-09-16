@@ -33,7 +33,7 @@ jobs:
         with:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo check --workspace --all-features --all-targets
+      - run: cargo check --locked --workspace --all-features --all-targets
 
   msrv-check:
     name: MSRV
@@ -59,7 +59,7 @@ jobs:
         with:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo check --workspace --all-features --all-targets
+      - run: cargo check --locked --workspace --all-features --all-targets
 
   test:
     name: Test
@@ -73,7 +73,7 @@ jobs:
         with:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo test --workspace --all-features
+      - run: cargo test --locked --workspace --all-features
 
   clippy:
     name: Clippy
@@ -91,7 +91,7 @@ jobs:
         with:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -145,12 +145,10 @@ jobs:
     name: Check generated code
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Note: the workspace has no committed Cargo.lock, so `cargo
-    # generate-lockfile` below resolves buffa and prettyplease (which formats
-    # the generated code) to the latest compatible releases at run time. A new
-    # release of either can therefore make this job fail on PRs that did not
-    # touch the protos or codegen — the fix is to run `task generate:all` on
-    # main and commit the resulting diff.
+    # The buffa plugins are built from the release tag matching the version in
+    # the committed Cargo.lock, so this job only changes behaviour when a PR
+    # bumps the lockfile — and such a PR must carry the regenerated code
+    # (`task generate:all`) with it.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -167,8 +165,6 @@ jobs:
           # regeneration when bumping.
           version: 1.69.0
       - uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2 (sha-pinned)
-      - name: Generate lockfile
-        run: cargo generate-lockfile
       - name: Resolve locked buffa version
         id: buffa-version
         shell: bash
@@ -225,7 +221,7 @@ jobs:
         with:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo doc --workspace --all-features --no-deps
+      - run: cargo doc --locked --workspace --all-features --no-deps
 
   # Integration test: start server, run client, verify RPCs work end-to-end
   examples:
@@ -264,7 +260,7 @@ jobs:
       - name: Download conformance runner
         run: ./conformance/scripts/download-conformance.sh
       - name: Build conformance binary
-        run: cargo build --release -p connectrpc-conformance --bin ${{ matrix.bin }}
+        run: cargo build --locked --release -p connectrpc-conformance --bin ${{ matrix.bin }}
       - name: Run conformance suite
         run: |
           ./conformance/bin/connectconformance --mode ${{ matrix.mode }} \
@@ -286,8 +282,8 @@ jobs:
           version: ${{ env.PROTOC_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - run: cargo check -p connectrpc --no-default-features --target wasm32-unknown-unknown
-      - run: cargo check -p connectrpc --no-default-features --features gzip --target wasm32-unknown-unknown
+      - run: cargo check --locked -p connectrpc --no-default-features --target wasm32-unknown-unknown
+      - run: cargo check --locked -p connectrpc --no-default-features --features gzip --target wasm32-unknown-unknown
       - run: ./examples/wasm-client/test.sh
 
   # Test with minimal feature set
@@ -299,5 +295,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (sha-pinned)
-      - run: cargo check -p connectrpc --no-default-features
-      - run: cargo test -p connectrpc --no-default-features
+      - run: cargo check --locked -p connectrpc --no-default-features
+      - run: cargo test --locked -p connectrpc --no-default-features

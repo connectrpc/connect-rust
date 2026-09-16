@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 /conformance/bin/
 
 # User-local Claude Code settings (project-level agents/commands ARE committed)
