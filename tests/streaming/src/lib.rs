@@ -1143,11 +1143,200 @@ mod tests {
         );
     }
 
+    /// An echo server on its own runtime and thread, so that stopping it
+    /// tears down its accepted connections too (aborting an `axum::serve`
+    /// task on the test runtime would leave them open).
+    struct KillableServer {
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl KillableServer {
+        fn start(listener: std::net::TcpListener) -> Self {
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            listener.set_nonblocking(true).unwrap();
+            let thread = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let listener = {
+                    let _entered = rt.enter();
+                    TcpListener::from_std(listener).unwrap()
+                };
+                rt.spawn(async move {
+                    let service = ConnectRpcService::new(EchoServiceServer::new(TestEchoService));
+                    let app = axum::Router::new().fallback_service(service);
+                    axum::serve(listener, app).await.unwrap();
+                });
+                rt.block_on(async move {
+                    let _ = tokio::task::spawn_blocking(move || stopped.recv()).await;
+                });
+                // Dropping the runtime drops the accept loop and every
+                // connection task, closing their sockets.
+                rt.shutdown_background();
+            });
+            Self {
+                stop: Some(stop),
+                thread: Some(thread),
+            }
+        }
+
+        fn shutdown(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for KillableServer {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// A `SharedHttp2Connection` survives its server going away: requests
+    /// fail while it is down, and once it is back the same handle (and every
+    /// clone of it) reconnects on a subsequent request.
+    #[tokio::test]
+    async fn shared_http2_connection_reconnects_after_server_restart() {
+        use connectrpc::Protocol;
+        use connectrpc::client::Http2Connection;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = KillableServer::start(listener);
+
+        let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+        let conn = Http2Connection::connect_plaintext(uri.clone())
+            .await
+            .unwrap()
+            .shared(16);
+        let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
+        let client = EchoServiceClient::new(conn.clone(), config.clone());
+        async fn echo(
+            client: &EchoServiceClient<connectrpc::client::SharedHttp2Connection>,
+            n: i32,
+        ) -> Result<i32, connectrpc::ConnectError> {
+            let resp = client
+                .echo(EchoRequest {
+                    sequence: n,
+                    data: format!("restart-{n}"),
+                    ..Default::default()
+                })
+                .await?;
+            Ok(resp.view().sequence)
+        }
+
+        assert_eq!(echo(&client, 1).await.unwrap(), 1);
+
+        drop(server);
+        let err = echo(&client, 2)
+            .await
+            .expect_err("no server: the request must fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable, "{err:?}");
+
+        // Back on the same port (std sets SO_REUSEADDR, and nothing else in
+        // the test binds in between). The next request re-establishes the
+        // connection; allow a few attempts in case the listener is not yet
+        // accepting when the first one is made.
+        let _server = KillableServer::start(std::net::TcpListener::bind(addr).unwrap());
+        let mut reconnected = false;
+        for attempt in 3..8 {
+            if let Ok(sequence) = echo(&client, attempt).await {
+                assert_eq!(sequence, attempt);
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(reconnected, "shared handle never reconnected");
+
+        // A clone made before the outage uses the new connection too.
+        let other = EchoServiceClient::new(conn, config);
+        assert_eq!(echo(&other, 9).await.unwrap(), 9);
+    }
+
+    /// A server that recycles connections (`with_max_connection_age`) sends
+    /// a graceful GOAWAY: no new streams on this connection, open streams may
+    /// finish. When one arrives while a stream is still open, the very next
+    /// request on the shared handle must go out on a fresh connection rather
+    /// than fail unsent against the retired one (issue #285), and the open
+    /// stream must be unharmed.
+    #[tokio::test]
+    async fn shared_http2_connection_survives_graceful_goaway_with_open_stream() {
+        use connectrpc::Protocol;
+        use connectrpc::client::Http2Connection;
+
+        const MAX_AGE: Duration = Duration::from_millis(300);
+        let bound = connectrpc::server::Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_max_connection_age(MAX_AGE)
+            .with_max_connection_age_grace(Duration::from_secs(30));
+        let addr = bound.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let service = ConnectRpcService::new(EchoServiceServer::new(TestEchoService));
+            bound.serve_with_service(service).await.unwrap();
+        });
+
+        let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+        let conn = Http2Connection::connect_plaintext(uri.clone())
+            .await
+            .unwrap()
+            .shared(16);
+        let client =
+            EchoServiceClient::new(conn, ClientConfig::new(uri).with_protocol(Protocol::Grpc));
+        let ping = |n: i32| {
+            let client = client.clone();
+            async move {
+                client
+                    .echo(EchoRequest {
+                        sequence: n,
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|r| r.view().sequence)
+            }
+        };
+
+        // A server stream that outlives the connection's max age: many
+        // messages, MSG_DELAY apart, of which only the first is read now.
+        let mut held = client
+            .server_stream(EchoRequest {
+                sequence: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(held.message().await.unwrap().unwrap().view().sequence, 0);
+        assert_eq!(ping(1).await.unwrap(), 1);
+
+        // Past max_connection_age (which carries +-10% jitter): the GOAWAY
+        // has arrived and the held stream keeps the old connection open.
+        tokio::time::sleep(MAX_AGE * 2).await;
+        for n in 2..5 {
+            assert_eq!(
+                ping(n).await.map_err(|e| format!("{e:?}")),
+                Ok(n),
+                "request #{n} after GOAWAY"
+            );
+        }
+        assert_eq!(
+            held.message().await.unwrap().unwrap().view().sequence,
+            1,
+            "the open stream continues on the retired connection"
+        );
+    }
+
     /// End-to-end test of `Http2Connection` / `SharedHttp2Connection`.
     ///
     /// Uses the raw h2 transport (no legacy pool) against the monomorphic
-    /// server. Verifies connect + reconnect-wrapper + buffer + ClientTransport
-    /// wiring works for a real unary RPC.
+    /// server. Verifies connect + reconnect-wrapper + ClientTransport wiring
+    /// works for a real unary RPC.
     #[tokio::test]
     async fn http2_connection_transport() {
         use connectrpc::Protocol;
@@ -1190,7 +1379,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.view().data, "h2-lazy");
 
-        // Concurrent requests on the shared handle — exercises the Buffer.
+        // Concurrent requests on the shared handle — multiplexed as h2 streams.
         let mut handles = Vec::new();
         for i in 0..16 {
             let c = shared.clone();
