@@ -397,6 +397,9 @@ pub use server::CloseReason;
 pub use server::ConnectionClosed;
 #[cfg(feature = "server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::ConnectionConfig;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub use server::ConnectionInfo;
 #[cfg(feature = "server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
