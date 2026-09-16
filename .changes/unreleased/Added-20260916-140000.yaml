@@ -1,0 +1,13 @@
+kind: Added
+body: |-
+    **`server::serve_connection`: the connection driver as a free function.**
+    `serve_connection(io, info, service, config, shutdown)` is the
+    service-generic form of `Server::serve_connection`: it serves one
+    already-accepted stream with any tower HTTP service — a
+    `ConnectRpcService`, an `axum::Router`, or your own stack around either —
+    under a `ConnectionConfig`, with the full connection lifecycle (settings,
+    timeouts, retirement, graceful GOAWAY on `shutdown`, panic isolation,
+    `PeerAddr` / `PeerCerts` / connection extensions), and resolves to
+    `ConnectionClosed`. A custom accept loop around it is a few dozen lines;
+    see the guide's "Custom accept loops".
+time: 2026-09-16T14:00:00.000000000+00:00

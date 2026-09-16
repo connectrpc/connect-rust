@@ -39,6 +39,9 @@
 //!     .fallback_service(connect.into_axum_service());
 //!
 //! axum::serve(listener, app).await?;
+//! // or, with the `server` feature, on connectrpc's connection driver
+//! // (TLS, PeerAddr/PeerCerts, max connection age, graceful GOAWAY, ...):
+//! connectrpc::axum::serve(listener, app).await?;
 //! ```
 //!
 //! ## With Raw Hyper
@@ -57,6 +60,13 @@
 //!
 //! Server::new(router).serve(addr).await?;
 //! ```
+//!
+//! To own the accept step — admit connections by client identity, cap them
+//! per tenant, listen on another transport, place them on different runtimes
+//! — write the loop yourself and hand each stream to
+//! [`Server::serve_connection`] (or [`server::serve_connection`] for any tower
+//! HTTP service); it keeps every timeout, retirement and drain guarantee of
+//! `Server::serve`. See the guide's "Custom accept loops".
 //!
 //! # Modules
 //!
@@ -159,7 +169,7 @@
 //! | `server` | ✗ | Standalone hyper-based server |
 //! | `server-tls` | ✗ | TLS for the built-in server |
 //! | `tls` | ✗ | Convenience: `server-tls` + `client-tls` |
-//! | `axum` | ✗ | Axum framework integration |
+//! | `axum` | ✗ | Axum framework integration (`connectrpc::axum::serve` also needs `server`) |
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -222,13 +232,14 @@ pub mod client;
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub mod server;
 
-// Optional: TLS-aware `axum::serve` counterpart with peer-identity passthrough.
+// Optional: `axum::serve` counterparts on the built-in server's accept loop
+// and connection driver.
 //
 // Note: this module shadows the extern-prelude `axum` crate within the crate
 // root scope only. Don't add `use axum::...` here in `lib.rs`; use
 // `::axum::...` if a root-level reference to the external crate is ever needed.
-#[cfg(all(feature = "axum", feature = "server-tls"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server-tls"))))]
+#[cfg(all(feature = "axum", feature = "server"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server"))))]
 pub mod axum;
 
 // ============================================================================

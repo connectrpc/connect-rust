@@ -1,0 +1,15 @@
+kind: Changed
+body: |-
+    **`connectrpc::axum::serve_tls` runs on the shared connection driver.**
+    Three observable changes on that path: a panicking handler now yields a
+    `500` with a Connect `internal` error body and the connection survives,
+    where previously the connection was dropped (`axum::serve` behaviour);
+    the standalone server's connection defaults now apply — HTTP/2 adaptive
+    flow-control windows on, HTTP/1.1 keep-alive on, and any max connection age
+    / idle / requests, keepalive or stream limits set through
+    `with_connection_config`; and connection tasks are owned by the `Serve`
+    future, so dropping or timing it out aborts live connections instead of
+    leaving them detached. `Server::serve_connection` and the built-in loop now
+    use hyper's `serve_connection_with_upgrades`, so HTTP upgrades work on
+    every path.
+time: 2026-09-16T14:02:00.000000000+00:00
