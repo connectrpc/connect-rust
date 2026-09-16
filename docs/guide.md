@@ -503,7 +503,9 @@ request context for the handler to read with
 `ctx.extensions().get::<UserId>()`. For the well-known peer types, prefer
 the typed `ctx.peer_addr()` / `ctx.peer_certs()` accessors — they return
 `None` rather than panicking when the transport didn't insert them. See
-[Tower middleware](#tower-middleware) for the full pattern.
+[Tower middleware](#tower-middleware) for the full pattern, and
+`with_connection_extensions` under [TLS](#tls) for state computed once
+per connection (TLS or plaintext) rather than per request.
 
 ### What you see vs. what you write
 
@@ -1474,6 +1476,38 @@ connectrpc::axum::serve_tls(listener, app, server_config)
     .await?;
 ```
 
+Work that depends only on the connection — parsing a workload identity
+out of the client certificate, say — need not repeat on every request.
+`with_connection_extensions` (on `Server`, `BoundServer` and
+`connectrpc::axum::Serve`) registers a function that runs once per
+accepted connection, after the TLS handshake and before the first
+request, with the connection's `ConnectionInfo` (`peer_addr()`,
+`peer_certs()`, `extensions_mut()`); whatever it puts in the extensions
+is cloned into every request on that connection and read with
+`ctx.extensions().get::<T>()`. `PeerAddr` / `PeerCerts` on requests
+always come from the transport, whatever the function inserts under
+those types. Inserted values must be `Clone + Send + Sync + 'static`;
+wrap large ones in an `Arc`. A [custom accept loop](#custom-accept-loops)
+does the same by writing `info.extensions_mut()` itself.
+
+```rust
+#[derive(Clone)]
+struct PeerIdentity(Arc<str>);
+
+Server::new(connect_router)
+    .with_tls(server_config)
+    .with_connection_extensions(|conn| {
+        if let Some(id) = parse_identity(conn.peer_certs()) {
+            conn.extensions_mut().insert(PeerIdentity(id));
+        }
+    })
+    .serve("0.0.0.0:8443".parse()?)
+    .await?;
+
+// In a handler:
+let who = ctx.extensions().get::<PeerIdentity>();
+```
+
 The eliza example
 ([`examples/eliza/README.md`](../examples/eliza/README.md)) walks
 through generating self-signed certificates with openssl, configuring
@@ -1481,8 +1515,8 @@ mTLS via `--client-ca`, and the rustls strict-PKI requirement that
 your CA cert must be distinct from the server leaf cert. The
 mtls-identity example
 ([`examples/mtls-identity/README.md`](../examples/mtls-identity/README.md))
-demonstrates `serve_tls` end-to-end with cert-SAN identity extraction
-and an ACL keyed on it.
+demonstrates `serve_tls` end-to-end with cert-SAN identity parsed once
+per connection and an ACL keyed on it.
 
 ## Health checking
 
@@ -2060,7 +2094,7 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 |---|---|
 | [`streaming-tour/`](../examples/streaming-tour) | All four RPC types (unary, server stream, client stream, bidi) on a trivial NumberService. Smallest demo of handler signatures and client invocation patterns. |
 | [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions()`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
-| [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
+| [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity parsed from the client cert's DNS SAN once per connection with `with_connection_extensions` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
 | [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage, and server reflection mounted from both descriptor sources (`REFLECTION_SOURCE=fds\|pool`; see `reflection-demo.sh`). |
 | [`wasm-client/`](../examples/wasm-client) | Browser fetch transport: same generated client used from `wasm32-unknown-unknown` with a custom `ClientTransport` backed by `web-sys::fetch`. |
