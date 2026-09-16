@@ -391,6 +391,15 @@ pub use server::Server;
 
 #[cfg(feature = "server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::CloseReason;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::ConnectionClosed;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::ConnectionInfo;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub use server::PeerAddr;
 #[cfg(feature = "server-tls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
