@@ -73,6 +73,8 @@ use tokio::net::TcpListener;
 
 use crate::server::AcceptConfig;
 use crate::server::ConnectionConfig;
+use crate::server::ConnectionExtensionsFn;
+use crate::server::ConnectionInfo;
 use crate::server::serve_with_listener;
 
 /// Serve an `axum::Router` over plaintext TCP on connectrpc's connection
@@ -93,6 +95,7 @@ pub fn serve(listener: TcpListener, router: axum::Router) -> Serve {
         router,
         accept: AcceptConfig::default(),
         connection: ConnectionConfig::default(),
+        connection_extensions: None,
         shutdown: None,
     }
 }
@@ -152,6 +155,7 @@ pub struct Serve {
     router: axum::Router,
     accept: AcceptConfig,
     connection: ConnectionConfig,
+    connection_extensions: Option<ConnectionExtensionsFn>,
     shutdown: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
@@ -194,6 +198,19 @@ impl Serve {
         self
     }
 
+    /// Populate [`ConnectionInfo`] once per accepted connection, before its
+    /// first request; same semantics as
+    /// [`BoundServer::with_connection_extensions`](crate::BoundServer::with_connection_extensions).
+    /// Calling this again replaces the function.
+    #[must_use = "Serve does nothing unless `.await`ed"]
+    pub fn with_connection_extensions<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut ConnectionInfo) + Send + Sync + 'static,
+    {
+        self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
+        self
+    }
+
     /// Stop accepting new connections when `signal` resolves and drain
     /// in-flight connections before the future resolves. Mirrors
     /// `axum::serve::Serve::with_graceful_shutdown`.
@@ -217,6 +234,10 @@ impl std::fmt::Debug for Serve {
             &self.accept.tls_handshake_timeout(),
         );
         s.field("connection", &self.connection)
+            .field(
+                "connection_extensions",
+                &self.connection_extensions.is_some(),
+            )
             .field("shutdown", &self.shutdown.is_some())
             .finish_non_exhaustive()
     }
@@ -232,10 +253,16 @@ impl IntoFuture for Serve {
             router,
             accept,
             connection,
+            connection_extensions,
             shutdown,
         } = self;
         Box::pin(serve_with_listener(
-            listener, router, accept, connection, shutdown,
+            listener,
+            router,
+            accept,
+            connection,
+            connection_extensions,
+            shutdown,
         ))
     }
 }
@@ -587,6 +614,89 @@ mod tests {
         let certs = peer_certs.expect("mTLS client should present a cert chain");
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].as_ref(), expected_client_der.as_ref());
+    }
+
+    /// The `with_connection_extensions` function runs once per connection
+    /// through `serve_tls`, sees the verified client chain, and what it
+    /// inserts reaches the handler next to (not instead of) `PeerAddr` /
+    /// `PeerCerts`.
+    #[cfg(feature = "server-tls")]
+    #[tokio::test]
+    async fn serve_tls_connection_extensions_reach_handler() {
+        let (server_cfg, client_cfg, expected_client_der) = pki();
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct LeafLen(usize);
+
+        type Captured = Arc<Mutex<Option<(Option<LeafLen>, std::net::SocketAddr, Option<usize>)>>>;
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let connect = ConnectRouter::new().route(
+            "svc",
+            "Echo",
+            handler_fn(
+                move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let cap = Arc::clone(&handler_captured);
+                    async move {
+                        *cap.lock().unwrap() = Some((
+                            ctx.extensions().get::<LeafLen>().cloned(),
+                            ctx.peer_addr().expect("serve_tls inserts PeerAddr"),
+                            ctx.peer_certs().map(|c| c[0].as_ref().len()),
+                        ));
+                        ConnectResponse::ok(buffa_types::Empty::default())
+                    }
+                },
+            ),
+        );
+        let app = axum::Router::new().fallback_service(connect.into_axum_service());
+
+        let calls_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&calls_seen);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            serve_tls(listener, app, server_cfg)
+                .with_connection_extensions(move |conn| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let leaf_len = conn
+                        .peer_certs()
+                        .and_then(<[_]>::first)
+                        .map(|l| l.as_ref().len());
+                    if let Some(len) = leaf_len {
+                        conn.extensions_mut().insert(LeafLen(len));
+                    }
+                    // The transport's `PeerAddr` must win over this one.
+                    conn.extensions_mut()
+                        .insert(crate::PeerAddr("10.0.0.1:1".parse().unwrap()));
+                })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .into_future(),
+        );
+
+        let resp = echo_over_tls(addr, client_cfg).await;
+        assert!(
+            resp.starts_with(b"HTTP/1.1 2"),
+            "expected 2xx, got: {}",
+            String::from_utf8_lossy(&resp[..resp.len().min(120)])
+        );
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve should shut down within timeout")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(calls_seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (leaf_len, peer_addr, handler_len) =
+            captured.lock().unwrap().take().expect("handler ran");
+        let expected = expected_client_der.as_ref().len();
+        assert_eq!(leaf_len, Some(LeafLen(expected)));
+        assert_eq!(handler_len, Some(expected));
+        assert_eq!(peer_addr.ip(), addr.ip());
     }
 
     /// Open a TLS+HTTP/1.1 connection, send `ECHO_REQ`, and return the raw
