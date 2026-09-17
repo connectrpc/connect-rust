@@ -630,13 +630,34 @@ impl ConnectionConfig {
         self
     }
 
-    /// Set the maximum size of a received HTTP/2 header block, in bytes: the
-    /// `SETTINGS_MAX_HEADER_LIST_SIZE` advertised to peers. A request whose
-    /// headers exceed it is answered `431 Request Header Fields Too Large`
-    /// before reaching any handler. Left at hyper's default (16 KiB) when
-    /// unset; raise it for callers that carry large tokens or metadata.
+    /// Set the maximum size of a received HTTP/2 header list, in bytes as
+    /// HTTP/2 counts it (each field's name and value plus 32, pseudo-headers
+    /// included): the `SETTINGS_MAX_HEADER_LIST_SIZE` advertised to peers.
+    /// Left at hyper's default (16 KiB) when unset; increase it for callers
+    /// that carry large tokens or metadata. HTTP/1.1 connections are
+    /// unaffected.
+    ///
+    /// A request whose header list reaches `max` is answered
+    /// `431 Request Header Fields Too Large` before reaching any handler. Some
+    /// requests close the whole connection with a GOAWAY instead, failing
+    /// every request on it. With h2 0.4.15 and later, that happens past four
+    /// times `max`, and for a header block spread over more CONTINUATION
+    /// frames than h2 allows (about 1.25 × `max` / 16 KiB, at least five),
+    /// whatever its size. For a limit of a few hundred KiB, the frame cap is
+    /// reached before twice `max`. Set `max` well above what legitimate peers
+    /// send.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` is zero: no request fits in an empty header list. A
+    /// limit of a few hundred bytes refuses nearly every request too, because
+    /// each field counts at least 32.
     #[must_use]
     pub fn with_http2_max_header_list_size(mut self, max: u32) -> Self {
+        assert!(
+            max != 0,
+            "with_http2_max_header_list_size requires a non-zero value",
+        );
         self.http2_max_header_list_size = Some(max);
         self
     }
@@ -1180,6 +1201,20 @@ impl Server {
         self
     }
 
+    /// Set the advertised HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` (hyper's
+    /// default, 16 KiB, when unset). Shorthand for
+    /// [`ConnectionConfig::with_http2_max_header_list_size`], which says when
+    /// an oversized request gets `431` and when it closes the connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` is zero.
+    #[must_use]
+    pub fn with_http2_max_header_list_size(mut self, max: u32) -> Self {
+        self.connection = self.connection.with_http2_max_header_list_size(max);
+        self
+    }
+
     /// Retire each connection after it has dispatched `max` requests.
     /// Shorthand for [`ConnectionConfig::with_max_requests_per_connection`].
     #[must_use]
@@ -1452,6 +1487,20 @@ impl BoundServer {
     #[must_use]
     pub fn with_max_concurrent_streams(mut self, max_streams: u32) -> Self {
         self.connection = self.connection.with_max_concurrent_streams(max_streams);
+        self
+    }
+
+    /// Set the advertised HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` (hyper's
+    /// default, 16 KiB, when unset). Shorthand for
+    /// [`ConnectionConfig::with_http2_max_header_list_size`], which says when
+    /// an oversized request gets `431` and when it closes the connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` is zero.
+    #[must_use]
+    pub fn with_http2_max_header_list_size(mut self, max: u32) -> Self {
+        self.connection = self.connection.with_http2_max_header_list_size(max);
         self
     }
 
@@ -2786,6 +2835,12 @@ mod tests {
         let _ = ConnectionConfig::new().with_max_concurrent_streams(0);
     }
 
+    #[test]
+    #[should_panic(expected = "non-zero value")]
+    fn with_http2_max_header_list_size_rejects_zero() {
+        let _ = ConnectionConfig::new().with_http2_max_header_list_size(0);
+    }
+
     /// `configure_http2` leaves keepalive untouched when no interval is set, so
     /// hyper's default (keepalive disabled) is preserved unless the user opts
     /// in. There is no public getter on the builder, so this guards the opt-in
@@ -2829,6 +2884,7 @@ mod tests {
             .with_http2_initial_stream_window_size(512 * 1024)
             .with_http2_initial_connection_window_size(1024 * 1024)
             .with_max_concurrent_streams(64)
+            .with_http2_max_header_list_size(64 << 10)
             .with_http2_keepalive_interval(Duration::from_secs(30))
             .with_http2_keepalive_timeout(Duration::from_secs(5))
             .with_max_connection_age(Duration::from_secs(600))
@@ -2843,6 +2899,7 @@ mod tests {
             .with_http2_initial_stream_window_size(512 * 1024)
             .with_http2_initial_connection_window_size(1024 * 1024)
             .with_max_concurrent_streams(64)
+            .with_http2_max_header_list_size(64 << 10)
             .with_http2_keepalive_interval(Duration::from_secs(30))
             .with_http2_keepalive_timeout(Duration::from_secs(5))
             .with_max_connection_age(Duration::from_secs(600))
@@ -2863,6 +2920,7 @@ mod tests {
             .with_http2_initial_stream_window_size(512 * 1024)
             .with_http2_initial_connection_window_size(1024 * 1024)
             .with_max_concurrent_streams(64)
+            .with_http2_max_header_list_size(64 << 10)
             .with_http2_keepalive_interval(Duration::from_secs(30))
             .with_http2_keepalive_timeout(Duration::from_secs(5))
             .with_max_connection_age(Duration::from_secs(600))
@@ -2916,9 +2974,12 @@ mod tests {
         }
     }
 
-    /// `SETTINGS_MAX_HEADER_LIST_SIZE` reaches hyper: a request whose headers
-    /// exceed it is refused with 431 before any handler runs, and one under it
-    /// is served.
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` reaches hyper: a request whose header
+    /// list reaches it is refused with 431 before any handler runs, one under
+    /// it is served, and one over four times the limit (h2 0.4.15 and later)
+    /// gets a connection-closing GOAWAY. The 431 pad (8 KiB) sits above the
+    /// 4 KiB limit, below hyper's 16 KiB default (so it only fails if the
+    /// setting arrived) and below h2's 4 × 4 KiB connection-close threshold.
     #[tokio::test]
     async fn http2_max_header_list_size_rejects_oversized_headers() {
         let bound = Server::bind("127.0.0.1:0")
@@ -2952,6 +3013,11 @@ mod tests {
         let too_large = http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
         assert_ne!(status(16).await.unwrap(), too_large);
         assert_eq!(status(8192).await.unwrap(), too_large);
+        let err = status(20_000).await.unwrap_err();
+        assert!(
+            err.is_go_away() && err.reason() == Some(h2::Reason::ENHANCE_YOUR_CALM),
+            "connection not closed: {err}",
+        );
 
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), serve)

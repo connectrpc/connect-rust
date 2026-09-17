@@ -10,9 +10,11 @@ body: |-
     `with_connection_config` / `connection_config()`; their existing `with_*`
     setters are unchanged and edit the same value, so the two builders can no
     longer drift and a configuration built once applies to either ([#250]).
-    New on it: `with_http2_max_header_list_size`, the advertised
+    New on `ConnectionConfig`, with shorthands on `Server` and `BoundServer`:
+    `with_http2_max_header_list_size`, the advertised
     `SETTINGS_MAX_HEADER_LIST_SIZE` (hyper's 16 KiB default is too small for
-    some bearer tokens; oversized requests get `431`).
+    some bearer tokens). Oversized requests get `431`; much larger ones get a
+    connection-closing GOAWAY. `with_http2_max_header_list_size(0)` panics.
 
     [#250]: https://github.com/connectrpc/connect-rust/issues/250
 time: 2026-09-16T13:00:00.000000000+00:00
