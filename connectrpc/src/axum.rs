@@ -40,10 +40,18 @@
 //!   HTTP/2 (required for gRPC; preferred for Connect streaming), set
 //!   `server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()]`
 //!   before passing it in. Without ALPN, hyper falls back to HTTP/1.1.
-//! - **Panics are caught.** A panicking handler yields a `500` whose body is a
-//!   Connect-JSON `internal` error (for non-RPC routes too) and the connection
-//!   survives; `axum::serve` would drop the connection. A `CatchPanicLayer`
-//!   of your own still takes precedence for the routes it wraps.
+//! - **Panics are caught.** A handler that panics before returning its
+//!   response yields a `500` whose body is a Connect-JSON `internal` error
+//!   (for non-RPC routes too) and the connection survives; `axum::serve`
+//!   drops the connection (HTTP/1.1) or resets the stream (HTTP/2). A panic
+//!   while a response body is produced is logged and resets that stream with
+//!   `INTERNAL_ERROR` (HTTP/2; `axum::serve` resets with `CANCEL`) or closes
+//!   the connection (HTTP/1.1). A `CatchPanicLayer` of your own still takes
+//!   precedence for the routes it wraps.
+//! - **Idle reaping ends HTTP/2 WebSockets.** With
+//!   [`ConnectionConfig::with_max_connection_idle`](crate::server::ConnectionConfig::with_max_connection_idle)
+//!   set, a connection that carries only extended-CONNECT streams counts as
+//!   idle and is closed; see that method.
 //! - **Connections are owned by the future.** Dropping (or timing out) the
 //!   [`Serve`] future aborts the connections it accepted rather than leaving
 //!   them running detached.
@@ -71,7 +79,9 @@ use crate::server::serve_with_listener;
 /// driver: [`PeerAddr`](crate::PeerAddr) on every request, every
 /// [`ConnectionConfig`] setting, graceful shutdown, panic isolation.
 ///
-/// See the [module docs](self) for what this adds over `axum::serve`.
+/// See the [module docs](self) for what this adds over `axum::serve`. After
+/// running out of file descriptors (`EMFILE` / `ENFILE`) the loop pauses
+/// accepts for up to a second, or until the shutdown signal fires.
 ///
 /// # Errors
 ///
@@ -148,7 +158,7 @@ pub struct Serve {
 /// The previous name of [`Serve`], from when only [`serve_tls`] existed.
 #[cfg(feature = "server-tls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
-#[deprecated(since = "0.9.1", note = "renamed to `Serve`; `serve_tls` returns it")]
+#[deprecated(since = "0.10.0", note = "renamed to `Serve`; `serve_tls` returns it")]
 pub type ServeTls = Serve;
 
 impl Serve {

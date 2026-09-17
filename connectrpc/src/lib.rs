@@ -169,7 +169,7 @@
 //! | `server` | ✗ | Standalone hyper-based server |
 //! | `server-tls` | ✗ | TLS for the built-in server |
 //! | `tls` | ✗ | Convenience: `server-tls` + `client-tls` |
-//! | `axum` | ✗ | Axum framework integration (`connectrpc::axum::serve` also needs `server`) |
+//! | `axum` | ✗ | Axum integration (`Router::into_axum_service`); the `connectrpc::axum` module also needs `server`, and `serve_tls` needs `server-tls` |
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

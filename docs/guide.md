@@ -1362,8 +1362,14 @@ loop {
         Some(_) = connections.join_next(), if !connections.is_empty() => continue,
         accepted = listener.accept() => accepted?, // production: retry transient errors
     };
+    // Where this connection runs: say, one `tokio::runtime::Handle` per class
+    // of client.
+    let runtime = runtime_for(peer);
+    // Take the socket off this runtime's I/O driver; the task re-registers it.
+    let Ok(stream) = stream.into_std() else { continue };
     let (server, tls, mut drain) = (Arc::clone(&server), tls.clone(), drain_rx.clone());
-    connections.spawn(async move {
+    connections.spawn_on(async move {
+        let Ok(stream) = tokio::net::TcpStream::from_std(stream) else { return };
         // TLS handshake on the connection's task, not the loop's, with a bound.
         let Ok(Ok(stream)) =
             tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await
@@ -1381,21 +1387,38 @@ loop {
             .serve_connection(stream, info, async move { let _ = drain.wait_for(|d| *d).await; })
             .await;
         metrics::connection_closed(closed.reason());
-    });
+    }, &runtime);
 }
 drop(listener);                   // refuse new connections
 let _ = drain_tx.send(true);      // GOAWAY every live one
 while connections.join_next().await.is_some() {}   // wait for them
 ```
 
-Two rules are the loop's to keep, because the library cannot: the loop
-must outlive what it spawned (track the tasks and drain them before
-returning, as above), and the runtime that accepted a socket must outlive
-the connection served on it — the socket stays registered there even if
-you spawn `serve_connection`'s future onto another runtime, which is
-otherwise all it takes to serve a connection elsewhere (the future binds
-timers, hyper's per-stream tasks and every handler to whichever runtime
-polls it).
+Serving a connection on another runtime takes the two steps shown. First,
+spawn its task there with `JoinSet::spawn_on`: the future binds timers,
+hyper's per-stream tasks and every handler to the runtime that polls it,
+and the set can still abort and drain the task. That runtime needs I/O and
+time enabled (`enable_all()`); `from_std` panics without I/O. Second,
+re-register the socket there: `into_std` on the accepting side,
+`TcpStream::from_std` inside the task. A tokio socket stays on the I/O
+driver of the runtime that created it, so without this step a busy
+accepting runtime delays the connection, and shutting that runtime down
+breaks it.
+
+A `TlsStream` cannot be rebuilt around a moved socket, so the loop moves
+the plain `TcpStream` first and picks the runtime from the peer address,
+before the TLS handshake. To place clients by class without inspecting
+certificates, give each class its own listener, with its accept loop on
+that class's runtime. To place them by client certificate, wrap the
+`TcpStream` in your own `AsyncRead + AsyncWrite` type that can detach the
+socket (`into_std`) and re-attach it (`from_std`), and hand that type to
+the TLS acceptor. After the handshake, reach the socket through
+`TlsStream::get_mut`: detach it while the accepting runtime is still
+running, re-attach it inside the task on the target runtime, and don't
+poll the stream in between.
+
+The loop must also outlive what it spawned: track the tasks and drain them
+before returning, as the code above shows.
 
 ### Raw hyper
 

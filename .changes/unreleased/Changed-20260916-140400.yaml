@@ -1,0 +1,13 @@
+kind: Changed
+body: |-
+    **Response-body panics and HTTP/2 extended CONNECT, for `Server` and
+    `connectrpc::axum::serve_tls`.** A panic while a response body is
+    produced (in a streaming handler's stream, for example) is logged and
+    becomes an error on that response. Over HTTP/2 the stream is reset with
+    `INTERNAL_ERROR`, which gRPC clients report as `internal`; previously the
+    panic killed the stream's task and the reset was `CANCEL`, reported as
+    `canceled`. Over HTTP/1.1 the connection is closed, as before. HTTP/2
+    connections now advertise extended CONNECT (RFC 8441), so HTTP/2
+    WebSockets work under `serve_tls` (and the new `serve`); the RPC routes
+    of `Server` answer such requests like any other.
+time: 2026-09-16T14:04:00.000000000+00:00
