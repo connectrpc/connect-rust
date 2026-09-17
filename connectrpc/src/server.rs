@@ -183,8 +183,8 @@ pub struct PeerCerts(pub Arc<[rustls::pki_types::CertificateDer<'static>]>);
 /// request then carries those extensions plus [`PeerAddr`] / `PeerCerts`,
 /// mirroring [`RequestContext`](crate::RequestContext) at connection scope.
 /// `PeerAddr` / `PeerCerts` always come from the typed fields here, never
-/// from `extensions`, so a request never reports a peer the transport did
-/// not see.
+/// from `extensions`: the built-in loop sets those fields from the
+/// transport, and a custom loop answers for what it records in them.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct ConnectionInfo {
@@ -254,8 +254,8 @@ impl ConnectionInfo {
 
     /// The extensions stamped into every request on this connection: the
     /// connection's own extensions, with [`PeerAddr`] / [`PeerCerts`] set from
-    /// what the transport observed. Whatever was put under those two types is
-    /// discarded first.
+    /// the peer fields. Whatever was put under those two types is discarded
+    /// first.
     fn request_extensions(&self) -> http::Extensions {
         let mut ext = self.extensions.clone();
         ext.remove::<PeerAddr>();
@@ -294,17 +294,23 @@ impl ConnectionClosed {
 
 /// Why a connection ended; see [`ConnectionClosed::reason`].
 ///
-/// A retirement reason ([`MaxAge`](Self::MaxAge), [`Idle`](Self::Idle),
-/// [`MaxRequests`](Self::MaxRequests)) is reported whether the connection
-/// drained within the grace period or was closed when it expired, and even
-/// if the shutdown signal arrived while it was draining.
+/// When a shutdown signal or retirement trigger tells a connection to wind
+/// down, that reason is final. A retirement reason ([`MaxAge`](Self::MaxAge),
+/// [`Idle`](Self::Idle), [`MaxRequests`](Self::MaxRequests)) is reported
+/// whether the connection drained within the grace period or was closed when
+/// the grace period expired, and even if the shutdown signal arrived while it
+/// drained. An error while winding down also reports that reason, not
+/// [`Error`](Self::Error): a peer that fails mid-drain, or one whose protocol
+/// was not yet detected (it had sent no bytes, say), ends that way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CloseReason {
-    /// The connection ended on its own while serving: the peer closed it, or
-    /// an HTTP/1.1 connection without keep-alive finished its request.
+    /// The connection ended on its own before anything told it to wind down:
+    /// the peer closed it, or an HTTP/1.1 connection without keep-alive
+    /// finished its request.
     Closed,
-    /// The shutdown signal resolved and the connection drained.
+    /// The shutdown signal told the connection to wind down before any
+    /// retirement trigger did.
     Shutdown,
     /// Retired on reaching its maximum age.
     MaxAge,
@@ -312,7 +318,8 @@ pub enum CloseReason {
     Idle,
     /// Retired after serving the configured number of requests.
     MaxRequests,
-    /// A connection-level I/O or protocol error ended it.
+    /// A connection-level I/O or protocol error ended it before anything told
+    /// it to wind down.
     Error,
 }
 
@@ -1902,10 +1909,15 @@ where
             match &mut this.state {
                 ConnectionLifecycleState::Serving => {
                     if let Poll::Ready(result) = this.conn.as_mut().poll(cx) {
+                        let reason = if result.is_ok() {
+                            CloseReason::Closed
+                        } else {
+                            CloseReason::Error
+                        };
                         return Poll::Ready(log_connection_result(
                             this.remote_addr,
                             result,
-                            CloseReason::Closed,
+                            reason,
                         ));
                     }
 
@@ -2029,7 +2041,11 @@ where
     }
 }
 
-/// Log how hyper's connection future ended; an error overrides `reason`.
+/// Log how hyper's connection future ended and report `reason`. A connection
+/// that was told to wind down passes that reason even for an error result:
+/// the error is then a consequence of winding down (hyper-util reports a
+/// graceful shutdown that arrives before protocol detection as one) or a
+/// failure mid-drain, and is only logged.
 fn log_connection_result<E: std::fmt::Display>(
     remote_addr: Option<SocketAddr>,
     result: Result<(), E>,
@@ -2037,15 +2053,10 @@ fn log_connection_result<E: std::fmt::Display>(
 ) -> ConnectionClosed {
     let remote_addr = remote_addr.map(tracing::field::display);
     match result {
-        Ok(()) => {
-            tracing::trace!(remote_addr, "Connection completed normally");
-            ConnectionClosed::new(reason)
-        }
-        Err(err) => {
-            tracing::trace!(remote_addr, error = %err, "Connection ended with error");
-            ConnectionClosed::new(CloseReason::Error)
-        }
+        Ok(()) => tracing::trace!(remote_addr, "Connection completed normally"),
+        Err(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
     }
+    ConnectionClosed::new(reason)
 }
 
 fn jitter_connection_age(age: Duration, sample: u64) -> Duration {
@@ -4624,6 +4635,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(closed.reason(), CloseReason::MaxRequests);
+    }
+
+    /// A connection told to wind down before its peer sent a byte reports
+    /// why, not `Error`; a peer that hangs up reports `Closed`, and a
+    /// malformed request reports `Error`.
+    #[tokio::test(start_paused = true)]
+    async fn serve_connection_close_reason_before_first_request() {
+        fn unstarted(
+            server: &Server,
+            shutdown: impl Future<Output = ()> + Send + 'static,
+        ) -> (
+            impl Future<Output = ConnectionClosed>,
+            tokio::io::DuplexStream,
+        ) {
+            let (io, client) = tokio::io::duplex(1024);
+            let conn = server.serve_connection(io, ConnectionInfo::new(), shutdown);
+            (conn, client)
+        }
+        let plain = Server::new(Router::new());
+        let (conn, _client) = unstarted(&plain, std::future::ready(()));
+        assert_eq!(conn.await.reason(), CloseReason::Shutdown);
+
+        let idle = Server::new(Router::new()).with_max_connection_idle(Duration::from_secs(1));
+        let (conn, _client) = unstarted(&idle, std::future::pending());
+        assert_eq!(conn.await.reason(), CloseReason::Idle);
+
+        let aged = Server::new(Router::new()).with_max_connection_age(Duration::from_secs(1));
+        let (conn, _client) = unstarted(&aged, std::future::pending());
+        assert_eq!(conn.await.reason(), CloseReason::MaxAge);
+
+        let (conn, client) = unstarted(&plain, std::future::pending());
+        drop(client);
+        assert_eq!(conn.await.reason(), CloseReason::Closed);
+
+        let (conn, mut client) = unstarted(&plain, std::future::pending());
+        client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
+        assert_eq!(conn.await.reason(), CloseReason::Error);
     }
 
     /// End-to-end mTLS: client presents a cert; handler reads it from
