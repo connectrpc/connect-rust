@@ -1504,14 +1504,21 @@ out of the client certificate, say — need not repeat on every request.
 `with_connection_extensions` (on `Server`, `BoundServer` and
 `connectrpc::axum::Serve`) registers a function that runs once per
 accepted connection, after the TLS handshake and before the first
-request, with the connection's `ConnectionInfo` (`peer_addr()`,
-`peer_certs()`, `extensions_mut()`); whatever it puts in the extensions
-is cloned into every request on that connection and read with
-`ctx.extensions().get::<T>()`. `PeerAddr` / `PeerCerts` on requests
-always come from the transport, whatever the function inserts under
-those types. Inserted values must be `Clone + Send + Sync + 'static`;
-wrap large ones in an `Arc`. A [custom accept loop](#custom-accept-loops)
-does the same by writing `info.extensions_mut()` itself.
+request. It reads the connection's `ConnectionInfo` (`peer_addr()`,
+`peer_certs()`, `extensions()`) and inserts into the `http::Extensions`
+it is handed. That map starts empty; what the function inserts joins the
+connection's extensions, replacing entries of the same type, is cloned
+into every request on that connection, and is read with
+`ctx.extensions().get::<T>()`. The function cannot remove an entry or
+change the peer: whatever it inserts under `PeerAddr` / `PeerCerts`,
+requests get those types from `ConnectionInfo`'s peer fields, which the
+built-in loops set from the transport. Inserted values must be
+`Clone + Send + Sync + 'static`; wrap large ones in an `Arc`.
+
+`Server::serve_connection` runs the function too, after whatever a
+[custom accept loop](#custom-accept-loops) put in
+`info.extensions_mut()`; a loop around the free
+`server::serve_connection` writes `info.extensions_mut()` itself.
 
 ```rust
 #[derive(Clone)]
@@ -1519,9 +1526,9 @@ struct PeerIdentity(Arc<str>);
 
 Server::new(connect_router)
     .with_tls(server_config)
-    .with_connection_extensions(|conn| {
+    .with_connection_extensions(|conn, ext| {
         if let Some(id) = parse_identity(conn.peer_certs()) {
-            conn.extensions_mut().insert(PeerIdentity(id));
+            ext.insert(PeerIdentity(id));
         }
     })
     .serve("0.0.0.0:8443".parse()?)

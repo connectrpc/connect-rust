@@ -198,14 +198,14 @@ impl Serve {
         self
     }
 
-    /// Populate [`ConnectionInfo`] once per accepted connection, before its
-    /// first request; same semantics as
+    /// Add request extensions computed once per accepted connection from its
+    /// [`ConnectionInfo`], before its first request; same semantics as
     /// [`BoundServer::with_connection_extensions`](crate::BoundServer::with_connection_extensions).
     /// Calling this again replaces the function.
     #[must_use = "Serve does nothing unless `.await`ed"]
     pub fn with_connection_extensions<F>(mut self, f: F) -> Self
     where
-        F: Fn(&mut ConnectionInfo) + Send + Sync + 'static,
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
     {
         self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
         self
@@ -657,18 +657,17 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(
             serve_tls(listener, app, server_cfg)
-                .with_connection_extensions(move |conn| {
+                .with_connection_extensions(move |conn, ext| {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let leaf_len = conn
                         .peer_certs()
                         .and_then(<[_]>::first)
                         .map(|l| l.as_ref().len());
                     if let Some(len) = leaf_len {
-                        conn.extensions_mut().insert(LeafLen(len));
+                        ext.insert(LeafLen(len));
                     }
                     // The transport's `PeerAddr` must win over this one.
-                    conn.extensions_mut()
-                        .insert(crate::PeerAddr("10.0.0.1:1".parse().unwrap()));
+                    ext.insert(crate::PeerAddr("10.0.0.1:1".parse().unwrap()));
                 })
                 .with_graceful_shutdown(async {
                     rx.await.ok();

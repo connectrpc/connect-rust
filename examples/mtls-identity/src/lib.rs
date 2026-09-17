@@ -13,10 +13,9 @@
 //! [`connectrpc::PeerCerts`].
 //!
 //! The same handler code works unchanged on the standalone
-//! [`connectrpc::Server::with_tls`] (register the function with
-//! [`connectrpc::Server::with_connection_extensions`]) or in a custom accept
-//! loop (insert the [`PeerIdentity`] into `ConnectionInfo::extensions_mut()`
-//! yourself) — the hosting choice doesn't leak into authorization logic.
+//! [`connectrpc::Server::with_tls`] or in a custom accept loop — the hosting
+//! choice doesn't leak into authorization logic. The README says, for each
+//! hosting path, where `PeerIdentity` enters the connection's extensions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -227,9 +226,8 @@ pub async fn serve(
     connectrpc::axum::serve_tls(listener, app, server_config)
         // Once per connection, after the TLS handshake: parse the leaf cert
         // here so handlers don't re-parse DER on every request.
-        .with_connection_extensions(|conn| {
-            let identity = PeerIdentity::from_connection(conn);
-            conn.extensions_mut().insert(identity);
+        .with_connection_extensions(|conn, ext| {
+            ext.insert(PeerIdentity::from_connection(conn));
         })
         .with_graceful_shutdown(shutdown)
         .await

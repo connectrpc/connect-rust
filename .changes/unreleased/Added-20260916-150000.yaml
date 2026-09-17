@@ -1,13 +1,14 @@
 kind: Added
 body: |-
-    **`Server::with_connection_extensions`: populate `ConnectionInfo` once per
-    connection.** The function registered with it (also on `BoundServer` and
-    `connectrpc::axum::Serve`) runs once for every accepted connection, after
-    the TLS handshake and before the first request, with `&mut ConnectionInfo`;
-    whatever it puts in `extensions_mut()` — a client-certificate identity
-    parsed from `peer_certs()`, say — is cloned into every request on that
-    connection instead of being recomputed per request. `PeerAddr` /
-    `PeerCerts` still always come from the transport. `Server::serve_connection`
-    applies it too. The `mtls-identity` example now parses its identity this
-    way.
+    **`Server::with_connection_extensions`: compute request extensions once
+    per connection.** The function registered with it (also on `BoundServer`
+    and `connectrpc::axum::Serve`) runs once for every accepted connection,
+    after the TLS handshake and before the first request. It reads the
+    connection's `ConnectionInfo` and inserts into the `http::Extensions` it
+    is handed; those values — a client-certificate identity parsed from
+    `peer_certs()`, say — are cloned into every request on that connection
+    instead of being recomputed per request. It cannot change the peer:
+    `PeerAddr` / `PeerCerts` on requests come only from `ConnectionInfo`'s
+    typed peer fields. `Server::serve_connection` applies it too. The
+    `mtls-identity` example now parses its identity this way.
 time: 2026-09-16T15:00:00.000000000+00:00

@@ -284,26 +284,50 @@ impl ConnectionInfo {
 /// The per-connection function registered with
 /// [`Server::with_connection_extensions`] and its equivalents.
 #[derive(Clone)]
-pub(crate) struct ConnectionExtensionsFn(Arc<dyn Fn(&mut ConnectionInfo) + Send + Sync>);
+pub(crate) struct ConnectionExtensionsFn(Arc<ExtendConnection>);
+
+type ExtendConnection = dyn Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync;
 
 impl ConnectionExtensionsFn {
     pub(crate) fn new<F>(f: F) -> Self
     where
-        F: Fn(&mut ConnectionInfo) + Send + Sync + 'static,
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
     {
         Self(Arc::new(f))
     }
 
-    /// Run the function on `info`, once, before the connection is served.
-    fn apply(&self, info: &mut ConnectionInfo) {
-        (self.0)(info);
+    /// Run the function once, before the connection is served: it reads
+    /// `info`, and what it inserts joins `info`'s extensions, replacing
+    /// entries of the same type. Returns `false`, having logged the panic, if
+    /// the function panicked; the caller then drops the connection.
+    #[must_use]
+    fn apply(&self, info: &mut ConnectionInfo) -> bool {
+        let mut added = http::Extensions::new();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.0)(info, &mut added);
+        }));
+        match ran {
+            Ok(()) => {
+                info.extensions.extend(added);
+                true
+            }
+            Err(panic) => {
+                let message = panic_message(&*panic).unwrap_or("non-string payload");
+                tracing::error!(
+                    remote_addr = info.peer_addr().map(tracing::field::display),
+                    "with_connection_extensions function panicked: {message}",
+                );
+                false
+            }
+        }
     }
 }
 
-// The function is only ever called, never inspected, so no state a panicking
-// one leaves behind is observable through a holder; asserting unwind safety
-// keeps `Server`, `BoundServer` and `axum::Serve` `UnwindSafe` /
-// `RefUnwindSafe` despite the `dyn Fn` inside.
+// A `dyn Fn` is neither `UnwindSafe` nor `RefUnwindSafe`, which would take
+// both from `BoundServer` (it has them without `server-tls`). The wrapper only
+// calls the function and has no state of its own for a panic to leave
+// half-updated; state the function captures is the function's to keep
+// consistent.
 impl std::panic::UnwindSafe for ConnectionExtensionsFn {}
 impl std::panic::RefUnwindSafe for ConnectionExtensionsFn {}
 
@@ -358,7 +382,10 @@ pub enum CloseReason {
     /// - an expired HTTP/1.1 header-read timeout;
     /// - an HTTP/2 keepalive ping that got no reply within
     ///   [`with_http2_keepalive_timeout`](ConnectionConfig::with_http2_keepalive_timeout);
-    /// - a panic while an HTTP/1.1 response body was produced.
+    /// - a panic while an HTTP/1.1 response body was produced;
+    /// - a panic in the
+    ///   [`with_connection_extensions`](Server::with_connection_extensions)
+    ///   function (reported by [`Server::serve_connection`]).
     Error,
 }
 
@@ -1293,25 +1320,28 @@ impl Server {
         self
     }
 
-    /// Populate [`ConnectionInfo`] once per accepted connection; see
-    /// [`BoundServer::with_connection_extensions`]. Also applied by
-    /// [`Server::serve_connection`]. Calling this again replaces the function.
+    /// Add request extensions computed once per accepted connection from its
+    /// [`ConnectionInfo`]; see [`BoundServer::with_connection_extensions`].
+    /// Also applied by [`Server::serve_connection`]. Calling this again
+    /// replaces the function.
     #[must_use]
     pub fn with_connection_extensions<F>(mut self, f: F) -> Self
     where
-        F: Fn(&mut ConnectionInfo) + Send + Sync + 'static,
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
     {
         self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
         self
     }
 
     /// The method form of [`serve_connection`]: serve one already-accepted
-    /// (and, over TLS, already-handshaken) stream with this server's service,
-    /// [`ConnectionConfig`] and
-    /// [`with_connection_extensions`](Self::with_connection_extensions)
-    /// function (which runs when the future is first polled), on whichever
-    /// runtime polls the future, and report why it ended. See the free
-    /// function for the runtime rules.
+    /// (and, over TLS, already-handshaken) stream with this server's service
+    /// and [`ConnectionConfig`], on whichever runtime polls the future, and
+    /// report why it ended. See the free function for the runtime rules.
+    ///
+    /// The [`with_connection_extensions`](Self::with_connection_extensions)
+    /// function runs when the future is first polled. If it panics, the panic
+    /// is logged and the future resolves to [`CloseReason::Error`] without
+    /// serving `io`.
     ///
     /// This is the building block for a custom accept loop: accept and
     /// authenticate the stream yourself (admit or refuse it, cap per tenant,
@@ -1331,11 +1361,13 @@ impl Server {
         let connection_extensions = self.connection_extensions.clone();
         let service = self.service.clone();
         let config = self.connection.clone();
-        // The function runs inside the future, on the serving task, so a panic
-        // in it is scoped to this connection exactly as on the built-in loop.
+        // The function runs inside the future, on the serving task; a panic in
+        // it drops only this connection, as on the built-in loop.
         async move {
-            if let Some(f) = &connection_extensions {
-                f.apply(&mut info);
+            if let Some(f) = &connection_extensions
+                && !f.apply(&mut info)
+            {
+                return ConnectionClosed::new(CloseReason::Error);
             }
             serve_connection(io, info, service, config, shutdown).await
         }
@@ -1599,35 +1631,43 @@ impl BoundServer {
         self
     }
 
-    /// Populate [`ConnectionInfo`] once per accepted connection.
+    /// Add request extensions computed once per accepted connection.
     ///
     /// `f` runs exactly once for every connection that completes the
     /// (optional) TLS handshake, on that connection's task and before its
-    /// first request, with the [`ConnectionInfo`] the accept loop produced.
-    /// Use it for work that would otherwise repeat per request — parsing an
-    /// identity out of `peer_certs()`, say — and put the result in
-    /// [`extensions_mut`](ConnectionInfo::extensions_mut): it is cloned into
-    /// every request on the connection and read with
-    /// `ctx.extensions().get::<T>()`. [`PeerAddr`] / `PeerCerts` on requests
-    /// always come from the transport, whatever `f` inserts under those
-    /// types. `f` is synchronous and cannot reject the connection (fail in a
-    /// handler or layer, or write a custom loop around
-    /// [`Server::serve_connection`]); a panic in it drops that one
-    /// connection. Calling this again replaces the function.
+    /// first request. It reads the connection's [`ConnectionInfo`], whose
+    /// extensions are empty on this built-in loop and hold what a custom loop
+    /// inserted under [`Server::serve_connection`]. It inserts into the
+    /// [`http::Extensions`] it is handed, which starts empty; those values join
+    /// the connection's extensions, replacing entries of the same type, and
+    /// are cloned into every request on the connection, where handlers read
+    /// them with `ctx.extensions().get::<T>()`. Use it for work that would
+    /// otherwise repeat per request — parsing an identity out of
+    /// `peer_certs()`, say.
+    ///
+    /// `f` cannot remove an entry or change the peer: [`PeerAddr`] /
+    /// `PeerCerts` on requests come only from the [`ConnectionInfo`] peer
+    /// fields, which the built-in loop sets from the transport, whatever `f`
+    /// inserts under those types. `f` is synchronous and cannot reject the
+    /// connection. To refuse requests, fail them in a handler or layer; to
+    /// refuse connections, write a custom loop around
+    /// [`Server::serve_connection`]. A panic in `f` is logged and drops that
+    /// one connection (under [`Server::serve_connection`], the future
+    /// resolves to [`CloseReason::Error`]); under `panic = "abort"` it aborts
+    /// the process. Calling this again replaces the function.
     ///
     /// ```rust,ignore
     /// Server::bind("0.0.0.0:8443").await?
     ///     .with_tls(tls_config)
-    ///     .with_connection_extensions(|conn| {
-    ///         let identity = PeerIdentity::parse(conn.peer_certs());
-    ///         conn.extensions_mut().insert(identity);
+    ///     .with_connection_extensions(|conn, ext| {
+    ///         ext.insert(PeerIdentity::parse(conn.peer_certs()));
     ///     })
     ///     .serve(router).await?;
     /// ```
     #[must_use]
     pub fn with_connection_extensions<F>(mut self, f: F) -> Self
     where
-        F: Fn(&mut ConnectionInfo) + Send + Sync + 'static,
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
     {
         self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
         self
@@ -2480,8 +2520,10 @@ where
                         peer.peer_certs = conn
                             .peer_certificates()
                             .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
-                        if let Some(f) = &connection_extensions {
-                            f.apply(&mut peer);
+                        if let Some(f) = &connection_extensions
+                            && !f.apply(&mut peer)
+                        {
+                            return;
                         }
                         serve_connection(tls_stream, peer, service, config, global_shutdown).await;
                     }
@@ -2504,8 +2546,10 @@ where
 
             // Plain TCP (no TLS or TLS not configured)
             let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
-            if let Some(f) = &connection_extensions {
-                f.apply(&mut peer);
+            if let Some(f) = &connection_extensions
+                && !f.apply(&mut peer)
+            {
+                return;
             }
             serve_connection(stream, peer, service, config, global_shutdown).await;
         });
@@ -5361,7 +5405,7 @@ mod tests {
         let bound = Server::bind("127.0.0.1:0")
             .await
             .unwrap()
-            .with_connection_extensions(move |conn| {
+            .with_connection_extensions(move |conn, ext| {
                 let n = calls_in_fn.fetch_add(1, Ordering::SeqCst) + 1;
                 #[cfg(feature = "server-tls")]
                 let has_certs = conn.peer_certs().is_some();
@@ -5371,10 +5415,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((conn.peer_addr(), has_certs));
-                conn.extensions_mut().insert(ConnTag(n));
+                ext.insert(ConnTag(n));
                 // The transport's `PeerAddr` must win over this one.
-                conn.extensions_mut()
-                    .insert(PeerAddr("10.0.0.1:1".parse().unwrap()));
+                ext.insert(PeerAddr("10.0.0.1:1".parse().unwrap()));
             });
         let addr = bound.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -5430,6 +5473,66 @@ mod tests {
             assert_eq!(tag, &Some(ConnTag(2)));
             assert_eq!(peer, &Some(client2));
         }
+    }
+
+    /// A panicking function drops only its own connection: under
+    /// `Server::serve_connection` the future reports `Error` instead of
+    /// panicking, and the built-in loop keeps serving later connections.
+    #[tokio::test]
+    async fn connection_extensions_panic_drops_only_that_connection() {
+        let (io, _client) = tokio::io::duplex(1024);
+        let closed = Server::new(Router::new())
+            .with_connection_extensions(|_, _| panic!("connection extensions panic on purpose"))
+            .serve_connection(io, ConnectionInfo::new(), std::future::pending())
+            .await;
+        assert_eq!(closed.reason(), CloseReason::Error);
+
+        let (router, seen) = tag_capturing_router();
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_connection_extensions(move |_, ext| {
+                if first.swap(false, Ordering::SeqCst) {
+                    panic!("connection extensions panic on purpose");
+                }
+                ext.insert(ConnTag(1));
+            });
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let mut dropped = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), dropped.read_to_end(&mut response))
+            .await
+            .expect("first connection was not dropped")
+            .ok();
+        assert!(response.is_empty(), "first connection was served");
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tcp.local_addr().unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(h2_conn);
+        call_over_h2(&mut send_request, addr, false).await;
+        drop(send_request);
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error")
+            .expect("serve error");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some(ConnTag(1)), Some(client))]
+        );
     }
 
     /// Without a registered function, handlers see nothing extra and
@@ -5507,14 +5610,14 @@ mod tests {
             .await
             .unwrap()
             .with_tls(server_cfg)
-            .with_connection_extensions(move |conn| {
+            .with_connection_extensions(move |conn, ext| {
                 let certs = conn.peer_certs().map(<[_]>::to_vec);
                 if let Some(leaf) = certs.as_deref().and_then(<[_]>::first) {
-                    conn.extensions_mut().insert(LeafLen(leaf.as_ref().len()));
+                    ext.insert(LeafLen(leaf.as_ref().len()));
                 }
                 *slot.lock().unwrap() = certs;
                 let forged = rustls::pki_types::CertificateDer::from(vec![9u8]);
-                conn.extensions_mut().insert(PeerCerts(vec![forged].into()));
+                ext.insert(PeerCerts(vec![forged].into()));
             });
         let addr = bound.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -5556,14 +5659,18 @@ mod tests {
 
     /// `Server::serve_connection` applies the registered function too, so a
     /// custom loop around it and `Server::serve` stamp requests identically.
+    /// The function sees what the loop inserted, and what it inserts replaces
+    /// an entry of the same type.
     #[tokio::test]
     async fn server_serve_connection_applies_connection_extensions() {
         let (router, seen) = tag_capturing_router();
-        let server = Server::new(router).with_connection_extensions(|conn| {
-            conn.extensions_mut().insert(ConnTag(9));
+        let server = Server::new(router).with_connection_extensions(|conn, ext| {
+            let from_loop = conn.extensions().get::<ConnTag>().map_or(0, |t| t.0);
+            ext.insert(ConnTag(from_loop + 8));
         });
         let (mut client_io, server_io) = tokio::io::duplex(64 << 10);
-        let info = ConnectionInfo::new().with_peer_addr("127.0.0.1:4242".parse().unwrap());
+        let mut info = ConnectionInfo::new().with_peer_addr("127.0.0.1:4242".parse().unwrap());
+        info.extensions_mut().insert(ConnTag(1));
         let conn = tokio::spawn(server.serve_connection(server_io, info, std::future::pending()));
         client_io.write_all(ECHO_REQ).await.unwrap();
         let mut resp = Vec::new();

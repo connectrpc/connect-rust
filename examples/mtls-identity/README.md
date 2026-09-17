@@ -76,18 +76,20 @@ extensions as `PeerIdentity`:
 
 ```rust
 connectrpc::axum::serve_tls(listener, app, server_config)
-    .with_connection_extensions(|conn| {
-        let identity = PeerIdentity::from_connection(conn);
-        conn.extensions_mut().insert(identity);
+    .with_connection_extensions(|conn, ext| {
+        ext.insert(PeerIdentity::from_connection(conn));
     })
 ```
 
 Handlers call `PeerIdentity::for_request(&ctx)` to read the pre-parsed
-value. On the standalone `Server::with_tls` path you would register the
-same function with `Server::with_connection_extensions`, and a custom
-accept loop inserts the `PeerIdentity` into `ConnectionInfo` itself; a
-hosting path that forgets gets an `Internal` error rather than a silent
-per-request re-parse.
+value. On the standalone `Server::with_tls` path, register the same
+function with `Server::with_connection_extensions`, which
+`Server::serve_connection` also runs for a custom accept loop. A custom
+accept loop that hosts an axum app calls the free
+`connectrpc::server::serve_connection`, which never runs the function, so
+that loop inserts the `PeerIdentity` into
+`ConnectionInfo::extensions_mut()` itself. A hosting path that forgets
+gets an `Internal` error rather than a silent per-request re-parse.
 
 Two failure modes both surface as `Unauthenticated`:
 
