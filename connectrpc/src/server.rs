@@ -281,6 +281,56 @@ impl ConnectionInfo {
     }
 }
 
+/// The per-connection function registered with
+/// [`Server::with_connection_extensions`] and its equivalents.
+#[derive(Clone)]
+pub(crate) struct ConnectionExtensionsFn(Arc<ExtendConnection>);
+
+type ExtendConnection = dyn Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync;
+
+impl ConnectionExtensionsFn {
+    pub(crate) fn new<F>(f: F) -> Self
+    where
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    /// Run the function once, before the connection is served: it reads
+    /// `info`, and what it inserts joins `info`'s extensions, replacing
+    /// entries of the same type. Returns `false`, having logged the panic, if
+    /// the function panicked; the caller then drops the connection.
+    #[must_use]
+    fn apply(&self, info: &mut ConnectionInfo) -> bool {
+        let mut added = http::Extensions::new();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.0)(info, &mut added);
+        }));
+        match ran {
+            Ok(()) => {
+                info.extensions.extend(added);
+                true
+            }
+            Err(panic) => {
+                let message = panic_message(&*panic).unwrap_or("non-string payload");
+                tracing::error!(
+                    remote_addr = info.peer_addr().map(tracing::field::display),
+                    "with_connection_extensions function panicked: {message}",
+                );
+                false
+            }
+        }
+    }
+}
+
+// A `dyn Fn` is neither `UnwindSafe` nor `RefUnwindSafe`, which would take
+// both from `BoundServer` (it has them without `server-tls`). The wrapper only
+// calls the function and has no state of its own for a panic to leave
+// half-updated; state the function captures is the function's to keep
+// consistent.
+impl std::panic::UnwindSafe for ConnectionExtensionsFn {}
+impl std::panic::RefUnwindSafe for ConnectionExtensionsFn {}
+
 /// How a connection served by [`Server::serve_connection`] ended.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -332,7 +382,10 @@ pub enum CloseReason {
     /// - an expired HTTP/1.1 header-read timeout;
     /// - an HTTP/2 keepalive ping that got no reply within
     ///   [`with_http2_keepalive_timeout`](ConnectionConfig::with_http2_keepalive_timeout);
-    /// - a panic while an HTTP/1.1 response body was produced.
+    /// - a panic while an HTTP/1.1 response body was produced;
+    /// - a panic in the
+    ///   [`with_connection_extensions`](Server::with_connection_extensions)
+    ///   function (reported by [`Server::serve_connection`]).
     Error,
 }
 
@@ -971,6 +1024,7 @@ pub struct Server {
     service: ConnectRpcService,
     connection: ConnectionConfig,
     accept: AcceptConfig,
+    connection_extensions: Option<ConnectionExtensionsFn>,
 }
 
 impl Server {
@@ -985,6 +1039,7 @@ impl Server {
             service,
             connection: ConnectionConfig::default(),
             accept: AcceptConfig::default(),
+            connection_extensions: None,
         }
     }
 
@@ -1265,10 +1320,28 @@ impl Server {
         self
     }
 
+    /// Add request extensions computed once per accepted connection from its
+    /// [`ConnectionInfo`]; see [`BoundServer::with_connection_extensions`].
+    /// Also applied by [`Server::serve_connection`]. Calling this again
+    /// replaces the function.
+    #[must_use]
+    pub fn with_connection_extensions<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
+    {
+        self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
+        self
+    }
+
     /// The method form of [`serve_connection`]: serve one already-accepted
     /// (and, over TLS, already-handshaken) stream with this server's service
     /// and [`ConnectionConfig`], on whichever runtime polls the future, and
     /// report why it ended. See the free function for the runtime rules.
+    ///
+    /// The [`with_connection_extensions`](Self::with_connection_extensions)
+    /// function runs when the future is first polled. If it panics, the panic
+    /// is logged and the future resolves to [`CloseReason::Error`] without
+    /// serving `io`.
     ///
     /// This is the building block for a custom accept loop: accept and
     /// authenticate the stream yourself (admit or refuse it, cap per tenant,
@@ -1278,20 +1351,26 @@ impl Server {
     pub fn serve_connection<S, F>(
         &self,
         io: S,
-        info: ConnectionInfo,
+        mut info: ConnectionInfo,
         shutdown: F,
     ) -> impl Future<Output = ConnectionClosed> + Send + 'static + use<S, F>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        serve_connection(
-            io,
-            info,
-            self.service.clone(),
-            self.connection.clone(),
-            shutdown,
-        )
+        let connection_extensions = self.connection_extensions.clone();
+        let service = self.service.clone();
+        let config = self.connection.clone();
+        // The function runs inside the future, on the serving task; a panic in
+        // it drops only this connection, as on the built-in loop.
+        async move {
+            if let Some(f) = &connection_extensions
+                && !f.apply(&mut info)
+            {
+                return ConnectionClosed::new(CloseReason::Error);
+            }
+            serve_connection(io, info, service, config, shutdown).await
+        }
     }
 
     /// Get a reference to the underlying router.
@@ -1315,7 +1394,15 @@ impl Server {
         };
         tracing::info!("ConnectRPC server listening on {scheme}://{addr}");
 
-        serve_with_listener(listener, self.service, self.accept, self.connection, None).await?;
+        serve_with_listener(
+            listener,
+            self.service,
+            self.accept,
+            self.connection,
+            self.connection_extensions,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1331,6 +1418,7 @@ impl Server {
             listener,
             connection: ConnectionConfig::default(),
             accept: AcceptConfig::default(),
+            connection_extensions: None,
         }
     }
 
@@ -1360,6 +1448,7 @@ pub struct BoundServer {
     listener: TcpListener,
     connection: ConnectionConfig,
     accept: AcceptConfig,
+    connection_extensions: Option<ConnectionExtensionsFn>,
 }
 
 impl BoundServer {
@@ -1542,6 +1631,48 @@ impl BoundServer {
         self
     }
 
+    /// Add request extensions computed once per accepted connection.
+    ///
+    /// `f` runs exactly once for every connection that completes the
+    /// (optional) TLS handshake, on that connection's task and before its
+    /// first request. It reads the connection's [`ConnectionInfo`], whose
+    /// extensions are empty on this built-in loop and hold what a custom loop
+    /// inserted under [`Server::serve_connection`]. It inserts into the
+    /// [`http::Extensions`] it is handed, which starts empty; those values join
+    /// the connection's extensions, replacing entries of the same type, and
+    /// are cloned into every request on the connection, where handlers read
+    /// them with `ctx.extensions().get::<T>()`. Use it for work that would
+    /// otherwise repeat per request — parsing an identity out of
+    /// `peer_certs()`, say.
+    ///
+    /// `f` cannot remove an entry or change the peer: [`PeerAddr`] /
+    /// `PeerCerts` on requests come only from the [`ConnectionInfo`] peer
+    /// fields, which the built-in loop sets from the transport, whatever `f`
+    /// inserts under those types. `f` is synchronous and cannot reject the
+    /// connection. To refuse requests, fail them in a handler or layer; to
+    /// refuse connections, write a custom loop around
+    /// [`Server::serve_connection`]. A panic in `f` is logged and drops that
+    /// one connection (under [`Server::serve_connection`], the future
+    /// resolves to [`CloseReason::Error`]); under `panic = "abort"` it aborts
+    /// the process. Calling this again replaces the function.
+    ///
+    /// ```rust,ignore
+    /// Server::bind("0.0.0.0:8443").await?
+    ///     .with_tls(tls_config)
+    ///     .with_connection_extensions(|conn, ext| {
+    ///         ext.insert(PeerIdentity::parse(conn.peer_certs()));
+    ///     })
+    ///     .serve(router).await?;
+    /// ```
+    #[must_use]
+    pub fn with_connection_extensions<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
+    {
+        self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
+        self
+    }
+
     /// Start serving requests with the given router.
     ///
     /// Runs until a non-transient accept error. For graceful shutdown use
@@ -1625,8 +1756,8 @@ impl BoundServer {
         self,
         service: ConnectRpcService<D>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serve_with_listener(self.listener, service, self.accept, self.connection, None).await?;
-        Ok(())
+        self.serve_with_service_and_shutdown(service, std::future::pending())
+            .await
     }
 
     /// Start serving requests with the given service, with graceful shutdown.
@@ -1647,6 +1778,7 @@ impl BoundServer {
             service,
             self.accept,
             self.connection,
+            self.connection_extensions,
             Some(Box::pin(signal)),
         )
         .await?;
@@ -2271,8 +2403,9 @@ pub(crate) type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>
 
 /// The built-in accept loop: serve connections from `listener` with `service`
 /// until `shutdown` resolves, then stop accepting, tell every live connection
-/// to drain, and wait for all of them. The only conditional code is the
-/// optional TLS handshake on the per-connection task. A fatal accept error
+/// to drain, and wait for all of them. `connection_extensions`, if set, runs
+/// on each connection's task between the (optional) TLS handshake and the
+/// first request. A fatal accept error
 /// detaches the live connections (they observe the dropped drain signal and
 /// wind down on their own) and returns the error; dropping the future aborts
 /// every connection task.
@@ -2281,6 +2414,7 @@ pub(crate) async fn serve_with_listener<S, B>(
     service: S,
     accept: AcceptConfig,
     config: ConnectionConfig,
+    connection_extensions: Option<ConnectionExtensionsFn>,
     shutdown: ShutdownSignal,
 ) -> std::io::Result<()>
 where
@@ -2361,6 +2495,7 @@ where
 
         let service = service.clone();
         let config = config.clone();
+        let connection_extensions = connection_extensions.clone();
         let global_shutdown = global_shutdown_future(global_shutdown_rx.clone());
 
         #[cfg(feature = "server-tls")]
@@ -2385,6 +2520,11 @@ where
                         peer.peer_certs = conn
                             .peer_certificates()
                             .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
+                        if let Some(f) = &connection_extensions
+                            && !f.apply(&mut peer)
+                        {
+                            return;
+                        }
                         serve_connection(tls_stream, peer, service, config, global_shutdown).await;
                     }
                     Ok(Err(err)) => {
@@ -2405,7 +2545,12 @@ where
             }
 
             // Plain TCP (no TLS or TLS not configured)
-            let peer = ConnectionInfo::new().with_peer_addr(remote_addr);
+            let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
+            if let Some(f) = &connection_extensions
+                && !f.apply(&mut peer)
+            {
+                return;
+            }
             serve_connection(stream, peer, service, config, global_shutdown).await;
         });
     }
@@ -5165,63 +5310,437 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // with_connection_extensions
+    // ========================================================================
+
+    /// Connect server-streaming request body for an empty message: one
+    /// envelope (flags 0, length 0) and nothing else.
+    const EMPTY_ENVELOPE: &[u8] = &[0, 0, 0, 0, 0];
+
+    /// What each handler invocation observed: the connection's tag and `PeerAddr`.
+    type Seen = Arc<Mutex<Vec<(Option<ConnTag>, Option<SocketAddr>)>>>;
+
+    /// Router with a unary `svc/Echo` and a server-streaming `svc/Stream`,
+    /// both recording the `ConnTag` and `PeerAddr` they observe.
+    fn tag_capturing_router() -> (Router, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let unary_seen = Arc::clone(&seen);
+        let stream_seen = Arc::clone(&seen);
+        let router = Router::new()
+            .route(
+                "svc",
+                "Echo",
+                crate::handler_fn(
+                    move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                        let seen = Arc::clone(&unary_seen);
+                        async move {
+                            seen.lock().unwrap().push((
+                                ctx.extensions().get::<ConnTag>().cloned(),
+                                ctx.peer_addr(),
+                            ));
+                            crate::Response::ok(buffa_types::Empty::default())
+                        }
+                    },
+                ),
+            )
+            .route_server_stream(
+                "svc",
+                "Stream",
+                crate::handler::streaming_handler_fn(
+                    move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                        let seen = Arc::clone(&stream_seen);
+                        async move {
+                            seen.lock().unwrap().push((
+                                ctx.extensions().get::<ConnTag>().cloned(),
+                                ctx.peer_addr(),
+                            ));
+                            crate::Response::stream_ok(futures::stream::iter([Ok(
+                                buffa_types::Empty::default(),
+                            )]))
+                        }
+                    },
+                ),
+            );
+        (router, seen)
+    }
+
+    /// POST a Connect request over h2 and drain the response; `streaming`
+    /// selects the server-streaming `svc/Stream` route and envelope framing.
+    async fn call_over_h2(
+        send_request: &mut h2::client::SendRequest<Bytes>,
+        addr: SocketAddr,
+        streaming: bool,
+    ) {
+        let (path, content_type, body) = if streaming {
+            ("svc/Stream", "application/connect+proto", EMPTY_ENVELOPE)
+        } else {
+            ("svc/Echo", "application/proto", &b""[..])
+        };
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://{addr}/{path}"))
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(())
+            .unwrap();
+        let (resp, mut send_body) = send_request.send_request(req, false).unwrap();
+        send_body.send_data(Bytes::from_static(body), true).unwrap();
+        let resp = resp.await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        drain_h2_body(resp).await;
+    }
+
+    /// The function runs once per connection (not per request), sees the peer
+    /// address and no certs on plaintext, and what it inserts reaches both
+    /// unary and streaming handlers on every request of that connection; a
+    /// `PeerAddr` it inserts does not displace the real one.
+    #[tokio::test]
+    async fn connection_extensions_run_once_per_connection_and_reach_handlers() {
+        let (router, seen) = tag_capturing_router();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // What the function observed per connection: (peer_addr, has_certs).
+        type Peers = Arc<Mutex<Vec<(Option<SocketAddr>, bool)>>>;
+        let peers: Peers = Arc::new(Mutex::new(Vec::new()));
+        let (calls_in_fn, peers_in_fn) = (Arc::clone(&calls), Arc::clone(&peers));
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_connection_extensions(move |conn, ext| {
+                let n = calls_in_fn.fetch_add(1, Ordering::SeqCst) + 1;
+                #[cfg(feature = "server-tls")]
+                let has_certs = conn.peer_certs().is_some();
+                #[cfg(not(feature = "server-tls"))]
+                let has_certs = false;
+                peers_in_fn
+                    .lock()
+                    .unwrap()
+                    .push((conn.peer_addr(), has_certs));
+                ext.insert(ConnTag(n));
+                // The transport's `PeerAddr` must win over this one.
+                ext.insert(PeerAddr("10.0.0.1:1".parse().unwrap()));
+            });
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        // Connection 1: three unary + two streaming requests on one h2
+        // connection.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client1 = tcp.local_addr().unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(h2_conn);
+        for i in 0..5 {
+            call_over_h2(&mut send_request, addr, i >= 3).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "once per connection");
+        drop(send_request);
+
+        // Connection 2 gets its own invocation and tag.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client2 = tcp.local_addr().unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(h2_conn);
+        call_over_h2(&mut send_request, addr, false).await;
+        call_over_h2(&mut send_request, addr, true).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(send_request);
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error")
+            .expect("serve error");
+
+        assert_eq!(
+            *peers.lock().unwrap(),
+            vec![(Some(client1), false), (Some(client2), false)],
+            "the function sees the real peer and no certs on plaintext"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 7);
+        for (tag, peer) in &seen[..5] {
+            assert_eq!(tag, &Some(ConnTag(1)));
+            assert_eq!(peer, &Some(client1), "must not displace PeerAddr");
+        }
+        for (tag, peer) in &seen[5..] {
+            assert_eq!(tag, &Some(ConnTag(2)));
+            assert_eq!(peer, &Some(client2));
+        }
+    }
+
+    /// A panicking function drops only its own connection: under
+    /// `Server::serve_connection` the future reports `Error` instead of
+    /// panicking, and the built-in loop keeps serving later connections.
+    #[tokio::test]
+    async fn connection_extensions_panic_drops_only_that_connection() {
+        let (io, _client) = tokio::io::duplex(1024);
+        let closed = Server::new(Router::new())
+            .with_connection_extensions(|_, _| panic!("connection extensions panic on purpose"))
+            .serve_connection(io, ConnectionInfo::new(), std::future::pending())
+            .await;
+        assert_eq!(closed.reason(), CloseReason::Error);
+
+        let (router, seen) = tag_capturing_router();
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_connection_extensions(move |_, ext| {
+                if first.swap(false, Ordering::SeqCst) {
+                    panic!("connection extensions panic on purpose");
+                }
+                ext.insert(ConnTag(1));
+            });
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let mut dropped = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), dropped.read_to_end(&mut response))
+            .await
+            .expect("first connection was not dropped")
+            .ok();
+        assert!(response.is_empty(), "first connection was served");
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tcp.local_addr().unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(h2_conn);
+        call_over_h2(&mut send_request, addr, false).await;
+        drop(send_request);
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error")
+            .expect("serve error");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some(ConnTag(1)), Some(client))]
+        );
+    }
+
+    /// Without a registered function, handlers see nothing extra and
+    /// `PeerAddr` is unchanged.
+    #[tokio::test]
+    async fn connection_extensions_absent_when_unset() {
+        let (router, seen) = tag_capturing_router();
+        let bound = Server::bind("127.0.0.1:0").await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tcp.local_addr().unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(h2_conn);
+        call_over_h2(&mut send_request, addr, false).await;
+        call_over_h2(&mut send_request, addr, true).await;
+        drop(send_request);
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error")
+            .expect("serve error");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(None, Some(client)), (None, Some(client))]
+        );
+    }
+
+    /// Over mTLS the function sees the verified client chain — the same DER
+    /// the handler later reads from `PeerCerts` — and can hand handlers a value
+    /// derived from it; a `PeerCerts` it inserts itself does not stick.
+    #[cfg(feature = "server-tls")]
+    #[tokio::test]
+    async fn connection_extensions_see_peer_certs_over_mtls() {
+        let (server_cfg, client_cfg, expected_client_der) = pki();
+
+        /// First DER byte length of the leaf, "parsed" once per connection.
+        #[derive(Clone, Debug, PartialEq)]
+        struct LeafLen(usize);
+
+        type Captured = Arc<Mutex<Option<(Option<LeafLen>, Option<usize>)>>>;
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let router = Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let cap = Arc::clone(&handler_captured);
+                    async move {
+                        *cap.lock().unwrap() = Some((
+                            ctx.extensions().get::<LeafLen>().cloned(),
+                            ctx.peer_certs().map(|c| c[0].as_ref().len()),
+                        ));
+                        crate::Response::ok(buffa_types::Empty::default())
+                    }
+                },
+            ),
+        );
+
+        let seen_certs: Arc<Mutex<Option<Vec<rustls::pki_types::CertificateDer<'static>>>>> =
+            Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen_certs);
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_tls(server_cfg)
+            .with_connection_extensions(move |conn, ext| {
+                let certs = conn.peer_certs().map(<[_]>::to_vec);
+                if let Some(leaf) = certs.as_deref().and_then(<[_]>::first) {
+                    ext.insert(LeafLen(leaf.as_ref().len()));
+                }
+                *slot.lock().unwrap() = certs;
+                let forged = rustls::pki_types::CertificateDer::from(vec![9u8]);
+                ext.insert(PeerCerts(vec![forged].into()));
+            });
+        let addr = bound.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    rx.await.ok();
+                })
+                .await
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(client_cfg);
+        let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.unwrap();
+        tls.write_all(ECHO_REQ).await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        assert!(
+            resp.starts_with(b"HTTP/1.1 2"),
+            "expected 2xx, got: {}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let seen_certs = seen_certs.lock().unwrap().take().expect("saw certs");
+        assert_eq!(seen_certs.len(), 1);
+        assert_eq!(seen_certs[0].as_ref(), expected_client_der.as_ref());
+        let (leaf_len, handler_len) = captured.lock().unwrap().take().expect("handler ran");
+        assert_eq!(leaf_len, Some(LeafLen(expected_client_der.as_ref().len())));
+        assert_eq!(handler_len, Some(expected_client_der.as_ref().len()));
+    }
+
+    /// `Server::serve_connection` applies the registered function too, so a
+    /// custom loop around it and `Server::serve` stamp requests identically.
+    /// The function sees what the loop inserted, and what it inserts replaces
+    /// an entry of the same type.
+    #[tokio::test]
+    async fn server_serve_connection_applies_connection_extensions() {
+        let (router, seen) = tag_capturing_router();
+        let server = Server::new(router).with_connection_extensions(|conn, ext| {
+            let from_loop = conn.extensions().get::<ConnTag>().map_or(0, |t| t.0);
+            ext.insert(ConnTag(from_loop + 8));
+        });
+        let (mut client_io, server_io) = tokio::io::duplex(64 << 10);
+        let mut info = ConnectionInfo::new().with_peer_addr("127.0.0.1:4242".parse().unwrap());
+        info.extensions_mut().insert(ConnTag(1));
+        let conn = tokio::spawn(server.serve_connection(server_io, info, std::future::pending()));
+        client_io.write_all(ECHO_REQ).await.unwrap();
+        let mut resp = Vec::new();
+        client_io.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(conn.await.unwrap().reason(), CloseReason::Closed);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some(ConnTag(9)), Some("127.0.0.1:4242".parse().unwrap()))]
+        );
+    }
+
+    /// Minimal mTLS PKI: one CA → one server leaf + one client leaf.
+    /// Returns (server_config, client_config, client_cert_der).
+    #[cfg(feature = "server-tls")]
+    fn pki() -> (
+        Arc<rustls::ServerConfig>,
+        Arc<rustls::ClientConfig>,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        use rcgen::CertificateParams;
+        use rcgen::KeyPair;
+        use rcgen::SanType;
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        // Idempotent; err = already installed (tests share process state).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+
+        let issue = |sans: &[SanType]| {
+            let k = KeyPair::generate().unwrap();
+            let mut p = CertificateParams::default();
+            p.subject_alt_names = sans.to_vec();
+            let c = p.signed_by(&k, &ca).unwrap();
+            (
+                CertificateDer::from(c.der().to_vec()),
+                PrivatePkcs8KeyDer::from(k.serialized_der().to_vec()).into(),
+            )
+        };
+
+        let (srv_cert, srv_key) = issue(&[SanType::DnsName("localhost".try_into().unwrap())]);
+        let (cli_cert, cli_key) = issue(&[]);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+        let roots = Arc::new(roots);
+
+        let cv = rustls::server::WebPkiClientVerifier::builder(Arc::clone(&roots))
+            .build()
+            .unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(cv)
+            .with_single_cert(vec![srv_cert], srv_key)
+            .unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![cli_cert.clone()], cli_key)
+            .unwrap();
+        (Arc::new(server), Arc::new(client), cli_cert)
+    }
+
     /// End-to-end mTLS: client presents a cert; handler reads it from
     /// `ctx.peer_certs()` and the DER bytes round-trip.
     #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn peer_certs_reach_handler() {
-        // Inline minimal mTLS PKI: one CA → one server leaf + one client leaf.
-        // Returns (server_config, client_config, client_cert_der).
-        fn pki() -> (
-            Arc<rustls::ServerConfig>,
-            Arc<rustls::ClientConfig>,
-            rustls::pki_types::CertificateDer<'static>,
-        ) {
-            use rcgen::CertificateParams;
-            use rcgen::KeyPair;
-            use rcgen::SanType;
-            use rustls::pki_types::CertificateDer;
-            use rustls::pki_types::PrivatePkcs8KeyDer;
-
-            // Idempotent; err = already installed (tests share process state).
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-            let ca_key = KeyPair::generate().unwrap();
-            let mut ca_params = CertificateParams::default();
-            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-            let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
-
-            let issue = |sans: &[SanType]| {
-                let k = KeyPair::generate().unwrap();
-                let mut p = CertificateParams::default();
-                p.subject_alt_names = sans.to_vec();
-                let c = p.signed_by(&k, &ca).unwrap();
-                (
-                    CertificateDer::from(c.der().to_vec()),
-                    PrivatePkcs8KeyDer::from(k.serialized_der().to_vec()).into(),
-                )
-            };
-
-            let (srv_cert, srv_key) = issue(&[SanType::DnsName("localhost".try_into().unwrap())]);
-            let (cli_cert, cli_key) = issue(&[]);
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
-            let roots = Arc::new(roots);
-
-            let cv = rustls::server::WebPkiClientVerifier::builder(Arc::clone(&roots))
-                .build()
-                .unwrap();
-            let server = rustls::ServerConfig::builder()
-                .with_client_cert_verifier(cv)
-                .with_single_cert(vec![srv_cert], srv_key)
-                .unwrap();
-            let client = rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_client_auth_cert(vec![cli_cert.clone()], cli_key)
-                .unwrap();
-            (Arc::new(server), Arc::new(client), cli_cert)
-        }
-
         let (server_cfg, client_cfg, expected_client_der) = pki();
 
         type CapturedCerts = Vec<rustls::pki_types::CertificateDer<'static>>;
