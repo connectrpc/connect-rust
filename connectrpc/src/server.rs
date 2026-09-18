@@ -87,6 +87,16 @@
 //! and two times the configured duration after the last activity. When both
 //! limits are configured, whichever fires first wins.
 //!
+//! # Custom Accept Loops
+//!
+//! [`Server::serve_connection`] serves one stream you accepted yourself with
+//! everything above, described by a [`ConnectionInfo`] you build (peer
+//! address, TLS client certificates, connection-scoped extensions), and
+//! reports why it ended as a [`ConnectionClosed`]. Use it when the accept
+//! step needs a policy the built-in loop does not have: admitting connections
+//! by client identity, capping them per tenant, listening on another
+//! transport, or placing connections on different runtimes.
+//!
 //! For transport and HTTP/2 knobs that [`Server`] does not expose, drive
 //! [`ConnectRpcService`] directly from a hyper accept loop. The crate guide's
 //! "Advanced transport configuration" section shows the `hyper_util` pattern.
@@ -160,26 +170,157 @@ pub struct PeerAddr(pub SocketAddr);
 #[derive(Clone, Debug)]
 pub struct PeerCerts(pub Arc<[rustls::pki_types::CertificateDer<'static>]>);
 
-/// Connection-scoped peer info captured once per accepted stream and
-/// inserted into every request's extensions by [`PeerInfo::insert_into`].
-#[derive(Clone, Debug)]
-struct PeerInfo {
-    addr: SocketAddr,
+/// What the server knows about one accepted connection before any request is
+/// served on it: the remote address, over TLS the verified client certificate
+/// chain, and connection-scoped [`http::Extensions`] that every request on
+/// the connection will carry.
+///
+/// The built-in accept loop builds one per connection after the (optional)
+/// TLS handshake. A custom accept loop (see [`Server::serve_connection`])
+/// builds its own with [`new`](Self::new) / [`with_peer_addr`](Self::with_peer_addr)
+/// and adds per-connection state — a parsed client identity, a tenant —
+/// through [`extensions_mut`](Self::extensions_mut) before serving. Every
+/// request then carries those extensions plus [`PeerAddr`] / `PeerCerts`,
+/// mirroring [`RequestContext`](crate::RequestContext) at connection scope.
+/// `PeerAddr` / `PeerCerts` always come from the typed fields here, never
+/// from `extensions`: the built-in loop sets those fields from the
+/// transport, and a custom loop answers for what it records in them.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct ConnectionInfo {
+    peer_addr: Option<SocketAddr>,
     #[cfg(feature = "server-tls")]
-    certs: Option<Arc<[rustls::pki_types::CertificateDer<'static>]>>,
+    peer_certs: Option<Arc<[rustls::pki_types::CertificateDer<'static>]>>,
+    extensions: http::Extensions,
 }
 
-impl PeerInfo {
-    /// Insert this connection's peer info as public extension types
-    /// ([`PeerAddr`], [`PeerCerts`]) so handlers can read them via
-    /// `ctx.peer_addr()` / `ctx.peer_certs()`.
-    fn insert_into(&self, ext: &mut http::Extensions) {
-        ext.insert(PeerAddr(self.addr));
-        #[cfg(feature = "server-tls")]
-        if let Some(certs) = &self.certs {
-            ext.insert(PeerCerts(Arc::clone(certs)));
-        }
+impl ConnectionInfo {
+    /// Describe a connection about which nothing is known yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
+
+    /// Record the peer's remote socket address.
+    #[must_use]
+    pub fn with_peer_addr(mut self, peer_addr: SocketAddr) -> Self {
+        self.peer_addr = Some(peer_addr);
+        self
+    }
+
+    /// Attach the TLS client certificate chain (leaf first) the peer
+    /// presented.
+    #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
+    #[must_use]
+    pub fn with_peer_certs(
+        mut self,
+        certs: Arc<[rustls::pki_types::CertificateDer<'static>]>,
+    ) -> Self {
+        self.peer_certs = Some(certs);
+        self
+    }
+
+    /// Remote socket address of the peer, or `None` when the transport has no
+    /// meaningful address (in-memory streams, Unix sockets). Reaches handlers
+    /// as [`PeerAddr`].
+    #[must_use]
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// TLS client certificate chain presented by the peer (leaf first), or
+    /// `None` for plaintext connections and TLS connections without client
+    /// authentication. Reaches handlers as [`PeerCerts`].
+    #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
+    #[must_use]
+    pub fn peer_certs(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        self.peer_certs.as_deref()
+    }
+
+    /// Connection-scoped extensions: cloned into every request served on this
+    /// connection, where handlers read them with `ctx.extensions().get::<T>()`.
+    #[must_use]
+    pub fn extensions(&self) -> &http::Extensions {
+        &self.extensions
+    }
+
+    /// Mutable access to the connection-scoped extensions, for code that owns
+    /// the accept step and computes per-connection state before serving.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.extensions
+    }
+
+    /// The extensions stamped into every request on this connection: the
+    /// connection's own extensions, with [`PeerAddr`] / [`PeerCerts`] set from
+    /// the peer fields. Whatever was put under those two types is discarded
+    /// first.
+    fn request_extensions(&self) -> http::Extensions {
+        let mut ext = self.extensions.clone();
+        ext.remove::<PeerAddr>();
+        if let Some(peer_addr) = self.peer_addr {
+            ext.insert(PeerAddr(peer_addr));
+        }
+        #[cfg(feature = "server-tls")]
+        {
+            ext.remove::<PeerCerts>();
+            if let Some(certs) = &self.peer_certs {
+                ext.insert(PeerCerts(Arc::clone(certs)));
+            }
+        }
+        ext
+    }
+}
+
+/// How a connection served by [`Server::serve_connection`] ended.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ConnectionClosed {
+    reason: CloseReason,
+}
+
+impl ConnectionClosed {
+    fn new(reason: CloseReason) -> Self {
+        Self { reason }
+    }
+
+    /// Why the connection ended.
+    #[must_use]
+    pub fn reason(&self) -> CloseReason {
+        self.reason
+    }
+}
+
+/// Why a connection ended; see [`ConnectionClosed::reason`].
+///
+/// When a shutdown signal or retirement trigger tells a connection to wind
+/// down, that reason is final. A retirement reason ([`MaxAge`](Self::MaxAge),
+/// [`Idle`](Self::Idle), [`MaxRequests`](Self::MaxRequests)) is reported
+/// whether the connection drained within the grace period or was closed when
+/// the grace period expired, and even if the shutdown signal arrived while it
+/// drained. An error while winding down also reports that reason, not
+/// [`Error`](Self::Error): a peer that fails mid-drain, or one whose protocol
+/// was not yet detected (it had sent no bytes, say), ends that way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CloseReason {
+    /// The connection ended on its own before anything told it to wind down:
+    /// the peer closed it, or an HTTP/1.1 connection without keep-alive
+    /// finished its request.
+    Closed,
+    /// The shutdown signal told the connection to wind down before any
+    /// retirement trigger did.
+    Shutdown,
+    /// Retired on reaching its maximum age.
+    MaxAge,
+    /// Retired after staying idle for the configured duration.
+    Idle,
+    /// Retired after serving the configured number of requests.
+    MaxRequests,
+    /// A connection-level I/O or protocol error ended it before anything told
+    /// it to wind down.
+    Error,
 }
 
 /// Default TLS handshake timeout.
@@ -692,6 +833,56 @@ impl Server {
             idle: self.connection_idle_config(),
             requests: self.request_retirement_config(),
         }
+    }
+
+    /// Serve one already-accepted (and, over TLS, already-handshaken) stream
+    /// with this server's service and every connection setting configured on
+    /// it: HTTP/1.1 / HTTP/2 settings, keepalive, header-read timeout, max
+    /// age (jittered) / idle / request-count retirement with their grace,
+    /// panic isolation, and `PeerAddr` / `PeerCerts` / `info.extensions()`
+    /// on every request. When `shutdown` resolves the connection drains
+    /// (HTTP/2 GOAWAY, HTTP/1.1 keep-alive off) and the future completes once
+    /// in-flight requests end; a retirement grace period never caps that
+    /// drain. The output says why the connection ended.
+    ///
+    /// This is the building block for a custom accept loop: accept and
+    /// authenticate the stream yourself (admit or refuse it, cap per tenant,
+    /// pick a runtime), then spawn this future wherever it should run. It
+    /// must be polled inside a tokio runtime with IO and time enabled;
+    /// timers, hyper's HTTP/2 stream tasks and every handler run on whichever
+    /// runtime polls it, while the stream stays registered with the runtime
+    /// that accepted it, which must outlive the connection. TLS is the
+    /// caller's job here — [`Server::with_tls`] only affects
+    /// [`serve`](Self::serve). Dropping the future closes the connection
+    /// abruptly.
+    pub fn serve_connection<S, F>(
+        &self,
+        io: S,
+        info: ConnectionInfo,
+        shutdown: F,
+    ) -> impl Future<Output = ConnectionClosed> + Send + 'static + use<S, F>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let service: WrappedService<_> = ServiceBuilder::new()
+            .layer(CatchPanicLayer::custom(panic_handler as fn(_) -> _))
+            .service(self.service.clone());
+        let mut retirement = self.retirement_config();
+        // Each `RandomState` carries fresh keys, so this is a uniform sample.
+        retirement.age = retirement
+            .age
+            .map(|config| config.with_jitter(RandomState::new().hash_one(info.peer_addr)));
+        serve_accepted_stream(
+            io,
+            info,
+            Arc::new(service),
+            self.http1_keep_alive,
+            self.header_read_timeout,
+            Box::pin(shutdown),
+            retirement,
+            self.http2,
+        )
     }
 
     /// Get a reference to the underlying router.
@@ -1454,26 +1645,31 @@ struct RequestRetirementConfig {
 /// Generic over the IO type so it works for both plain TCP and TLS streams.
 /// Logs connection outcome at trace level.
 ///
-/// `peer` is inserted into every request's extensions so handlers can read
-/// the remote address (and TLS client cert chain, if any) via
-/// `ctx.peer_addr()` / `ctx.peer_certs()`.
+/// `peer`'s extensions plus `PeerAddr` / `PeerCerts` are inserted into every
+/// request's extensions so handlers can read them via `ctx.peer_addr()` /
+/// `ctx.peer_certs()` / `ctx.extensions()`.
 // Each accepted-connection knob is forwarded verbatim from the accept loop;
 // see the matching allow on `serve_with_listener`.
 #[allow(clippy::too_many_arguments)]
 async fn serve_accepted_stream<D, S>(
     io: S,
-    peer: PeerInfo,
+    peer: ConnectionInfo,
     service: Arc<WrappedService<D>>,
     http1_keep_alive: bool,
     header_read_timeout: Option<Duration>,
-    global_shutdown: watch::Receiver<bool>,
+    global_shutdown: RetirementSignal,
     retirement: RetirementConfig,
     http2: Http2Config,
-) where
+) -> ConnectionClosed
+where
     D: Dispatcher,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::trace!(remote_addr = %peer.addr, "Accepted new connection");
+    let remote_addr = peer.peer_addr();
+    tracing::trace!(
+        remote_addr = remote_addr.map(tracing::field::display),
+        "Accepted new connection"
+    );
 
     // In-flight accounting is only needed when idle reaping is enabled; when it
     // is off there is no per-request bookkeeping overhead.
@@ -1500,10 +1696,12 @@ async fn serve_accepted_stream<D, S>(
         None => (None, None),
     };
 
-    let peer_for_requests = peer.clone();
+    // Computed once, before hyper reads the first request; cloned into each
+    // request below.
+    let request_extensions = peer.request_extensions();
     let activity_for_requests = activity.clone();
-    let svc = hyper::service::service_fn(move |mut req| {
-        peer_for_requests.insert_into(req.extensions_mut());
+    let svc = hyper::service::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
+        req.extensions_mut().extend(request_extensions.clone());
         if let Some(counter) = &request_counter {
             counter.record_request();
         }
@@ -1533,13 +1731,13 @@ async fn serve_accepted_stream<D, S>(
     let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
     serve_connection_with_lifecycle(
         conn,
-        peer.addr,
+        remote_addr,
         global_shutdown,
         retirement.age,
         retirement.idle.zip(activity),
         request_retire,
     )
-    .await;
+    .await
 }
 
 /// Per-connection request counter that triggers retirement once the configured
@@ -1603,8 +1801,8 @@ fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: Http2Config
 
 fn serve_connection_with_lifecycle<C>(
     conn: C,
-    remote_addr: SocketAddr,
-    global_shutdown: watch::Receiver<bool>,
+    remote_addr: Option<SocketAddr>,
+    global_shutdown: RetirementSignal,
     connection_age: Option<ConnectionAgeConfig>,
     connection_idle: Option<(IdleConfig, Arc<ConnectionActivity>)>,
     request_retire: Option<(watch::Receiver<bool>, Duration)>,
@@ -1616,7 +1814,7 @@ where
     ConnectionLifecycle {
         conn: Box::pin(conn),
         remote_addr,
-        global_shutdown: global_shutdown_future(global_shutdown),
+        global_shutdown,
         age: connection_age.map(|config| (Box::pin(tokio::time::sleep(config.max_age)), config)),
         idle: connection_idle.map(|(config, activity)| {
             let armed_epoch = activity.snapshot().1;
@@ -1649,14 +1847,15 @@ fn global_shutdown_future(
     })
 }
 
-/// A boxed future that resolves when a per-connection retirement trigger (such
-/// as the request-count limit) fires.
+/// A boxed future that resolves when the connection should begin graceful
+/// shutdown: the shutdown signal, or a per-connection retirement trigger such
+/// as the request-count limit.
 type RetirementSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 struct ConnectionLifecycle<C: GracefulConnection> {
     conn: Pin<Box<C>>,
-    remote_addr: SocketAddr,
-    global_shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    remote_addr: Option<SocketAddr>,
+    global_shutdown: RetirementSignal,
     age: Option<(Pin<Box<tokio::time::Sleep>>, ConnectionAgeConfig)>,
     idle: Option<IdleTracker>,
     /// Resolves when the per-connection request count reaches its limit; the
@@ -1679,7 +1878,11 @@ struct IdleTracker {
 
 enum ConnectionLifecycleState {
     Serving,
-    GlobalDraining,
+    /// Draining with no deadline after the shutdown signal; `reason` is
+    /// `Shutdown` unless a retirement trigger had already fired.
+    GlobalDraining {
+        reason: CloseReason,
+    },
     /// Draining after a per-connection retirement trigger (max age, max idle,
     /// or max requests): graceful shutdown has been issued and the connection
     /// is given a grace window to finish in-flight work before being
@@ -1687,6 +1890,7 @@ enum ConnectionLifecycleState {
     Draining {
         grace: Pin<Box<tokio::time::Sleep>>,
         duration: Duration,
+        reason: CloseReason,
     },
 }
 
@@ -1695,22 +1899,33 @@ where
     C: GracefulConnection,
     C::Error: std::fmt::Display,
 {
-    type Output = ();
+    type Output = ConnectionClosed;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ConnectionClosed> {
         let this = self.get_mut();
+        let remote_addr = this.remote_addr.map(tracing::field::display);
 
         loop {
             match &mut this.state {
                 ConnectionLifecycleState::Serving => {
                     if let Poll::Ready(result) = this.conn.as_mut().poll(cx) {
-                        log_connection_result(this.remote_addr, result);
-                        return Poll::Ready(());
+                        let reason = if result.is_ok() {
+                            CloseReason::Closed
+                        } else {
+                            CloseReason::Error
+                        };
+                        return Poll::Ready(log_connection_result(
+                            this.remote_addr,
+                            result,
+                            reason,
+                        ));
                     }
 
                     if let Poll::Ready(()) = this.global_shutdown.as_mut().poll(cx) {
                         this.conn.as_mut().graceful_shutdown();
-                        this.state = ConnectionLifecycleState::GlobalDraining;
+                        this.state = ConnectionLifecycleState::GlobalDraining {
+                            reason: CloseReason::Shutdown,
+                        };
                         continue;
                     }
 
@@ -1718,7 +1933,7 @@ where
                         && age.as_mut().poll(cx).is_ready()
                     {
                         tracing::trace!(
-                            remote_addr = %this.remote_addr,
+                            remote_addr,
                             max_age = ?config.max_age,
                             grace = ?config.grace,
                             "Connection reached maximum age; starting graceful shutdown",
@@ -1727,6 +1942,7 @@ where
                         this.state = ConnectionLifecycleState::Draining {
                             grace: Box::pin(tokio::time::sleep(config.grace)),
                             duration: config.grace,
+                            reason: CloseReason::MaxAge,
                         };
                         continue;
                     }
@@ -1737,7 +1953,7 @@ where
                         let (in_flight, epoch) = idle.activity.snapshot();
                         if in_flight == 0 && epoch == idle.armed_epoch {
                             tracing::trace!(
-                                remote_addr = %this.remote_addr,
+                                remote_addr,
                                 idle = ?idle.config.idle,
                                 grace = ?idle.config.grace,
                                 "Connection idle; starting graceful shutdown",
@@ -1746,6 +1962,7 @@ where
                             this.state = ConnectionLifecycleState::Draining {
                                 grace: Box::pin(tokio::time::sleep(idle.config.grace)),
                                 duration: idle.config.grace,
+                                reason: CloseReason::Idle,
                             };
                             continue;
                         }
@@ -1764,7 +1981,7 @@ where
                     {
                         let grace = *grace;
                         tracing::trace!(
-                            remote_addr = %this.remote_addr,
+                            remote_addr,
                             grace = ?grace,
                             "Connection reached maximum requests; starting graceful shutdown",
                         );
@@ -1772,37 +1989,49 @@ where
                         this.state = ConnectionLifecycleState::Draining {
                             grace: Box::pin(tokio::time::sleep(grace)),
                             duration: grace,
+                            reason: CloseReason::MaxRequests,
                         };
                         continue;
                     }
 
                     return Poll::Pending;
                 }
-                ConnectionLifecycleState::GlobalDraining => {
+                ConnectionLifecycleState::GlobalDraining { reason } => {
                     if let Poll::Ready(result) = this.conn.as_mut().poll(cx) {
-                        log_connection_result(this.remote_addr, result);
-                        return Poll::Ready(());
+                        return Poll::Ready(log_connection_result(
+                            this.remote_addr,
+                            result,
+                            *reason,
+                        ));
                     }
                     return Poll::Pending;
                 }
-                ConnectionLifecycleState::Draining { grace, duration } => {
+                ConnectionLifecycleState::Draining {
+                    grace,
+                    duration,
+                    reason,
+                } => {
+                    let reason = *reason;
                     if let Poll::Ready(result) = this.conn.as_mut().poll(cx) {
-                        log_connection_result(this.remote_addr, result);
-                        return Poll::Ready(());
+                        return Poll::Ready(log_connection_result(
+                            this.remote_addr,
+                            result,
+                            reason,
+                        ));
                     }
 
                     if let Poll::Ready(()) = this.global_shutdown.as_mut().poll(cx) {
-                        this.state = ConnectionLifecycleState::GlobalDraining;
+                        this.state = ConnectionLifecycleState::GlobalDraining { reason };
                         continue;
                     }
 
                     if grace.as_mut().poll(cx).is_ready() {
                         tracing::trace!(
-                            remote_addr = %this.remote_addr,
+                            remote_addr,
                             grace = ?duration,
                             "Connection retirement grace expired; closing connection",
                         );
-                        return Poll::Ready(());
+                        return Poll::Ready(ConnectionClosed::new(reason));
                     }
 
                     return Poll::Pending;
@@ -1812,19 +2041,22 @@ where
     }
 }
 
-fn log_connection_result<E: std::fmt::Display>(remote_addr: SocketAddr, result: Result<(), E>) {
+/// Log how hyper's connection future ended and report `reason`. A connection
+/// that was told to wind down passes that reason even for an error result:
+/// the error is then a consequence of winding down (hyper-util reports a
+/// graceful shutdown that arrives before protocol detection as one) or a
+/// failure mid-drain, and is only logged.
+fn log_connection_result<E: std::fmt::Display>(
+    remote_addr: Option<SocketAddr>,
+    result: Result<(), E>,
+    reason: CloseReason,
+) -> ConnectionClosed {
+    let remote_addr = remote_addr.map(tracing::field::display);
     match result {
-        Ok(()) => {
-            tracing::trace!(remote_addr = %remote_addr, "Connection completed normally");
-        }
-        Err(err) => {
-            tracing::trace!(
-                remote_addr = %remote_addr,
-                error = %err,
-                "Connection ended with error",
-            );
-        }
+        Ok(()) => tracing::trace!(remote_addr, "Connection completed normally"),
+        Err(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
     }
+    ConnectionClosed::new(reason)
 }
 
 fn jitter_connection_age(age: Duration, sample: u64) -> Duration {
@@ -1951,7 +2183,7 @@ async fn serve_with_listener<D: Dispatcher>(
         }
 
         let service = Arc::clone(&service);
-        let global_shutdown = global_shutdown_rx.clone();
+        let global_shutdown = global_shutdown_future(global_shutdown_rx.clone());
         connection_sequence = connection_sequence.wrapping_add(1);
         // Max age gets per-connection jitter; idle reaping and request-count
         // retirement are reactive and need none.
@@ -1980,13 +2212,10 @@ async fn serve_with_listener<D: Dispatcher>(
                         // since we move the stream into hyper but need the certs
                         // for every request on this connection).
                         let (_, conn) = tls_stream.get_ref();
-                        let certs = conn.peer_certificates().map(|chain| -> Arc<[_]> {
-                            chain.iter().map(|c| c.clone().into_owned()).collect()
-                        });
-                        let peer = PeerInfo {
-                            addr: remote_addr,
-                            certs,
-                        };
+                        let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
+                        peer.peer_certs = conn
+                            .peer_certificates()
+                            .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
                         serve_accepted_stream(
                             tls_stream,
                             peer,
@@ -2017,11 +2246,7 @@ async fn serve_with_listener<D: Dispatcher>(
             }
 
             // Plain TCP (no TLS or TLS not configured)
-            let peer = PeerInfo {
-                addr: remote_addr,
-                #[cfg(feature = "server-tls")]
-                certs: None,
-            };
+            let peer = ConnectionInfo::new().with_peer_addr(remote_addr);
             serve_accepted_stream(
                 stream,
                 peer,
@@ -4205,6 +4430,248 @@ mod tests {
             .expect("handler should have captured PeerAddr");
         // The server sees the client's local_addr() as the remote peer.
         assert_eq!(peer, client_local);
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ConnTag(usize);
+
+    #[test]
+    fn connection_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ConnectionInfo>();
+        assert_send_sync::<ConnectionClosed>();
+    }
+
+    /// `request_extensions` sets the built-ins from the transport over the
+    /// connection's own extensions: a loop can neither replace `PeerAddr` /
+    /// `PeerCerts` nor supply them when the transport saw none, but its own
+    /// values survive.
+    #[test]
+    fn builtins_are_authoritative_over_inserted_extensions() {
+        let real: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let spoofed: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let mut info = ConnectionInfo::new().with_peer_addr(real);
+        info.extensions_mut().insert(PeerAddr(spoofed));
+        info.extensions_mut().insert(ConnTag(7));
+        let ext = info.request_extensions();
+        assert_eq!(ext.get::<PeerAddr>().unwrap().0, real);
+        assert_eq!(ext.get::<ConnTag>(), Some(&ConnTag(7)));
+
+        let ext = ConnectionInfo::new()
+            .with_peer_addr(real)
+            .request_extensions();
+        assert_eq!(ext.get::<PeerAddr>().unwrap().0, real);
+        assert!(ext.get::<ConnTag>().is_none());
+        #[cfg(feature = "server-tls")]
+        assert!(ext.get::<PeerCerts>().is_none());
+
+        // No address, no `PeerAddr` — even if something inserted one.
+        let mut info = ConnectionInfo::new();
+        info.extensions_mut().insert(PeerAddr(spoofed));
+        assert!(info.request_extensions().get::<PeerAddr>().is_none());
+    }
+
+    /// A `PeerCerts` inserted into the extensions of a connection without a
+    /// verified client chain does not reach requests; a real chain does.
+    #[cfg(feature = "server-tls")]
+    #[test]
+    fn extensions_cannot_forge_peer_certs() {
+        let forged = PeerCerts(vec![rustls::pki_types::CertificateDer::from(vec![9u8])].into());
+        let mut info = ConnectionInfo::new().with_peer_addr("127.0.0.1:1".parse().unwrap());
+        info.extensions_mut().insert(forged);
+        assert!(info.request_extensions().get::<PeerCerts>().is_none());
+
+        let der = rustls::pki_types::CertificateDer::from(vec![1u8, 2, 3]);
+        let info = ConnectionInfo::new().with_peer_certs(vec![der.clone()].into());
+        assert_eq!(info.peer_certs().unwrap(), &[der.clone()][..]);
+        let ext = info.request_extensions();
+        assert_eq!(&ext.get::<PeerCerts>().unwrap().0[..], &[der][..]);
+    }
+
+    /// A hand-written accept loop over `Server::serve_connection`: the
+    /// connection-scoped extension and the transport's `PeerAddr` reach the
+    /// handler (a spoofed `PeerAddr` does not), the server's max connection
+    /// age retires the connection, and the output names that reason; a
+    /// connection the peer closes reports `Closed`.
+    #[tokio::test(start_paused = true)]
+    async fn serve_connection_custom_loop_applies_max_age_and_reports_reason() {
+        type Seen = Arc<Mutex<Vec<(Option<SocketAddr>, Option<ConnTag>)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let handler_seen = Arc::clone(&seen);
+        let router = Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let seen = Arc::clone(&handler_seen);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push((ctx.peer_addr(), ctx.extensions().get::<ConnTag>().cloned()));
+                        crate::Response::ok(buffa_types::Empty::default())
+                    }
+                },
+            ),
+        );
+        let server = Arc::new(Server::new(router).with_max_connection_age(Duration::from_secs(10)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let loop_server = Arc::clone(&server);
+        let serve = tokio::spawn(async move {
+            let mut reasons = Vec::new();
+            for n in 1..=2 {
+                let (stream, peer) = listener.accept().await.unwrap();
+                let mut info = ConnectionInfo::new().with_peer_addr(peer);
+                info.extensions_mut().insert(ConnTag(n));
+                info.extensions_mut()
+                    .insert(PeerAddr("10.9.8.7:6".parse().unwrap()));
+                let closed = loop_server
+                    .serve_connection(stream, info, std::future::pending())
+                    .await;
+                reasons.push(closed.reason());
+            }
+            reasons
+        });
+
+        // Connection 1: keep-alive; retired by max age.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client1 = stream.local_addr().unwrap();
+        stream.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        let resp = read_http1_response(&mut stream).await;
+        assert!(resp.starts_with(b"HTTP/1.1 2"));
+        tokio::time::advance(Duration::from_secs(12)).await;
+        yield_to_tasks().await;
+        let mut buf = [0; 1];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0, "not retired");
+        drop(stream);
+
+        // Connection 2: `Connection: close`; ends on its own.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client2 = stream.local_addr().unwrap();
+        stream.write_all(ECHO_REQ).await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 2"));
+
+        let reasons = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("loop did not finish")
+            .unwrap();
+        assert_eq!(reasons, vec![CloseReason::MaxAge, CloseReason::Closed]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (Some(client1), Some(ConnTag(1))),
+                (Some(client2), Some(ConnTag(2)))
+            ]
+        );
+    }
+
+    /// `Server::serve_connection` reports `Shutdown` when the shutdown future
+    /// drains the connection and `MaxRequests` when the request count retires
+    /// it.
+    #[tokio::test]
+    async fn serve_connection_reports_shutdown_and_max_requests() {
+        let router = || {
+            Router::new().route(
+                "svc",
+                "Echo",
+                crate::handler_fn(
+                    |_ctx: crate::RequestContext, _req: buffa_types::Empty| async move {
+                        crate::Response::ok(buffa_types::Empty::default())
+                    },
+                ),
+            )
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Shutdown: an idle keep-alive connection drains when the signal fires.
+        let server = Server::new(router());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let conn = tokio::spawn(server.serve_connection(
+            accepted,
+            ConnectionInfo::new().with_peer_addr(peer),
+            async move {
+                rx.await.ok();
+            },
+        ));
+        stream.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        assert!(
+            read_http1_response(&mut stream)
+                .await
+                .starts_with(b"HTTP/1.1 2")
+        );
+        tx.send(()).unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.reason(), CloseReason::Shutdown);
+        let mut buf = [0; 1];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+
+        // MaxRequests: one request allowed, then the connection is retired.
+        let server =
+            Server::new(router()).with_max_requests_per_connection(NonZeroU64::new(1).unwrap());
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let conn = tokio::spawn(server.serve_connection(
+            accepted,
+            ConnectionInfo::new().with_peer_addr(peer),
+            std::future::pending(),
+        ));
+        stream.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        assert!(
+            read_http1_response(&mut stream)
+                .await
+                .starts_with(b"HTTP/1.1 2")
+        );
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0, "not retired");
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.reason(), CloseReason::MaxRequests);
+    }
+
+    /// A connection told to wind down before its peer sent a byte reports
+    /// why, not `Error`; a peer that hangs up reports `Closed`, and a
+    /// malformed request reports `Error`.
+    #[tokio::test(start_paused = true)]
+    async fn serve_connection_close_reason_before_first_request() {
+        fn unstarted(
+            server: &Server,
+            shutdown: impl Future<Output = ()> + Send + 'static,
+        ) -> (
+            impl Future<Output = ConnectionClosed>,
+            tokio::io::DuplexStream,
+        ) {
+            let (io, client) = tokio::io::duplex(1024);
+            let conn = server.serve_connection(io, ConnectionInfo::new(), shutdown);
+            (conn, client)
+        }
+        let plain = Server::new(Router::new());
+        let (conn, _client) = unstarted(&plain, std::future::ready(()));
+        assert_eq!(conn.await.reason(), CloseReason::Shutdown);
+
+        let idle = Server::new(Router::new()).with_max_connection_idle(Duration::from_secs(1));
+        let (conn, _client) = unstarted(&idle, std::future::pending());
+        assert_eq!(conn.await.reason(), CloseReason::Idle);
+
+        let aged = Server::new(Router::new()).with_max_connection_age(Duration::from_secs(1));
+        let (conn, _client) = unstarted(&aged, std::future::pending());
+        assert_eq!(conn.await.reason(), CloseReason::MaxAge);
+
+        let (conn, client) = unstarted(&plain, std::future::pending());
+        drop(client);
+        assert_eq!(conn.await.reason(), CloseReason::Closed);
+
+        let (conn, mut client) = unstarted(&plain, std::future::pending());
+        client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
+        assert_eq!(conn.await.reason(), CloseReason::Error);
     }
 
     /// End-to-end mTLS: client presents a cert; handler reads it from
