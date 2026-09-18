@@ -5,11 +5,13 @@ body: |-
     one already-accepted (and, over TLS, already-handshaken) stream with the
     server's service and every connection setting configured on it — HTTP/1.1 /
     HTTP/2 settings, keepalive, header-read timeout, max age / idle / request
-    retirement, graceful GOAWAY on `shutdown`, panic isolation — on whichever
-    runtime polls it, and resolves to a `ConnectionClosed` whose `reason()`
-    (`CloseReason::{Closed, Shutdown, MaxAge, Idle, MaxRequests, Error}`) says
-    how it ended. The new public `ConnectionInfo` (also at the crate root)
-    describes the connection: `peer_addr()`, `peer_certs()`, and
+    retirement, graceful GOAWAY on `shutdown`, panic isolation — and resolves
+    to a `ConnectionClosed` whose `reason()` says how it ended
+    (`CloseReason::{Closed, Shutdown, MaxAge, Idle, MaxRequests, Error}`).
+    It runs on whichever runtime polls it; a tokio socket's I/O stays on the
+    runtime that created it until moved with `into_std` /
+    `TcpStream::from_std`. The new public `ConnectionInfo` (also at the crate
+    root) describes the connection: `peer_addr()`, `peer_certs()`, and
     connection-scoped `extensions_mut()` that the loop fills once — a parsed
     client-certificate identity, say — and that are cloned into every request
     on the connection. `PeerAddr` / `PeerCerts` on requests always come from

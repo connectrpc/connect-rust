@@ -97,14 +97,17 @@
 //! [`Server::serve_connection`] serves one stream you accepted yourself with
 //! everything above, described by a [`ConnectionInfo`] you build (peer
 //! address, TLS client certificates, connection-scoped extensions), and
-//! reports why it ended as a [`ConnectionClosed`]. Use it when the accept
+//! reports why it ended as a [`ConnectionClosed`]; the free
+//! [`serve_connection`] does the same for any tower HTTP service (an
+//! `axum::Router`, say) under a [`ConnectionConfig`]. Use them when the accept
 //! step needs a policy the built-in loop does not have: admitting connections
 //! by client identity, capping them per tenant, listening on another
 //! transport, or placing connections on different runtimes.
 //!
-//! For transport and HTTP/2 knobs that [`Server`] does not expose, drive
-//! [`ConnectRpcService`] directly from a hyper accept loop. The crate guide's
-//! "Advanced transport configuration" section shows the `hyper_util` pattern.
+//! For hyper connection-builder knobs that [`ConnectionConfig`] does not
+//! expose, drive [`ConnectRpcService`] directly from a hyper accept loop (and
+//! own the whole lifecycle yourself). The crate guide's "Raw hyper" section
+//! shows the `hyper_util` pattern.
 
 use std::any::Any;
 use std::collections::hash_map::RandomState;
@@ -135,8 +138,8 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tower::Service;
-use tower::ServiceBuilder;
-use tower_http::catch_panic::CatchPanicLayer;
+use tower::ServiceExt;
+use tower_http::catch_panic::CatchPanic;
 
 use crate::codec::content_type;
 use crate::dispatcher::Dispatcher;
@@ -323,8 +326,13 @@ pub enum CloseReason {
     Idle,
     /// Retired after serving the configured number of requests.
     MaxRequests,
-    /// A connection-level I/O or protocol error ended it before anything told
-    /// it to wind down.
+    /// Something failed before anything told the connection to wind down:
+    ///
+    /// - an I/O or protocol error;
+    /// - an expired HTTP/1.1 header-read timeout;
+    /// - an HTTP/2 keepalive ping that got no reply within
+    ///   [`with_http2_keepalive_timeout`](ConnectionConfig::with_http2_keepalive_timeout);
+    /// - a panic while an HTTP/1.1 response body was produced.
     Error,
 }
 
@@ -722,6 +730,18 @@ impl ConnectionConfig {
     /// (a grace period shared with maximum age) for any straggling request
     /// before force-closing it.
     ///
+    /// A request is in flight until its response body has been sent, so a
+    /// long streaming response keeps its connection busy, even while it waits
+    /// for the client's flow-control window. Idle reaping therefore does not
+    /// bound a client that stops reading;
+    /// [`with_max_connection_age`](Self::with_max_connection_age) does.
+    ///
+    /// An HTTP/2 stream upgraded with extended CONNECT (such as a WebSocket)
+    /// stops counting once its response head is sent. A connection that
+    /// carries only such streams is reaped, and closed when the grace period
+    /// ends, even while they carry traffic. Do not enable idle reaping on a
+    /// server that hosts HTTP/2 WebSockets.
+    ///
     /// The idle window is evaluated lazily — it is re-checked when the timer
     /// expires rather than re-armed at the instant of each request — so a
     /// connection is retired between one and two times `duration` after its
@@ -916,17 +936,17 @@ impl ConnectionConfig {
 /// may take. Empty without the `server-tls` feature, so holders and the
 /// accept loop carry one field in every feature set.
 #[derive(Clone, Default)]
-struct AcceptConfig {
+pub(crate) struct AcceptConfig {
     #[cfg(feature = "server-tls")]
-    tls: Option<Arc<rustls::ServerConfig>>,
+    pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     /// `None` means [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`].
     #[cfg(feature = "server-tls")]
-    tls_handshake_timeout: Option<Duration>,
+    pub(crate) tls_handshake_timeout: Option<Duration>,
 }
 
 impl AcceptConfig {
     #[cfg(feature = "server-tls")]
-    fn tls_handshake_timeout(&self) -> Duration {
+    pub(crate) fn tls_handshake_timeout(&self) -> Duration {
         self.tls_handshake_timeout
             .unwrap_or(DEFAULT_TLS_HANDSHAKE_TIMEOUT)
     }
@@ -1245,26 +1265,16 @@ impl Server {
         self
     }
 
-    /// Serve one already-accepted (and, over TLS, already-handshaken) stream
-    /// with this server's service and [`ConnectionConfig`]: HTTP/1.1 / HTTP/2
-    /// settings, keepalive, header-read timeout, max age (jittered) / idle /
-    /// request-count retirement with their grace, panic isolation, and
-    /// `PeerAddr` / `PeerCerts` / `info.extensions()` on every request. When
-    /// `shutdown` resolves the connection drains (HTTP/2 GOAWAY, HTTP/1.1
-    /// keep-alive off) and the future completes once in-flight requests end;
-    /// a retirement grace period never caps that drain. The output says why
-    /// the connection ended.
+    /// The method form of [`serve_connection`]: serve one already-accepted
+    /// (and, over TLS, already-handshaken) stream with this server's service
+    /// and [`ConnectionConfig`], on whichever runtime polls the future, and
+    /// report why it ended. See the free function for the runtime rules.
     ///
     /// This is the building block for a custom accept loop: accept and
     /// authenticate the stream yourself (admit or refuse it, cap per tenant,
-    /// pick a runtime), then spawn this future wherever it should run. It
-    /// must be polled inside a tokio runtime with IO and time enabled;
-    /// timers, hyper's HTTP/2 stream tasks and every handler run on whichever
-    /// runtime polls it, while the stream stays registered with the runtime
-    /// that accepted it, which must outlive the connection. TLS is the
-    /// caller's job here — [`Server::with_tls`] only affects
-    /// [`serve`](Self::serve). Dropping the future closes the connection
-    /// abruptly.
+    /// pick a runtime), then spawn this future on that runtime, with the socket
+    /// moved there too. TLS is the caller's job here — [`Server::with_tls`]
+    /// only affects [`serve`](Self::serve).
     pub fn serve_connection<S, F>(
         &self,
         io: S,
@@ -1275,15 +1285,12 @@ impl Server {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        let service: WrappedService<_> = ServiceBuilder::new()
-            .layer(CatchPanicLayer::custom(panic_handler as fn(_) -> _))
-            .service(self.service.clone());
-        serve_accepted_stream(
+        serve_connection(
             io,
             info,
-            Arc::new(service),
+            self.service.clone(),
             self.connection.clone(),
-            Box::pin(shutdown),
+            shutdown,
         )
     }
 
@@ -1308,7 +1315,8 @@ impl Server {
         };
         tracing::info!("ConnectRPC server listening on {scheme}://{addr}");
 
-        serve_with_listener(listener, self.service, self.accept, self.connection, None).await
+        serve_with_listener(listener, self.service, self.accept, self.connection, None).await?;
+        Ok(())
     }
 
     /// Wrap a pre-bound [`TcpListener`].
@@ -1536,8 +1544,16 @@ impl BoundServer {
 
     /// Start serving requests with the given router.
     ///
-    /// Runs until the process is killed. For graceful shutdown use
+    /// Runs until a non-transient accept error. For graceful shutdown use
     /// [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown).
+    /// Transient accept errors are logged and skipped; after running out of
+    /// file descriptors (`EMFILE` / `ENFILE`) the loop pauses accepts for a
+    /// second.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a non-transient `accept(2)` error; live connections
+    /// are detached and wind down on their own.
     pub async fn serve(
         self,
         router: Router,
@@ -1558,6 +1574,10 @@ impl BoundServer {
     ///  3. waits for all in-flight requests to complete before returning
     ///     `Ok(())`.
     ///
+    /// Transient accept errors are logged and skipped; after running out of
+    /// file descriptors (`EMFILE` / `ENFILE`) the loop pauses accepts for up to
+    /// a second, or until `signal` resolves.
+    ///
     /// In-flight requests are not cancelled; this method waits indefinitely
     /// for them. For bounded shutdown (e.g. Kubernetes preStop hooks with a
     /// deadline), wrap this call in `tokio::time::timeout`:
@@ -1569,6 +1589,11 @@ impl BoundServer {
     /// )
     /// .await??;
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a non-transient `accept(2)` error, without waiting
+    /// for a drain; live connections are detached and wind down on their own.
     ///
     /// # Example
     ///
@@ -1600,7 +1625,8 @@ impl BoundServer {
         self,
         service: ConnectRpcService<D>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serve_with_listener(self.listener, service, self.accept, self.connection, None).await
+        serve_with_listener(self.listener, service, self.accept, self.connection, None).await?;
+        Ok(())
     }
 
     /// Start serving requests with the given service, with graceful shutdown.
@@ -1623,16 +1649,10 @@ impl BoundServer {
             self.connection,
             Some(Box::pin(signal)),
         )
-        .await
+        .await?;
+        Ok(())
     }
 }
-
-/// Type alias for the panic-catching wrapper around ConnectRpcService, used
-/// by the per-connection task. Writing this out inline below would be verbose.
-type WrappedService<D> = tower_http::catch_panic::CatchPanic<
-    ConnectRpcService<D>,
-    fn(Box<dyn Any + Send>) -> Response<Full<Bytes>>,
->;
 
 /// Per-connection max-age settings, after jitter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1654,12 +1674,14 @@ struct IdleConfig {
 
 /// Shared in-flight request accounting for one connection.
 ///
-/// The per-request `service_fn` wrapper bumps these counters at the dispatch
-/// boundary (hyper does not surface per-connection stream counts directly), and
-/// the connection lifecycle reads them to decide whether the connection has
-/// been idle. `epoch` increments on every request start *and* completion, so a
-/// short request that begins and ends entirely within an idle window is still
-/// observed as activity and resets the idle timer.
+/// The per-request `service_fn` wrapper bumps these counters when a request is
+/// dispatched and when it completes: when hyper drops its response body, or its
+/// response future if no response is produced (hyper does not surface
+/// per-connection stream counts directly). The connection lifecycle reads them
+/// to decide whether the connection has been idle. `epoch` increments on every
+/// request start *and* completion, so a short request that begins and ends
+/// entirely within an idle window is still observed as activity and resets the
+/// idle timer.
 ///
 /// The two counters use `SeqCst` for clarity; correctness only needs each
 /// counter to be individually monotonic, so `Relaxed` would also be sound. The
@@ -1700,10 +1722,11 @@ impl ConnectionActivity {
     }
 }
 
-/// RAII guard that records a request as in-flight for the lifetime of its
-/// response future. Decrementing on drop (rather than on a success path) keeps
-/// the in-flight count correct even when a request future is cancelled or its
-/// handler panics.
+/// RAII guard that records a request as in flight until hyper drops its
+/// response body, or its response future if no response is produced.
+/// Decrementing on drop (rather than on a success path) keeps the in-flight
+/// count correct even when a request future is cancelled or its handler
+/// panics.
 struct ActiveRequestGuard(Arc<ConnectionActivity>);
 
 impl ActiveRequestGuard {
@@ -1719,110 +1742,172 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
-/// Serve HTTP requests on an already-accepted stream.
+/// Serve HTTP/1.1 or HTTP/2 (auto-detected) on one already-accepted,
+/// already-authenticated stream with the RPC connection lifecycle: the
+/// service-generic form of [`Server::serve_connection`], for loops that host
+/// something other than a [`Server`]'s own service.
 ///
-/// Generic over the IO type so it works for both plain TCP and TLS streams.
-/// Logs connection outcome at trace level.
+/// Applies everything in `config`: HTTP/1.1 keep-alive and the header-read
+/// timeout, HTTP/2 windows / keepalive / stream and header limits, and max-age
+/// (with ±10% jitter) / idle / request-count retirement followed by the shared
+/// grace period. When `shutdown` resolves the connection is told to wind down
+/// (HTTP/2 GOAWAY, HTTP/1.1 keep-alive off) and the future completes once
+/// in-flight requests have finished — a retirement grace period never caps
+/// that drain. Every request carries `info`'s
+/// [extensions](ConnectionInfo::extensions) plus [`PeerAddr`] / `PeerCerts`
+/// for the peer `info` describes. The output says why the connection ended;
+/// the future never fails, and dropping it closes the socket abruptly.
 ///
-/// `peer`'s extensions plus `PeerAddr` / `PeerCerts` are inserted into every
-/// request's extensions so handlers can read them via `ctx.peer_addr()` /
-/// `ctx.peer_certs()` / `ctx.extensions()`.
-async fn serve_accepted_stream<D, S>(
-    io: S,
-    peer: ConnectionInfo,
-    service: Arc<WrappedService<D>>,
+/// A handler that panics before returning its response becomes a `500` with
+/// a Connect `internal` error body instead of tearing the connection down.
+/// Clients that read the Connect error body (Connect unary clients, and this
+/// crate's Connect streaming client) report `internal`; clients that go by
+/// the HTTP status (gRPC, gRPC-Web and most Connect streaming clients) report
+/// `unknown`. A panic while any response body is polled is logged, and resets
+/// that stream with `INTERNAL_ERROR` (HTTP/2) or ends the connection
+/// (HTTP/1.1, where the response status is already committed). Under
+/// `panic = "abort"`, any of these panics aborts the process instead.
+///
+/// `service` is any tower HTTP service — a [`ConnectRpcService`], an
+/// `axum::Router`, or your own stack around either. HTTP upgrades
+/// (`hyper::upgrade::on`) are supported, including HTTP/2 extended CONNECT
+/// (RFC 8441), which the connection advertises. A completed HTTP/1.1 upgrade
+/// ends the future, with [`CloseReason::Closed`] unless shutdown or retirement
+/// had already begun; shutdown, retirement and dropping the future then no
+/// longer reach the upgraded socket. An extended CONNECT stream stays on its
+/// HTTP/2 connection, so a shutdown drain waits for it to end.
+///
+/// Must be polled inside a tokio runtime with I/O and time enabled. Nothing is
+/// bound to a runtime until first poll: timers, the HTTP/2 stream tasks hyper
+/// spawns, and every handler run on the runtime that polls this future. So an
+/// accept loop chooses where a connection is served by choosing where to spawn
+/// it. `io` is the exception: a tokio socket stays registered with the I/O
+/// driver of the runtime that created it, so that runtime delivers the
+/// socket's readiness and must outlive the connection. To move the I/O too,
+/// convert the accepted socket with
+/// [`into_std`](tokio::net::TcpStream::into_std) before wrapping it (a TLS
+/// stream cannot be rebuilt around a moved socket), and back with
+/// [`from_std`](tokio::net::TcpStream::from_std) inside the task on the
+/// target runtime, as the guide's
+/// [custom accept loops](https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md#custom-accept-loops)
+/// section shows.
+#[allow(clippy::manual_async_fn, reason = "`Send` belongs in the signature")]
+pub fn serve_connection<I, S, B, F>(
+    io: I,
+    info: ConnectionInfo,
+    service: S,
     config: ConnectionConfig,
-    global_shutdown: RetirementSignal,
-) -> ConnectionClosed
+    shutdown: F,
+) -> impl Future<Output = ConnectionClosed> + Send + 'static
 where
-    D: Dispatcher,
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: Service<http::Request<hyper::body::Incoming>, Response = Response<B>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    F: Future<Output = ()> + Send + 'static,
 {
-    let remote_addr = peer.peer_addr();
-    tracing::trace!(
-        remote_addr = remote_addr.map(tracing::field::display),
-        "Accepted new connection"
-    );
-    let grace = config.max_connection_age_grace;
+    // Everything runtime-touching (timers, hyper's executor, the trace) is
+    // created on first poll, so the future can be built anywhere and binds to
+    // whichever runtime polls it.
+    async move {
+        let service = CatchPanic::custom(service, InternalErrorForPanic);
+        let global_shutdown: RetirementSignal = Box::pin(shutdown);
+        let remote_addr = info.peer_addr();
+        tracing::trace!(
+            remote_addr = remote_addr.map(tracing::field::display),
+            "Accepted new connection"
+        );
+        let grace = config.max_connection_age_grace;
 
-    // In-flight accounting is only needed when idle reaping is enabled; when it
-    // is off there is no per-request bookkeeping overhead.
-    let activity = config
-        .max_connection_idle
-        .map(|_| Arc::new(ConnectionActivity::default()));
+        // In-flight accounting is only needed when idle reaping is enabled; when it
+        // is off there is no per-request bookkeeping overhead.
+        let activity = config
+            .max_connection_idle
+            .map(|_| Arc::new(ConnectionActivity::default()));
 
-    // When request-count retirement is enabled, the service counts every
-    // dispatched request and flips this watch channel once the limit is
-    // reached; the connection lifecycle observes it and starts draining. The
-    // counter lives only as long as this connection task.
-    let (request_counter, request_retire) = match config.max_requests_per_connection {
-        Some(max) => {
-            let (tx, rx) = watch::channel(false);
-            (
-                Some(RequestCounter {
-                    served: AtomicU64::new(0),
-                    max,
-                    retire: tx,
-                }),
-                Some((rx, grace)),
-            )
-        }
-        None => (None, None),
-    };
+        // When request-count retirement is enabled, the service counts every
+        // dispatched request and flips this watch channel once the limit is
+        // reached; the connection lifecycle observes it and starts draining. The
+        // counter lives only as long as this connection task.
+        let (request_counter, request_retire) = match config.max_requests_per_connection {
+            Some(max) => {
+                let (tx, rx) = watch::channel(false);
+                (
+                    Some(RequestCounter {
+                        served: AtomicU64::new(0),
+                        max,
+                        retire: tx,
+                    }),
+                    Some((rx, grace)),
+                )
+            }
+            None => (None, None),
+        };
 
-    // Computed once, before hyper reads the first request; cloned into each
-    // request below.
-    let request_extensions = peer.request_extensions();
-    let activity_for_requests = activity.clone();
-    let svc = hyper::service::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
-        req.extensions_mut().extend(request_extensions.clone());
-        if let Some(counter) = &request_counter {
-            counter.record_request();
-        }
-        let mut service = (*service).clone();
-        // Mark the request in-flight before its future is polled; the guard
-        // decrements on completion or drop.
-        let guard = activity_for_requests
-            .as_ref()
-            .map(|activity| ActiveRequestGuard::new(Arc::clone(activity)));
-        async move {
-            let _guard = guard;
-            service.call(req).await
-        }
-    });
+        // Computed once, before hyper reads the first request; cloned into each
+        // request below.
+        let request_extensions = info.request_extensions();
+        let activity_for_requests = activity.clone();
+        let svc =
+            hyper::service::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
+                req.extensions_mut().extend(request_extensions.clone());
+                if let Some(counter) = &request_counter {
+                    counter.record_request();
+                }
+                let service = service.clone();
+                // Mark the request in flight before its future is polled; the guard
+                // moves into the response body (see `ActiveRequestGuard`).
+                let guard = activity_for_requests
+                    .as_ref()
+                    .map(|activity| ActiveRequestGuard::new(Arc::clone(activity)));
+                async move {
+                    let response = service.oneshot(req).await;
+                    response.map(|response| {
+                        response.map(|body| ServedBody::new(body, remote_addr, guard))
+                    })
+                }
+            });
 
-    let mut builder = AutoBuilder::new(TokioExecutor::new());
-    // A timer is required for hyper's header read timeout (and any other
-    // time-based connection behaviour) to take effect; without it the
-    // configured `header_read_timeout` is silently ignored.
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .keep_alive(config.http1_keep_alive)
-        .header_read_timeout(config.header_read_timeout);
-    configure_http2(&mut builder, &config);
+        let mut builder = AutoBuilder::new(TokioExecutor::new());
+        // A timer is required for hyper's header read timeout (and any other
+        // time-based connection behaviour) to take effect; without it the
+        // configured `header_read_timeout` is silently ignored.
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .keep_alive(config.http1_keep_alive)
+            .header_read_timeout(config.header_read_timeout);
+        configure_http2(&mut builder, &config);
 
-    // Max age gets per-connection jitter so connections opened together do not
-    // retire together; idle and request-count retirement are reactive and
-    // need none. Each `RandomState` carries fresh keys, so this is a uniform
-    // sample.
-    let age = config.max_connection_age.map(|age| ConnectionAgeConfig {
-        max_age: jitter_connection_age(age, RandomState::new().hash_one(remote_addr)),
-        grace,
-    });
-    let idle = config
-        .max_connection_idle
-        .map(|idle| IdleConfig { idle, grace });
-    let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
-    serve_connection_with_lifecycle(
-        conn,
-        remote_addr,
-        global_shutdown,
-        age,
-        idle.zip(activity),
-        request_retire,
-    )
-    .await
+        // Max age gets per-connection jitter so connections opened together do not
+        // retire together; idle and request-count retirement are reactive and
+        // need none. Each `RandomState` carries fresh keys, so this is a uniform
+        // sample.
+        let age = config.max_connection_age.map(|age| ConnectionAgeConfig {
+            max_age: jitter_connection_age(age, RandomState::new().hash_one(remote_addr)),
+            grace,
+        });
+        let idle = config
+            .max_connection_idle
+            .map(|idle| IdleConfig { idle, grace });
+        let conn = builder
+            .serve_connection_with_upgrades(TokioIo::new(io), svc)
+            .into_owned();
+        serve_connection_with_lifecycle(
+            conn,
+            remote_addr,
+            global_shutdown,
+            age,
+            idle.zip(activity),
+            request_retire,
+        )
+        .await
+    }
 }
 
 /// Per-connection request counter that triggers retirement once the configured
@@ -1877,6 +1962,11 @@ fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: &Connection
     if let Some(max) = config.http2_max_header_list_size {
         http2.max_header_list_size(max);
     }
+    // Extended CONNECT (RFC 8441) carries HTTP/2 WebSockets; without it, an
+    // axum app moved onto `connectrpc::axum::serve` loses its HTTP/2 WebSocket
+    // routes. A service that does not handle it answers such a request like
+    // any other.
+    http2.enable_connect_protocol();
     // Keepalive is opt-in: when no interval is set, leave hyper's default
     // (disabled) untouched. When enabled, a timer must be installed — hyper's
     // HTTP/2 keepalive requires one and panics the connection task without it.
@@ -2177,26 +2267,33 @@ fn duration_from_nanos(nanos: u128) -> Duration {
 }
 
 /// Optional boxed shutdown-signal future.
-type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>>;
+pub(crate) type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>>;
 
 /// The built-in accept loop: serve connections from `listener` with `service`
 /// until `shutdown` resolves, then stop accepting, tell every live connection
 /// to drain, and wait for all of them. The only conditional code is the
-/// optional TLS handshake on the per-connection task.
-async fn serve_with_listener<D: Dispatcher>(
+/// optional TLS handshake on the per-connection task. A fatal accept error
+/// detaches the live connections (they observe the dropped drain signal and
+/// wind down on their own) and returns the error; dropping the future aborts
+/// every connection task.
+pub(crate) async fn serve_with_listener<S, B>(
     listener: TcpListener,
-    service: ConnectRpcService<D>,
+    service: S,
     accept: AcceptConfig,
     config: ConnectionConfig,
     shutdown: ShutdownSignal,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> std::io::Result<()>
+where
+    S: Service<http::Request<hyper::body::Incoming>, Response = Response<B>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     config.lint();
-
-    // Wrap the service with panic handling to convert panics to 500 responses
-    let service: WrappedService<D> = ServiceBuilder::new()
-        .layer(CatchPanicLayer::custom(panic_handler as fn(_) -> _))
-        .service(service);
-    let service = Arc::new(service);
 
     #[cfg(feature = "server-tls")]
     let tls_handshake_timeout = accept.tls_handshake_timeout();
@@ -2229,12 +2326,28 @@ async fn serve_with_listener<D: Dispatcher>(
             accept_result = listener.accept() => match accept_result {
                 Ok(conn) => conn,
                 Err(err) => {
+                    if is_fd_exhaustion(&err) {
+                        tracing::warn!(
+                            error = %err,
+                            "Out of file descriptors accepting a connection; \
+                             pausing accepts for {FD_EXHAUSTION_BACKOFF:?}"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown => {
+                                tracing::info!("Shutdown signal received; draining connections");
+                                break;
+                            }
+                            () = tokio::time::sleep(FD_EXHAUSTION_BACKOFF) => {}
+                        }
+                        continue;
+                    }
                     if is_transient_accept_error(&err) {
-                        tracing::warn!("Transient accept error (continuing): {}", err);
+                        tracing::warn!(error = %err, "Transient accept error (continuing)");
                         continue;
                     }
                     connections.detach_all();
-                    return Err(err.into());
+                    return Err(err);
                 }
             },
         };
@@ -2246,7 +2359,7 @@ async fn serve_with_listener<D: Dispatcher>(
             tracing::warn!("failed to set TCP_NODELAY: {e}");
         }
 
-        let service = Arc::clone(&service);
+        let service = service.clone();
         let config = config.clone();
         let global_shutdown = global_shutdown_future(global_shutdown_rx.clone());
 
@@ -2272,8 +2385,7 @@ async fn serve_with_listener<D: Dispatcher>(
                         peer.peer_certs = conn
                             .peer_certificates()
                             .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
-                        serve_accepted_stream(tls_stream, peer, service, config, global_shutdown)
-                            .await;
+                        serve_connection(tls_stream, peer, service, config, global_shutdown).await;
                     }
                     Ok(Err(err)) => {
                         tracing::debug!(
@@ -2294,7 +2406,7 @@ async fn serve_with_listener<D: Dispatcher>(
 
             // Plain TCP (no TLS or TLS not configured)
             let peer = ConnectionInfo::new().with_peer_addr(remote_addr);
-            serve_accepted_stream(stream, peer, service, config, global_shutdown).await;
+            serve_connection(stream, peer, service, config, global_shutdown).await;
         });
     }
 
@@ -2317,51 +2429,150 @@ fn log_connection_task_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
-/// Handle panics in request handlers by converting them to ConnectRPC error responses.
-fn panic_handler(err: Box<dyn Any + Send + 'static>) -> Response<Full<Bytes>> {
-    // Capture the backtrace for debugging
-    let backtrace = std::backtrace::Backtrace::capture();
+/// Converts a handler panic into a `500` with a Connect `internal` error body,
+/// logging the message and (if enabled) the backtrace, so one request's panic
+/// costs that request and not the connection.
+#[derive(Clone, Copy)]
+struct InternalErrorForPanic;
 
-    // Try to extract a message from the panic
-    let message = if let Some(s) = err.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = err.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else {
-        "handler panicked".to_string()
-    };
+impl tower_http::catch_panic::ResponseForPanic for InternalErrorForPanic {
+    type ResponseBody = Full<Bytes>;
 
-    // Log the panic with backtrace if available
-    match backtrace.status() {
-        std::backtrace::BacktraceStatus::Captured => {
-            tracing::error!(
-                "Request handler panicked: {}\n\nBacktrace:\n{}",
-                message,
-                backtrace
-            );
+    fn response_for_panic(&mut self, err: Box<dyn Any + Send + 'static>) -> Response<Full<Bytes>> {
+        // Capture the backtrace for debugging
+        let backtrace = std::backtrace::Backtrace::capture();
+
+        let message = panic_message(&*err).unwrap_or("handler panicked");
+
+        // Log the panic with backtrace if available
+        match backtrace.status() {
+            std::backtrace::BacktraceStatus::Captured => {
+                tracing::error!(
+                    "Request handler panicked: {}\n\nBacktrace:\n{}",
+                    message,
+                    backtrace
+                );
+            }
+            _ => {
+                tracing::error!(
+                    "Request handler panicked: {} (set RUST_BACKTRACE=1 for backtrace)",
+                    message
+                );
+            }
         }
-        _ => {
-            tracing::error!(
-                "Request handler panicked: {} (set RUST_BACKTRACE=1 for backtrace)",
-                message
-            );
+
+        // Create a ConnectRPC internal error response
+        let error = ConnectError::new(ErrorCode::Internal, "internal server error");
+        let body = error.to_json();
+
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, content_type::JSON)
+            .body(Full::new(body))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap()
+            })
+    }
+}
+
+/// The message a panic payload carries, when it is a string.
+fn panic_message(payload: &(dyn Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+}
+
+/// The response body of the panic-catching service layer.
+type CaughtBody = tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The body hyper sends for every response. It holds the request's in-flight
+/// guard until hyper drops it, and turns a panic in `poll_frame` (such as a
+/// streaming handler's stream panicking) into a body error. Then hyper resets
+/// that stream (HTTP/2) or closes the connection (HTTP/1.1), instead of the
+/// panic unwinding through the connection task (HTTP/1.1) or hyper's
+/// per-stream task (HTTP/2). It wraps the concrete [`CaughtBody`]: a generic
+/// `B::Error: Into<BoxError>` bound trips a higher-ranked lifetime error in
+/// the connection future.
+struct ServedBody {
+    /// `None` once a poll has panicked.
+    inner: Option<CaughtBody>,
+    remote_addr: Option<SocketAddr>,
+    /// Keeps the request in flight for idle reaping.
+    _in_flight: Option<ActiveRequestGuard>,
+}
+
+impl ServedBody {
+    fn new(
+        inner: CaughtBody,
+        remote_addr: Option<SocketAddr>,
+        in_flight: Option<ActiveRequestGuard>,
+    ) -> Self {
+        Self {
+            inner: Some(inner),
+            remote_addr,
+            _in_flight: in_flight,
         }
     }
+}
 
-    // Create a ConnectRPC internal error response
-    let error = ConnectError::new(ErrorCode::Internal, "internal server error");
-    let body = error.to_json();
+impl http_body::Body for ServedBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(header::CONTENT_TYPE, content_type::JSON)
-        .body(Full::new(body))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::new()))
-                .unwrap()
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = &mut *self;
+        // hyper stops polling a body once it has returned an error, so only a
+        // caller that polls past that error sees this end.
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Pin::new(inner).poll_frame(cx)
+        }));
+        polled.unwrap_or_else(|panic| {
+            let message = panic_message(&*panic).unwrap_or("non-string payload");
+            tracing::error!(
+                remote_addr = this.remote_addr.map(tracing::field::display),
+                "Request handler panicked in its response body: {message}",
+            );
+            // A body the panic left inconsistent might panic again as it drops.
+            let poisoned = this.inner.take();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(poisoned)));
+            Poll::Ready(Some(Err("response body panicked".into())))
         })
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(http_body::Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(http_body::SizeHint::default, http_body::Body::size_hint)
+    }
+}
+
+/// How long the accept loop waits after `EMFILE` / `ENFILE` before accepting
+/// again, unless shutdown fires first. Accepting sooner fails the same way,
+/// spinning a core until a descriptor is freed.
+const FD_EXHAUSTION_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Whether an accept error means the process or the system ran out of file
+/// descriptors (`EMFILE` / `ENFILE`). Accepting again fails the same way
+/// until one is freed.
+fn is_fd_exhaustion(err: &std::io::Error) -> bool {
+    err.raw_os_error()
+        .is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE)
 }
 
 /// Check if an accept error is transient and can be recovered from.
@@ -2383,12 +2594,7 @@ pub(crate) fn is_transient_accept_error(err: &std::io::Error) -> bool {
         ErrorKind::ConnectionAborted |
         // Connection reset by peer
         ErrorKind::ConnectionReset
-    ) || {
-        // Check for EMFILE/ENFILE (too many open files)
-        // These are mapped to Other on some platforms
-        err.raw_os_error()
-            .is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE)
-    }
+    ) || is_fd_exhaustion(err)
 }
 
 #[cfg(test)]
@@ -3341,7 +3547,7 @@ mod tests {
                 .await
         });
 
-        let advertised = read_advertised_max_concurrent_streams(addr).await;
+        let advertised = read_advertised_setting(addr, SETTINGS_MAX_CONCURRENT_STREAMS_ID).await;
         assert_eq!(
             advertised,
             Some(7),
@@ -3374,7 +3580,7 @@ mod tests {
                 .await
         });
 
-        let advertised = read_advertised_max_concurrent_streams(addr).await;
+        let advertised = read_advertised_setting(addr, SETTINGS_MAX_CONCURRENT_STREAMS_ID).await;
         assert_eq!(
             advertised,
             Some(200),
@@ -3391,11 +3597,25 @@ mod tests {
 
     /// HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS identifier (RFC 7540 §6.5.2).
     const SETTINGS_MAX_CONCURRENT_STREAMS_ID: u16 = 0x3;
+    /// HTTP/2 SETTINGS_ENABLE_CONNECT_PROTOCOL identifier (RFC 8441 §3).
+    const SETTINGS_ENABLE_CONNECT_PROTOCOL_ID: u16 = 0x8;
+
+    /// The server advertises extended CONNECT, so HTTP/2 WebSocket requests
+    /// reach the service.
+    #[tokio::test]
+    async fn extended_connect_is_advertised_in_settings() {
+        let bound = Server::bind("127.0.0.1:0").await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.serve(Router::new()));
+        let advertised = read_advertised_setting(addr, SETTINGS_ENABLE_CONNECT_PROTOCOL_ID).await;
+        assert_eq!(advertised, Some(1));
+        serve.abort();
+    }
 
     /// Open a raw HTTP/2 connection, send the client preface plus an empty
     /// SETTINGS frame, then read the server's initial SETTINGS frame and
-    /// return the advertised `MAX_CONCURRENT_STREAMS` value, if present.
-    async fn read_advertised_max_concurrent_streams(addr: SocketAddr) -> Option<u32> {
+    /// return the value it advertises for setting `id`, if present.
+    async fn read_advertised_setting(addr: SocketAddr, id: u16) -> Option<u32> {
         let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         // Client connection preface, then an empty SETTINGS frame (length 0,
@@ -3421,17 +3641,16 @@ mod tests {
             // SETTINGS = 0x4; skip the ACK (flag 0x1) the server sends for our
             // empty SETTINGS frame.
             if frame_type == 0x4 && flags & 0x1 == 0 {
-                return parse_max_concurrent_streams(&payload);
+                return parse_setting(&payload, id);
             }
         }
     }
 
-    /// Parse a SETTINGS frame payload (6-byte id/value entries) for the
-    /// `MAX_CONCURRENT_STREAMS` value.
-    fn parse_max_concurrent_streams(payload: &[u8]) -> Option<u32> {
+    /// Parse a SETTINGS frame payload (6-byte id/value entries) for the value
+    /// of setting `id`.
+    fn parse_setting(payload: &[u8], id: u16) -> Option<u32> {
         payload.chunks_exact(6).find_map(|entry| {
-            let id = u16::from_be_bytes([entry[0], entry[1]]);
-            (id == SETTINGS_MAX_CONCURRENT_STREAMS_ID)
+            (u16::from_be_bytes([entry[0], entry[1]]) == id)
                 .then(|| u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]))
         })
     }
@@ -3979,6 +4198,95 @@ mod tests {
             .expect("server did not shut down")
             .expect("join error");
         assert!(result.is_ok(), "serve returned error: {result:?}");
+    }
+
+    /// A request stays in flight until its response body is sent, so idle
+    /// reaping never closes a connection in the middle of a streaming
+    /// response.
+    #[tokio::test(start_paused = true)]
+    async fn max_connection_idle_waits_for_the_response_body() {
+        use futures::StreamExt;
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+        let router = Router::new().route_server_stream(
+            "svc",
+            "Tick",
+            crate::handler::streaming_handler_fn(
+                move |_ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let release = release.lock().unwrap().take();
+                    async move {
+                        let first = futures::stream::iter([Ok::<_, ConnectError>(
+                            buffa_types::Empty::default(),
+                        )]);
+                        let second = futures::stream::once(async move {
+                            if let Some(release) = release {
+                                release.await.ok();
+                            }
+                            Ok(buffa_types::Empty::default())
+                        });
+                        crate::Response::stream_ok(first.chain(second))
+                    }
+                },
+            ),
+        );
+        let bound = Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_max_connection_idle(Duration::from_secs(10))
+            .with_max_connection_age_grace(Duration::from_secs(1));
+        let addr = bound.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(async move {
+            bound
+                .serve_with_graceful_shutdown(router, async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        let h2_task = tokio::spawn(h2_conn);
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://{addr}/svc/Tick"))
+            .header(header::CONTENT_TYPE, "application/connect+proto")
+            .body(())
+            .unwrap();
+        let (resp, mut req_body) = send_request.send_request(req, false).unwrap();
+        req_body
+            .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+            .unwrap();
+        // tokio's paused clock can jump to the idle deadline during these
+        // awaits. That is harmless: the connection lifecycle polls hyper, which
+        // dispatches the request, before it checks for idleness.
+        let mut resp = resp.await.expect("h2 request failed");
+        assert!(resp.status().is_success(), "got status {}", resp.status());
+        resp.body_mut()
+            .data()
+            .await
+            .expect("stream ended before its first message")
+            .expect("h2 response body failed");
+
+        // The body is still open, so the connection is never idle, although the
+        // idle timeout and the grace after it elapse several times over.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(11)).await;
+            yield_to_tasks().await;
+        }
+        assert!(
+            !h2_task.is_finished(),
+            "connection with an open response body was retired by the idle timer"
+        );
+
+        release_tx.send(()).unwrap();
+        drain_h2_body(resp).await;
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server did not shut down")
+            .expect("join error")
+            .expect("serve error");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4570,6 +4878,48 @@ mod tests {
         );
     }
 
+    /// The free `serve_connection` builds nothing runtime-bound until first
+    /// poll: constructed on a plain thread with age and idle timers configured,
+    /// then served to completion by a runtime created afterwards.
+    #[test]
+    fn serve_connection_future_is_built_outside_a_runtime() {
+        let router = Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                |_ctx: crate::RequestContext, _req: buffa_types::Empty| async move {
+                    crate::Response::ok(buffa_types::Empty::default())
+                },
+            ),
+        );
+        let (mut client_io, server_io) = tokio::io::duplex(64 << 10);
+        let config = ConnectionConfig::new()
+            .with_max_connection_age(Duration::from_secs(60))
+            .with_max_connection_idle(Duration::from_secs(30));
+        // No runtime exists yet.
+        let conn = serve_connection(
+            server_io,
+            ConnectionInfo::new(),
+            ConnectRpcService::new(router),
+            config,
+            std::future::pending(),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = runtime.block_on(async move {
+            let conn = tokio::spawn(conn);
+            client_io.write_all(ECHO_REQ).await.unwrap();
+            let mut resp = Vec::new();
+            client_io.read_to_end(&mut resp).await.unwrap();
+            assert!(resp.starts_with(b"HTTP/1.1 2"));
+            conn.await.unwrap()
+        });
+        assert_eq!(closed.reason(), CloseReason::Closed);
+    }
+
     /// `Server::serve_connection` reports `Shutdown` when the shutdown future
     /// drains the connection and `MaxRequests` when the request count retires
     /// it.
@@ -4675,6 +5025,144 @@ mod tests {
         let (conn, mut client) = unstarted(&plain, std::future::pending());
         client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
         assert_eq!(conn.await.reason(), CloseReason::Error);
+    }
+
+    /// A streaming body that panics after the response started ends the
+    /// HTTP/1.1 connection with `Error`, instead of the panic unwinding out
+    /// of `serve_connection`.
+    #[tokio::test]
+    async fn serve_connection_reports_error_when_a_response_body_panics() {
+        use futures::StreamExt;
+        let router = Router::new().route_server_stream(
+            "svc",
+            "Boom",
+            crate::handler::streaming_handler_fn(
+                |_ctx: crate::RequestContext, _req: buffa_types::Empty| async {
+                    let first = futures::stream::iter([Ok(buffa_types::Empty::default())]);
+                    let boom = futures::stream::poll_fn(
+                        |_| -> Poll<Option<Result<buffa_types::Empty, ConnectError>>> {
+                            panic!("response body panics on purpose")
+                        },
+                    );
+                    crate::Response::stream_ok(first.chain(boom))
+                },
+            ),
+        );
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(Server::new(router).serve_connection(
+            io,
+            ConnectionInfo::new(),
+            std::future::pending(),
+        ));
+        client
+            .write_all(
+                concat!(
+                    "POST /svc/Boom HTTP/1.1\r\nHost: x\r\n",
+                    "Content-Type: application/connect+proto\r\nContent-Length: 5\r\n\r\n",
+                    "\0\0\0\0\0",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("connection did not end")
+            .expect("serve_connection panicked");
+        assert_eq!(closed.reason(), CloseReason::Error);
+    }
+
+    #[test]
+    fn fd_exhaustion_is_transient_and_distinguished() {
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(is_transient_accept_error(&emfile) && is_fd_exhaustion(&emfile));
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert!(is_transient_accept_error(&aborted) && !is_fd_exhaustion(&aborted));
+    }
+
+    /// The guide's runtime placement: a stream accepted on one runtime and
+    /// re-registered on another with `into_std` / `from_std` is served there,
+    /// with its handler running there, and keeps working after the accepting
+    /// runtime has shut down.
+    #[test]
+    fn serve_connection_runs_where_the_stream_is_reregistered() {
+        let runtime = |name: &'static str| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name(name)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let handler_threads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&handler_threads);
+        let router = Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                move |_ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let thread = std::thread::current().name().map(str::to_owned);
+                    seen.lock().unwrap().push(thread);
+                    async { crate::Response::ok(buffa_types::Empty::default()) }
+                },
+            ),
+        );
+        let server = Server::new(router);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let accept_rt = runtime("accept-rt");
+        let accepted = accept_rt.block_on(async {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.into_std().unwrap()
+        });
+        drop(accept_rt);
+
+        let serve_rt = runtime("serve-rt");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn = serve_rt.spawn(async move {
+            let stream = tokio::net::TcpStream::from_std(accepted).unwrap();
+            let shutdown = async move {
+                shutdown_rx.await.ok();
+            };
+            server
+                .serve_connection(stream, ConnectionInfo::new(), shutdown)
+                .await
+        });
+
+        let client_rt = runtime("client-rt");
+        // Hold the request handle: dropping it lets h2 close the idle
+        // connection, racing the shutdown below.
+        let _send_request = client_rt.block_on(async {
+            client.set_nonblocking(true).unwrap();
+            let tcp = tokio::net::TcpStream::from_std(client).unwrap();
+            let (send_request, connection) = h2::client::handshake(tcp).await.unwrap();
+            tokio::spawn(connection);
+            let mut send_request = send_request.ready().await.unwrap();
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{addr}/svc/Echo"))
+                .header("content-type", "application/proto")
+                .body(())
+                .unwrap();
+            let (resp, _) = send_request.send_request(req, true).unwrap();
+            assert_eq!(resp.await.unwrap().status(), http::StatusCode::OK);
+            send_request
+        });
+
+        shutdown_tx.send(()).unwrap();
+        let closed = serve_rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), conn).await })
+            .expect("connection did not drain")
+            .unwrap();
+        assert_eq!(closed.reason(), CloseReason::Shutdown);
+        assert_eq!(
+            *handler_threads.lock().unwrap(),
+            vec![Some("serve-rt".to_owned())]
+        );
     }
 
     /// End-to-end mTLS: client presents a cert; handler reads it from

@@ -1,0 +1,11 @@
+kind: Fixed
+body: |-
+    **Idle reaping and file-descriptor exhaustion.** With
+    `with_max_connection_idle` set, a request now counts as in flight until
+    its response body has been sent, so a long streaming response is no
+    longer closed as idle. As with gRPC's `MaxConnectionIdle`, a client that
+    stops reading now keeps its connection until `with_max_connection_age`
+    retires it. After `EMFILE` / `ENFILE` the accept loop of
+    `Server` / `BoundServer` and `connectrpc::axum::serve_tls` pauses accepts
+    for up to a second, or until shutdown, instead of spinning.
+time: 2026-09-16T14:05:00.000000000+00:00

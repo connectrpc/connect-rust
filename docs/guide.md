@@ -1326,20 +1326,106 @@ and graceful shutdown. It's a single dispatcher with no per-route
 configuration, so add things like health endpoints either as RPC
 methods or by mounting the Connect service in axum.
 
-For connection and HTTP/2 settings that `Server` does not expose, drop
-down to raw hyper instead.
+Every per-connection setting (`with_max_connection_age`, the HTTP/2
+knobs, ...) lives on `ConnectionConfig`; `Server`, `BoundServer` and
+`connectrpc::axum::serve` all accept one via `with_connection_config`, so
+a configuration built once applies to any of them.
 
-### Advanced transport configuration
+### Custom accept loops
 
-The built-in `Server` exposes the common connection knobs, but it does
-not try to mirror every hyper option. For long-tail transport tuning —
-flow-control windows, HPACK table size, frame size, or exact keepalive
-behavior — drive the Connect service from your own hyper accept loop.
+When you need a policy at accept time or per connection that the built-in
+loop does not have — admit or refuse by client certificate or source
+address, cap connections per tenant, shed load before HTTP is spoken,
+serve some clients on a different runtime, listen on a Unix socket — write
+the loop yourself and hand each accepted stream to
+`Server::serve_connection` (or the free `server::serve_connection`, which
+takes any tower HTTP service such as an `axum::Router`). You decide which
+connections are served and where; the connection driver still gives each
+one the full lifecycle (settings, timeouts, retirement, GOAWAY on
+shutdown, panic isolation, `PeerAddr` / `PeerCerts` / extensions) and
+tells you why it ended.
 
-Add `hyper-util` as a direct dependency with the `server-auto`,
-`service`, and `tokio` features enabled. Then wrap `ConnectRpcService`
-with `TowerToHyperService` before handing each connection to hyper's
-auto builder:
+```rust,ignore
+use connectrpc::{ConnectionInfo, Server};
+
+let server = Arc::new(Server::new(router).with_max_connection_age(Duration::from_secs(600)));
+let tls = tokio_rustls::TlsAcceptor::from(tls_config);
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+let mut connections = tokio::task::JoinSet::new();
+let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+
+loop {
+    let (stream, peer) = tokio::select! {
+        biased; // a pending shutdown wins over one more accept
+        _ = &mut shutdown => break,
+        Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        accepted = listener.accept() => accepted?, // production: retry transient errors
+    };
+    // Where this connection runs: say, one `tokio::runtime::Handle` per class
+    // of client.
+    let runtime = runtime_for(peer);
+    // Take the socket off this runtime's I/O driver; the task re-registers it.
+    let Ok(stream) = stream.into_std() else { continue };
+    let (server, tls, mut drain) = (Arc::clone(&server), tls.clone(), drain_rx.clone());
+    connections.spawn_on(async move {
+        let Ok(stream) = tokio::net::TcpStream::from_std(stream) else { return };
+        // TLS handshake on the connection's task, not the loop's, with a bound.
+        let Ok(Ok(stream)) =
+            tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await
+        else { return };
+        let certs: Arc<[_]> = match stream.get_ref().1.peer_certificates() {
+            Some(chain) => chain.iter().map(|c| c.clone().into_owned()).collect(),
+            None => return, // your policy: no client certificate, no service
+        };
+        let mut info = ConnectionInfo::new().with_peer_addr(peer).with_peer_certs(certs);
+        // Anything handlers should see, computed once per connection.
+        let Some(identity) = Identity::from_certs(info.peer_certs()) else { return };
+        info.extensions_mut().insert(identity);
+        // Everything Server::serve does for a connection, on this task.
+        let closed = server
+            .serve_connection(stream, info, async move { let _ = drain.wait_for(|d| *d).await; })
+            .await;
+        metrics::connection_closed(closed.reason());
+    }, &runtime);
+}
+drop(listener);                   // refuse new connections
+let _ = drain_tx.send(true);      // GOAWAY every live one
+while connections.join_next().await.is_some() {}   // wait for them
+```
+
+Serving a connection on another runtime takes the two steps shown. First,
+spawn its task there with `JoinSet::spawn_on`: the future binds timers,
+hyper's per-stream tasks and every handler to the runtime that polls it,
+and the set can still abort and drain the task. That runtime needs I/O and
+time enabled (`enable_all()`); `from_std` panics without I/O. Second,
+re-register the socket there: `into_std` on the accepting side,
+`TcpStream::from_std` inside the task. A tokio socket stays on the I/O
+driver of the runtime that created it, so without this step a busy
+accepting runtime delays the connection, and shutting that runtime down
+breaks it.
+
+A `TlsStream` cannot be rebuilt around a moved socket, so the loop moves
+the plain `TcpStream` first and picks the runtime from the peer address,
+before the TLS handshake. To place clients by class without inspecting
+certificates, give each class its own listener, with its accept loop on
+that class's runtime. To place them by client certificate, wrap the
+`TcpStream` in your own `AsyncRead + AsyncWrite` type that can detach the
+socket (`into_std`) and re-attach it (`from_std`), and hand that type to
+the TLS acceptor. After the handshake, reach the socket through
+`TlsStream::get_mut`: detach it while the accepting runtime is still
+running, re-attach it inside the task on the target runtime, and don't
+poll the stream in between.
+
+The loop must also outlive what it spawned: track the tasks and drain them
+before returning, as the code above shows.
+
+### Raw hyper
+
+For hyper connection-builder settings `ConnectionConfig` does not expose
+(HPACK table size, max frame size, ...), `ConnectRpcService` is an
+ordinary tower service: wrap it in `hyper_util::service::TowerToHyperService`
+and hand it to `hyper_util::server::conn::auto::Builder` yourself.
 
 ```rust,ignore
 use connectrpc::{ConnectRpcService, Router};
@@ -1349,26 +1435,16 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 
-let connect_router = Router::new().add_service(greeter_service);
-let connect_service = ConnectRpcService::new(connect_router);
-
+let connect_service = ConnectRpcService::new(Router::new().add_service(greeter_service));
 let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 let mut builder = AutoBuilder::new(TokioExecutor::new());
-builder
-    .http2()
-    .max_concurrent_streams(1_000)
-    .max_frame_size(1 << 20)
-    .adaptive_window(true);
+builder.http2().max_frame_size(1 << 20);
 
 loop {
     let (stream, _peer_addr) = listener.accept().await?;
     let conn = builder
-        .serve_connection(
-            TokioIo::new(stream),
-            TowerToHyperService::new(connect_service.clone()),
-        )
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(connect_service.clone()))
         .into_owned();
-
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             eprintln!("connection ended with error: {err}");
@@ -1377,16 +1453,11 @@ loop {
 }
 ```
 
-This is the escape hatch for connection- and protocol-level settings.
-Axum remains the better fit for routing, health checks, ordinary HTTP
-endpoints, and request-level Tower middleware such as auth, timeouts,
-or rate limiting.
-
-Unlike the built-in `Server` and `connectrpc::axum::serve_tls`, a raw
-hyper loop does not automatically insert `PeerAddr` or `PeerCerts` into
-request extensions. If handlers call `ctx.peer_addr()` or
-`ctx.peer_certs()`, insert those extensions in your own Tower layer or
-service wrapper before the request reaches `ConnectRpcService`.
+You then own the whole connection lifecycle — none of the timeouts,
+retirement, graceful shutdown, panic isolation or `PeerAddr` / `PeerCerts`
+stamping described above happens unless you re-implement it — so prefer a
+custom accept loop built on `serve_connection` over raw hyper unless it is
+specifically a hyper knob you are missing.
 
 ### TLS
 
@@ -1407,11 +1478,13 @@ Server::new(connect_router)
 ```
 
 For the axum path, `connectrpc::axum::serve_tls` (requires both the
-`axum` and `server-tls` features) is a drop-in replacement for
-`axum::serve` that owns the rustls accept loop and stamps `PeerAddr` /
-`PeerCerts` into request extensions exactly as the standalone `Server`
-does, so handler code that reads `ctx.peer_certs()` is portable across
-both hosting paths:
+`axum` and `server-tls` features; plaintext `connectrpc::axum::serve`
+needs `axum` and `server`) is a drop-in replacement for `axum::serve`
+that runs the app on the same accept loop and connection driver as the
+standalone `Server` — TLS termination, `PeerAddr` / `PeerCerts` in
+request extensions, every `ConnectionConfig` setting, graceful GOAWAY,
+panic isolation — so handler code that reads `ctx.peer_certs()` is
+portable across both hosting paths:
 
 ```rust
 let app = axum::Router::new()
