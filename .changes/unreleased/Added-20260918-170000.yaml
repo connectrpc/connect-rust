@@ -1,0 +1,7 @@
+kind: Added
+body: |-
+    **`connectrpc::http`: re-export of the `http` crate.** Its types appear
+    throughout the public API — `http::Extensions` in the
+    `with_connection_extensions` function, header maps on requests and
+    responses — so code can name them without its own `http` dependency.
+time: 2026-09-18T17:00:00.000000000+00:00

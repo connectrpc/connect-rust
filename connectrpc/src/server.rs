@@ -293,9 +293,9 @@ impl ConnectionInfo {
 /// The per-connection function registered with
 /// [`Server::with_connection_extensions`] and its equivalents.
 #[derive(Clone)]
-pub(crate) struct ConnectionExtensionsFn(Arc<ExtendConnection>);
+pub(crate) struct ConnectionExtensionsFn(Arc<DynConnectionExtensionsFn>);
 
-type ExtendConnection = dyn Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync;
+type DynConnectionExtensionsFn = dyn Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync;
 
 impl ConnectionExtensionsFn {
     pub(crate) fn new<F>(f: F) -> Self
@@ -1729,6 +1729,33 @@ impl BoundServer {
     ///         ext.insert(PeerIdentity::parse(conn.peer_certs()));
     ///     })
     ///     .serve(router).await?;
+    /// ```
+    ///
+    /// `f` sees the [`ConnectionInfo`] read-only: it can read the connection's
+    /// extensions,
+    ///
+    /// ```no_run
+    /// # async fn bind() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let _bound = connectrpc::server::Server::bind("127.0.0.1:0")
+    ///     .await?
+    ///     .with_connection_extensions(|conn, _ext| {
+    ///         let _ = conn.extensions().len();
+    ///     });
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// but not change them, so this does not compile:
+    ///
+    /// ```compile_fail,E0596
+    /// # async fn bind() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let _bound = connectrpc::server::Server::bind("127.0.0.1:0")
+    ///     .await?
+    ///     .with_connection_extensions(|conn, _ext| {
+    ///         conn.extensions_mut().clear();
+    ///     });
+    /// # Ok(())
+    /// # }
     /// ```
     #[must_use]
     pub fn with_connection_extensions<F>(mut self, f: F) -> Self
