@@ -3,6 +3,14 @@
 //! This module provides the HTTP server implementation that handles incoming
 //! ConnectRPC requests and routes them to the appropriate handlers.
 //!
+//! Serving needs a tokio runtime with I/O and time enabled
+//! ([`enable_all`](tokio::runtime::Builder::enable_all), as `#[tokio::main]`
+//! does). These features use tokio's timer: the header-read timeout and, with
+//! `server-tls`, the TLS handshake timeout (both on by default), the
+//! retirement timers, HTTP/2 keepalive, and the accept loop's pause after
+//! running out of file descriptors. Without time enabled, tokio panics when
+//! the first of them starts.
+//!
 //! # TLS Support
 //!
 //! When the `tls` feature is enabled, the server can be configured with a
@@ -145,6 +153,7 @@ use crate::codec::content_type;
 use crate::dispatcher::Dispatcher;
 use crate::error::ConnectError;
 use crate::error::ErrorCode;
+use crate::error::SharedSource;
 use crate::router::Router;
 use crate::service::ConnectRpcService;
 
@@ -284,9 +293,9 @@ impl ConnectionInfo {
 /// The per-connection function registered with
 /// [`Server::with_connection_extensions`] and its equivalents.
 #[derive(Clone)]
-pub(crate) struct ConnectionExtensionsFn(Arc<ExtendConnection>);
+pub(crate) struct ConnectionExtensionsFn(Arc<DynConnectionExtensionsFn>);
 
-type ExtendConnection = dyn Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync;
+type DynConnectionExtensionsFn = dyn Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync;
 
 impl ConnectionExtensionsFn {
     pub(crate) fn new<F>(f: F) -> Self
@@ -298,10 +307,9 @@ impl ConnectionExtensionsFn {
 
     /// Run the function once, before the connection is served: it reads
     /// `info`, and what it inserts joins `info`'s extensions, replacing
-    /// entries of the same type. Returns `false`, having logged the panic, if
-    /// the function panicked; the caller then drops the connection.
-    #[must_use]
-    fn apply(&self, info: &mut ConnectionInfo) -> bool {
+    /// entries of the same type. If the function panicked, logs the panic and
+    /// returns it as an error; the caller then drops the connection.
+    fn apply(&self, info: &mut ConnectionInfo) -> Result<(), Box<ConnectionError>> {
         let mut added = http::Extensions::new();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (self.0)(info, &mut added);
@@ -309,15 +317,16 @@ impl ConnectionExtensionsFn {
         match ran {
             Ok(()) => {
                 info.extensions.extend(added);
-                true
+                Ok(())
             }
             Err(panic) => {
                 let message = panic_message(&*panic).unwrap_or("non-string payload");
+                let err = format!("with_connection_extensions function panicked: {message}");
                 tracing::error!(
                     remote_addr = info.peer_addr().map(tracing::field::display),
-                    "with_connection_extensions function panicked: {message}",
+                    "{err}"
                 );
-                false
+                Err(err.into())
             }
         }
     }
@@ -331,22 +340,70 @@ impl ConnectionExtensionsFn {
 impl std::panic::UnwindSafe for ConnectionExtensionsFn {}
 impl std::panic::RefUnwindSafe for ConnectionExtensionsFn {}
 
-/// How a connection served by [`Server::serve_connection`] ended.
+/// How a connection served by [`Server::serve_connection`] or
+/// [`serve_connection`] ended.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ConnectionClosed {
     reason: CloseReason,
+    error: Option<SharedSource>,
 }
 
+type ConnectionError = dyn std::error::Error + Send + Sync;
+
+// `dyn Error` is not `RefUnwindSafe`, which would take both traits from
+// `ConnectionClosed`. The error is `Sync`, so any interior mutability in it
+// already goes through locks or atomics that stay consistent across a panic;
+// as with the unwind-safety traits generally, these impls are advisory.
+impl std::panic::UnwindSafe for ConnectionClosed {}
+impl std::panic::RefUnwindSafe for ConnectionClosed {}
+
 impl ConnectionClosed {
-    fn new(reason: CloseReason) -> Self {
-        Self { reason }
+    fn new(reason: CloseReason, error: Option<Box<ConnectionError>>) -> Self {
+        debug_assert!(
+            reason != CloseReason::Error || error.is_some(),
+            "CloseReason::Error without an error"
+        );
+        Self {
+            reason,
+            error: error.map(Arc::from),
+        }
     }
 
     /// Why the connection ended.
     #[must_use]
     pub fn reason(&self) -> CloseReason {
         self.reason
+    }
+
+    /// The error that ended the connection, if one did.
+    ///
+    /// Always `Some` when [`reason`](Self::reason) is [`CloseReason::Error`].
+    /// Also `Some` when the connection failed while winding down; the reason
+    /// then stays the one that started the wind-down, so
+    /// `reason() != CloseReason::Error && error().is_some()` identifies a
+    /// failed drain. `None` when the connection ended cleanly, when it was
+    /// closed because its retirement grace period expired, and when it was
+    /// told to wind down before enough bytes arrived to pick HTTP/1.1 or
+    /// HTTP/2.
+    ///
+    /// Once the protocol is known, a failure is a [`hyper::Error`]
+    /// ([`is_timeout`](hyper::Error::is_timeout) is true for an expired
+    /// header-read timeout); a read failure before that is a
+    /// [`std::io::Error`]. A panic in the
+    /// [`with_connection_extensions`](Server::with_connection_extensions)
+    /// function is an error whose message contains the panic message when that
+    /// is a string; the panic is also logged at `error` level.
+    #[must_use]
+    pub fn error(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.error.as_deref()
+    }
+
+    /// The same error as [`error`](Self::error), as an owned handle to keep
+    /// or to pass on as another error's source.
+    #[must_use]
+    pub fn error_arc(&self) -> Option<SharedSource> {
+        self.error.clone()
     }
 }
 
@@ -357,9 +414,9 @@ impl ConnectionClosed {
 /// [`Idle`](Self::Idle), [`MaxRequests`](Self::MaxRequests)) is reported
 /// whether the connection drained within the grace period or was closed when
 /// the grace period expired, and even if the shutdown signal arrived while it
-/// drained. An error while winding down also reports that reason, not
-/// [`Error`](Self::Error): a peer that fails mid-drain, or one whose protocol
-/// was not yet detected (it had sent no bytes, say), ends that way.
+/// drained. A connection that fails while winding down also reports that
+/// reason, not [`Error`](Self::Error); [`ConnectionClosed::error`] returns
+/// the failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CloseReason {
@@ -376,7 +433,8 @@ pub enum CloseReason {
     Idle,
     /// Retired after serving the configured number of requests.
     MaxRequests,
-    /// Something failed before anything told the connection to wind down:
+    /// Something failed before anything told the connection to wind down;
+    /// [`ConnectionClosed::error`] returns the error. The causes are:
     ///
     /// - an I/O or protocol error;
     /// - an expired HTTP/1.1 header-read timeout;
@@ -1365,9 +1423,9 @@ impl Server {
         // it drops only this connection, as on the built-in loop.
         async move {
             if let Some(f) = &connection_extensions
-                && !f.apply(&mut info)
+                && let Err(err) = f.apply(&mut info)
             {
-                return ConnectionClosed::new(CloseReason::Error);
+                return ConnectionClosed::new(CloseReason::Error, Some(err));
             }
             serve_connection(io, info, service, config, shutdown).await
         }
@@ -1380,8 +1438,16 @@ impl Server {
 
     /// Bind and serve on the given address.
     ///
-    /// This runs forever until the process is killed. For graceful shutdown,
-    /// use [`Server::bind`] + [`BoundServer::serve_with_graceful_shutdown`].
+    /// Runs until a non-transient accept error. Dropping the future aborts
+    /// every live connection; to drain them instead, use [`Server::bind`] +
+    /// [`BoundServer::serve_with_graceful_shutdown`]. Accept errors are
+    /// handled as by [`BoundServer::serve`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if binding `addr` fails, and for an accept error that is neither
+    /// transient nor file-descriptor exhaustion, after detaching the live
+    /// connections, which then drain with no deadline.
     pub async fn serve(
         self,
         addr: SocketAddr,
@@ -1664,6 +1730,33 @@ impl BoundServer {
     ///     })
     ///     .serve(router).await?;
     /// ```
+    ///
+    /// `f` sees the [`ConnectionInfo`] read-only: it can read the connection's
+    /// extensions,
+    ///
+    /// ```no_run
+    /// # async fn bind() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let _bound = connectrpc::server::Server::bind("127.0.0.1:0")
+    ///     .await?
+    ///     .with_connection_extensions(|conn, _ext| {
+    ///         let _ = conn.extensions().len();
+    ///     });
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// but not change them, so this does not compile:
+    ///
+    /// ```compile_fail,E0596
+    /// # async fn bind() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let _bound = connectrpc::server::Server::bind("127.0.0.1:0")
+    ///     .await?
+    ///     .with_connection_extensions(|conn, _ext| {
+    ///         conn.extensions_mut().clear();
+    ///     });
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn with_connection_extensions<F>(mut self, f: F) -> Self
     where
@@ -1675,16 +1768,20 @@ impl BoundServer {
 
     /// Start serving requests with the given router.
     ///
-    /// Runs until a non-transient accept error. For graceful shutdown use
+    /// Runs until a non-transient accept error. Dropping the future aborts
+    /// every live connection; to drain them instead, use
     /// [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown).
-    /// Transient accept errors are logged and skipped; after running out of
-    /// file descriptors (`EMFILE` / `ENFILE`) the loop pauses accepts for a
-    /// second.
+    /// Transient accept errors ([`ErrorKind`](std::io::ErrorKind)
+    /// `WouldBlock`, `Interrupted`, `ConnectionAborted`, `ConnectionReset`)
+    /// are logged and skipped. After
+    /// running out of file descriptors (`EMFILE` / `ENFILE`, or `WSAEMFILE`
+    /// on Windows) the loop pauses accepts for a second.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a non-transient `accept(2)` error; live connections
-    /// are detached and wind down on their own.
+    /// Returns `Err` for an accept error that is neither
+    /// transient nor file-descriptor exhaustion, after detaching the live
+    /// connections, which then drain with no deadline.
     pub async fn serve(
         self,
         router: Router,
@@ -1705,9 +1802,10 @@ impl BoundServer {
     ///  3. waits for all in-flight requests to complete before returning
     ///     `Ok(())`.
     ///
-    /// Transient accept errors are logged and skipped; after running out of
-    /// file descriptors (`EMFILE` / `ENFILE`) the loop pauses accepts for up to
-    /// a second, or until `signal` resolves.
+    /// Transient accept errors are logged and skipped, as for
+    /// [`serve`](Self::serve). After running out of file descriptors
+    /// (`EMFILE` / `ENFILE`, or `WSAEMFILE` on Windows) the loop pauses
+    /// accepts for up to a second, or until `signal` resolves.
     ///
     /// In-flight requests are not cancelled; this method waits indefinitely
     /// for them. For bounded shutdown (e.g. Kubernetes preStop hooks with a
@@ -1723,8 +1821,9 @@ impl BoundServer {
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a non-transient `accept(2)` error, without waiting
-    /// for a drain; live connections are detached and wind down on their own.
+    /// Returns `Err` for an accept error that is neither transient nor
+    /// file-descriptor exhaustion, without waiting for a drain; the live
+    /// connections are detached and drain with no deadline.
     ///
     /// # Example
     ///
@@ -1750,8 +1849,18 @@ impl BoundServer {
 
     /// Start serving requests with the given [`ConnectRpcService`].
     ///
-    /// This is useful when you want to share a service between multiple servers,
-    /// or when you've wrapped the service with additional tower layers.
+    /// Use this for a service configured with
+    /// [`with_limits`](ConnectRpcService::with_limits),
+    /// [`with_compression`](ConnectRpcService::with_compression) or
+    /// [`with_interceptor`](ConnectRpcService::with_interceptor), or one shared
+    /// between servers. To serve a tower-layered stack, pass it to
+    /// [`serve_connection`] from your own accept loop, or, with the `axum`
+    /// feature, mount it with `axum::Router::fallback_service` and use
+    /// `connectrpc::axum::serve`. Otherwise behaves as [`serve`](Self::serve).
+    ///
+    /// # Errors
+    ///
+    /// As for [`serve`](Self::serve).
     pub async fn serve_with_service<D: Dispatcher>(
         self,
         service: ConnectRpcService<D>,
@@ -1764,6 +1873,11 @@ impl BoundServer {
     ///
     /// See [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown)
     /// for behaviour and limitations.
+    ///
+    /// # Errors
+    ///
+    /// As for
+    /// [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown).
     pub async fn serve_with_service_and_shutdown<D, F>(
         self,
         service: ConnectRpcService<D>,
@@ -2120,7 +2234,7 @@ fn serve_connection_with_lifecycle<C>(
 ) -> ConnectionLifecycle<C>
 where
     C: GracefulConnection,
-    C::Error: std::fmt::Display,
+    C::Error: Into<Box<ConnectionError>>,
 {
     ConnectionLifecycle {
         conn: Box::pin(conn),
@@ -2208,7 +2322,7 @@ enum ConnectionLifecycleState {
 impl<C> Future for ConnectionLifecycle<C>
 where
     C: GracefulConnection,
-    C::Error: std::fmt::Display,
+    C::Error: Into<Box<ConnectionError>>,
 {
     type Output = ConnectionClosed;
 
@@ -2342,7 +2456,7 @@ where
                             grace = ?duration,
                             "Connection retirement grace expired; closing connection",
                         );
-                        return Poll::Ready(ConnectionClosed::new(reason));
+                        return Poll::Ready(ConnectionClosed::new(reason, None));
                     }
 
                     return Poll::Pending;
@@ -2352,22 +2466,42 @@ where
     }
 }
 
-/// Log how hyper's connection future ended and report `reason`. A connection
-/// that was told to wind down passes that reason even for an error result:
-/// the error is then a consequence of winding down (hyper-util reports a
-/// graceful shutdown that arrives before protocol detection as one) or a
-/// failure mid-drain, and is only logged.
-fn log_connection_result<E: std::fmt::Display>(
+/// Log how hyper's connection future ended and report `reason` with its
+/// error, if any.
+///
+/// A connection told to wind down passes that reason even when it failed
+/// mid-drain. The exception is hyper-util's error for a connection told to
+/// wind down before it picked a protocol: that error is dropped, so the
+/// result has the wind-down reason and no error.
+fn log_connection_result<E: Into<Box<ConnectionError>>>(
     remote_addr: Option<SocketAddr>,
     result: Result<(), E>,
     reason: CloseReason,
 ) -> ConnectionClosed {
     let remote_addr = remote_addr.map(tracing::field::display);
-    match result {
-        Ok(()) => tracing::trace!(remote_addr, "Connection completed normally"),
-        Err(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
+    let error = result
+        .err()
+        .map(Into::into)
+        .filter(|err| reason == CloseReason::Error || !is_cancelled_before_detection(err.as_ref()));
+    match &error {
+        None => tracing::trace!(remote_addr, "Connection completed normally"),
+        Some(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
     }
-    ConnectionClosed::new(reason)
+    ConnectionClosed::new(reason, error)
+}
+
+/// Whether `err` is the one hyper-util's auto connection returns when a
+/// graceful shutdown arrives before it has read enough to pick HTTP/1.1 or
+/// HTTP/2.
+///
+/// It comes from `ReadVersion::poll` in hyper-util's `server::conn::auto`,
+/// which identifies it only as an `Interrupted` error reading "Cancelled";
+/// `serve_connection_close_reason_before_first_request` fails if that
+/// changes.
+fn is_cancelled_before_detection(err: &ConnectionError) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|err| {
+        err.kind() == std::io::ErrorKind::Interrupted && err.to_string() == "Cancelled"
+    })
 }
 
 fn jitter_connection_age(age: Duration, sample: u64) -> Duration {
@@ -2405,10 +2539,9 @@ pub(crate) type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>
 /// until `shutdown` resolves, then stop accepting, tell every live connection
 /// to drain, and wait for all of them. `connection_extensions`, if set, runs
 /// on each connection's task between the (optional) TLS handshake and the
-/// first request. A fatal accept error
-/// detaches the live connections (they observe the dropped drain signal and
-/// wind down on their own) and returns the error; dropping the future aborts
-/// every connection task.
+/// first request. A fatal accept error detaches the live connections (they
+/// observe the dropped drain signal and wind down on their own) and returns
+/// the error; dropping the future aborts every connection task.
 pub(crate) async fn serve_with_listener<S, B>(
     listener: TcpListener,
     service: S,
@@ -2521,7 +2654,7 @@ where
                             .peer_certificates()
                             .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
                         if let Some(f) = &connection_extensions
-                            && !f.apply(&mut peer)
+                            && f.apply(&mut peer).is_err()
                         {
                             return;
                         }
@@ -2547,7 +2680,7 @@ where
             // Plain TCP (no TLS or TLS not configured)
             let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
             if let Some(f) = &connection_extensions
-                && !f.apply(&mut peer)
+                && f.apply(&mut peer).is_err()
             {
                 return;
             }
@@ -2707,38 +2840,40 @@ impl http_body::Body for ServedBody {
     }
 }
 
-/// How long the accept loop waits after `EMFILE` / `ENFILE` before accepting
-/// again, unless shutdown fires first. Accepting sooner fails the same way,
-/// spinning a core until a descriptor is freed.
+/// How long the accept loop waits after running out of file descriptors
+/// before accepting again, unless shutdown fires first. Accepting sooner
+/// fails the same way, spinning a core until a descriptor is freed.
 const FD_EXHAUSTION_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Whether an accept error means the process or the system ran out of file
-/// descriptors (`EMFILE` / `ENFILE`). Accepting again fails the same way
-/// until one is freed.
+/// descriptors (`EMFILE` / `ENFILE`, or `WSAEMFILE` on Windows). Accepting
+/// again fails the same way until one is freed.
 fn is_fd_exhaustion(err: &std::io::Error) -> bool {
     err.raw_os_error()
-        .is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE)
+        .is_some_and(|code| FD_EXHAUSTION_ERRORS.contains(&code))
 }
 
-/// Check if an accept error is transient and can be recovered from.
-///
-/// Transient errors include:
-/// - `EMFILE` / `ENFILE`: Too many open files (file descriptor exhaustion)
-/// - `ECONNABORTED`: Connection was aborted before accept completed
-/// - `EINTR`: Interrupted system call
+/// The raw OS errors [`is_fd_exhaustion`] matches.
+#[cfg(not(windows))]
+const FD_EXHAUSTION_ERRORS: &[i32] = &[libc::EMFILE, libc::ENFILE];
+#[cfg(windows)]
+const FD_EXHAUSTION_ERRORS: &[i32] = &[WSAEMFILE];
+
+/// Winsock's "too many open sockets", which it reports in place of the C
+/// runtime's `EMFILE`.
+#[cfg(any(windows, test))]
+const WSAEMFILE: i32 = 10024;
+
+/// Whether the accept loop should log `err` and keep accepting.
 pub(crate) fn is_transient_accept_error(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
     matches!(
         err.kind(),
-        // Resource temporarily unavailable
-        ErrorKind::WouldBlock |
-        // Interrupted system call
-        ErrorKind::Interrupted |
-        // Connection aborted
-        ErrorKind::ConnectionAborted |
-        // Connection reset by peer
-        ErrorKind::ConnectionReset
+        ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
     ) || is_fd_exhaustion(err)
 }
 
@@ -4892,10 +5027,16 @@ mod tests {
     struct ConnTag(usize);
 
     #[test]
-    fn connection_types_are_send_and_sync() {
+    fn connection_types_are_thread_and_unwind_safe() {
         fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         assert_send_sync::<ConnectionInfo>();
         assert_send_sync::<ConnectionClosed>();
+        assert_unwind_safe::<ConnectionClosed>();
+        // The connection-extensions function must not take these from
+        // `BoundServer`; with TLS, `rustls::ServerConfig` already does.
+        #[cfg(not(feature = "server-tls"))]
+        assert_unwind_safe::<BoundServer>();
     }
 
     /// `request_extensions` sets the built-ins from the transport over the
@@ -5136,8 +5277,8 @@ mod tests {
     }
 
     /// A connection told to wind down before its peer sent a byte reports
-    /// why, not `Error`; a peer that hangs up reports `Closed`, and a
-    /// malformed request reports `Error`.
+    /// why, not `Error`, and no error; a peer that hangs up reports `Closed`,
+    /// and a malformed request reports `Error` with the error.
     #[tokio::test(start_paused = true)]
     async fn serve_connection_close_reason_before_first_request() {
         fn unstarted(
@@ -5153,23 +5294,120 @@ mod tests {
         }
         let plain = Server::new(Router::new());
         let (conn, _client) = unstarted(&plain, std::future::ready(()));
-        assert_eq!(conn.await.reason(), CloseReason::Shutdown);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Shutdown);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let idle = Server::new(Router::new()).with_max_connection_idle(Duration::from_secs(1));
         let (conn, _client) = unstarted(&idle, std::future::pending());
-        assert_eq!(conn.await.reason(), CloseReason::Idle);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Idle);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let aged = Server::new(Router::new()).with_max_connection_age(Duration::from_secs(1));
         let (conn, _client) = unstarted(&aged, std::future::pending());
-        assert_eq!(conn.await.reason(), CloseReason::MaxAge);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::MaxAge);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let (conn, client) = unstarted(&plain, std::future::pending());
         drop(client);
-        assert_eq!(conn.await.reason(), CloseReason::Closed);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Closed);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let (conn, mut client) = unstarted(&plain, std::future::pending());
         client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
-        assert_eq!(conn.await.reason(), CloseReason::Error);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Error);
+        assert!(closed.error().is_some());
+    }
+
+    /// A router whose one method, `svc/Echo`, never responds.
+    fn never_responding_router() -> Router {
+        Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                |_ctx: crate::RequestContext, _req: buffa_types::Empty| async move {
+                    std::future::pending::<()>().await;
+                    crate::Response::ok(buffa_types::Empty::default())
+                },
+            ),
+        )
+    }
+
+    /// Request-count and idle retirement close a connection that has not
+    /// drained once the configured grace period expires, and report no error.
+    #[tokio::test(start_paused = true)]
+    async fn retirement_closes_after_the_configured_grace() {
+        const GRACE: Duration = Duration::from_secs(7);
+        const IDLE: Duration = Duration::from_secs(1);
+
+        // Retired as its one request is dispatched; the request never ends.
+        let server = Server::new(never_responding_router())
+            .with_max_requests_per_connection(NonZeroU64::MIN)
+            .with_max_connection_age_grace(GRACE);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = server.serve_connection(io, ConnectionInfo::new(), std::future::pending());
+        client.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("grace period never expired");
+        assert_eq!(closed.reason(), CloseReason::MaxRequests);
+        assert_eq!(started.elapsed(), GRACE);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
+
+        // Idle with a request head half sent, which hyper keeps reading
+        // through the drain. No header-read timeout, so only the grace period
+        // can end it.
+        let server = Server::new(never_responding_router())
+            .with_max_connection_idle(IDLE)
+            .with_max_connection_age_grace(GRACE)
+            .with_header_read_timeout(None);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = server.serve_connection(io, ConnectionInfo::new(), std::future::pending());
+        client
+            .write_all(b"POST /svc/Echo HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("grace period never expired");
+        assert_eq!(closed.reason(), CloseReason::Idle);
+        assert_eq!(started.elapsed(), IDLE + GRACE);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
+    }
+
+    /// A connection that fails while draining keeps the reason that started
+    /// the drain and reports the failure through `error()`.
+    #[tokio::test(start_paused = true)]
+    async fn error_while_draining_keeps_the_reason() {
+        let server = Server::new(never_responding_router())
+            .with_max_requests_per_connection(NonZeroU64::MIN);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(server.serve_connection(
+            io,
+            ConnectionInfo::new(),
+            std::future::pending(),
+        ));
+        client.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(client);
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("connection did not end")
+            .unwrap();
+        assert_eq!(closed.reason(), CloseReason::MaxRequests);
+        let error = closed.error_arc().expect("no error for the hang-up");
+        assert!(
+            error
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_incomplete_message),
+            "{error:?}"
+        );
     }
 
     /// A streaming body that panics after the response started ends the
@@ -5215,12 +5453,26 @@ mod tests {
             .expect("connection did not end")
             .expect("serve_connection panicked");
         assert_eq!(closed.reason(), CloseReason::Error);
+        assert!(closed.error().is_some());
     }
 
     #[test]
     fn fd_exhaustion_is_transient_and_distinguished() {
-        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
-        assert!(is_transient_accept_error(&emfile) && is_fd_exhaustion(&emfile));
+        #[cfg(not(windows))]
+        let (exhausted, other_platform) = ([libc::EMFILE, libc::ENFILE], WSAEMFILE);
+        // 24 is the C runtime's `EMFILE`, which Winsock does not return.
+        #[cfg(windows)]
+        let (exhausted, other_platform) = ([WSAEMFILE], 24);
+        for code in exhausted {
+            let err = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_transient_accept_error(&err) && is_fd_exhaustion(&err),
+                "{err}"
+            );
+        }
+        assert!(!is_fd_exhaustion(&std::io::Error::from_raw_os_error(
+            other_platform
+        )));
         let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
         assert!(is_transient_accept_error(&aborted) && !is_fd_exhaustion(&aborted));
     }
@@ -5486,6 +5738,8 @@ mod tests {
             .serve_connection(io, ConnectionInfo::new(), std::future::pending())
             .await;
         assert_eq!(closed.reason(), CloseReason::Error);
+        let error = closed.error().expect("no error for the panic").to_string();
+        assert!(error.contains("panic on purpose"), "{error}");
 
         let (router, seen) = tag_capturing_router();
         let first = std::sync::atomic::AtomicBool::new(true);

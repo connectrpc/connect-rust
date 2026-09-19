@@ -316,6 +316,12 @@ pub use error::SharedSource;
 /// `http-body` dependency to use generated code.
 pub use http_body;
 
+/// Re-export of the `http` crate, whose types, such as
+/// [`HeaderMap`](http::HeaderMap) and [`Extensions`](http::Extensions),
+/// appear throughout the public API — so consumers can name them without
+/// their own `http` dependency.
+pub use http;
+
 // Protocol detection
 pub use protocol::Protocol;
 pub use protocol::RequestProtocol;

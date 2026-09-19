@@ -82,13 +82,16 @@ use crate::server::serve_with_listener;
 /// [`ConnectionConfig`] setting, graceful shutdown, panic isolation.
 ///
 /// See the [module docs](self) for what this adds over `axum::serve`. After
-/// running out of file descriptors (`EMFILE` / `ENFILE`) the loop pauses
-/// accepts for up to a second, or until the shutdown signal fires.
+/// running out of file descriptors (`EMFILE` / `ENFILE`, or `WSAEMFILE` on
+/// Windows) the loop pauses accepts for up to a second, or until the
+/// shutdown signal fires.
 ///
 /// # Errors
 ///
-/// The future resolves to `Err` only for a non-transient `accept(2)` error.
-/// Per-connection failures are logged and never end the loop.
+/// The future resolves to `Err` only for an accept error that is neither
+/// transient nor file-descriptor exhaustion, as for
+/// [`BoundServer::serve`](crate::BoundServer::serve). Per-connection
+/// failures are logged and never end the loop.
 pub fn serve(listener: TcpListener, router: axum::Router) -> Serve {
     Serve {
         listener,
@@ -128,9 +131,9 @@ pub fn serve(listener: TcpListener, router: axum::Router) -> Serve {
 ///
 /// # Errors
 ///
-/// As [`serve`]: only a non-transient `accept(2)` error. TLS handshake
-/// failures and timeouts are logged at `debug` / `warn` and never end the
-/// loop.
+/// As [`serve`]: only an accept error that is neither transient nor
+/// file-descriptor exhaustion. TLS handshake failures and timeouts are
+/// logged at `debug` / `warn` and never end the loop.
 #[cfg(feature = "server-tls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
 pub fn serve_tls(
