@@ -145,6 +145,7 @@ use crate::codec::content_type;
 use crate::dispatcher::Dispatcher;
 use crate::error::ConnectError;
 use crate::error::ErrorCode;
+use crate::error::SharedSource;
 use crate::router::Router;
 use crate::service::ConnectRpcService;
 
@@ -298,10 +299,9 @@ impl ConnectionExtensionsFn {
 
     /// Run the function once, before the connection is served: it reads
     /// `info`, and what it inserts joins `info`'s extensions, replacing
-    /// entries of the same type. Returns `false`, having logged the panic, if
-    /// the function panicked; the caller then drops the connection.
-    #[must_use]
-    fn apply(&self, info: &mut ConnectionInfo) -> bool {
+    /// entries of the same type. If the function panicked, logs the panic and
+    /// returns it as an error; the caller then drops the connection.
+    fn apply(&self, info: &mut ConnectionInfo) -> Result<(), Box<ConnectionError>> {
         let mut added = http::Extensions::new();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (self.0)(info, &mut added);
@@ -309,15 +309,16 @@ impl ConnectionExtensionsFn {
         match ran {
             Ok(()) => {
                 info.extensions.extend(added);
-                true
+                Ok(())
             }
             Err(panic) => {
                 let message = panic_message(&*panic).unwrap_or("non-string payload");
+                let err = format!("with_connection_extensions function panicked: {message}");
                 tracing::error!(
                     remote_addr = info.peer_addr().map(tracing::field::display),
-                    "with_connection_extensions function panicked: {message}",
+                    "{err}"
                 );
-                false
+                Err(err.into())
             }
         }
     }
@@ -331,22 +332,70 @@ impl ConnectionExtensionsFn {
 impl std::panic::UnwindSafe for ConnectionExtensionsFn {}
 impl std::panic::RefUnwindSafe for ConnectionExtensionsFn {}
 
-/// How a connection served by [`Server::serve_connection`] ended.
+/// How a connection served by [`Server::serve_connection`] or
+/// [`serve_connection`] ended.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ConnectionClosed {
     reason: CloseReason,
+    error: Option<SharedSource>,
 }
 
+type ConnectionError = dyn std::error::Error + Send + Sync;
+
+// `dyn Error` is not `RefUnwindSafe`, which would take both traits from
+// `ConnectionClosed`. The error is `Sync`, so any interior mutability in it
+// already goes through locks or atomics that stay consistent across a panic;
+// as with the unwind-safety traits generally, these impls are advisory.
+impl std::panic::UnwindSafe for ConnectionClosed {}
+impl std::panic::RefUnwindSafe for ConnectionClosed {}
+
 impl ConnectionClosed {
-    fn new(reason: CloseReason) -> Self {
-        Self { reason }
+    fn new(reason: CloseReason, error: Option<Box<ConnectionError>>) -> Self {
+        debug_assert!(
+            reason != CloseReason::Error || error.is_some(),
+            "CloseReason::Error without an error"
+        );
+        Self {
+            reason,
+            error: error.map(Arc::from),
+        }
     }
 
     /// Why the connection ended.
     #[must_use]
     pub fn reason(&self) -> CloseReason {
         self.reason
+    }
+
+    /// The error that ended the connection, if one did.
+    ///
+    /// Always `Some` when [`reason`](Self::reason) is [`CloseReason::Error`].
+    /// Also `Some` when the connection failed while winding down; the reason
+    /// then stays the one that started the wind-down, so
+    /// `reason() != CloseReason::Error && error().is_some()` identifies a
+    /// failed drain. `None` when the connection ended cleanly, when it was
+    /// closed because its retirement grace period expired, and when it was
+    /// told to wind down before enough bytes arrived to pick HTTP/1.1 or
+    /// HTTP/2.
+    ///
+    /// Once the protocol is known, a failure is a [`hyper::Error`]
+    /// ([`is_timeout`](hyper::Error::is_timeout) is true for an expired
+    /// header-read timeout); a read failure before that is a
+    /// [`std::io::Error`]. A panic in the
+    /// [`with_connection_extensions`](Server::with_connection_extensions)
+    /// function is an error whose message contains the panic message when that
+    /// is a string; the panic is also logged at `error` level.
+    #[must_use]
+    pub fn error(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.error.as_deref()
+    }
+
+    /// The same error as [`error`](Self::error), as an owned handle to keep
+    /// or to pass on as another error's source.
+    #[must_use]
+    pub fn error_arc(&self) -> Option<SharedSource> {
+        self.error.clone()
     }
 }
 
@@ -357,9 +406,9 @@ impl ConnectionClosed {
 /// [`Idle`](Self::Idle), [`MaxRequests`](Self::MaxRequests)) is reported
 /// whether the connection drained within the grace period or was closed when
 /// the grace period expired, and even if the shutdown signal arrived while it
-/// drained. An error while winding down also reports that reason, not
-/// [`Error`](Self::Error): a peer that fails mid-drain, or one whose protocol
-/// was not yet detected (it had sent no bytes, say), ends that way.
+/// drained. A connection that fails while winding down also reports that
+/// reason, not [`Error`](Self::Error); [`ConnectionClosed::error`] returns
+/// the failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CloseReason {
@@ -376,7 +425,8 @@ pub enum CloseReason {
     Idle,
     /// Retired after serving the configured number of requests.
     MaxRequests,
-    /// Something failed before anything told the connection to wind down:
+    /// Something failed before anything told the connection to wind down;
+    /// [`ConnectionClosed::error`] returns the error. The causes are:
     ///
     /// - an I/O or protocol error;
     /// - an expired HTTP/1.1 header-read timeout;
@@ -1365,9 +1415,9 @@ impl Server {
         // it drops only this connection, as on the built-in loop.
         async move {
             if let Some(f) = &connection_extensions
-                && !f.apply(&mut info)
+                && let Err(err) = f.apply(&mut info)
             {
-                return ConnectionClosed::new(CloseReason::Error);
+                return ConnectionClosed::new(CloseReason::Error, Some(err));
             }
             serve_connection(io, info, service, config, shutdown).await
         }
@@ -2120,7 +2170,7 @@ fn serve_connection_with_lifecycle<C>(
 ) -> ConnectionLifecycle<C>
 where
     C: GracefulConnection,
-    C::Error: std::fmt::Display,
+    C::Error: Into<Box<ConnectionError>>,
 {
     ConnectionLifecycle {
         conn: Box::pin(conn),
@@ -2208,7 +2258,7 @@ enum ConnectionLifecycleState {
 impl<C> Future for ConnectionLifecycle<C>
 where
     C: GracefulConnection,
-    C::Error: std::fmt::Display,
+    C::Error: Into<Box<ConnectionError>>,
 {
     type Output = ConnectionClosed;
 
@@ -2342,7 +2392,7 @@ where
                             grace = ?duration,
                             "Connection retirement grace expired; closing connection",
                         );
-                        return Poll::Ready(ConnectionClosed::new(reason));
+                        return Poll::Ready(ConnectionClosed::new(reason, None));
                     }
 
                     return Poll::Pending;
@@ -2352,22 +2402,42 @@ where
     }
 }
 
-/// Log how hyper's connection future ended and report `reason`. A connection
-/// that was told to wind down passes that reason even for an error result:
-/// the error is then a consequence of winding down (hyper-util reports a
-/// graceful shutdown that arrives before protocol detection as one) or a
-/// failure mid-drain, and is only logged.
-fn log_connection_result<E: std::fmt::Display>(
+/// Log how hyper's connection future ended and report `reason` with its
+/// error, if any.
+///
+/// A connection told to wind down passes that reason even when it failed
+/// mid-drain. The exception is hyper-util's error for a connection told to
+/// wind down before it picked a protocol: that error is dropped, so the
+/// result has the wind-down reason and no error.
+fn log_connection_result<E: Into<Box<ConnectionError>>>(
     remote_addr: Option<SocketAddr>,
     result: Result<(), E>,
     reason: CloseReason,
 ) -> ConnectionClosed {
     let remote_addr = remote_addr.map(tracing::field::display);
-    match result {
-        Ok(()) => tracing::trace!(remote_addr, "Connection completed normally"),
-        Err(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
+    let error = result
+        .err()
+        .map(Into::into)
+        .filter(|err| reason == CloseReason::Error || !is_cancelled_before_detection(err.as_ref()));
+    match &error {
+        None => tracing::trace!(remote_addr, "Connection completed normally"),
+        Some(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
     }
-    ConnectionClosed::new(reason)
+    ConnectionClosed::new(reason, error)
+}
+
+/// Whether `err` is the one hyper-util's auto connection returns when a
+/// graceful shutdown arrives before it has read enough to pick HTTP/1.1 or
+/// HTTP/2.
+///
+/// It comes from `ReadVersion::poll` in hyper-util's `server::conn::auto`,
+/// which identifies it only as an `Interrupted` error reading "Cancelled";
+/// `serve_connection_close_reason_before_first_request` fails if that
+/// changes.
+fn is_cancelled_before_detection(err: &ConnectionError) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|err| {
+        err.kind() == std::io::ErrorKind::Interrupted && err.to_string() == "Cancelled"
+    })
 }
 
 fn jitter_connection_age(age: Duration, sample: u64) -> Duration {
@@ -2521,7 +2591,7 @@ where
                             .peer_certificates()
                             .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
                         if let Some(f) = &connection_extensions
-                            && !f.apply(&mut peer)
+                            && f.apply(&mut peer).is_err()
                         {
                             return;
                         }
@@ -2547,7 +2617,7 @@ where
             // Plain TCP (no TLS or TLS not configured)
             let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
             if let Some(f) = &connection_extensions
-                && !f.apply(&mut peer)
+                && f.apply(&mut peer).is_err()
             {
                 return;
             }
@@ -4892,10 +4962,16 @@ mod tests {
     struct ConnTag(usize);
 
     #[test]
-    fn connection_types_are_send_and_sync() {
+    fn connection_types_are_thread_and_unwind_safe() {
         fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         assert_send_sync::<ConnectionInfo>();
         assert_send_sync::<ConnectionClosed>();
+        assert_unwind_safe::<ConnectionClosed>();
+        // The connection-extensions function must not take these from
+        // `BoundServer`; with TLS, `rustls::ServerConfig` already does.
+        #[cfg(not(feature = "server-tls"))]
+        assert_unwind_safe::<BoundServer>();
     }
 
     /// `request_extensions` sets the built-ins from the transport over the
@@ -5136,8 +5212,8 @@ mod tests {
     }
 
     /// A connection told to wind down before its peer sent a byte reports
-    /// why, not `Error`; a peer that hangs up reports `Closed`, and a
-    /// malformed request reports `Error`.
+    /// why, not `Error`, and no error; a peer that hangs up reports `Closed`,
+    /// and a malformed request reports `Error` with the error.
     #[tokio::test(start_paused = true)]
     async fn serve_connection_close_reason_before_first_request() {
         fn unstarted(
@@ -5153,23 +5229,120 @@ mod tests {
         }
         let plain = Server::new(Router::new());
         let (conn, _client) = unstarted(&plain, std::future::ready(()));
-        assert_eq!(conn.await.reason(), CloseReason::Shutdown);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Shutdown);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let idle = Server::new(Router::new()).with_max_connection_idle(Duration::from_secs(1));
         let (conn, _client) = unstarted(&idle, std::future::pending());
-        assert_eq!(conn.await.reason(), CloseReason::Idle);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Idle);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let aged = Server::new(Router::new()).with_max_connection_age(Duration::from_secs(1));
         let (conn, _client) = unstarted(&aged, std::future::pending());
-        assert_eq!(conn.await.reason(), CloseReason::MaxAge);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::MaxAge);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let (conn, client) = unstarted(&plain, std::future::pending());
         drop(client);
-        assert_eq!(conn.await.reason(), CloseReason::Closed);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Closed);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
 
         let (conn, mut client) = unstarted(&plain, std::future::pending());
         client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
-        assert_eq!(conn.await.reason(), CloseReason::Error);
+        let closed = conn.await;
+        assert_eq!(closed.reason(), CloseReason::Error);
+        assert!(closed.error().is_some());
+    }
+
+    /// A router whose one method, `svc/Echo`, never responds.
+    fn never_responding_router() -> Router {
+        Router::new().route(
+            "svc",
+            "Echo",
+            crate::handler_fn(
+                |_ctx: crate::RequestContext, _req: buffa_types::Empty| async move {
+                    std::future::pending::<()>().await;
+                    crate::Response::ok(buffa_types::Empty::default())
+                },
+            ),
+        )
+    }
+
+    /// Request-count and idle retirement close a connection that has not
+    /// drained once the configured grace period expires, and report no error.
+    #[tokio::test(start_paused = true)]
+    async fn retirement_closes_after_the_configured_grace() {
+        const GRACE: Duration = Duration::from_secs(7);
+        const IDLE: Duration = Duration::from_secs(1);
+
+        // Retired as its one request is dispatched; the request never ends.
+        let server = Server::new(never_responding_router())
+            .with_max_requests_per_connection(NonZeroU64::MIN)
+            .with_max_connection_age_grace(GRACE);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = server.serve_connection(io, ConnectionInfo::new(), std::future::pending());
+        client.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("grace period never expired");
+        assert_eq!(closed.reason(), CloseReason::MaxRequests);
+        assert_eq!(started.elapsed(), GRACE);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
+
+        // Idle with a request head half sent, which hyper keeps reading
+        // through the drain. No header-read timeout, so only the grace period
+        // can end it.
+        let server = Server::new(never_responding_router())
+            .with_max_connection_idle(IDLE)
+            .with_max_connection_age_grace(GRACE)
+            .with_header_read_timeout(None);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = server.serve_connection(io, ConnectionInfo::new(), std::future::pending());
+        client
+            .write_all(b"POST /svc/Echo HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("grace period never expired");
+        assert_eq!(closed.reason(), CloseReason::Idle);
+        assert_eq!(started.elapsed(), IDLE + GRACE);
+        assert!(closed.error().is_none(), "{:?}", closed.error());
+    }
+
+    /// A connection that fails while draining keeps the reason that started
+    /// the drain and reports the failure through `error()`.
+    #[tokio::test(start_paused = true)]
+    async fn error_while_draining_keeps_the_reason() {
+        let server = Server::new(never_responding_router())
+            .with_max_requests_per_connection(NonZeroU64::MIN);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(server.serve_connection(
+            io,
+            ConnectionInfo::new(),
+            std::future::pending(),
+        ));
+        client.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(client);
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("connection did not end")
+            .unwrap();
+        assert_eq!(closed.reason(), CloseReason::MaxRequests);
+        let error = closed.error_arc().expect("no error for the hang-up");
+        assert!(
+            error
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_incomplete_message),
+            "{error:?}"
+        );
     }
 
     /// A streaming body that panics after the response started ends the
@@ -5215,6 +5388,7 @@ mod tests {
             .expect("connection did not end")
             .expect("serve_connection panicked");
         assert_eq!(closed.reason(), CloseReason::Error);
+        assert!(closed.error().is_some());
     }
 
     #[test]
@@ -5486,6 +5660,8 @@ mod tests {
             .serve_connection(io, ConnectionInfo::new(), std::future::pending())
             .await;
         assert_eq!(closed.reason(), CloseReason::Error);
+        let error = closed.error().expect("no error for the panic").to_string();
+        assert!(error.contains("panic on purpose"), "{error}");
 
         let (router, seen) = tag_capturing_router();
         let first = std::sync::atomic::AtomicBool::new(true);
