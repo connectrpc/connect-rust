@@ -3,6 +3,14 @@
 //! This module provides the HTTP server implementation that handles incoming
 //! ConnectRPC requests and routes them to the appropriate handlers.
 //!
+//! Serving needs a tokio runtime with I/O and time enabled
+//! ([`enable_all`](tokio::runtime::Builder::enable_all), as `#[tokio::main]`
+//! does). These features use tokio's timer: the header-read timeout and, with
+//! `server-tls`, the TLS handshake timeout (both on by default), the
+//! retirement timers, HTTP/2 keepalive, and the accept loop's pause after
+//! running out of file descriptors. Without time enabled, tokio panics when
+//! the first of them starts.
+//!
 //! # TLS Support
 //!
 //! When the `tls` feature is enabled, the server can be configured with a
@@ -1430,8 +1438,16 @@ impl Server {
 
     /// Bind and serve on the given address.
     ///
-    /// This runs forever until the process is killed. For graceful shutdown,
-    /// use [`Server::bind`] + [`BoundServer::serve_with_graceful_shutdown`].
+    /// Runs until a non-transient accept error. Dropping the future aborts
+    /// every live connection; to drain them instead, use [`Server::bind`] +
+    /// [`BoundServer::serve_with_graceful_shutdown`]. Accept errors are
+    /// handled as by [`BoundServer::serve`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if binding `addr` fails, and for an accept error that is neither
+    /// transient nor file-descriptor exhaustion, after detaching the live
+    /// connections, which then drain with no deadline.
     pub async fn serve(
         self,
         addr: SocketAddr,
@@ -1725,16 +1741,20 @@ impl BoundServer {
 
     /// Start serving requests with the given router.
     ///
-    /// Runs until a non-transient accept error. For graceful shutdown use
+    /// Runs until a non-transient accept error. Dropping the future aborts
+    /// every live connection; to drain them instead, use
     /// [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown).
-    /// Transient accept errors are logged and skipped; after running out of
-    /// file descriptors (`EMFILE` / `ENFILE`) the loop pauses accepts for a
-    /// second.
+    /// Transient accept errors ([`ErrorKind`](std::io::ErrorKind)
+    /// `WouldBlock`, `Interrupted`, `ConnectionAborted`, `ConnectionReset`)
+    /// are logged and skipped. After
+    /// running out of file descriptors (`EMFILE` / `ENFILE`, or `WSAEMFILE`
+    /// on Windows) the loop pauses accepts for a second.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a non-transient `accept(2)` error; live connections
-    /// are detached and wind down on their own.
+    /// Returns `Err` for an accept error that is neither
+    /// transient nor file-descriptor exhaustion, after detaching the live
+    /// connections, which then drain with no deadline.
     pub async fn serve(
         self,
         router: Router,
@@ -1755,9 +1775,10 @@ impl BoundServer {
     ///  3. waits for all in-flight requests to complete before returning
     ///     `Ok(())`.
     ///
-    /// Transient accept errors are logged and skipped; after running out of
-    /// file descriptors (`EMFILE` / `ENFILE`) the loop pauses accepts for up to
-    /// a second, or until `signal` resolves.
+    /// Transient accept errors are logged and skipped, as for
+    /// [`serve`](Self::serve). After running out of file descriptors
+    /// (`EMFILE` / `ENFILE`, or `WSAEMFILE` on Windows) the loop pauses
+    /// accepts for up to a second, or until `signal` resolves.
     ///
     /// In-flight requests are not cancelled; this method waits indefinitely
     /// for them. For bounded shutdown (e.g. Kubernetes preStop hooks with a
@@ -1773,8 +1794,9 @@ impl BoundServer {
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a non-transient `accept(2)` error, without waiting
-    /// for a drain; live connections are detached and wind down on their own.
+    /// Returns `Err` for an accept error that is neither transient nor
+    /// file-descriptor exhaustion, without waiting for a drain; the live
+    /// connections are detached and drain with no deadline.
     ///
     /// # Example
     ///
@@ -1800,8 +1822,18 @@ impl BoundServer {
 
     /// Start serving requests with the given [`ConnectRpcService`].
     ///
-    /// This is useful when you want to share a service between multiple servers,
-    /// or when you've wrapped the service with additional tower layers.
+    /// Use this for a service configured with
+    /// [`with_limits`](ConnectRpcService::with_limits),
+    /// [`with_compression`](ConnectRpcService::with_compression) or
+    /// [`with_interceptor`](ConnectRpcService::with_interceptor), or one shared
+    /// between servers. To serve a tower-layered stack, pass it to
+    /// [`serve_connection`] from your own accept loop, or, with the `axum`
+    /// feature, mount it with `axum::Router::fallback_service` and use
+    /// `connectrpc::axum::serve`. Otherwise behaves as [`serve`](Self::serve).
+    ///
+    /// # Errors
+    ///
+    /// As for [`serve`](Self::serve).
     pub async fn serve_with_service<D: Dispatcher>(
         self,
         service: ConnectRpcService<D>,
@@ -1814,6 +1846,11 @@ impl BoundServer {
     ///
     /// See [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown)
     /// for behaviour and limitations.
+    ///
+    /// # Errors
+    ///
+    /// As for
+    /// [`serve_with_graceful_shutdown`](Self::serve_with_graceful_shutdown).
     pub async fn serve_with_service_and_shutdown<D, F>(
         self,
         service: ConnectRpcService<D>,
@@ -2475,10 +2512,9 @@ pub(crate) type ShutdownSignal = Option<Pin<Box<dyn Future<Output = ()> + Send>>
 /// until `shutdown` resolves, then stop accepting, tell every live connection
 /// to drain, and wait for all of them. `connection_extensions`, if set, runs
 /// on each connection's task between the (optional) TLS handshake and the
-/// first request. A fatal accept error
-/// detaches the live connections (they observe the dropped drain signal and
-/// wind down on their own) and returns the error; dropping the future aborts
-/// every connection task.
+/// first request. A fatal accept error detaches the live connections (they
+/// observe the dropped drain signal and wind down on their own) and returns
+/// the error; dropping the future aborts every connection task.
 pub(crate) async fn serve_with_listener<S, B>(
     listener: TcpListener,
     service: S,
@@ -2777,38 +2813,40 @@ impl http_body::Body for ServedBody {
     }
 }
 
-/// How long the accept loop waits after `EMFILE` / `ENFILE` before accepting
-/// again, unless shutdown fires first. Accepting sooner fails the same way,
-/// spinning a core until a descriptor is freed.
+/// How long the accept loop waits after running out of file descriptors
+/// before accepting again, unless shutdown fires first. Accepting sooner
+/// fails the same way, spinning a core until a descriptor is freed.
 const FD_EXHAUSTION_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Whether an accept error means the process or the system ran out of file
-/// descriptors (`EMFILE` / `ENFILE`). Accepting again fails the same way
-/// until one is freed.
+/// descriptors (`EMFILE` / `ENFILE`, or `WSAEMFILE` on Windows). Accepting
+/// again fails the same way until one is freed.
 fn is_fd_exhaustion(err: &std::io::Error) -> bool {
     err.raw_os_error()
-        .is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE)
+        .is_some_and(|code| FD_EXHAUSTION_ERRORS.contains(&code))
 }
 
-/// Check if an accept error is transient and can be recovered from.
-///
-/// Transient errors include:
-/// - `EMFILE` / `ENFILE`: Too many open files (file descriptor exhaustion)
-/// - `ECONNABORTED`: Connection was aborted before accept completed
-/// - `EINTR`: Interrupted system call
+/// The raw OS errors [`is_fd_exhaustion`] matches.
+#[cfg(not(windows))]
+const FD_EXHAUSTION_ERRORS: &[i32] = &[libc::EMFILE, libc::ENFILE];
+#[cfg(windows)]
+const FD_EXHAUSTION_ERRORS: &[i32] = &[WSAEMFILE];
+
+/// Winsock's "too many open sockets", which it reports in place of the C
+/// runtime's `EMFILE`.
+#[cfg(any(windows, test))]
+const WSAEMFILE: i32 = 10024;
+
+/// Whether the accept loop should log `err` and keep accepting.
 pub(crate) fn is_transient_accept_error(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
     matches!(
         err.kind(),
-        // Resource temporarily unavailable
-        ErrorKind::WouldBlock |
-        // Interrupted system call
-        ErrorKind::Interrupted |
-        // Connection aborted
-        ErrorKind::ConnectionAborted |
-        // Connection reset by peer
-        ErrorKind::ConnectionReset
+        ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
     ) || is_fd_exhaustion(err)
 }
 
@@ -5393,8 +5431,21 @@ mod tests {
 
     #[test]
     fn fd_exhaustion_is_transient_and_distinguished() {
-        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
-        assert!(is_transient_accept_error(&emfile) && is_fd_exhaustion(&emfile));
+        #[cfg(not(windows))]
+        let (exhausted, other_platform) = ([libc::EMFILE, libc::ENFILE], WSAEMFILE);
+        // 24 is the C runtime's `EMFILE`, which Winsock does not return.
+        #[cfg(windows)]
+        let (exhausted, other_platform) = ([WSAEMFILE], 24);
+        for code in exhausted {
+            let err = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_transient_accept_error(&err) && is_fd_exhaustion(&err),
+                "{err}"
+            );
+        }
+        assert!(!is_fd_exhaustion(&std::io::Error::from_raw_os_error(
+            other_platform
+        )));
         let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
         assert!(is_transient_accept_error(&aborted) && !is_fd_exhaustion(&aborted));
     }
