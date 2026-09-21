@@ -1,0 +1,22 @@
+kind: Security
+body: |-
+    **The header-read timeout now closes a connection that sends nothing, or
+    only part of the HTTP/2 connection preface.** Such a peer was held open
+    until it hung up, or until shutdown or a configured retirement trigger
+    ended it: the timeout started only after enough bytes had arrived to
+    pick HTTP/1.1 or HTTP/2. It now ends when the timeout expires. This
+    applies to `Server` and `connectrpc::axum::serve_tls`. A client or proxy
+    that opens connections ahead of use and sends nothing on them now has
+    them closed after the timeout (30 seconds by default). An HTTP/2
+    connection that has sent its preface is still not bound by the timeout.
+
+    `with_header_read_timeout(None)` disables both bounds. A zero timeout now
+    disables them too; before, it ended every HTTP/1.1 connection after at
+    most one request. A timeout too long to add to the current time also
+    disables them, instead of panicking the connection.
+
+    `serve_tls` now wraps the TLS stream in a private type, so
+    `hyper_util::server::conn::auto::upgrade::downcast` no longer recovers it
+    from an upgraded connection; use the upgraded connection's own `Read` /
+    `Write`.
+time: 2026-09-21T07:00:00.000000000-07:00
