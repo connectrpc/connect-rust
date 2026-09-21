@@ -2134,6 +2134,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
+    use std::time::Instant;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
@@ -4140,6 +4141,354 @@ mod tests {
                 .then(|| value.trim().parse().ok())
                 .flatten()
         })
+    }
+
+    // ========================================================================
+    // Streaming calls that end before their request body does
+    // ========================================================================
+
+    /// A client-streaming route that refuses the call without reading its
+    /// request stream.
+    fn refusing_upload_router() -> Router {
+        Router::new().route_client_stream(
+            "svc",
+            "Upload",
+            crate::handler::client_streaming_handler_fn(
+                |_ctx: crate::RequestContext,
+                 _requests: crate::ServiceStream<buffa_types::Empty>| async move {
+                    Err::<crate::Response<buffa_types::Empty>, _>(ConnectError::permission_denied(
+                        "refused before reading",
+                    ))
+                },
+            ),
+        )
+    }
+
+    /// Send `data` on an h2 client stream, waiting for flow-control capacity.
+    /// Stops quietly if the server has already ended the stream.
+    async fn send_h2_data(send: &mut h2::SendStream<Bytes>, mut data: Bytes) {
+        while !data.is_empty() {
+            send.reserve_capacity(data.len());
+            let capacity = tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| send.poll_capacity(cx)),
+            )
+            .await
+            .expect("no send window: the server is not releasing flow control");
+            let Some(Ok(capacity)) = capacity else {
+                return; // reset by the server
+            };
+            let chunk = data.split_to(capacity.min(data.len()));
+            if send.send_data(chunk, false).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A server for [`refusing_upload_router`], shut down with [`Self::stop`].
+    struct RefusingServer {
+        addr: std::net::SocketAddr,
+        shutdown_tx: tokio::sync::oneshot::Sender<()>,
+        serve: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    }
+
+    impl RefusingServer {
+        async fn start(bound: BoundServer) -> Self {
+            let addr = bound.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let serve = tokio::spawn(async move {
+                bound
+                    .serve_with_graceful_shutdown(refusing_upload_router(), async {
+                        shutdown_rx.await.ok();
+                    })
+                    .await
+            });
+            Self {
+                addr,
+                shutdown_tx,
+                serve,
+            }
+        }
+
+        /// Shut down once every client connection is closed.
+        async fn stop(self) {
+            self.shutdown_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), self.serve)
+                .await
+                .expect("server did not shut down")
+                .expect("join error")
+                .expect("serve error");
+        }
+
+        /// An h2 client connection to the server, and its driving task.
+        async fn connect_h2(
+            &self,
+        ) -> (
+            h2::client::SendRequest<Bytes>,
+            tokio::task::JoinHandle<Result<(), h2::Error>>,
+        ) {
+            let tcp = tokio::net::TcpStream::connect(self.addr).await.unwrap();
+            let (send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+            (send_request, tokio::spawn(h2_conn))
+        }
+
+        /// The request head of a call to the refusing route.
+        fn upload_request(&self) -> http::Request<()> {
+            http::Request::post(format!("http://{}/svc/Upload", self.addr))
+                .header(header::CONTENT_TYPE, "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .unwrap()
+        }
+
+        /// Open one call on an h2 connection: request head, then the response
+        /// (which arrives at once, whatever the client sends).
+        async fn start_upload(
+            &self,
+            send_request: &mut h2::client::SendRequest<Bytes>,
+        ) -> (h2::SendStream<Bytes>, http::Response<h2::RecvStream>) {
+            let (resp, send) = send_request
+                .send_request(self.upload_request(), false)
+                .unwrap();
+            let resp = resp.await.expect("response headers");
+            assert_eq!(resp.headers()["grpc-status"], "7");
+            (send, resp)
+        }
+    }
+
+    /// Over HTTP/2 a call that ends before its request stream does releases
+    /// the stream after the drain: the client receives the whole response
+    /// and, once the server gives up on the rest of the request,
+    /// `RST_STREAM(NO_ERROR)` (RFC 9113 §8.1), although it stalled part-way
+    /// through a message. The single-stream limit shows the slot is freed.
+    #[tokio::test]
+    async fn http2_early_return_releases_stalled_stream() {
+        use crate::service::DRAIN_TIMEOUT;
+
+        let server = RefusingServer::start(
+            Server::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .with_max_concurrent_streams(1),
+        )
+        .await;
+        let (send_request, h2_task) = server.connect_h2().await;
+        let mut send_request = send_request.ready().await.unwrap();
+
+        // The server's drain starts after this, so it cannot end sooner.
+        let started = Instant::now();
+        let (mut send, resp) = server.start_upload(&mut send_request).await;
+        drain_h2_body(resp).await;
+        // A header declaring 1 MiB, then 32 KiB of it.
+        let mut partial = vec![0_u8];
+        partial.extend_from_slice(&(1024_u32 * 1024).to_be_bytes());
+        partial.resize(5 + 32 * 1024, 0);
+        send_h2_data(&mut send, Bytes::from(partial)).await;
+
+        let reason = tokio::time::timeout(
+            DRAIN_TIMEOUT + Duration::from_secs(3),
+            std::future::poll_fn(|cx| send.poll_reset(cx)),
+        )
+        .await
+        .expect("the stalled stream was not reset")
+        .expect("reset");
+        assert_eq!(reason, h2::Reason::NO_ERROR);
+        assert!(
+            started.elapsed() >= DRAIN_TIMEOUT,
+            "reset before the drain was over: {:?}",
+            started.elapsed()
+        );
+
+        // The slot is free again.
+        send_request = tokio::time::timeout(Duration::from_secs(2), send_request.clone().ready())
+            .await
+            .expect("the stream slot was not freed")
+            .unwrap();
+        let (send, resp) = server.start_upload(&mut send_request).await;
+        drain_h2_body(resp).await;
+
+        drop(send);
+        drop(send_request);
+        server.stop().await;
+        h2_task.await.expect("h2 connection task panicked").ok();
+    }
+
+    /// Small DATA frames that are still in flight when a call ends early
+    /// must not cost the connection. h2 charges small frames it receives
+    /// for a stream nobody reads to connection-wide budgets, and closes the
+    /// connection with `GOAWAY(ENHANCE_YOUR_CALM)` when they run out, so a
+    /// reader that gave up on the body as soon as the handler returned would
+    /// take every other call on the connection down with it.
+    ///
+    /// A 105-byte frame costs 151 bytes of a budget of at least 25,600, so
+    /// about 170 ignored frames are enough to trip it; the drop-at-once
+    /// design fails this test after roughly 1700 calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http2_early_return_keeps_connection_alive_under_small_frames() {
+        const CALLS: usize = 3000;
+        const CONCURRENCY: usize = 20;
+        const FRAMES_PER_CALL: usize = 10;
+
+        let server = RefusingServer::start(Server::bind("127.0.0.1:0").await.unwrap()).await;
+        let (send_request, h2_task) = server.connect_h2().await;
+        let request = server.upload_request();
+        let next = Arc::new(AtomicUsize::new(0));
+        let answered = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..CONCURRENCY)
+            .map(|_| {
+                let (send_request, request, next, answered) = (
+                    send_request.clone(),
+                    request.clone(),
+                    Arc::clone(&next),
+                    Arc::clone(&answered),
+                );
+                tokio::spawn(async move {
+                    let frame = Bytes::from(vec![0_u8; 105]);
+                    while next.fetch_add(1, Ordering::Relaxed) < CALLS {
+                        let Ok(mut send_request) = send_request.clone().ready().await else {
+                            return;
+                        };
+                        let Ok((resp, mut send)) =
+                            send_request.send_request(request.clone(), false)
+                        else {
+                            return;
+                        };
+                        for _ in 0..FRAMES_PER_CALL {
+                            send_h2_data(&mut send, frame.clone()).await;
+                            tokio::time::sleep(Duration::from_micros(100)).await;
+                        }
+                        let _ = send.send_data(Bytes::new(), true);
+                        let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(5), resp).await
+                        else {
+                            return;
+                        };
+                        drain_h2_body(resp).await;
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.await.unwrap();
+        }
+        assert_eq!(answered.load(Ordering::Relaxed), CALLS, "calls were lost");
+        assert!(!h2_task.is_finished(), "the connection was closed");
+
+        drop(send_request);
+        server.stop().await;
+        h2_task.await.expect("h2 connection task panicked").ok();
+    }
+
+    /// Length of the message the upload request's envelope declares.
+    const UPLOAD_MESSAGE_LEN: usize = 100;
+
+    /// Head of an HTTP/1.1 request to the refusing route; its body is one
+    /// Connect envelope (see [`upload_body`]).
+    fn upload_head() -> Vec<u8> {
+        format!(
+            "POST /svc/Upload HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/connect+proto\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            upload_body().len(),
+        )
+        .into_bytes()
+    }
+
+    /// One envelope: a 5-byte header, then the message it declares.
+    fn upload_body() -> Vec<u8> {
+        let mut body = vec![0_u8];
+        body.extend_from_slice(&u32::try_from(UPLOAD_MESSAGE_LEN).unwrap().to_be_bytes());
+        body.resize(5 + UPLOAD_MESSAGE_LEN, 0);
+        body
+    }
+
+    /// Read a chunked HTTP/1.1 response through its final chunk.
+    async fn read_chunked_response(stream: &mut tokio::net::TcpStream) -> String {
+        let mut resp = Vec::new();
+        let mut buf = [0; 1024];
+        while !resp.ends_with(b"0\r\n\r\n") {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("response did not arrive")
+                .unwrap();
+            assert!(read > 0, "connection closed before full response arrived");
+            resp.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// Serve [`refusing_upload_router`] and connect to it over raw TCP.
+    async fn refusing_upload_server() -> (tokio::net::TcpStream, RefusingServer) {
+        let server = RefusingServer::start(Server::bind("127.0.0.1:0").await.unwrap()).await;
+        (
+            tokio::net::TcpStream::connect(server.addr).await.unwrap(),
+            server,
+        )
+    }
+
+    /// Over HTTP/1.1 the request body is the connection: a call that ends
+    /// early while the client is still sending must leave the connection
+    /// reusable, so the reader drains what the client sends after the
+    /// response.
+    #[tokio::test]
+    async fn http1_early_return_keeps_connection_reusable() {
+        let (mut stream, server) = refusing_upload_server().await;
+
+        let body = upload_body();
+        stream.write_all(&upload_head()).await.unwrap();
+        stream.write_all(&body[..10]).await.unwrap();
+        let first = read_chunked_response(&mut stream).await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(first.contains("permission_denied"), "{first}");
+
+        // The rest of the body arrives after the response, then the same
+        // connection carries a second request.
+        stream.write_all(&body[10..]).await.unwrap();
+        stream.write_all(&upload_head()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let second = read_chunked_response(&mut stream).await;
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+
+        drop(stream);
+        server.stop().await;
+    }
+
+    /// A client that stalls part-way through the body of a call that has
+    /// already ended keeps the connection only for the bounded drain, after
+    /// which the server closes it.
+    #[tokio::test]
+    async fn http1_early_return_closes_connection_of_stalled_client() {
+        use crate::service::DRAIN_TIMEOUT;
+
+        let (mut stream, server) = refusing_upload_server().await;
+
+        // The server's drain starts after this, so it cannot end sooner.
+        let started = Instant::now();
+        stream.write_all(&upload_head()).await.unwrap();
+        stream.write_all(&upload_body()[..10]).await.unwrap();
+        let first = read_chunked_response(&mut stream).await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+
+        let mut buf = [0; 16];
+        let closed = tokio::time::timeout(
+            DRAIN_TIMEOUT + Duration::from_secs(2),
+            stream.read(&mut buf),
+        )
+        .await
+        .expect("the server still holds the connection of a stalled client");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "expected the connection to close, read {closed:?}"
+        );
+        assert!(
+            started.elapsed() >= DRAIN_TIMEOUT,
+            "closed before the drain was over: {:?}",
+            started.elapsed()
+        );
+
+        server.stop().await;
     }
 
     // ========================================================================
