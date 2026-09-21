@@ -25,7 +25,7 @@ bytes = { workspace = true }
 tower = { workspace = true }
 
 # Async runtime (minimal features for core)
-tokio = { workspace = true, features = ["rt", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "io-util", "sync", "time", "macros"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
 async-trait = { workspace = true }
