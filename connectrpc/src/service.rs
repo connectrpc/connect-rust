@@ -946,9 +946,10 @@ pub struct StreamingResponseBody {
     inner: Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>,
     /// Optional background reader task handle. The task is detached (not aborted)
     /// when the response body is dropped — it continues draining the request body
-    /// until EOF or `MAX_DRAIN_BYTES`, which is critical for HTTP/1.1 keep-alive.
-    /// Aborting the task early was found to cause a race where hyper's dispatcher
-    /// sees the `Incoming` body dropped before EOF and closes the connection.
+    /// until EOF, `MAX_DRAIN_BYTES` or `DRAIN_TIMEOUT`, which is critical for
+    /// HTTP/1.1 keep-alive. Aborting the task early was found to cause a race
+    /// where hyper's dispatcher sees the `Incoming` body dropped before EOF and
+    /// closes the connection.
     _reader_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -2735,7 +2736,8 @@ where
 ///
 /// If the handler returns early (e.g., on error) without consuming the full
 /// request stream, the reader task drains remaining body bytes (up to
-/// [`MAX_DRAIN_BYTES`]) to allow HTTP/1.1 connection reuse.
+/// [`MAX_DRAIN_BYTES`] and [`DRAIN_TIMEOUT`]) to allow HTTP/1.1 connection
+/// reuse.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_streaming_request<D, B>(
     dispatcher: &D,
@@ -2774,10 +2776,8 @@ where
         .with_path(format!("/{path}"))
         .with_decode_options(limits.decode_options());
 
-    // Call the handler. On error paths, the reader task is left running
-    // (detached) so it can finish draining the request body — aborting it
-    // early races with hyper's body-EOF detection and breaks HTTP/1.1
-    // keep-alive. The task is bounded by MAX_DRAIN_BYTES.
+    // Call the handler. On error paths the reader task is left running
+    // (detached) rather than aborted; see `spawn_body_reader`.
     let handler_result = if let Some(timeout) = metadata.timeout {
         match tokio::time::timeout(
             timeout,
@@ -2870,14 +2870,47 @@ where
 /// envelope (after which any further body bytes are trailing garbage).
 const MAX_DRAIN_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// How long a drain may take, however few bytes arrive. Bytes alone do not
+/// bound the drain: a client that sends less than [`MAX_DRAIN_BYTES`] and then
+/// stalls would otherwise hold the reader task and the request body for as
+/// long as it keeps the connection open.
+///
+/// The deadline is absolute, not an idle timeout, so a client that trickles
+/// data cannot extend it. A client still uploading when it passes loses the
+/// stream (HTTP/2, reset with `NO_ERROR`) or the connection (HTTP/1.x). If the
+/// response outlives the drain, as in a bidi call whose handler stopped reading
+/// requests, the stream is not reset and the body is dropped anyway; see
+/// [`spawn_body_reader`] for what that costs an HTTP/2 connection.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A timer for one drain. `wasm32-unknown-unknown` has no clock, so a drain
+/// there is bounded by [`MAX_DRAIN_BYTES`] alone.
+fn drain_timeout() -> impl Future<Output = ()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::time::sleep(DRAIN_TIMEOUT)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::future::pending()
+    }
+}
+
 /// Whether a [`BodyReader`] is still decoding messages or draining trailing
 /// body bytes.
 enum ReadMode {
-    /// Decoding envelopes and forwarding messages to the handler.
-    Decoding,
+    /// Decoding envelopes and forwarding messages on `tx` to the handler.
+    /// The decoder and the sender live here so that leaving this mode frees
+    /// whatever partial message the decoder has buffered and ends the
+    /// handler's request stream, without waiting for the drain.
+    Decoding {
+        decoder: EnvelopeDecoder,
+        tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
+    },
     /// The decoder is finished (END_STREAM, a decode error, or the handler
     /// dropped the request stream); remaining body bytes are discarded,
-    /// bounded by [`MAX_DRAIN_BYTES`].
+    /// bounded by [`MAX_DRAIN_BYTES`] and [`DRAIN_TIMEOUT`].
     Draining {
         /// Bytes discarded so far.
         drained: usize,
@@ -2890,11 +2923,10 @@ enum ReadMode {
 }
 
 /// Decoding state for the background task spawned by [`spawn_body_reader`]:
-/// turns request body frames into decoded messages on `tx`, then drains the
-/// rest of the body (bounded) once the decoder is finished.
+/// turns request body frames into decoded messages for the handler's request
+/// stream, then drains the rest of the body (bounded) once the decoder is
+/// finished.
 struct BodyReader {
-    decoder: EnvelopeDecoder,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
     mode: ReadMode,
 }
 
@@ -2906,9 +2938,110 @@ impl BodyReader {
         tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
     ) -> Self {
         Self {
-            decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
-            tx,
-            mode: ReadMode::Decoding,
+            mode: ReadMode::Decoding {
+                decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
+                tx,
+            },
+        }
+    }
+
+    /// Read the body until it ends, fails, or the drain is over.
+    ///
+    /// While decoding, a body with nothing ready is also raced against the
+    /// handler's end of the channel, so a handler that goes away (returns, is
+    /// rejected by an interceptor, or is cancelled by its deadline) is noticed
+    /// while the client is stalled, not only at the next complete message. A
+    /// client that keeps sending is noticed at the next complete message, with
+    /// at most `max_message_size` buffered meanwhile.
+    async fn run<B>(&mut self, mut body: Pin<&mut B>)
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: std::fmt::Display + Send,
+    {
+        /// What the reader woke up for.
+        enum Event<E> {
+            HandlerGone,
+            Frame(Option<Result<Frame<Bytes>, E>>),
+        }
+
+        // A clone of the sender, so that its `closed()` future can stay
+        // registered across frames instead of being registered and cancelled
+        // for each one, and does not borrow `self`. It goes out of scope
+        // before the drain, which must not keep the handler's stream open.
+        if let ReadMode::Decoding { tx, .. } = &self.mode {
+            let watcher = tx.clone();
+            let mut handler_gone = std::pin::pin!(watcher.closed());
+            while matches!(self.mode, ReadMode::Decoding { .. }) {
+                let event = tokio::select! {
+                    // The body first: the handler's end of the channel is
+                    // only consulted when the body has nothing to give, which
+                    // is when a client can be stalled.
+                    biased;
+                    frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)) => {
+                        Event::Frame(frame)
+                    }
+                    () = &mut handler_gone => Event::HandlerGone,
+                };
+                match event {
+                    Event::HandlerGone => self.enter_drain_mode(false),
+                    Event::Frame(frame) => {
+                        if self.on_frame(frame).await.is_break() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.drain(body).await;
+    }
+
+    /// Discard the rest of the body until it ends, [`MAX_DRAIN_BYTES`] have
+    /// been discarded, or [`DRAIN_TIMEOUT`] has passed.
+    async fn drain<B>(&mut self, mut body: Pin<&mut B>)
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: std::fmt::Display + Send,
+    {
+        // One timer for the whole drain, so trickled data cannot extend it.
+        let mut timeout = std::pin::pin!(drain_timeout());
+        loop {
+            tokio::select! {
+                // The timer first, so a body that always has data ready
+                // cannot postpone it.
+                biased;
+                () = &mut timeout => {
+                    tracing::debug!("body drain timed out, stopping");
+                    return;
+                }
+                frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)) => {
+                    if self.on_frame(frame).await.is_break() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle what the body produced: [`ControlFlow::Break`] once there is
+    /// nothing more to read — the body ended or failed, or the drain limit was
+    /// exceeded.
+    async fn on_frame<E: std::fmt::Display + Send>(
+        &mut self,
+        frame: Option<Result<Frame<Bytes>, E>>,
+    ) -> ControlFlow<()> {
+        match frame {
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(data) => self.on_data(data).await,
+                Err(_trailers) => ControlFlow::Continue(()),
+            },
+            Some(Err(e)) => {
+                self.on_body_error(e).await;
+                ControlFlow::Break(())
+            }
+            None => {
+                self.on_eof().await;
+                ControlFlow::Break(())
+            }
         }
     }
 
@@ -2917,7 +3050,7 @@ impl BodyReader {
     /// Returns [`ControlFlow::Break`] when the reader should stop reading the
     /// body because the post-decoder drain limit was exceeded.
     async fn on_data(&mut self, mut data: Bytes) -> ControlFlow<()> {
-        if matches!(self.mode, ReadMode::Decoding) {
+        if matches!(self.mode, ReadMode::Decoding { .. }) {
             // May switch to draining; what is left of `data` (bytes after
             // END_STREAM or a decode error) is drained below with the frame.
             self.decode_available(&mut data).await;
@@ -2951,47 +3084,47 @@ impl BodyReader {
     /// Handle the end of the request body. Every complete message has already
     /// been forwarded frame by frame; a client may end the body without an
     /// END_STREAM envelope — the body ending is itself the end-of-stream
-    /// signal — but not part-way through an envelope.
+    /// signal — but not part-way through an envelope. Nothing to do once the
+    /// reader is draining.
     async fn on_eof(&mut self) {
-        if !matches!(self.mode, ReadMode::Decoding) {
+        let ReadMode::Decoding { decoder, tx } = &self.mode else {
             return;
-        }
-        if let Err(e) = self.decoder.finish() {
-            let _ = self.tx.send(Err(e)).await;
+        };
+        if let Err(e) = decoder.finish() {
+            let _ = tx.send(Err(e)).await;
         }
     }
 
     /// Decode and forward every complete message in `frame`, switching to
     /// drain mode if the decoder finishes.
     async fn decode_available(&mut self, frame: &mut Bytes) {
-        loop {
-            match self.decoder.decode(frame) {
+        while let ReadMode::Decoding { decoder, tx } = &mut self.mode {
+            match decoder.decode(frame) {
                 Ok(Some(Decoded::Message(data))) => {
-                    if self.tx.send(Ok(data)).await.is_err() {
+                    if tx.send(Ok(data)).await.is_err() {
                         // The handler dropped the request stream; the rest of
-                        // the body is drained without inspection.
+                        // the body is not inspected.
                         self.enter_drain_mode(false);
-                        return;
                     }
                 }
                 Ok(Some(Decoded::EndStream)) => {
                     // The stream is finished; any further request data is a
                     // protocol violation by the client.
                     self.enter_drain_mode(true);
-                    return;
                 }
                 Ok(None) => return, // need more data from the body
                 Err(e) => {
-                    let _ = self.tx.send(Err(e)).await;
+                    let _ = tx.send(Err(e)).await;
                     self.enter_drain_mode(false);
-                    return;
                 }
             }
         }
     }
 
-    /// Switch to bounded drain mode; `end_stream` arms the one-time warning
-    /// for request data after END_STREAM.
+    /// Switch to bounded drain mode, dropping the decoder (and any partial
+    /// message it holds) and the sender (which ends the handler's request
+    /// stream); `end_stream` arms the one-time warning for request data
+    /// after END_STREAM.
     fn enter_drain_mode(&mut self, end_stream: bool) {
         self.mode = ReadMode::Draining {
             drained: 0,
@@ -3019,9 +3152,8 @@ impl BodyReader {
 
         // Only the decoding path allocates the message; the drain path logs
         // via `Display` above and returns without touching the handler.
-        if matches!(self.mode, ReadMode::Decoding) {
-            let _ = self
-                .tx
+        if let ReadMode::Decoding { tx, .. } = &self.mode {
+            let _ = tx
                 .send(Err(ConnectError::internal(format!(
                     "failed to read request body: {err}"
                 ))))
@@ -3036,15 +3168,27 @@ impl BodyReader {
 /// Returns a `(request_stream, reader_task)` pair. The `request_stream` yields
 /// decoded message payloads. The `reader_task` should be attached to the
 /// response via [`StreamingResponseBody::with_reader_task`]. The handle is
-/// held for lifetime association but is NOT aborted when the response drops —
-/// the task must be allowed to finish draining or hyper's dispatcher will see
-/// the body dropped before EOF and close the connection.
+/// held for lifetime association but is NOT aborted when the response drops.
 ///
-/// When the channel receiver is dropped (e.g., the handler finishes or
-/// encounters an error), the reader task continues consuming remaining body
-/// bytes (up to [`MAX_DRAIN_BYTES`]) before completing. This is critical for
-/// HTTP/1.1 where the server must read the entire request body before it can
-/// send the response.
+/// The task ends on its own once the handler has no further use for the body.
+/// When the channel receiver is dropped (the handler finished, was rejected
+/// or timed out), the task drops the partial message it has buffered and stops
+/// decoding, without waiting for the next complete message. It then only
+/// drains the body, for up to [`MAX_DRAIN_BYTES`] and [`DRAIN_TIMEOUT`], and
+/// drops it. The drain matters on HTTP/1.1, where the server must read the
+/// request body before the connection can serve another request, and dropping
+/// an unread body makes hyper close the connection. On HTTP/2 dropping the
+/// body resets the stream once the response is done, so the stream's slot is
+/// held until the drain ends. The drain is not only a delay: h2 charges each
+/// small DATA frame it receives for a stream nobody reads to connection-wide
+/// budgets that only frames of 256 bytes or more refill, and answers with
+/// `GOAWAY(ENHANCE_YOUR_CALM)` when they run out. Dropping the body at once
+/// therefore takes the connection down once enough calls end early while their
+/// clients are still sending (see
+/// `http2_early_return_keeps_connection_alive_under_small_frames`). The same
+/// applies to frames that arrive after the drain has ended and the stream is
+/// still open, as when a bidi handler stops reading requests but keeps
+/// streaming its response for longer than [`DRAIN_TIMEOUT`].
 fn spawn_body_reader<B>(
     body: B,
     max_message_size: usize,
@@ -3062,32 +3206,9 @@ where
 
     let reader_future = async move {
         let mut body = std::pin::pin!(body);
-        let mut reader = BodyReader::new(max_message_size, streaming_encoding, compression, tx);
-
-        // Read body frames until EOF, a body error, or the drain limit.
-        // Continuing to read (bounded) after the decoder finishes is critical
-        // for HTTP/1.1, where the server must consume the request body before
-        // the response can be sent.
-        loop {
-            match std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data()
-                        && reader.on_data(data).await.is_break()
-                    {
-                        break;
-                    }
-                }
-                Some(Err(e)) => {
-                    reader.on_body_error(e).await;
-                    break;
-                }
-                None => {
-                    // Body EOF — flush any remaining buffered messages.
-                    reader.on_eof().await;
-                    break;
-                }
-            }
-        }
+        BodyReader::new(max_message_size, streaming_encoding, compression, tx)
+            .run(body.as_mut())
+            .await;
     };
 
     // The reader runs detached — it has to outlive the response stream so it
@@ -3110,8 +3231,9 @@ where
 /// The reader task is attached to the response body via
 /// [`StreamingResponseBody::with_reader_task`]. When the response body drops,
 /// the task is **detached** (not aborted) — it continues draining the request
-/// body until EOF or [`MAX_DRAIN_BYTES`]. Aborting early was found to race
-/// with hyper's HTTP/1.1 body-EOF detection (see `_reader_task` field docs).
+/// body until EOF, [`MAX_DRAIN_BYTES`] or [`DRAIN_TIMEOUT`]. Aborting early was
+/// found to race with hyper's HTTP/1.1 body-EOF detection (see `_reader_task`
+/// field docs).
 #[allow(clippy::too_many_arguments)]
 async fn handle_bidi_streaming_request<D, B>(
     dispatcher: &D,
@@ -3508,6 +3630,8 @@ pub mod axum_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Every limit must survive the builder chain and come back out of the
     /// accessor of the same name. Setting all three in one chain also pins
@@ -4750,7 +4874,6 @@ mod tests {
     async fn interceptor_runs_on_connect_get_request() {
         use crate::interceptor::{Interceptor, Next, UnaryRequest, UnaryResponse};
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         let intercepted = Arc::new(AtomicBool::new(false));
         let handler_ran = Arc::new(Mutex::new(false));
@@ -5389,6 +5512,313 @@ mod tests {
         );
     }
 
+    /// Test body that yields its frames, then stays pending forever, and
+    /// records when it is dropped: a client that stalls part-way through a
+    /// request.
+    struct StalledBody {
+        frames: std::collections::VecDeque<Bytes>,
+        _dropped: DropFlag,
+    }
+
+    impl Body for StalledBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.get_mut().frames.pop_front() {
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Body fed by the test through a channel.
+    struct FedBody {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        _dropped: DropFlag,
+    }
+
+    impl Body for FedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.get_mut()
+                .rx
+                .poll_recv(cx)
+                .map(|data| data.map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    /// A body reader on a test body, seen from the handler's side.
+    struct Reader {
+        request_stream: Option<BoxStream<Result<Bytes, ConnectError>>>,
+        reader_task: tokio::task::JoinHandle<()>,
+        body_dropped: Arc<AtomicBool>,
+        /// Held by the decoder while the reader is decoding.
+        registry: Arc<CompressionRegistry>,
+    }
+
+    impl Reader {
+        /// A reader on a body that yields `frames` and then stalls.
+        fn stalled(frames: impl IntoIterator<Item = Bytes>) -> Self {
+            let body_dropped = Arc::new(AtomicBool::new(false));
+            Self::on(
+                StalledBody {
+                    frames: frames.into_iter().collect(),
+                    _dropped: DropFlag(Arc::clone(&body_dropped)),
+                },
+                body_dropped,
+            )
+        }
+
+        fn on<B>(body: B, body_dropped: Arc<AtomicBool>) -> Self
+        where
+            B: Body<Data = Bytes, Error = Infallible> + Send + 'static,
+        {
+            let registry = Arc::new(CompressionRegistry::new());
+            let (request_stream, reader_task) =
+                spawn_body_reader(body, DEFAULT_MAX_MESSAGE_SIZE, None, Arc::clone(&registry));
+            Self {
+                request_stream: Some(request_stream),
+                reader_task: reader_task.expect("tests run inside a tokio runtime"),
+                body_dropped,
+                registry,
+            }
+        }
+
+        /// The next item the handler would see.
+        async fn next(&mut self) -> Option<Result<Bytes, ConnectError>> {
+            self.request_stream
+                .as_mut()
+                .expect("stream not dropped")
+                .next()
+                .await
+        }
+
+        /// Assert that the handler's stream has ended now, not when a timer
+        /// the reader is waiting on fires: with time paused, awaiting the
+        /// stream would auto-advance the clock and hide the difference.
+        async fn assert_stream_ended(&mut self) {
+            Self::settle().await;
+            assert!(
+                matches!(self.next().now_or_never(), Some(None)),
+                "the handler's stream must have ended"
+            );
+        }
+
+        /// The handler is done with the request stream.
+        fn handler_drops_stream(&mut self) {
+            self.request_stream = None;
+        }
+
+        fn body_dropped(&self) -> bool {
+            self.body_dropped.load(Ordering::Relaxed)
+        }
+
+        /// Let the reader run until it is waiting on the body.
+        async fn settle() {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Assert that the reader drains the stalled body for
+        /// [`DRAIN_TIMEOUT`] and then drops it, without panicking. The
+        /// decoder, and with it any partial message, is gone from the start
+        /// of the drain. Time is paused, so a reader that never lets go
+        /// fails at an `assert` instead of hanging.
+        async fn assert_drains_then_releases(self) {
+            Self::settle().await;
+            assert_eq!(
+                Arc::strong_count(&self.registry),
+                1,
+                "the decoder must be dropped when the drain starts"
+            );
+            tokio::time::advance(DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+            Self::settle().await;
+            assert!(!self.reader_task.is_finished(), "the reader drains");
+            assert!(!self.body_dropped(), "the body is held while draining");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            Self::settle().await;
+            assert!(self.body_dropped(), "the body must be dropped");
+            self.reader_task.await.expect("reader task must not panic");
+        }
+    }
+
+    /// A client declares a message, sends all but its last byte, and
+    /// stalls. Once the handler drops the request stream the reader must not
+    /// wait for the rest of the message.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_partial_envelope_released_when_handler_drops() {
+        let mut wire = Envelope::data(Bytes::from(vec![7_u8; 4096]))
+            .encode()
+            .to_vec();
+        wire.pop();
+        let mut reader = Reader::stalled([Bytes::from(wire)]);
+        Reader::settle().await;
+        assert!(!reader.reader_task.is_finished());
+        assert!(
+            !reader.body_dropped(),
+            "held while the handler holds the stream"
+        );
+        assert_eq!(
+            Arc::strong_count(&reader.registry),
+            2,
+            "the decoder is alive while the handler holds the stream"
+        );
+
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// The handler is gone before the client has sent anything.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_no_data_released_when_handler_drops() {
+        let mut reader = Reader::stalled([]);
+        Reader::settle().await;
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// The handler has read a whole message and then goes away while the
+    /// client stalls.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_complete_message_then_stall_released_when_handler_drops() {
+        let frame = Envelope::data(Bytes::from_static(b"hello")).encode();
+        let mut reader = Reader::stalled([frame]);
+        let first = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&first[..], b"hello");
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A handler that keeps its request stream open and idle is not cut off:
+    /// waiting for the client is the handler's business (and its deadline's).
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_waits_while_handler_holds_stream() {
+        let reader = Reader::stalled([]);
+        Reader::settle().await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        Reader::settle().await;
+        assert!(!reader.reader_task.is_finished());
+        assert!(!reader.body_dropped());
+    }
+
+    /// The reader is woken by frames that arrive while it waits, and hands
+    /// them to the handler.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_wakes_for_frames_arriving_later() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = Reader::on(
+            FedBody {
+                rx,
+                _dropped: DropFlag(Arc::clone(&dropped)),
+            },
+            dropped,
+        );
+        Reader::settle().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        feed.send(Envelope::data(Bytes::from_static(b"late")).encode())
+            .unwrap();
+        let msg = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&msg[..], b"late");
+    }
+
+    /// After a decode error the decoder is finished whether or not the
+    /// handler has dropped the stream: the reader drains, bounded in time.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_decode_error_then_stall_released() {
+        // A header declaring more than the message limit.
+        let mut header = vec![0_u8];
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut reader = Reader::stalled([Bytes::from(header)]);
+        let err = reader
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("oversize message is an error");
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// Likewise after the END_STREAM envelope: the client has said it is
+    /// done, and anything it sends afterwards is discarded.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_end_stream_then_stall_released() {
+        let frame = Envelope::end_stream(Bytes::from_static(b"{}")).encode();
+        let mut reader = Reader::stalled([frame]);
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A message that arrives in the same frame as END_STREAM is still
+    /// delivered, ahead of the end of the stream.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_message_before_end_stream_is_delivered() {
+        let mut wire = Envelope::data(Bytes::from_static(b"hello"))
+            .encode()
+            .to_vec();
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let mut reader = Reader::stalled([Bytes::from(wire)]);
+        let first = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&first[..], b"hello");
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A client that trickles data during the drain cannot extend it: the
+    /// deadline is absolute, not an idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_drain_deadline_is_not_extended_by_trickled_data() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = Reader::on(
+            FedBody {
+                rx,
+                _dropped: DropFlag(Arc::clone(&dropped)),
+            },
+            dropped,
+        );
+        Reader::settle().await;
+        reader.handler_drops_stream();
+        Reader::settle().await;
+
+        for _ in 0..4 {
+            feed.send(Bytes::from_static(&[0xAA; 8])).unwrap();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            Reader::settle().await;
+        }
+        assert!(
+            !reader.reader_task.is_finished(),
+            "still draining before the deadline"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        Reader::settle().await;
+        assert!(reader.body_dropped(), "trickled data extended the drain");
+        reader
+            .reader_task
+            .await
+            .expect("reader task must not panic");
+    }
+
     fn test_reader() -> (
         BodyReader,
         tokio::sync::mpsc::Receiver<Result<Bytes, ConnectError>>,
@@ -5423,7 +5853,10 @@ mod tests {
         let msg = rx.recv().await.expect("message").expect("decodes");
         assert_eq!(msg, payload, "message must arrive intact");
         assert!(msg.is_unique(), "reader shares the message's allocation");
-        assert!(reader.decoder.finish().is_ok(), "nothing left buffered");
+        let ReadMode::Decoding { decoder, .. } = &reader.mode else {
+            panic!("reader has left decoding");
+        };
+        assert!(decoder.finish().is_ok(), "nothing left buffered");
     }
 
     /// A compressed envelope split across frames is reassembled and
