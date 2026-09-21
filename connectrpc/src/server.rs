@@ -361,8 +361,9 @@ impl std::panic::RefUnwindSafe for ConnectionClosed {}
 impl ConnectionClosed {
     fn new(reason: CloseReason, error: Option<Box<ConnectionError>>) -> Self {
         debug_assert!(
-            reason != CloseReason::Error || error.is_some(),
-            "CloseReason::Error without an error"
+            !matches!(reason, CloseReason::Error | CloseReason::HeaderReadTimeout)
+                || error.is_some(),
+            "{reason:?} without an error"
         );
         Self {
             reason,
@@ -378,20 +379,36 @@ impl ConnectionClosed {
 
     /// The error that ended the connection, if one did.
     ///
-    /// Always `Some` when [`reason`](Self::reason) is [`CloseReason::Error`].
-    /// Also `Some` when the connection failed while winding down; the reason
-    /// then stays the one that started the wind-down, so
-    /// `reason() != CloseReason::Error && error().is_some()` identifies a
-    /// failed drain. `None` when the connection ended cleanly, when it was
-    /// closed because its retirement grace period expired, and when it was
-    /// told to wind down before enough bytes arrived to pick HTTP/1.1 or
-    /// HTTP/2.
+    /// Always `Some` when [`reason`](Self::reason) is [`CloseReason::Error`]
+    /// or [`CloseReason::HeaderReadTimeout`]. The latter is routine for an
+    /// idle HTTP/1.1 keep-alive connection, so log by reason rather than by
+    /// the presence of an error. Also `Some` when the connection failed while
+    /// winding down; the reason then stays the one that started the
+    /// wind-down, so this identifies a failed drain:
     ///
-    /// After the protocol is known, a failure is a [`hyper::Error`]
-    /// ([`is_timeout`](hyper::Error::is_timeout) is true for an expired
-    /// header-read timeout); a failure before that is a [`std::io::Error`],
-    /// of kind [`TimedOut`](std::io::ErrorKind::TimedOut) when the
-    /// header-read timeout expired. A panic in the
+    /// ```
+    /// # use connectrpc::{CloseReason, ConnectionClosed};
+    /// fn failed_drain(closed: &ConnectionClosed) -> bool {
+    ///     let draining = matches!(
+    ///         closed.reason(),
+    ///         CloseReason::Shutdown
+    ///             | CloseReason::MaxAge
+    ///             | CloseReason::Idle
+    ///             | CloseReason::MaxRequests
+    ///     );
+    ///     draining && closed.error().is_some()
+    /// }
+    /// ```
+    ///
+    /// A connection closed because its grace period expired does not count
+    /// there: it reports no error.
+    ///
+    /// `None` when the connection ended cleanly, when it was closed because
+    /// its retirement grace period expired, and when it was told to wind down
+    /// before enough bytes arrived to pick HTTP/1.1 or HTTP/2.
+    ///
+    /// After the protocol is known, a failure is a [`hyper::Error`]; a
+    /// failure before that is a [`std::io::Error`]. A panic in the
     /// [`with_connection_extensions`](Server::with_connection_extensions)
     /// function is an error whose message contains the panic message when that
     /// is a string; the panic is also logged at `error` level.
@@ -415,9 +432,10 @@ impl ConnectionClosed {
 /// [`Idle`](Self::Idle), [`MaxRequests`](Self::MaxRequests)) is reported
 /// whether the connection drained within the grace period or was closed when
 /// the grace period expired, and even if the shutdown signal arrived while it
-/// drained. A connection that fails while winding down also reports that
-/// reason, not [`Error`](Self::Error); [`ConnectionClosed::error`] returns
-/// the failure.
+/// drained. A connection that fails while winding down, including when its
+/// header-read timeout expires, also reports that reason, not
+/// [`Error`](Self::Error) or [`HeaderReadTimeout`](Self::HeaderReadTimeout);
+/// [`ConnectionClosed::error`] returns the failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CloseReason {
@@ -430,17 +448,30 @@ pub enum CloseReason {
     Shutdown,
     /// Retired on reaching its maximum age.
     MaxAge,
-    /// Retired after staying idle for the configured duration.
+    /// Retired after staying idle for the duration set with
+    /// [`with_max_connection_idle`](ConnectionConfig::with_max_connection_idle).
+    /// An idle HTTP/1.1 keep-alive connection can instead reach its
+    /// header-read timeout first, which reports
+    /// [`HeaderReadTimeout`](Self::HeaderReadTimeout).
     Idle,
     /// Retired after serving the configured number of requests.
     MaxRequests,
+    /// The [header-read timeout](ConnectionConfig::with_header_read_timeout)
+    /// expired before anything told the connection to wind down, while:
+    ///
+    /// - the peer had not sent enough to pick HTTP/1.1 or HTTP/2;
+    /// - an HTTP/1.1 request head was incomplete;
+    /// - an HTTP/1.1 keep-alive connection waited idle for its next request.
+    ///
+    /// [`ConnectionClosed::error`] returns the timeout error: a
+    /// [`std::io::Error`] of kind [`TimedOut`](std::io::ErrorKind::TimedOut)
+    /// in the first case, otherwise a [`hyper::Error`] whose
+    /// [`is_timeout`](hyper::Error::is_timeout) is true.
+    HeaderReadTimeout,
     /// Something failed before anything told the connection to wind down;
     /// [`ConnectionClosed::error`] returns the error. The causes are:
     ///
     /// - an I/O or protocol error;
-    /// - an expired header-read timeout: before the peer picked HTTP/1.1 or
-    ///   HTTP/2, while it sent an HTTP/1.1 request head, or while an idle
-    ///   keep-alive connection waited for the next one;
     /// - an HTTP/2 keepalive ping that got no reply within
     ///   [`with_http2_keepalive_timeout`](ConnectionConfig::with_http2_keepalive_timeout);
     /// - a panic while an HTTP/1.1 response body was produced;
@@ -471,7 +502,7 @@ pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Durati
 /// bounds and when each bound starts.
 ///
 /// Override via [`Server::with_header_read_timeout`] or
-/// [`BoundServer::with_header_read_timeout`]; pass `None` to disable.
+/// [`BoundServer::with_header_read_timeout`]; pass `None` or zero to disable.
 pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default drain window after a per-connection retirement trigger fires.
@@ -596,8 +627,10 @@ impl ConnectionConfig {
     /// after the first read. A peer that connects, or finishes a request, and
     /// then stalls before completing the next request head is disconnected,
     /// which mitigates slowloris-style connection-exhaustion attacks. Pass
-    /// `None` to disable both bounds; a timeout too long to add to the
-    /// current time, such as [`Duration::MAX`], also disables them.
+    /// `None` or [`Duration::ZERO`] to disable both bounds; a timeout too long
+    /// to add to the current time, such as [`Duration::MAX`], also disables
+    /// them. Unlike `with_max_connection_age` and `with_max_connection_idle`,
+    /// which panic on zero, this setter treats zero as `None`.
     ///
     /// After a peer has sent the HTTP/2 connection preface, this timeout no
     /// longer applies to it. Both of the following are off by default: use
@@ -607,7 +640,7 @@ impl ConnectionConfig {
     /// any connection by age.
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
-        self.header_read_timeout = timeout.into();
+        self.header_read_timeout = timeout.into().filter(|timeout| !timeout.is_zero());
         self
     }
 
@@ -923,7 +956,9 @@ impl ConnectionConfig {
         self.http1_keep_alive
     }
 
-    /// The header read timeout, or `None` if disabled.
+    /// The header read timeout, or `None` if disabled. A timeout too long to
+    /// add to the current time is returned as set, although it also disables
+    /// the timeout.
     #[must_use]
     pub fn header_read_timeout(&self) -> Option<Duration> {
         self.header_read_timeout
@@ -1164,7 +1199,7 @@ impl Server {
     }
 
     /// Set the header read timeout (default
-    /// [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` disables). Shorthand for
+    /// [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` or zero disables). Shorthand for
     /// [`ConnectionConfig::with_header_read_timeout`].
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
@@ -1562,7 +1597,7 @@ impl BoundServer {
     }
 
     /// Set the header read timeout (default
-    /// [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` disables). Shorthand for
+    /// [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` or zero disables). Shorthand for
     /// [`ConnectionConfig::with_header_read_timeout`].
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
@@ -2127,7 +2162,8 @@ where
             });
 
         // A timeout too long to add to the clock would panic hyper and
-        // `DetectionTimeout`, so it disables both bounds.
+        // `DetectionTimeout`, so it disables both bounds. The setter has
+        // already turned zero into `None`.
         let detection_deadline = config
             .header_read_timeout
             .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
@@ -2483,10 +2519,13 @@ where
 /// Log how hyper's connection future ended and report `reason` with its
 /// error, if any.
 ///
-/// A connection told to wind down passes that reason even when it failed
-/// mid-drain. The exception is hyper-util's error for a connection told to
-/// wind down before it picked a protocol: that error is dropped, so the
-/// result has the wind-down reason and no error.
+/// A connection that was serving passes `CloseReason::Error` for any
+/// failure; an expired header-read timeout is reported as
+/// `CloseReason::HeaderReadTimeout` instead. A connection told to wind down
+/// passes that reason even when it failed mid-drain. The exception is
+/// hyper-util's error for a connection told to wind down before it picked a
+/// protocol: that error is dropped, so the result has the wind-down reason
+/// and no error.
 fn log_connection_result<E: Into<Box<ConnectionError>>>(
     remote_addr: Option<SocketAddr>,
     result: Result<(), E>,
@@ -2497,11 +2536,38 @@ fn log_connection_result<E: Into<Box<ConnectionError>>>(
         .err()
         .map(Into::into)
         .filter(|err| reason == CloseReason::Error || !is_cancelled_before_detection(err.as_ref()));
+    let reason = match &error {
+        Some(err) if reason == CloseReason::Error && is_header_read_timeout(err.as_ref()) => {
+            CloseReason::HeaderReadTimeout
+        }
+        _ => reason,
+    };
     match &error {
         None => tracing::trace!(remote_addr, "Connection completed normally"),
         Some(err) => tracing::trace!(remote_addr, error = %err, "Connection ended with error"),
     }
     ConnectionClosed::new(reason, error)
+}
+
+/// Whether `err` is an expired header-read timeout: hyper's, once it reads
+/// HTTP/1.1 request heads, or [`DetectionTimeout`]'s before that.
+///
+/// hyper reports its header-read timeout as `is_timeout` from 1.6.0;
+/// hyper-util 0.1.20 needs 1.8.0. hyper's HTTP/2 keepalive timeout is also
+/// `is_timeout`, but carries its timeout as a source; the header-read
+/// timeout has none.
+/// `header_read_timeout_closes_idle_keep_alive_connection` and
+/// `http2_keepalive_timeout_is_not_a_header_read_timeout` fail if that
+/// changes.
+fn is_header_read_timeout(err: &ConnectionError) -> bool {
+    use std::error::Error as _;
+
+    if let Some(err) = err.downcast_ref::<hyper::Error>() {
+        return err.is_timeout() && err.source().is_none();
+    }
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .is_some_and(|inner| inner.is::<DetectionTimedOut>())
 }
 
 /// Whether `err` is the one hyper-util's auto connection returns when a
@@ -2517,6 +2583,19 @@ fn is_cancelled_before_detection(err: &ConnectionError) -> bool {
         err.kind() == std::io::ErrorKind::Interrupted && err.to_string() == "Cancelled"
     })
 }
+
+/// The error [`DetectionTimeout`] fails a read with, inside an
+/// [`std::io::Error`] of kind `TimedOut`.
+#[derive(Debug)]
+struct DetectionTimedOut;
+
+impl std::fmt::Display for DetectionTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("header read timeout expired before the peer chose HTTP/1.1 or HTTP/2")
+    }
+}
+
+impl std::error::Error for DetectionTimedOut {}
 
 /// The bytes an HTTP/2 client sends first (RFC 9113 §3.4).
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -2601,7 +2680,7 @@ impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DetectionTimeout<
                 this.detection = None;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "header read timeout expired before the peer chose HTTP/1.1 or HTTP/2",
+                    DetectionTimedOut,
                 )))
             }
         }
@@ -3355,6 +3434,8 @@ mod tests {
         let config = ConnectionConfig::new().with_header_read_timeout(Some(Duration::from_secs(5)));
         assert_eq!(config.header_read_timeout(), Some(Duration::from_secs(5)));
         let config = ConnectionConfig::new().with_header_read_timeout(None::<Duration>);
+        assert_eq!(config.header_read_timeout(), None);
+        let config = ConnectionConfig::new().with_header_read_timeout(Duration::ZERO);
         assert_eq!(config.header_read_timeout(), None);
 
         let config = ConnectionConfig::new()
@@ -5493,7 +5574,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("peer that sent {sent:?} was never closed"));
             assert_eq!(started.elapsed(), TIMEOUT);
-            assert_eq!(closed.reason(), CloseReason::Error);
+            assert_eq!(closed.reason(), CloseReason::HeaderReadTimeout);
             let err = closed
                 .error()
                 .and_then(|err| err.downcast_ref::<std::io::Error>());
@@ -5521,28 +5602,106 @@ mod tests {
         client.write_all(&H2_PREFACE[3..4]).await.unwrap();
         let closed = conn.await.unwrap();
         assert_eq!(started.elapsed(), TIMEOUT);
-        assert_eq!(closed.reason(), CloseReason::Error);
+        assert_eq!(closed.reason(), CloseReason::HeaderReadTimeout);
     }
 
-    /// A timeout too long to add to the clock disables the bound instead of
-    /// panicking the connection.
+    /// A zero timeout, or one too long to add to the clock, disables both
+    /// bounds; the latter would otherwise panic the connection.
     #[tokio::test(start_paused = true)]
-    async fn unrepresentable_header_read_timeout_disables_it() {
-        let server = Server::new(Router::new()).with_header_read_timeout(Duration::MAX);
-        let (io, mut client) = tokio::io::duplex(1024);
-        let conn = tokio::spawn(server.serve_connection(
-            io,
-            ConnectionInfo::new(),
-            std::future::pending(),
-        ));
-        tokio::time::sleep(Duration::from_secs(3600)).await;
-        assert!(!conn.is_finished(), "silent peer was closed");
-        client.write_all(ECHO_REQ).await.unwrap();
-        let mut response = [0; 12];
-        client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"HTTP/1.1 404");
-        drop(client);
-        assert_eq!(conn.await.unwrap().reason(), CloseReason::Closed);
+    async fn zero_or_unrepresentable_header_read_timeout_disables_it() {
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let server = Server::new(Router::new()).with_header_read_timeout(timeout);
+            let (io, mut client) = tokio::io::duplex(1024);
+            let conn = tokio::spawn(server.serve_connection(
+                io,
+                ConnectionInfo::new(),
+                std::future::pending(),
+            ));
+            let (head, rest) = ECHO_REQ.split_at(4);
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(!conn.is_finished(), "{timeout:?} closed a silent peer");
+            client.write_all(head).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(!conn.is_finished(), "{timeout:?} closed a partial head");
+            client.write_all(rest).await.unwrap();
+            let mut response = [0; 12];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"HTTP/1.1 404", "{timeout:?}");
+            drop(client);
+            assert_eq!(conn.await.unwrap().reason(), CloseReason::Closed);
+        }
+    }
+
+    /// An HTTP/2 keepalive ping that goes unanswered is an `Error`, not a
+    /// header-read timeout, although both are hyper timeouts.
+    #[tokio::test(start_paused = true)]
+    async fn http2_keepalive_timeout_is_not_a_header_read_timeout() {
+        // A SETTINGS frame: 3-byte length 0, type 4, no flags, stream 0.
+        const EMPTY_SETTINGS: [u8; 9] = [0, 0, 0, 4, 0, 0, 0, 0, 0];
+        let server = Server::new(Router::new())
+            .with_header_read_timeout(Duration::from_secs(10))
+            .with_http2_keepalive_interval(Duration::from_secs(1))
+            .with_http2_keepalive_timeout(Duration::from_secs(1));
+        let (io, mut client) = tokio::io::duplex(64 * 1024);
+        let conn = server.serve_connection(io, ConnectionInfo::new(), std::future::pending());
+        client.write_all(H2_PREFACE).await.unwrap();
+        client.write_all(&EMPTY_SETTINGS).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("unanswered keepalive ping never closed the connection");
+        assert_eq!(closed.reason(), CloseReason::Error, "{:?}", closed.error());
+        let err = closed
+            .error()
+            .and_then(|err| err.downcast_ref::<hyper::Error>());
+        assert!(
+            err.is_some_and(hyper::Error::is_timeout),
+            "{:?}",
+            closed.error()
+        );
+    }
+
+    #[test]
+    fn header_read_timeout_is_recognised_by_error_type_not_kind() {
+        let detection = std::io::Error::new(std::io::ErrorKind::TimedOut, DetectionTimedOut);
+        assert!(is_header_read_timeout(&detection));
+        let os_timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(!is_header_read_timeout(&os_timeout));
+    }
+
+    /// A header-read timeout that expires while the connection drains keeps
+    /// the drain's reason.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_while_draining_keeps_the_reason() {
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let server = Server::new(Router::new()).with_header_read_timeout(TIMEOUT);
+        let (io, mut client) = tokio::io::duplex(4096);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn = tokio::spawn(server.serve_connection(io, ConnectionInfo::new(), async {
+            shutdown_rx.await.ok();
+        }));
+        client
+            .write_all(b"POST /svc/Echo HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        // Under the paused clock this runs every task until it is idle.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        shutdown_tx.send(()).unwrap();
+        let started = tokio::time::Instant::now();
+        let closed = conn.await.unwrap();
+        assert!(
+            started.elapsed() >= TIMEOUT - Duration::from_millis(1),
+            "closed after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(closed.reason(), CloseReason::Shutdown);
+        let err = closed
+            .error()
+            .and_then(|err| err.downcast_ref::<hyper::Error>());
+        assert!(
+            err.is_some_and(hyper::Error::is_timeout),
+            "{:?}",
+            closed.error()
+        );
     }
 
     /// Once an HTTP/1.1 request has started, hyper's own header-read timer
@@ -5566,7 +5725,7 @@ mod tests {
             .expect("stalled request head was never timed out")
             .unwrap();
         assert_eq!(started.elapsed(), DELAY + TIMEOUT);
-        assert_eq!(closed.reason(), CloseReason::Error);
+        assert_eq!(closed.reason(), CloseReason::HeaderReadTimeout);
         let err = closed
             .error()
             .and_then(|err| err.downcast_ref::<hyper::Error>());
@@ -5596,7 +5755,7 @@ mod tests {
         let answered = tokio::time::Instant::now();
         let closed = conn.await.unwrap();
         assert_eq!(answered.elapsed(), TIMEOUT);
-        assert_eq!(closed.reason(), CloseReason::Error);
+        assert_eq!(closed.reason(), CloseReason::HeaderReadTimeout);
         let err = closed
             .error()
             .and_then(|err| err.downcast_ref::<hyper::Error>());
