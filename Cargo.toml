@@ -67,9 +67,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 # HTTP server/client
-h2 = "0.4"
+# 0.4.15: the header-list-size tests expect its GOAWAY on oversized header lists.
+h2 = "0.4.15"
 hyper = "1"
-hyper-util = "0"
+# `ConnectionClosed::error` relies on the auto connection's `Interrupted`
+# "Cancelled" error for a shutdown before protocol detection (checked in
+# 0.1.19 and 0.1.20).
+hyper-util = "0.1.20"
 
 # TLS
 rustls = "0.23"

@@ -1362,16 +1362,34 @@ loop {
         biased; // a pending shutdown wins over one more accept
         _ = &mut shutdown => break,
         Some(_) = connections.join_next(), if !connections.is_empty() => continue,
-        accepted = listener.accept() => accepted?, // production: retry transient errors
+        // Production: skip WouldBlock, Interrupted, ConnectionAborted and
+        // ConnectionReset, and pause after EMFILE / ENFILE, as Server does.
+        accepted = listener.accept() => accepted?,
     };
+    // As the built-in loop does: no Nagle delay on small HTTP/2 frames.
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!(%peer, %err, "set_nodelay failed");
+    }
     // Where this connection runs: say, one `tokio::runtime::Handle` per class
     // of client.
     let runtime = runtime_for(peer);
     // Take the socket off this runtime's I/O driver; the task re-registers it.
-    let Ok(stream) = stream.into_std() else { continue };
+    let stream = match stream.into_std() {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::warn!(%peer, %err, "detaching the socket failed");
+            continue;
+        }
+    };
     let (server, tls, mut drain) = (Arc::clone(&server), tls.clone(), drain_rx.clone());
     connections.spawn_on(async move {
-        let Ok(stream) = tokio::net::TcpStream::from_std(stream) else { return };
+        let stream = match tokio::net::TcpStream::from_std(stream) {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!(%peer, %err, "registering the socket failed");
+                return;
+            }
+        };
         // TLS handshake on the connection's task, not the loop's, with a bound.
         let Ok(Ok(stream)) =
             tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await
@@ -1388,7 +1406,8 @@ loop {
         let closed = server
             .serve_connection(stream, info, async move { let _ = drain.wait_for(|d| *d).await; })
             .await;
-        metrics::connection_closed(closed.reason());
+        // Why it ended, and whether it failed (also while draining).
+        metrics::connection_closed(closed.reason(), closed.error().is_some());
     }, &runtime);
 }
 drop(listener);                   // refuse new connections
