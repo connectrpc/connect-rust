@@ -181,7 +181,7 @@ impl Serve {
         self
     }
 
-    /// Override the HTTP/1.1 header read timeout (default
+    /// Override the header read timeout (default
     /// [`DEFAULT_HEADER_READ_TIMEOUT`](crate::server::DEFAULT_HEADER_READ_TIMEOUT);
     /// `None` disables). Shorthand for
     /// [`ConnectionConfig::with_header_read_timeout`].
