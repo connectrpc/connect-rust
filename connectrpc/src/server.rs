@@ -1267,12 +1267,10 @@ impl Server {
     /// Append an [`Interceptor`](crate::Interceptor) to the chain on the
     /// underlying service.
     ///
-    /// Delegates to [`ConnectRpcService::with_interceptor`]. Interceptors
-    /// run after the request body has been read and decompressed and before
-    /// it is decoded — they see the parsed request head and a lazily decoded
-    /// body, not the wire bytes; a credential check belongs in Tower
-    /// middleware, before the body is read. The first interceptor registered runs **outermost**:
-    /// first on the way in, last on the way out. To share one interceptor
+    /// Delegates to [`ConnectRpcService::with_interceptor`], which says when
+    /// each interceptor hook runs relative to the request body. The first
+    /// interceptor registered runs **outermost**: first on the way in, last
+    /// on the way out. To share one interceptor
     /// instance across several `Server`s, use
     /// [`with_interceptor_arc`](Self::with_interceptor_arc).
     #[must_use]

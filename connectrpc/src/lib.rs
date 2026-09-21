@@ -345,6 +345,7 @@ pub use interceptor::Interceptor;
 pub use interceptor::Next;
 pub use interceptor::NextStream;
 pub use interceptor::PayloadStream;
+pub use interceptor::RequestHead;
 pub use interceptor::streaming_interceptor;
 pub use interceptor::unary_interceptor;
 
