@@ -13,6 +13,45 @@ Entries for unreleased changes live as fragment files under
 one. This file is assembled from `.changes/` at release time — do not edit it
 directly.
 
+## [0.9.1] - 2026-09-21
+
+### Security
+
+- **A client- or bidi-streaming call that ends before its request body no longer
+  lets a stalled client hold that body indefinitely.** When the handler stopped
+  reading its request stream (it returned, an interceptor rejected the call, or
+  the request timeout fired), the request-body reader kept the partial message
+  it had buffered, its task and the HTTP/2 stream until the client ended the
+  stream or the connection closed. The reader now frees the partial message once
+  it sees the handler is gone. It discards the rest of the body for at most 5
+  seconds and 1 MiB (1 MiB only, on `wasm32`), also after the END_STREAM
+  envelope or a decode error, and then drops it. Dropping the body resets an
+  HTTP/2 stream once the response is done and closes an HTTP/1.x connection, so
+  a client still uploading when the limit is reached loses the stream or the
+  connection. A bidi call whose handler stops reading requests but keeps its
+  response open past the limit can still draw a connection-wide `GOAWAY` from h2
+  if the client keeps sending small frames.
+
+- **The header-read timeout now closes a connection that sends nothing, or
+  only part of the HTTP/2 connection preface.** Such a peer was held open
+  until it hung up, or until shutdown or a configured retirement trigger
+  ended it: the timeout started only after enough bytes had arrived to
+  pick HTTP/1.1 or HTTP/2. It now ends when the timeout expires. This
+  applies to `Server` and `connectrpc::axum::serve_tls`. A client or proxy
+  that opens connections ahead of use and sends nothing on them now has
+  them closed after the timeout (30 seconds by default). An HTTP/2
+  connection that has sent its preface is still not bound by the timeout.
+  
+  `with_header_read_timeout(None)` disables both bounds. A zero timeout now
+  disables them too; before, it ended every HTTP/1.1 connection after at
+  most one request. A timeout too long to add to the current time also
+  disables them, instead of panicking the connection.
+  
+  `serve_tls` now wraps the TLS stream in a private type, so
+  `hyper_util::server::conn::auto::upgrade::downcast` no longer recovers it
+  from an upgraded connection; use the upgraded connection's own `Read` /
+  `Write`.
+
 ## [0.9.0] - 2026-08-24
 
 ### Added
