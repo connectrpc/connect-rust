@@ -69,7 +69,9 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 # HTTP server/client
 # 0.4.15: the header-list-size tests expect its GOAWAY on oversized header lists.
 h2 = "0.4.15"
-hyper = "1"
+# `CloseReason::HeaderReadTimeout` needs `hyper::Error::is_timeout` to cover
+# the HTTP/1.1 header-read timeout (1.6); hyper-util 0.1.20 needs 1.8.
+hyper = "1.8"
 # `ConnectionClosed::error` relies on the auto connection's `Interrupted`
 # "Cancelled" error for a shutdown before protocol detection (checked in
 # 0.1.19 and 0.1.20).

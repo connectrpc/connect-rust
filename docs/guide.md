@@ -1348,7 +1348,7 @@ shutdown, panic isolation, `PeerAddr` / `PeerCerts` / extensions) and
 tells you why it ended.
 
 ```rust,ignore
-use connectrpc::{ConnectionInfo, Server};
+use connectrpc::{CloseReason, ConnectionInfo, Server};
 
 let server = Arc::new(Server::new(router).with_max_connection_age(Duration::from_secs(600)));
 let tls = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -1406,8 +1406,12 @@ loop {
         let closed = server
             .serve_connection(stream, info, async move { let _ = drain.wait_for(|d| *d).await; })
             .await;
-        // Why it ended, and whether it failed (also while draining).
-        metrics::connection_closed(closed.reason(), closed.error().is_some());
+        // Why it ended, and whether it failed (also while draining). An
+        // expired header-read timeout, routine for idle keep-alive
+        // connections, carries an error but is not a failure.
+        let failed = closed.error().is_some()
+            && closed.reason() != CloseReason::HeaderReadTimeout;
+        metrics::connection_closed(closed.reason(), failed);
     }, &runtime);
 }
 drop(listener);                   // refuse new connections
