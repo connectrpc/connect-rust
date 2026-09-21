@@ -19,6 +19,7 @@ bytes = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
+tower = { workspace = true }
 redis = { version = "1.0", default-features = false, features = ["tokio-comp"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 pprof = { version = "0.15", features = ["criterion", "flamegraph", "protobuf-codec"] }
@@ -58,6 +59,10 @@ name = "log_load_noutf8"
 
 [[bench]]
 name = "rpc_bench"
+harness = false
+
+[[bench]]
+name = "reader_bench"
 harness = false
 
 [[bench]]
