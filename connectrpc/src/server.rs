@@ -195,18 +195,21 @@ impl PeerInfo {
 #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Default HTTP/1.1 header read timeout.
+/// Default header read timeout.
 ///
-/// Bounds how long the server waits to receive a complete set of request
-/// headers, measured from the point hyper begins reading a new request on the
-/// connection. On a keep-alive connection this also bounds the idle wait
-/// between requests, so a peer that opens a connection (or finishes one
-/// request) and then stalls without sending the next request's headers is
-/// disconnected rather than holding a task and file descriptor open
+/// Bounds how long a new connection may take to send either the HTTP/2
+/// connection preface or a byte that differs from it, which picks HTTP/1.1.
+/// After that, it bounds how long the server waits to receive a complete set
+/// of HTTP/1.1 request headers, measured from the point hyper begins reading
+/// a new request on the connection. On a keep-alive connection this also
+/// bounds the idle wait between requests. A peer that opens a connection (or
+/// finishes one request) and then stalls before completing the next request
+/// head is disconnected rather than holding a task and file descriptor open
 /// indefinitely. This mitigates slowloris-style connection-exhaustion attacks.
 ///
-/// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-/// connections — use `with_max_connection_age` to retire those by age.
+/// Once a peer has sent the HTTP/2 connection preface, this timeout no
+/// longer applies to it; on [`Server`], use `with_max_connection_idle` or
+/// `with_max_connection_age` to retire idle or stalled HTTP/2 connections.
 ///
 /// This default is applied to every accepted connection. Earlier releases
 /// installed no connection timer, so the header read timeout never took
@@ -396,18 +399,23 @@ impl Server {
         self
     }
 
-    /// Set the HTTP/1.1 header read timeout.
+    /// Set the header read timeout.
     ///
     /// Defaults to [`DEFAULT_HEADER_READ_TIMEOUT`] (30 seconds). Bounds how
-    /// long the server waits to read a complete set of request headers,
-    /// measured from when hyper begins reading a new request; on a keep-alive
-    /// connection this also bounds the idle wait between requests. A peer that
-    /// connects (or finishes a request) and then stalls without sending the
-    /// next request's headers is disconnected, which mitigates slowloris-style
-    /// connection-exhaustion attacks. Pass `None` to disable.
+    /// long a new connection may take to send either the HTTP/2 connection
+    /// preface or a byte that differs from it, which picks HTTP/1.1. After
+    /// that, it bounds how long the server waits to read a complete set of
+    /// HTTP/1.1 request headers, measured from when hyper begins reading a new
+    /// request; on a keep-alive connection this also bounds the idle wait
+    /// between requests. A peer that connects (or finishes a request) and then
+    /// stalls before completing the next request head is disconnected, which
+    /// mitigates slowloris-style connection-exhaustion attacks. Pass `None` or
+    /// [`Duration::ZERO`] to disable both bounds; a timeout too long to add to
+    /// the current time, such as [`Duration::MAX`], also disables them.
     ///
-    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-    /// connections — use `with_max_connection_age` to retire those by age.
+    /// Once a peer has sent the HTTP/2 connection preface, this timeout no
+    /// longer applies to it; use `with_max_connection_idle` or
+    /// `with_max_connection_age` to retire idle or stalled HTTP/2 connections.
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.header_read_timeout = timeout.into();
@@ -835,18 +843,23 @@ impl BoundServer {
         self
     }
 
-    /// Set the HTTP/1.1 header read timeout.
+    /// Set the header read timeout.
     ///
     /// Defaults to [`DEFAULT_HEADER_READ_TIMEOUT`] (30 seconds). Bounds how
-    /// long the server waits to read a complete set of request headers,
-    /// measured from when hyper begins reading a new request; on a keep-alive
-    /// connection this also bounds the idle wait between requests. A peer that
-    /// connects (or finishes a request) and then stalls without sending the
-    /// next request's headers is disconnected, which mitigates slowloris-style
-    /// connection-exhaustion attacks. Pass `None` to disable.
+    /// long a new connection may take to send either the HTTP/2 connection
+    /// preface or a byte that differs from it, which picks HTTP/1.1. After
+    /// that, it bounds how long the server waits to read a complete set of
+    /// HTTP/1.1 request headers, measured from when hyper begins reading a new
+    /// request; on a keep-alive connection this also bounds the idle wait
+    /// between requests. A peer that connects (or finishes a request) and then
+    /// stalls before completing the next request head is disconnected, which
+    /// mitigates slowloris-style connection-exhaustion attacks. Pass `None` or
+    /// [`Duration::ZERO`] to disable both bounds; a timeout too long to add to
+    /// the current time, such as [`Duration::MAX`], also disables them.
     ///
-    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-    /// connections — use `with_max_connection_age` to retire those by age.
+    /// Once a peer has sent the HTTP/2 connection preface, this timeout no
+    /// longer applies to it; use `with_max_connection_idle` or
+    /// `with_max_connection_age` to retire idle or stalled HTTP/2 connections.
     #[must_use]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.header_read_timeout = timeout.into();
@@ -1519,6 +1532,7 @@ async fn serve_accepted_stream<D, S>(
         }
     });
 
+    let (detection_deadline, header_read_timeout) = header_read_bounds(header_read_timeout);
     let mut builder = AutoBuilder::new(TokioExecutor::new());
     // A timer is required for hyper's header read timeout (and any other
     // time-based connection behaviour) to take effect; without it the
@@ -1530,6 +1544,7 @@ async fn serve_accepted_stream<D, S>(
         .header_read_timeout(header_read_timeout);
     configure_http2(&mut builder, http2);
 
+    let io = DetectionTimeout::new(io, detection_deadline);
     let conn = builder.serve_connection(TokioIo::new(io), svc).into_owned();
     serve_connection_with_lifecycle(
         conn,
@@ -1824,6 +1839,153 @@ fn log_connection_result<E: std::fmt::Display>(remote_addr: SocketAddr, result: 
                 "Connection ended with error",
             );
         }
+    }
+}
+
+/// The deadline for a connection to pick HTTP/1.1 or HTTP/2, and the
+/// header-read timeout to give hyper, for a configured `timeout`.
+///
+/// Zero disables both bounds, as does a timeout too long to add to the
+/// clock, which would panic hyper and [`DetectionTimeout`].
+pub(crate) fn header_read_bounds(
+    timeout: Option<Duration>,
+) -> (Option<tokio::time::Instant>, Option<Duration>) {
+    let deadline = timeout
+        .filter(|timeout| !timeout.is_zero())
+        .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+    (deadline, deadline.and(timeout))
+}
+
+/// The error [`DetectionTimeout`] fails a read with, inside an
+/// [`std::io::Error`] of kind `TimedOut`.
+#[derive(Debug)]
+struct DetectionTimedOut;
+
+impl std::fmt::Display for DetectionTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("header read timeout expired before the peer chose HTTP/1.1 or HTTP/2")
+    }
+}
+
+impl std::error::Error for DetectionTimedOut {}
+
+/// The bytes an HTTP/2 client sends first (RFC 9113 §3.4).
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// An accepted stream whose reads fail once a deadline passes before the
+/// peer has sent enough to pick HTTP/1.1 or HTTP/2.
+///
+/// hyper-util's auto connection reads until the bytes stop matching
+/// [`H2_PREFACE`], the whole preface has arrived, or the peer closes, and has
+/// no timer while it does; hyper's header-read timeout starts only after
+/// that. This wrapper applies the same test to what the auto connection
+/// reads and, once the protocol is picked, passes reads through untouched.
+/// The test follows `ReadVersion::poll` in hyper-util 0.1.20's
+/// `server::conn::auto`. If hyper-util picks a protocol where this wrapper
+/// does not, `header_read_timeout_hands_over_to_hyper_after_detection` and
+/// `header_read_timeout_leaves_idle_http2_connections_open` fail.
+pub(crate) struct DetectionTimeout<I> {
+    io: I,
+    detection: Option<Detection>,
+}
+
+struct Detection {
+    /// How many bytes of [`H2_PREFACE`] have arrived so far.
+    matched: usize,
+    deadline: tokio::time::Instant,
+    /// Created on the first read that has to wait.
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<I> DetectionTimeout<I> {
+    pub(crate) fn new(io: I, deadline: Option<tokio::time::Instant>) -> Self {
+        Self {
+            io,
+            detection: deadline.map(|deadline| Detection {
+                matched: 0,
+                deadline,
+                sleep: None,
+            }),
+        }
+    }
+}
+
+impl Detection {
+    /// Record bytes the auto connection read; returns whether it has now
+    /// picked a protocol. An empty read is the peer closing, which the auto
+    /// connection treats as HTTP/1.1.
+    fn observe(&mut self, read: &[u8]) -> bool {
+        let rest = &H2_PREFACE[self.matched..];
+        if read.is_empty() || read.len() >= rest.len() || !rest.starts_with(read) {
+            return true;
+        }
+        self.matched += read.len();
+        false
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DetectionTimeout<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        let Some(detection) = &mut this.detection else {
+            return Pin::new(&mut this.io).poll_read(cx, buf);
+        };
+        let start = buf.filled().len();
+        match Pin::new(&mut this.io).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if detection.observe(&buf.filled()[start..]) {
+                    this.detection = None;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                let deadline = detection.deadline;
+                let sleep = detection
+                    .sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                std::task::ready!(sleep.as_mut().poll(cx));
+                this.detection = None;
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    DetectionTimedOut,
+                )))
+            }
+        }
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DetectionTimeout<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -2134,6 +2296,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
+    use std::time::Instant;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
@@ -2610,6 +2773,173 @@ mod tests {
             .expect("server did not shut down")
             .expect("join error");
         assert!(result.is_ok(), "serve returned error: {result:?}");
+    }
+
+    /// Serves an empty router on one end of an in-memory stream with
+    /// `timeout` as the header read timeout; the task ends when the
+    /// connection does.
+    fn serve_in_memory(
+        timeout: Option<Duration>,
+    ) -> (tokio::task::JoinHandle<()>, tokio::io::DuplexStream) {
+        let (io, client) = tokio::io::duplex(64 * 1024);
+        let service: WrappedService<_> = ServiceBuilder::new()
+            .layer(CatchPanicLayer::custom(panic_handler as fn(_) -> _))
+            .service(ConnectRpcService::new(Router::new()));
+        let peer = PeerInfo {
+            addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            #[cfg(feature = "server-tls")]
+            certs: None,
+        };
+        let conn = tokio::spawn(async move {
+            // Dropping the sender would start a graceful shutdown.
+            let (_shutdown, global_shutdown) = watch::channel(false);
+            serve_accepted_stream(
+                io,
+                peer,
+                Arc::new(service),
+                true,
+                timeout,
+                global_shutdown,
+                RetirementConfig::default(),
+                Http2Config::default(),
+            )
+            .await;
+        });
+        (conn, client)
+    }
+
+    #[test]
+    fn detection_ends_where_the_auto_connection_picks_a_protocol() {
+        fn reads(chunks: &[&[u8]]) -> Vec<bool> {
+            let mut detection = DetectionTimeout::new((), Some(tokio::time::Instant::now()))
+                .detection
+                .unwrap();
+            chunks.iter().map(|read| detection.observe(read)).collect()
+        }
+        assert_eq!(reads(&[b"P", b"RI * ", b"HTTP"]), [false; 3]);
+        assert_eq!(
+            reads(&[b"PRI * HTTP/2.0\r\n", b"\r\nSM\r\n\r\n"]),
+            [false, true]
+        );
+        assert_eq!(reads(&[H2_PREFACE]), [true]);
+        assert_eq!(reads(&[b"GET "]), [true]);
+        assert_eq!(reads(&[b"PRI", b" X"]), [false, true]);
+        assert_eq!(reads(&[b"POST"]), [true]);
+        assert_eq!(reads(&[b"PRI", b""]), [false, true]);
+        assert_eq!(reads(&[b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nX"]), [true]);
+    }
+
+    /// A peer that sends nothing, or only part of the HTTP/2 preface, is
+    /// closed when the header-read timeout expires, even if it keeps sending
+    /// preface bytes.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_closes_peer_before_protocol_detection() {
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        for sent in [&b""[..], b"PRI * HTTP/2.0\r\n"] {
+            let (conn, mut client) = serve_in_memory(Some(TIMEOUT));
+            client.write_all(sent).await.unwrap();
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(Duration::from_secs(3600), conn)
+                .await
+                .unwrap_or_else(|_| panic!("peer that sent {sent:?} was never closed"))
+                .unwrap();
+            assert_eq!(started.elapsed(), TIMEOUT);
+            assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+        }
+
+        let (conn, mut client) = serve_in_memory(Some(TIMEOUT));
+        let started = tokio::time::Instant::now();
+        for byte in &H2_PREFACE[..3] {
+            client.write_all(&[*byte]).await.unwrap();
+            tokio::time::sleep(TIMEOUT / 3 - Duration::from_millis(1)).await;
+        }
+        client.write_all(&H2_PREFACE[3..4]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3600), conn)
+            .await
+            .expect("trickling peer was never closed")
+            .unwrap();
+        assert_eq!(started.elapsed(), TIMEOUT);
+    }
+
+    /// Once a byte picks HTTP/1.1, hyper's own header-read timer takes over,
+    /// so an incomplete head is closed a full timeout after detection.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_hands_over_to_hyper_after_detection() {
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        const DELAY: Duration = Duration::from_secs(9);
+        let (conn, mut client) = serve_in_memory(Some(TIMEOUT));
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(DELAY).await;
+        client
+            .write_all(b"POST /svc/Echo HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3600), conn)
+            .await
+            .expect("stalled request head was never timed out")
+            .unwrap();
+        assert_eq!(started.elapsed(), DELAY + TIMEOUT);
+    }
+
+    /// A keep-alive connection that goes idle after a request is closed when
+    /// the timeout expires.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_closes_idle_keep_alive_connection() {
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let (conn, mut client) = serve_in_memory(Some(TIMEOUT));
+        client.write_all(KEEPALIVE_ECHO_REQ).await.unwrap();
+        let mut response = [0; 12];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"HTTP/1.1 404");
+        let answered = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(3600), conn)
+            .await
+            .expect("idle keep-alive connection was never closed")
+            .unwrap();
+        assert_eq!(answered.elapsed(), TIMEOUT);
+    }
+
+    /// An HTTP/2 client that has sent its preface may stay idle past the
+    /// header-read timeout.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_leaves_idle_http2_connections_open() {
+        let (conn, client) = serve_in_memory(Some(Duration::from_secs(10)));
+        let (send_request, connection) = h2::client::handshake(client).await.unwrap();
+        tokio::spawn(connection);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!conn.is_finished(), "idle HTTP/2 connection was closed");
+
+        let mut send_request = send_request.ready().await.unwrap();
+        let request = http::Request::post("http://localhost/svc/Unknown")
+            .body(())
+            .unwrap();
+        let (response, _) = send_request.send_request(request, true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(60), response)
+            .await
+            .expect("no response");
+        assert!(response.is_ok());
+    }
+
+    /// A zero timeout, or one too long to add to the clock, disables both
+    /// bounds; the latter would otherwise panic the connection.
+    #[tokio::test(start_paused = true)]
+    async fn zero_or_unrepresentable_header_read_timeout_disables_it() {
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let (conn, mut client) = serve_in_memory(Some(timeout));
+            let (head, rest) = ECHO_REQ.split_at(4);
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(!conn.is_finished(), "{timeout:?} closed a silent peer");
+            client.write_all(head).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(!conn.is_finished(), "{timeout:?} closed a partial head");
+            client.write_all(rest).await.unwrap();
+            let mut response = [0; 9];
+            tokio::time::timeout(Duration::from_secs(60), client.read_exact(&mut response))
+                .await
+                .expect("no response")
+                .unwrap();
+            assert_eq!(&response, b"HTTP/1.1 ", "{timeout:?}");
+        }
     }
 
     /// A complete request well within the header read timeout is served
@@ -4140,6 +4470,354 @@ mod tests {
                 .then(|| value.trim().parse().ok())
                 .flatten()
         })
+    }
+
+    // ========================================================================
+    // Streaming calls that end before their request body does
+    // ========================================================================
+
+    /// A client-streaming route that refuses the call without reading its
+    /// request stream.
+    fn refusing_upload_router() -> Router {
+        Router::new().route_client_stream(
+            "svc",
+            "Upload",
+            crate::handler::client_streaming_handler_fn(
+                |_ctx: crate::RequestContext,
+                 _requests: crate::ServiceStream<buffa_types::Empty>| async move {
+                    Err::<crate::Response<buffa_types::Empty>, _>(ConnectError::permission_denied(
+                        "refused before reading",
+                    ))
+                },
+            ),
+        )
+    }
+
+    /// Send `data` on an h2 client stream, waiting for flow-control capacity.
+    /// Stops quietly if the server has already ended the stream.
+    async fn send_h2_data(send: &mut h2::SendStream<Bytes>, mut data: Bytes) {
+        while !data.is_empty() {
+            send.reserve_capacity(data.len());
+            let capacity = tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| send.poll_capacity(cx)),
+            )
+            .await
+            .expect("no send window: the server is not releasing flow control");
+            let Some(Ok(capacity)) = capacity else {
+                return; // reset by the server
+            };
+            let chunk = data.split_to(capacity.min(data.len()));
+            if send.send_data(chunk, false).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A server for [`refusing_upload_router`], shut down with [`Self::stop`].
+    struct RefusingServer {
+        addr: std::net::SocketAddr,
+        shutdown_tx: tokio::sync::oneshot::Sender<()>,
+        serve: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    }
+
+    impl RefusingServer {
+        async fn start(bound: BoundServer) -> Self {
+            let addr = bound.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let serve = tokio::spawn(async move {
+                bound
+                    .serve_with_graceful_shutdown(refusing_upload_router(), async {
+                        shutdown_rx.await.ok();
+                    })
+                    .await
+            });
+            Self {
+                addr,
+                shutdown_tx,
+                serve,
+            }
+        }
+
+        /// Shut down once every client connection is closed.
+        async fn stop(self) {
+            self.shutdown_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), self.serve)
+                .await
+                .expect("server did not shut down")
+                .expect("join error")
+                .expect("serve error");
+        }
+
+        /// An h2 client connection to the server, and its driving task.
+        async fn connect_h2(
+            &self,
+        ) -> (
+            h2::client::SendRequest<Bytes>,
+            tokio::task::JoinHandle<Result<(), h2::Error>>,
+        ) {
+            let tcp = tokio::net::TcpStream::connect(self.addr).await.unwrap();
+            let (send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+            (send_request, tokio::spawn(h2_conn))
+        }
+
+        /// The request head of a call to the refusing route.
+        fn upload_request(&self) -> http::Request<()> {
+            http::Request::post(format!("http://{}/svc/Upload", self.addr))
+                .header(header::CONTENT_TYPE, "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .unwrap()
+        }
+
+        /// Open one call on an h2 connection: request head, then the response
+        /// (which arrives at once, whatever the client sends).
+        async fn start_upload(
+            &self,
+            send_request: &mut h2::client::SendRequest<Bytes>,
+        ) -> (h2::SendStream<Bytes>, http::Response<h2::RecvStream>) {
+            let (resp, send) = send_request
+                .send_request(self.upload_request(), false)
+                .unwrap();
+            let resp = resp.await.expect("response headers");
+            assert_eq!(resp.headers()["grpc-status"], "7");
+            (send, resp)
+        }
+    }
+
+    /// Over HTTP/2 a call that ends before its request stream does releases
+    /// the stream after the drain: the client receives the whole response
+    /// and, once the server gives up on the rest of the request,
+    /// `RST_STREAM(NO_ERROR)` (RFC 9113 §8.1), although it stalled part-way
+    /// through a message. The single-stream limit shows the slot is freed.
+    #[tokio::test]
+    async fn http2_early_return_releases_stalled_stream() {
+        use crate::service::DRAIN_TIMEOUT;
+
+        let server = RefusingServer::start(
+            Server::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .with_max_concurrent_streams(1),
+        )
+        .await;
+        let (send_request, h2_task) = server.connect_h2().await;
+        let mut send_request = send_request.ready().await.unwrap();
+
+        // The server's drain starts after this, so it cannot end sooner.
+        let started = Instant::now();
+        let (mut send, resp) = server.start_upload(&mut send_request).await;
+        drain_h2_body(resp).await;
+        // A header declaring 1 MiB, then 32 KiB of it.
+        let mut partial = vec![0_u8];
+        partial.extend_from_slice(&(1024_u32 * 1024).to_be_bytes());
+        partial.resize(5 + 32 * 1024, 0);
+        send_h2_data(&mut send, Bytes::from(partial)).await;
+
+        let reason = tokio::time::timeout(
+            DRAIN_TIMEOUT + Duration::from_secs(3),
+            std::future::poll_fn(|cx| send.poll_reset(cx)),
+        )
+        .await
+        .expect("the stalled stream was not reset")
+        .expect("reset");
+        assert_eq!(reason, h2::Reason::NO_ERROR);
+        assert!(
+            started.elapsed() >= DRAIN_TIMEOUT,
+            "reset before the drain was over: {:?}",
+            started.elapsed()
+        );
+
+        // The slot is free again.
+        send_request = tokio::time::timeout(Duration::from_secs(2), send_request.clone().ready())
+            .await
+            .expect("the stream slot was not freed")
+            .unwrap();
+        let (send, resp) = server.start_upload(&mut send_request).await;
+        drain_h2_body(resp).await;
+
+        drop(send);
+        drop(send_request);
+        server.stop().await;
+        h2_task.await.expect("h2 connection task panicked").ok();
+    }
+
+    /// Small DATA frames that are still in flight when a call ends early
+    /// must not cost the connection. h2 charges small frames it receives
+    /// for a stream nobody reads to connection-wide budgets, and closes the
+    /// connection with `GOAWAY(ENHANCE_YOUR_CALM)` when they run out, so a
+    /// reader that gave up on the body as soon as the handler returned would
+    /// take every other call on the connection down with it.
+    ///
+    /// A 105-byte frame costs 151 bytes of a budget of at least 25,600, so
+    /// about 170 ignored frames are enough to trip it; the drop-at-once
+    /// design fails this test after roughly 1700 calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http2_early_return_keeps_connection_alive_under_small_frames() {
+        const CALLS: usize = 3000;
+        const CONCURRENCY: usize = 20;
+        const FRAMES_PER_CALL: usize = 10;
+
+        let server = RefusingServer::start(Server::bind("127.0.0.1:0").await.unwrap()).await;
+        let (send_request, h2_task) = server.connect_h2().await;
+        let request = server.upload_request();
+        let next = Arc::new(AtomicUsize::new(0));
+        let answered = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..CONCURRENCY)
+            .map(|_| {
+                let (send_request, request, next, answered) = (
+                    send_request.clone(),
+                    request.clone(),
+                    Arc::clone(&next),
+                    Arc::clone(&answered),
+                );
+                tokio::spawn(async move {
+                    let frame = Bytes::from(vec![0_u8; 105]);
+                    while next.fetch_add(1, Ordering::Relaxed) < CALLS {
+                        let Ok(mut send_request) = send_request.clone().ready().await else {
+                            return;
+                        };
+                        let Ok((resp, mut send)) =
+                            send_request.send_request(request.clone(), false)
+                        else {
+                            return;
+                        };
+                        for _ in 0..FRAMES_PER_CALL {
+                            send_h2_data(&mut send, frame.clone()).await;
+                            tokio::time::sleep(Duration::from_micros(100)).await;
+                        }
+                        let _ = send.send_data(Bytes::new(), true);
+                        let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(5), resp).await
+                        else {
+                            return;
+                        };
+                        drain_h2_body(resp).await;
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.await.unwrap();
+        }
+        assert_eq!(answered.load(Ordering::Relaxed), CALLS, "calls were lost");
+        assert!(!h2_task.is_finished(), "the connection was closed");
+
+        drop(send_request);
+        server.stop().await;
+        h2_task.await.expect("h2 connection task panicked").ok();
+    }
+
+    /// Length of the message the upload request's envelope declares.
+    const UPLOAD_MESSAGE_LEN: usize = 100;
+
+    /// Head of an HTTP/1.1 request to the refusing route; its body is one
+    /// Connect envelope (see [`upload_body`]).
+    fn upload_head() -> Vec<u8> {
+        format!(
+            "POST /svc/Upload HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/connect+proto\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            upload_body().len(),
+        )
+        .into_bytes()
+    }
+
+    /// One envelope: a 5-byte header, then the message it declares.
+    fn upload_body() -> Vec<u8> {
+        let mut body = vec![0_u8];
+        body.extend_from_slice(&u32::try_from(UPLOAD_MESSAGE_LEN).unwrap().to_be_bytes());
+        body.resize(5 + UPLOAD_MESSAGE_LEN, 0);
+        body
+    }
+
+    /// Read a chunked HTTP/1.1 response through its final chunk.
+    async fn read_chunked_response(stream: &mut tokio::net::TcpStream) -> String {
+        let mut resp = Vec::new();
+        let mut buf = [0; 1024];
+        while !resp.ends_with(b"0\r\n\r\n") {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("response did not arrive")
+                .unwrap();
+            assert!(read > 0, "connection closed before full response arrived");
+            resp.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// Serve [`refusing_upload_router`] and connect to it over raw TCP.
+    async fn refusing_upload_server() -> (tokio::net::TcpStream, RefusingServer) {
+        let server = RefusingServer::start(Server::bind("127.0.0.1:0").await.unwrap()).await;
+        (
+            tokio::net::TcpStream::connect(server.addr).await.unwrap(),
+            server,
+        )
+    }
+
+    /// Over HTTP/1.1 the request body is the connection: a call that ends
+    /// early while the client is still sending must leave the connection
+    /// reusable, so the reader drains what the client sends after the
+    /// response.
+    #[tokio::test]
+    async fn http1_early_return_keeps_connection_reusable() {
+        let (mut stream, server) = refusing_upload_server().await;
+
+        let body = upload_body();
+        stream.write_all(&upload_head()).await.unwrap();
+        stream.write_all(&body[..10]).await.unwrap();
+        let first = read_chunked_response(&mut stream).await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(first.contains("permission_denied"), "{first}");
+
+        // The rest of the body arrives after the response, then the same
+        // connection carries a second request.
+        stream.write_all(&body[10..]).await.unwrap();
+        stream.write_all(&upload_head()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let second = read_chunked_response(&mut stream).await;
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+
+        drop(stream);
+        server.stop().await;
+    }
+
+    /// A client that stalls part-way through the body of a call that has
+    /// already ended keeps the connection only for the bounded drain, after
+    /// which the server closes it.
+    #[tokio::test]
+    async fn http1_early_return_closes_connection_of_stalled_client() {
+        use crate::service::DRAIN_TIMEOUT;
+
+        let (mut stream, server) = refusing_upload_server().await;
+
+        // The server's drain starts after this, so it cannot end sooner.
+        let started = Instant::now();
+        stream.write_all(&upload_head()).await.unwrap();
+        stream.write_all(&upload_body()[..10]).await.unwrap();
+        let first = read_chunked_response(&mut stream).await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+
+        let mut buf = [0; 16];
+        let closed = tokio::time::timeout(
+            DRAIN_TIMEOUT + Duration::from_secs(2),
+            stream.read(&mut buf),
+        )
+        .await
+        .expect("the server still holds the connection of a stalled client");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "expected the connection to close, read {closed:?}"
+        );
+        assert!(
+            started.elapsed() >= DRAIN_TIMEOUT,
+            "closed before the drain was over: {:?}",
+            started.elapsed()
+        );
+
+        server.stop().await;
     }
 
     // ========================================================================
