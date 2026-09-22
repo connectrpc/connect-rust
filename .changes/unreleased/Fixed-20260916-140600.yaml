@@ -1,0 +1,8 @@
+kind: Fixed
+body: |-
+    **The accept loop pauses when out of file descriptors.** After `EMFILE` /
+    `ENFILE` (`WSAEMFILE` on Windows), the accept loop of `Server` /
+    `BoundServer` and `connectrpc::axum::serve_tls` pauses accepts for up to a
+    second, or until shutdown. Before, it retried at once on Unix, spinning a
+    core, and did not recognise the Windows code.
+time: 2026-09-16T14:06:00.000000000+00:00

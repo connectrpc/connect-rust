@@ -746,9 +746,14 @@ pub fn encode_view_body<'a, V: ViewEncode<'a>>(
         CodecFormat::Proto => {
             let mut cache = buffa::SizeCache::new();
             let size = checked_response_size(view.compute_size(&mut cache))?;
-            let mut buf = BytesMut::with_capacity(size);
+            // `Vec<u8>`, not `BytesMut`: `<BytesMut as BufMut>::put_slice` is
+            // not inlined, so each tag/varint byte through it is an out-of-line
+            // call. `Bytes::from(Vec)` is zero-copy, and allocation-free when
+            // `len == capacity`.
+            let mut buf = Vec::with_capacity(size);
             view.write_to(&mut cache, &mut buf);
-            Ok(buf.freeze())
+            debug_assert_eq!(buf.len(), size);
+            Ok(Bytes::from(buf))
         }
         CodecFormat::Json => Err(ConnectError::unimplemented(
             "view-body responses do not support the JSON codec; return the owned message type for JSON-serving handlers",
@@ -990,9 +995,10 @@ pub fn encode_view_body_with_min_segment<'a, V: ViewEncode<'a>>(
             if !worth_segmenting(size, backing.len(), min_segment)
                 || !has_capturable_field(view, &mut cache, backing, min_segment)
             {
-                let mut buf = BytesMut::with_capacity(size);
+                let mut buf = Vec::with_capacity(size);
                 view.write_to(&mut cache, &mut buf);
-                return Ok(EncodedBody::Contiguous(buf.freeze()));
+                debug_assert_eq!(buf.len(), size);
+                return Ok(EncodedBody::Contiguous(Bytes::from(buf)));
             }
 
             // Known cost: a rope's tail starts empty and grows by doubling,

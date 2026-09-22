@@ -1,0 +1,20 @@
+kind: Added
+body: |-
+    **`ConnectionConfig`: per-connection settings as one value.** Every knob
+    `Server` and `BoundServer` apply to an accepted connection — HTTP/1.1
+    keep-alive, header-read timeout, HTTP/2 adaptive window / window sizes /
+    max concurrent streams / keepalive, max connection age / grace / idle /
+    requests — now lives on the public `#[non_exhaustive] ConnectionConfig`
+    (`new()`, `with_*` setters, plain accessors, `Default`, also at the crate
+    root). `Server` and `BoundServer` each hold one and gain
+    `with_connection_config` / `connection_config()`; their existing `with_*`
+    setters are unchanged and edit the same value, so the two builders can no
+    longer drift and a configuration built once applies to either ([#250]).
+    New on `ConnectionConfig`, with shorthands on `Server` and `BoundServer`:
+    `with_http2_max_header_list_size`, the advertised
+    `SETTINGS_MAX_HEADER_LIST_SIZE` (hyper's 16 KiB default is too small for
+    some bearer tokens). Oversized requests get `431`; much larger ones get a
+    connection-closing GOAWAY. `with_http2_max_header_list_size(0)` panics.
+
+    [#250]: https://github.com/connectrpc/connect-rust/issues/250
+time: 2026-09-16T13:00:00.000000000+00:00
