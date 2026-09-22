@@ -67,7 +67,7 @@ use crate::envelope::EnvelopeDecoder;
 use crate::error::ConnectError;
 use crate::handler::BoxStream;
 use crate::interceptor::{
-    Interceptor, InterceptorChain, call_bidi_streaming_intercepted,
+    Interceptor, InterceptorChain, RequestHead, call_bidi_streaming_intercepted,
     call_client_streaming_intercepted, call_server_streaming_intercepted, call_unary_intercepted,
 };
 use crate::protocol::Protocol;
@@ -1481,15 +1481,15 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// The first interceptor registered runs **outermost**: first on the
     /// way in, last on the way out (matching `connect-go`'s
-    /// `WithInterceptors`). Interceptors run after the request body has
-    /// been read and decompressed under this service's [`Limits`] and
-    /// before it is decoded; a credential check that should run before any
-    /// body byte is read belongs in Tower middleware around the service
-    /// instead. See [`Interceptor`]'s "When it runs".
+    /// `WithInterceptors`). `intercept_unary` and `intercept_streaming` run
+    /// after the request body has been read and decompressed under this
+    /// service's [`Limits`] and before it is decoded; a check that should
+    /// run before any body byte is read belongs in
+    /// [`Interceptor::intercept_head`] or in Tower middleware around the
+    /// service. See [`Interceptor`]'s "When it runs".
     ///
-    /// When no interceptors are registered the dispatch path is identical
-    /// to a build without this call — there is no per-request allocation
-    /// or branch beyond a single `is_empty` check.
+    /// When no interceptors are registered the dispatch path allocates
+    /// nothing for them and only checks that the chain is empty.
     ///
     /// Interceptors run for unary and streaming calls alike. The unary
     /// surface is [`Interceptor::intercept_unary`]; the streaming surface
@@ -1680,7 +1680,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_request<D, B>(
     dispatcher: Arc<D>,
-    req: Request<B>,
+    mut req: Request<B>,
     limits: Limits,
     compression: Arc<CompressionRegistry>,
     compression_policy: &CompressionPolicy,
@@ -1723,6 +1723,9 @@ where
     // detection returns None. Route GET requests directly to the unary handler
     // which handles Connect GET query parameter parsing.
     if req.method() == Method::GET {
+        if !interceptors.is_empty() {
+            intercept_heads(interceptors, &mut req, desc, Protocol::Connect).await?;
+        }
         return handle_unary_request(
             &*dispatcher,
             &path,
@@ -1797,6 +1800,15 @@ where
 
     match request_protocol {
         Some(rp) if rp.is_streaming => {
+            // Head checks run before anything reads the body, the text-mode
+            // rejection's drain included.
+            if !interceptors.is_empty()
+                && let Err(err) = intercept_heads(interceptors, &mut req, desc, rp.protocol).await
+            {
+                return Ok(streaming_error_response(&err, rp.protocol, rp.codec_format)
+                    .map(ConnectRpcBody::Streaming));
+            }
+
             // gRPC-Web text mode (application/grpc-web-text) base64-encodes the
             // entire body. We detect it (protocol.rs) but don't decode it — reject
             // explicitly with a clear error rather than failing with garbage-envelope
@@ -1859,6 +1871,9 @@ where
             Ok(response.map(ConnectRpcBody::Streaming))
         }
         Some(_) | None => {
+            if !interceptors.is_empty() {
+                intercept_heads(interceptors, &mut req, desc, Protocol::Connect).await?;
+            }
             // Unary request (Connect unary) or unknown content type (for error reporting)
             handle_unary_request(
                 &*dispatcher,
@@ -1875,6 +1890,38 @@ where
             .map(|r| r.map(ConnectRpcBody::Full))
         }
     }
+}
+
+/// Run every interceptor's [`Interceptor::intercept_head`] on a request whose
+/// body has not been read, stopping at the first error. Callers skip it when
+/// no interceptor is registered, so that path builds no [`RequestHead`].
+///
+/// The request's extensions are moved into the head for the duration and put
+/// back afterwards, so a value a head check inserts reaches the handler.
+/// Taking `&mut Request<B>` needs only `B: Send`; a shared reference held
+/// across the `.await` would need `B: Sync`.
+async fn intercept_heads<B>(
+    interceptors: &[Arc<dyn Interceptor>],
+    req: &mut Request<B>,
+    desc: Option<MethodDescriptor>,
+    protocol: Protocol,
+) -> Result<(), ConnectError> {
+    let mut extensions = std::mem::take(req.extensions_mut());
+    let result = {
+        let mut head = RequestHead::new(req.uri().path(), req.headers(), &mut extensions)
+            .with_spec(desc.and_then(|desc| desc.spec))
+            .with_protocol(protocol);
+        let mut result = Ok(());
+        for interceptor in interceptors {
+            result = interceptor.intercept_head(&mut head).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        result
+    };
+    *req.extensions_mut() = extensions;
+    result
 }
 
 /// `Accept-Post` advertised on a 415 response: the content types this server
@@ -6784,5 +6831,447 @@ mod tests {
             .expect("miss");
             assert_eq!(err.code, crate::ErrorCode::Unimplemented);
         }
+    }
+}
+
+#[cfg(test)]
+mod intercept_head_tests {
+    use super::*;
+    use crate::interceptor::Interceptor;
+    use crate::spec::{Spec, StreamType};
+    use crate::{ServiceStream, client_streaming_handler_fn, handler_fn};
+    use buffa_types::Empty;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    const UNARY: Spec = Spec::server("/svc/Unary", StreamType::Unary);
+
+    /// A request body that counts how often it is polled.
+    struct CountedBody(Arc<AtomicUsize>);
+
+    impl Body for CountedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(None)
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        Accept,
+        Reject,
+    }
+
+    /// Records its name in `log`, then accepts or rejects in `intercept_head`.
+    struct Head {
+        name: &'static str,
+        verdict: Verdict,
+        log: Log,
+    }
+
+    #[async_trait::async_trait]
+    impl Interceptor for Head {
+        async fn intercept_head(&self, _head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+            self.log.lock().unwrap().push(self.name);
+            match self.verdict {
+                Verdict::Accept => Ok(()),
+                Verdict::Reject => Err(ConnectError::unauthenticated("no credential")),
+            }
+        }
+    }
+
+    fn head(name: &'static str, verdict: Verdict, log: &Log) -> Arc<dyn Interceptor> {
+        Arc::new(Head {
+            name,
+            verdict,
+            log: Arc::clone(log),
+        })
+    }
+
+    /// One handler of each kind; each records that it ran.
+    fn router(ran: &Arc<AtomicBool>) -> Router {
+        let unary = Arc::clone(ran);
+        let get = Arc::clone(ran);
+        let client = Arc::clone(ran);
+        Router::new()
+            .route(
+                "svc",
+                "Unary",
+                handler_fn(move |_ctx: RequestContext, _req: Empty| {
+                    unary.store(true, Ordering::SeqCst);
+                    async { crate::Response::ok(Empty::default()) }
+                }),
+            )
+            .with_spec(UNARY)
+            .route_idempotent(
+                "svc",
+                "Get",
+                handler_fn(move |_ctx: RequestContext, _req: Empty| {
+                    get.store(true, Ordering::SeqCst);
+                    async { crate::Response::ok(Empty::default()) }
+                }),
+            )
+            .route_client_stream(
+                "svc",
+                "Client",
+                client_streaming_handler_fn(
+                    move |_ctx: RequestContext, requests: ServiceStream<Empty>| {
+                        client.store(true, Ordering::SeqCst);
+                        async move {
+                            drop(requests);
+                            crate::Response::ok(Empty::default())
+                        }
+                    },
+                ),
+            )
+    }
+
+    async fn dispatch(
+        router: Router,
+        interceptors: &[Arc<dyn Interceptor>],
+        req: Request<CountedBody>,
+    ) -> Result<Response<ConnectRpcBody>, ConnectError> {
+        handle_request(
+            Arc::new(router),
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+            interceptors,
+        )
+        .await
+    }
+
+    fn post(path: &str, content_type: &str, polls: &Arc<AtomicUsize>) -> Request<CountedBody> {
+        Request::post(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(CountedBody(Arc::clone(polls)))
+            .unwrap()
+    }
+
+    /// How a rejection reaches the client in each protocol.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Connect unary: an HTTP error status.
+        HttpStatus,
+        /// gRPC: `grpc-status: 16` in the trailers.
+        GrpcTrailer,
+        /// gRPC-Web: a trailers frame in the body carrying `grpc-status: 16`.
+        GrpcWebFrame,
+        /// Connect streaming: an end-of-stream envelope carrying the code.
+        ConnectEndStream,
+    }
+
+    async fn assert_rejected(result: Result<Response<ConnectRpcBody>, ConnectError>, reply: Reply) {
+        match reply {
+            Reply::HttpStatus => {
+                let Err(err) = result else {
+                    panic!("a Connect unary rejection is an error");
+                };
+                assert_eq!(err.http_status(), StatusCode::UNAUTHORIZED);
+            }
+            Reply::GrpcTrailer => {
+                let response = result.expect("a gRPC rejection is a response");
+                let collected = response.into_body().collect().await.unwrap();
+                let trailers = collected.trailers().expect("gRPC status trailers");
+                assert_eq!(trailers.get("grpc-status").unwrap(), "16");
+            }
+            Reply::GrpcWebFrame => {
+                let response = result.expect("a gRPC-Web rejection is a response");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("grpc-status: 16"),
+                    "the trailers frame must carry the code: {body:?}"
+                );
+            }
+            Reply::ConnectEndStream => {
+                let response = result.expect("a Connect streaming rejection is a response");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("unauthenticated"),
+                    "the end-of-stream envelope must carry the code: {body:?}"
+                );
+            }
+        }
+    }
+
+    /// A rejection in `intercept_head` must leave the body unread and the
+    /// handler unrun, in every dispatch shape, and reach the client in that
+    /// shape's own error format. The streaming shapes are the ones where a
+    /// body reader would otherwise start before any interceptor runs, so the
+    /// polls are counted after the runtime has had time to run a spawned
+    /// reader. The gRPC-Web text-mode shape is one the service rejects with
+    /// its own drain unless the hook runs first.
+    #[tokio::test]
+    async fn head_rejection_reads_no_body_and_runs_no_handler() {
+        const SHAPES: [(&str, &str, &str, Reply); 6] = [
+            (
+                "connect unary",
+                "/svc/Unary",
+                "application/proto",
+                Reply::HttpStatus,
+            ),
+            (
+                "grpc unary",
+                "/svc/Unary",
+                "application/grpc+proto",
+                Reply::GrpcTrailer,
+            ),
+            (
+                "connect client stream",
+                "/svc/Client",
+                "application/connect+proto",
+                Reply::ConnectEndStream,
+            ),
+            (
+                "grpc client stream",
+                "/svc/Client",
+                "application/grpc+proto",
+                Reply::GrpcTrailer,
+            ),
+            (
+                "grpc-web client stream",
+                "/svc/Client",
+                "application/grpc-web+proto",
+                Reply::GrpcWebFrame,
+            ),
+            (
+                "grpc-web text mode",
+                "/svc/Client",
+                "application/grpc-web-text+proto",
+                Reply::GrpcWebFrame,
+            ),
+        ];
+
+        for (name, path, content_type, reply) in SHAPES {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let ran = Arc::new(AtomicBool::new(false));
+            let log = Log::default();
+            let chain = [head("gate", Verdict::Reject, &log)];
+
+            let result = dispatch(router(&ran), &chain, post(path, content_type, &polls)).await;
+            for _ in 0..YIELDS {
+                tokio::task::yield_now().await;
+            }
+
+            assert_rejected(result, reply).await;
+            assert_eq!(polls.load(Ordering::SeqCst), 0, "{name}: body was read");
+            assert!(!ran.load(Ordering::SeqCst), "{name}: handler ran");
+            assert_eq!(*log.lock().unwrap(), ["gate"], "{name}");
+        }
+
+        // Connect GET has no content type, so it gets its own request.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [head("gate", Verdict::Reject, &log)];
+        let req = Request::get("/svc/Get?message=&encoding=proto&base64=1&connect=v1")
+            .body(CountedBody(Arc::clone(&polls)))
+            .unwrap();
+        let result = dispatch(router(&ran), &chain, req).await;
+        assert_rejected(result, Reply::HttpStatus).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "connect get: body was read"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "connect get: handler ran");
+    }
+
+    /// Enough turns for a spawned body reader to poll the body.
+    const YIELDS: usize = 5;
+
+    /// Every interceptor's head check runs, outermost first, until one
+    /// rejects; interceptors after the rejecting one are not consulted.
+    #[tokio::test]
+    async fn head_checks_run_in_registration_order_and_stop_at_the_first_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [
+            head("first", Verdict::Accept, &log),
+            head("second", Verdict::Reject, &log),
+            head("third", Verdict::Accept, &log),
+        ];
+
+        let result = dispatch(
+            router(&ran),
+            &chain,
+            post("/svc/Unary", "application/proto", &polls),
+        )
+        .await;
+
+        assert_rejected(result, Reply::HttpStatus).await;
+        assert_eq!(*log.lock().unwrap(), ["first", "second"]);
+    }
+
+    /// What the head shows for one request.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        path: String,
+        spec: Option<Spec>,
+        protocol: Protocol,
+        authorization: Option<String>,
+        peer: Option<Peer>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Peer(u32);
+
+    struct Inspect(Arc<Mutex<Option<Seen>>>);
+
+    #[async_trait::async_trait]
+    impl Interceptor for Inspect {
+        async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+            *self.0.lock().unwrap() = Some(Seen {
+                path: head.path().to_owned(),
+                spec: head.spec(),
+                protocol: head.protocol(),
+                authorization: head
+                    .header("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                peer: head.extensions().get::<Peer>().copied(),
+            });
+            Ok(())
+        }
+    }
+
+    /// Dispatch `req` through an accepting `Inspect` and return what it saw.
+    async fn inspect(
+        req: Request<CountedBody>,
+    ) -> (Option<Seen>, Result<StatusCode, ConnectError>) {
+        let seen = Arc::new(Mutex::new(None));
+        let chain: [Arc<dyn Interceptor>; 1] = [Arc::new(Inspect(Arc::clone(&seen)))];
+        let ran = Arc::new(AtomicBool::new(false));
+        let status = dispatch(router(&ran), &chain, req)
+            .await
+            .map(|response| response.status());
+        (seen.lock().unwrap().take(), status)
+    }
+
+    /// The head shows the path, the resolved `Spec`, the headers and the
+    /// transport's extensions, and accepting it lets the call run.
+    #[tokio::test]
+    async fn head_exposes_the_request_and_an_accepted_call_proceeds() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut req = post("/svc/Unary", "application/proto", &polls);
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer token".parse().unwrap());
+        req.extensions_mut().insert(Peer(7));
+
+        let (seen, status) = inspect(req).await;
+
+        assert_eq!(
+            status.expect("an accepted call is dispatched"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            seen,
+            Some(Seen {
+                path: "/svc/Unary".to_owned(),
+                spec: Some(UNARY),
+                protocol: Protocol::Connect,
+                authorization: Some("Bearer token".to_owned()),
+                peer: Some(Peer(7)),
+            })
+        );
+    }
+
+    /// The protocol the head reports follows the request's content type.
+    #[tokio::test]
+    async fn head_reports_the_protocol_of_the_request() {
+        for (path, content_type, expected) in [
+            ("/svc/Unary", "application/proto", Protocol::Connect),
+            (
+                "/svc/Client",
+                "application/connect+proto",
+                Protocol::Connect,
+            ),
+            ("/svc/Unary", "application/grpc+proto", Protocol::Grpc),
+            (
+                "/svc/Client",
+                "application/grpc-web+proto",
+                Protocol::GrpcWeb,
+            ),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let (seen, _) = inspect(post(path, content_type, &polls)).await;
+            let seen = seen.unwrap_or_else(|| panic!("{content_type}: the hook did not run"));
+            assert_eq!(seen.protocol, expected, "{content_type}");
+        }
+    }
+
+    /// A path that matches no method still reaches the head, with no `Spec`,
+    /// so a rejecting hook answers before the not-found error does.
+    #[tokio::test]
+    async fn head_runs_for_an_unknown_path_before_the_not_found_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (seen, status) = inspect(post("/svc/Missing", "application/proto", &polls)).await;
+        let seen = seen.expect("the hook must run for an unknown path");
+        assert_eq!((seen.path.as_str(), seen.spec), ("/svc/Missing", None));
+        assert_eq!(status.unwrap_err().http_status(), StatusCode::NOT_FOUND);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [head("gate", Verdict::Reject, &log)];
+        let result = dispatch(
+            router(&ran),
+            &chain,
+            post("/svc/Missing", "application/proto", &polls),
+        )
+        .await;
+        assert_rejected(result, Reply::HttpStatus).await;
+    }
+
+    /// A value a head check inserts reaches the handler through the request
+    /// context, so authentication can hand the caller's identity on.
+    #[tokio::test]
+    async fn head_extensions_reach_the_handler() {
+        #[derive(Clone)]
+        struct Caller(&'static str);
+
+        struct Authenticate;
+
+        #[async_trait::async_trait]
+        impl Interceptor for Authenticate {
+            async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+                head.extensions_mut().insert(Caller("alice"));
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let router = Router::new().route(
+            "svc",
+            "Unary",
+            handler_fn(move |ctx: RequestContext, _req: Empty| {
+                *handler_seen.lock().unwrap() = ctx.extensions().get::<Caller>().map(|c| c.0);
+                async { crate::Response::ok(Empty::default()) }
+            }),
+        );
+        let chain: [Arc<dyn Interceptor>; 1] = [Arc::new(Authenticate)];
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        dispatch(
+            router,
+            &chain,
+            post("/svc/Unary", "application/proto", &polls),
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(*seen.lock().unwrap(), Some("alice"));
     }
 }

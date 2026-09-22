@@ -1039,18 +1039,23 @@ errors.
 Tower middleware (above) operates on `http::Request` / `http::Response`
 — it's the right level for cross-cutting concerns that don't need to
 know they're wrapping an RPC: connection-scoped tracing, gzip, raw
-header manipulation. **Interceptors** are the typed RPC layer on top: a
-single async hook per call that runs after the request head is parsed
-and the request body has been read and decompressed (under the
+header manipulation. **Interceptors** are the typed RPC layer on top:
+async hooks per call. `intercept_head` runs before the request body is
+read; `intercept_unary` and `intercept_streaming` run after the request
+head is parsed and the body has been read and decompressed (under the
 service's `Limits`), but *before* the message is decoded, and before
 the handler. Interceptors see the resolved
 [`Spec`](#static-method-metadata-spec), the parsed headers, the deadline,
 the negotiated protocol, the request extensions, and a lazily decoded
 message body — what a span builder, validator, rate limiter, or
-authorization check wants. For *authentication* — rejecting a caller
-that has presented no credential — read
+authorization check wants. A check that needs only the resolved `Spec`,
+the headers, and the connection's extensions can run earlier, in
+`Interceptor::intercept_head`, before any of the body is read (see
+[Rejecting before the body is read](#rejecting-before-the-body-is-read)).
+For *authentication* — rejecting a caller that has presented no credential —
+read
 [what an unauthenticated request costs](#authentication-and-the-cost-of-an-unauthenticated-request)
-before choosing between an interceptor and Tower middleware.
+before choosing between the two.
 
 ```rust,ignore
 use connectrpc::interceptor::{UnaryRequest, UnaryResponse};
@@ -1237,26 +1242,89 @@ client-streaming the outbound stream yields exactly one item. Read
 | | Tower middleware | Interceptor |
 |---|---|---|
 | Operates on | `http::Request` / `http::Response` | Decoded RPC: `Spec`, headers, deadline, `Payload` |
-| Runs | Before the body is read | After the body is read, before it is decoded ([details](#authentication-and-the-cost-of-an-unauthenticated-request)) |
-| Sees the RPC method | No (must re-parse the URI) | Yes (`ctx.path()`, `ctx.spec()`) |
+| Runs | Before the body is read | `intercept_head`: before the body is read. `intercept_unary` and `intercept_streaming`: after the body is read, before it is decoded ([details](#authentication-and-the-cost-of-an-unauthenticated-request)) |
+| Sees the RPC method | No (must re-parse the URI) | Yes (`head.path()`, `head.spec()`, `ctx.path()`, `ctx.spec()`) |
 | Sees the message body | Compressed/enveloped wire bytes | Lazily decoded, codec-aware `Payload` |
 | Short-circuits | By returning an `http::Response` | By returning `Err` or a `UnaryResponse` |
-| Best for | Authentication, gzip, raw header rewriting, generic HTTP concerns | Authorization on the `Spec`, RPC-aware tracing, validation, rate limiting |
+| Best for | Authentication, gzip, raw header rewriting, generic HTTP concerns | Authorization on the `Spec` and headers (`intercept_head`), RPC-aware tracing, validation, rate limiting |
 
 Both compose: a Tower layer wraps the whole `ConnectRpcService`
 (including its interceptor chain). An interceptor that needs an
 HTTP-level fact (e.g. the remote socket address) reads it from
 `ctx.extensions()` after a Tower layer inserts it.
 
+### Rejecting before the body is read
+
+`Interceptor::intercept_head` receives a `RequestHead` — the path, the
+resolved `Spec`, the headers, the protocol, and the request extensions —
+before the server reads any of the body or starts a body reader. It returns
+`Ok(())` to continue or an error to reject. The first rejection ends the
+request: later interceptors' head checks do not run, no interceptor's
+`intercept_unary` or `intercept_streaming` runs (so count or trace
+rejections inside the head check or in a Tower layer), the body is not read,
+and the client gets the error in its protocol's format. As with a Tower
+layer that returns a response without calling the service, an HTTP/2 stream
+is reset and an HTTP/1.x connection is usually closed instead of being
+drained, so a client that is still uploading can see a transport error
+instead of the error you returned.
+
+A head check can insert values into `head.extensions_mut()`; later
+interceptors and the handler read them from `ctx.extensions()`. That makes
+it the place to authenticate once and pass the caller on:
+
+```rust,ignore
+use connectrpc::{ConnectError, Interceptor, RequestHead};
+
+struct Caller(String);
+
+struct Authenticate {
+    verifier: Verifier,
+}
+
+#[connectrpc::async_trait]
+impl Interceptor for Authenticate {
+    async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+        let token = head.header("authorization").and_then(|v| v.to_str().ok());
+        let Some(caller) = token.and_then(|t| self.verifier.verify(t)) else {
+            return Err(ConnectError::unauthenticated("missing or invalid token"));
+        };
+        head.extensions_mut().insert(Caller(caller));
+        Ok(())
+    }
+}
+```
+
+`verifier.verify` stands for your own credential check; compare secrets with
+a constant-time comparison, not `==`.
+
+Every interceptor's head check runs before any interceptor's
+`intercept_unary` or `intercept_streaming`, so a head check sees the headers
+as they reached the service, not as an outer interceptor rewrote them with
+`headers_mut`. Decide one policy in one hook rather than splitting it across
+the two. The check also runs for a path that matches no method, with
+`head.spec()` `None`, ahead of the not-found error; gate on `head.path()` or
+treat `None` as a denial. `head.peer_addr()` (and `head.peer_certs()` with
+the `server-tls` feature) return the connection's address and client
+certificates when the transport recorded them.
+
+The check has no message to look at, and it runs before the request
+deadline applies, so wrap a wait on a slow dependency in
+`tokio::time::timeout`. A request the service rejects for an unsupported
+HTTP method or an unrecognized content type never reaches interceptors, and
+so never reaches this check either; the service drains such a request's
+body, bounded by `max_request_body_size` and the request deadline, before it
+answers.
+
 ### Authentication and the cost of an unauthenticated request
 
 A credential check should run as early as the server allows, because
 everything the server does before rejecting a request is work an
-unauthenticated peer can make it do for free. The two hooks sit at
-different points, and the difference is what has been spent by the time
-each one can say no:
+unauthenticated peer can make it do for free. Tower middleware and
+`intercept_head` run before the body is read; `intercept_unary` and
+`intercept_streaming` run after. The difference is what has been spent by
+the time each one can say no:
 
-| Before the hook runs | Tower middleware | Interceptor |
+| Before the hook runs | Tower middleware, `intercept_head` | `intercept_unary`, `intercept_streaming` |
 |---|---|---|
 | Request head parsed | yes | yes |
 | Request body read | no | unary and server-streaming: yes, up to `max_request_body_size` (4 MB by default); client- and bidi-streaming: at most a message or two are read ahead |
@@ -1268,25 +1336,27 @@ The message decode is the step that multiplies memory: a few bytes of
 element, so a 4 MB body can decode into hundreds of MB. In this crate
 that step happens after the interceptor chain, and is bounded by
 `Limits::element_memory_limit` (32 MiB by default) when it does. An
-interceptor that returns `unauthenticated` therefore costs at most the
-bounded body read and inflate; a Tower layer that does the same costs
-only the head. Under the default limits, the worst an unauthenticated
-caller can hold open against an interceptor-based check is
+`intercept_unary` or `intercept_streaming` that returns `unauthenticated`
+therefore costs at most the bounded body read and inflate; a Tower layer or
+`intercept_head` that does the same costs only the head. Under the default
+limits, the worst an unauthenticated caller can hold open against a check in
+`intercept_unary` or `intercept_streaming` is
 `max_request_body_size + max_message_size` per in-flight request (the
 compressed body is held while it inflates), multiplied by the HTTP/2
 concurrent-stream limit per connection.
 
 Put *authentication* — "does this caller hold any credential at all" —
-in Tower middleware, where it runs before a single body byte is read. The [middleware example](../examples/middleware)
+in Tower middleware or in `intercept_head`, where it runs before a single
+body byte is read. The [middleware example](../examples/middleware)
 does this with `axum::middleware::from_fn` for a bearer token. Put
-*authorization* — "may this identity call this method" — in an
-interceptor, where the resolved `Spec` and the parsed headers are
-available and the body is still undecoded; an `Err` from it still
-costs the peer nothing past the limits above. If the same component
-must do both, it can still be an interceptor: keep `max_message_size`
-and `max_request_body_size` at values the deployment can absorb across
-its concurrent-stream budget, and reject before touching
-`req.payload`.
+*authorization* — "may this identity call this method" — in
+`intercept_head` too when it needs only the resolved `Spec`, the headers,
+and the connection's extensions: a rejection there costs the peer only the
+head. An authorization check that must read the message runs in
+`intercept_unary` or `intercept_streaming`, where an `Err` costs the peer
+the bounded reads above and nothing more; keep `max_message_size` and
+`max_request_body_size` at values the deployment can absorb across its
+concurrent-stream budget, and reject before touching `req.payload`.
 
 ## Hosting
 
