@@ -585,7 +585,10 @@ impl GzipProvider {
         compressor: &mut flate2::Compress,
         data: &[u8],
     ) -> Result<Bytes, ConnectError> {
-        let mut output = Vec::with_capacity(data.len() + 32);
+        // Header + trailer + deflate's worst case (stored blocks add a few
+        // bytes per block), so even incompressible input finishes without
+        // growing the buffer.
+        let mut output = Vec::with_capacity(data.len() + (data.len() >> 8) + 64);
 
         // Gzip header (RFC 1952): fixed 10 bytes, no optional fields
         output.extend_from_slice(&[
@@ -601,7 +604,12 @@ impl GzipProvider {
         let start_in = compressor.total_in();
         loop {
             let consumed = (compressor.total_in() - start_in) as usize;
-            output.reserve(output.capacity().max(4096));
+            // `compress_vec` writes into spare capacity only; grow when there
+            // is none left rather than on every pass, so the pre-sized buffer
+            // is not doubled before the first byte is written.
+            if output.len() == output.capacity() {
+                output.reserve(output.capacity().max(4096));
+            }
             let status = compressor
                 .compress_vec(
                     &data[consumed..],

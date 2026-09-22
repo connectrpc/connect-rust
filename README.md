@@ -328,7 +328,7 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 | `server`     | No      | Standalone hyper-based server                    |
 | `server-tls` | No      | TLS for the built-in server (`Server::with_tls`) |
 | `tls`        | No      | Convenience: enables both `server-tls` + `client-tls` |
-| `axum`       | No      | Axum framework integration                       |
+| `axum`       | No      | Axum integration (`Router::into_axum_service`); the `connectrpc::axum` module also needs `server`, and `serve_tls` needs `server-tls` |
 
 ### wasm32
 
