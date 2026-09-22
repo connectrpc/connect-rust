@@ -639,6 +639,7 @@ pub const __TEST_SUITE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
 pub mod test_suite {
     #[allow(unused_imports)]
     use super::*;
+    #[allow(non_camel_case_types)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     #[repr(i32)]
     pub enum TestMode {
@@ -798,6 +799,7 @@ pub mod test_suite {
             ]
         }
     }
+    #[allow(non_camel_case_types)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     #[repr(i32)]
     pub enum ConnectVersionMode {

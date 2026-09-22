@@ -18,8 +18,8 @@ http-body-util = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
-tower = { workspace = true }
 futures = { workspace = true }
+tower = { workspace = true }
 redis = { version = "1.0", default-features = false, features = ["tokio-comp"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 pprof = { version = "0.15", features = ["criterion", "flamegraph", "protobuf-codec"] }
@@ -62,6 +62,10 @@ name = "rpc_bench"
 harness = false
 
 [[bench]]
+name = "reader_bench"
+harness = false
+
+[[bench]]
 name = "cross_impl_bench"
 harness = false
 
@@ -79,6 +83,10 @@ harness = false
 
 [[bench]]
 name = "stream_compressed_encode"
+harness = false
+
+[[bench]]
+name = "encode_frame"
 harness = false
 
 [lints]

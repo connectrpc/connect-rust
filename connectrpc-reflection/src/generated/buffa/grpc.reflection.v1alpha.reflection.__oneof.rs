@@ -29,12 +29,12 @@ pub mod server_reflection_request {
             Self::Some(MessageRequest::from(v))
         }
     }
-    impl serde::Serialize for MessageRequest {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for MessageRequest {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::FileByFilename(v) => {
@@ -44,7 +44,7 @@ pub mod server_reflection_request {
                     map.serialize_entry("fileContainingSymbol", v)?;
                 }
                 Self::FileContainingExtension(v) => {
-                    map.serialize_entry("fileContainingExtension", v)?;
+                    map.serialize_entry("fileContainingExtension", &**v)?;
                 }
                 Self::AllExtensionNumbersOfType(v) => {
                     map.serialize_entry("allExtensionNumbersOfType", v)?;
@@ -120,25 +120,25 @@ pub mod server_reflection_response {
             Self::Some(MessageResponse::from(v))
         }
     }
-    impl serde::Serialize for MessageResponse {
-        fn serialize<S: serde::Serializer>(
+    impl ::serde::Serialize for MessageResponse {
+        fn serialize<S: ::serde::Serializer>(
             &self,
             s: S,
         ) -> ::core::result::Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
+            use ::serde::ser::SerializeMap;
             let mut map = s.serialize_map(Some(1))?;
             match self {
                 Self::FileDescriptorResponse(v) => {
-                    map.serialize_entry("fileDescriptorResponse", v)?;
+                    map.serialize_entry("fileDescriptorResponse", &**v)?;
                 }
                 Self::AllExtensionNumbersResponse(v) => {
-                    map.serialize_entry("allExtensionNumbersResponse", v)?;
+                    map.serialize_entry("allExtensionNumbersResponse", &**v)?;
                 }
                 Self::ListServicesResponse(v) => {
-                    map.serialize_entry("listServicesResponse", v)?;
+                    map.serialize_entry("listServicesResponse", &**v)?;
                 }
                 Self::ErrorResponse(v) => {
-                    map.serialize_entry("errorResponse", v)?;
+                    map.serialize_entry("errorResponse", &**v)?;
                 }
             }
             map.end()
