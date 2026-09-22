@@ -1,0 +1,16 @@
+kind: Fixed
+body: |-
+    **`connectrpc-codegen` now rejects Rust identifier collisions between
+    services that share a module** ([#279]). Every service in a proto package
+    is generated into one Rust module, but the collision check only looked
+    within a single service, so two services whose names normalize alike
+    (`XGet` and `X_Get`), or two `(service, method)` pairs that split the same
+    words differently (`XGet.Foo` and `X.GetFoo`, both `X_GET_FOO_SPEC`),
+    generated duplicate items and failed in rustc with E0428 pointing at
+    generated code. Generation now fails with a message naming both producers,
+    their proto files and the identifier they share, so the error points at
+    the proto to rename. Message types are not covered: a message named like
+    a generated service item still surfaces as a rustc error.
+
+    [#279]: https://github.com/connectrpc/connect-rust/issues/279
+time: 2026-08-25T20:23:07.346388300+00:00

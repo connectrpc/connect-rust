@@ -3,21 +3,26 @@
 //! Mirrors `examples/middleware/`, swapping bearer-token auth for mTLS:
 //! instead of an `axum::middleware::from_fn` reading an `Authorization`
 //! header, identity comes from the verified client certificate that
-//! `connectrpc::axum::serve_tls` captures during the TLS handshake and
-//! stamps into request extensions as [`connectrpc::PeerCerts`]. The
-//! handler reads it via [`RequestContext::peer_certs`], parses the leaf
-//! cert's DNS SAN to derive a workload identity, then enforces an ACL
-//! against it.
+//! `connectrpc::axum::serve_tls` captures during the TLS handshake. The
+//! function registered with
+//! [`with_connection_extensions`](connectrpc::axum::Serve::with_connection_extensions)
+//! parses the leaf cert's DNS SAN into a [`PeerIdentity`] once per
+//! connection; every request on that connection carries it in its
+//! extensions, and the handler reads it from [`RequestContext::extensions`]
+//! to enforce an ACL. The raw chain is still available per request as
+//! [`connectrpc::PeerCerts`].
 //!
 //! The same handler code works unchanged on the standalone
-//! [`connectrpc::Server::with_tls`], which populates
-//! [`connectrpc::PeerCerts`] the same way — the hosting choice doesn't
-//! leak into authorization logic.
+//! [`connectrpc::Server::with_tls`] or in a custom accept loop — the hosting
+//! choice doesn't leak into authorization logic. The README says, for each
+//! hosting path, where `PeerIdentity` enters the connection's extensions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use connectrpc::{ConnectError, ErrorCode, RequestContext, Router, ServiceRequest, ServiceResult};
+use connectrpc::{
+    ConnectError, ConnectionInfo, ErrorCode, RequestContext, Router, ServiceRequest, ServiceResult,
+};
 
 pub mod proto {
     connectrpc::include_generated!();
@@ -53,8 +58,8 @@ pub struct Identity {
 /// In a real deployment you'd typically match a SPIFFE ID
 /// (`spiffe://trust-domain/path`, a URI SAN) instead of a DNS SAN, or
 /// delegate this whole step to an authorization framework. The shape is
-/// the same: read [`RequestContext::peer_certs`], parse the leaf, derive
-/// an identity.
+/// the same: take the verified chain, parse the leaf, derive an identity —
+/// once per connection via [`PeerIdentity::from_connection`].
 pub fn extract_identity(
     certs: Option<&[rustls_pki_types::CertificateDer<'static>]>,
 ) -> Result<Identity, ConnectError> {
@@ -101,6 +106,37 @@ pub fn extract_identity(
         })
 }
 
+/// The caller's identity, parsed from its client certificate once per
+/// connection and stamped into every request's extensions.
+///
+/// Holds the [`extract_identity`] outcome rather than just the success case
+/// so a handler reports the same `Unauthenticated` detail it would have
+/// produced by parsing the chain itself.
+#[derive(Debug, Clone)]
+pub struct PeerIdentity(pub Result<Identity, ConnectError>);
+
+impl PeerIdentity {
+    /// Parse the leaf certificate of `conn`; run it once per accepted TLS
+    /// connection, not once per request.
+    pub fn from_connection(conn: &ConnectionInfo) -> Self {
+        Self(extract_identity(conn.peer_certs()))
+    }
+
+    /// The identity for this request, as parsed for its connection. A missing
+    /// [`PeerIdentity`] means the hosting path never populated it — a server
+    /// misconfiguration, reported as `Internal` rather than by silently
+    /// re-parsing the chain per request.
+    pub fn for_request(ctx: &RequestContext) -> Result<Identity, ConnectError> {
+        let Some(PeerIdentity(parsed)) = ctx.extensions().get::<PeerIdentity>() else {
+            return Err(ConnectError::new(
+                ErrorCode::Internal,
+                "no PeerIdentity on the request: populate it with with_connection_extensions",
+            ));
+        };
+        parsed.clone()
+    }
+}
+
 // ============================================================================
 // IdentityService handler
 // ============================================================================
@@ -129,12 +165,11 @@ impl IdentityService for IdentityServiceImpl {
         ctx: RequestContext,
         _request: ServiceRequest<'_, WhoAmIRequest>,
     ) -> ServiceResult<WhoAmIResponse> {
-        // Both PeerCerts and PeerAddr are stamped per connection by
-        // serve_tls; the dispatcher copies request extensions verbatim
-        // into the request context. Use the typed accessors rather than
-        // raw extension lookups so a missing transport insert is a clean
-        // `None` instead of a panic.
-        let id = extract_identity(ctx.peer_certs())?;
+        // PeerIdentity was parsed once for this connection by the
+        // `with_connection_extensions` function; PeerAddr is stamped
+        // alongside it. The dispatcher copies request extensions verbatim
+        // into the request context.
+        let id = PeerIdentity::for_request(&ctx)?;
         let remote = ctx.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         connectrpc::Response::ok(WhoAmIResponse {
             identity: Some(id.name),
@@ -149,7 +184,7 @@ impl IdentityService for IdentityServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, GetSecretRequest>,
     ) -> ServiceResult<GetSecretResponse> {
-        let id = extract_identity(ctx.peer_certs())?;
+        let id = PeerIdentity::for_request(&ctx)?;
         let name = request.name.unwrap_or("").to_owned();
         let (value, allowed) = self.store.get(&name).ok_or_else(|| {
             ConnectError::new(ErrorCode::NotFound, format!("no secret named {name:?}"))
@@ -174,8 +209,9 @@ impl IdentityService for IdentityServiceImpl {
 
 /// Build the axum app and serve it over TLS until `shutdown` resolves.
 ///
-/// This is the only line that differs from a plaintext axum app:
-/// `connectrpc::axum::serve_tls` instead of `axum::serve`.
+/// Two lines differ from a plaintext axum app: `connectrpc::axum::serve_tls`
+/// instead of `axum::serve`, and `with_connection_extensions` parsing the
+/// client certificate into a [`PeerIdentity`] once per connection.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     server_config: Arc<connectrpc::rustls::ServerConfig>,
@@ -188,6 +224,11 @@ pub async fn serve(
     let app = axum::Router::new().fallback_service(connect_router.into_axum_service());
 
     connectrpc::axum::serve_tls(listener, app, server_config)
+        // Once per connection, after the TLS handshake: parse the leaf cert
+        // here so handlers don't re-parse DER on every request.
+        .with_connection_extensions(|conn, ext| {
+            ext.insert(PeerIdentity::from_connection(conn));
+        })
         .with_graceful_shutdown(shutdown)
         .await
 }

@@ -583,10 +583,14 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -646,7 +650,9 @@ pub struct ElizaServiceClient<T> {
 impl<T> ElizaServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {

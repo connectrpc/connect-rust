@@ -1,0 +1,26 @@
+kind: Fixed
+body: |-
+    **The header-read timeout now closes a connection that sends nothing, or
+    only part of the HTTP/2 connection preface.** Such a peer was held open
+    until it hung up, or until the shutdown signal or a configured retirement
+    trigger ended it: the timeout started only after enough bytes had arrived
+    to pick HTTP/1.1 or HTTP/2. Such a connection is now closed when the
+    timeout expires, reported as `CloseReason::HeaderReadTimeout`. A client or
+    proxy that opens connections ahead of use and sends nothing on them now
+    has them closed after the timeout (30 seconds by default), as does a test
+    that pauses the tokio clock before its client writes. An HTTP/2 connection
+    that has sent its preface is still not bound by the timeout; set
+    `with_max_connection_idle` or `with_max_connection_age`, both off by
+    default, to retire it.
+
+    `with_header_read_timeout(None)` disables both bounds. A zero timeout now
+    disables them too; before, it ended every HTTP/1.1 connection after at
+    most one request. A timeout too long to add to the current time also
+    disables them, instead of panicking the connection.
+
+    The accepted stream is now wrapped in a private type, so
+    `hyper_util::server::conn::auto::upgrade::downcast` no longer recovers it
+    from an upgraded connection (for example one served by
+    `connectrpc::axum::serve_tls`); use the upgraded connection's own `Read` /
+    `Write`.
+time: 2026-09-20T18:42:29.164727867-07:00
