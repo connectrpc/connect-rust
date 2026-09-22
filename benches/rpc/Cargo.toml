@@ -82,6 +82,10 @@ name = "view_rope_encode"
 harness = false
 
 [[bench]]
+name = "stream_compressed_encode"
+harness = false
+
+[[bench]]
 name = "encode_frame"
 harness = false
 
