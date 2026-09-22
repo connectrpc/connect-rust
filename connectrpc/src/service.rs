@@ -3227,8 +3227,8 @@ impl BodyReader {
 /// an unread body makes hyper close the connection. On HTTP/2 dropping the
 /// body resets the stream once the response is done, so the stream's slot is
 /// held until the drain ends. The drain is not only a delay: h2 charges each
-/// small DATA frame it receives for a stream nobody reads to connection-wide
-/// budgets that only frames of 256 bytes or more refill, and answers with
+/// small DATA frame it receives against connection-wide budgets, refunded only
+/// when the frame is read or discarded, and answers with
 /// `GOAWAY(ENHANCE_YOUR_CALM)` when they run out. Dropping the body at once
 /// therefore takes the connection down once enough calls end early while their
 /// clients are still sending (see
