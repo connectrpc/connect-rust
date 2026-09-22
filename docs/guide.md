@@ -399,8 +399,17 @@ other, so raising the build-time bound has no effect on either.
 ## Implementing servers
 
 A service is a Rust trait generated from your `.proto` file. The
-trait name matches the proto service name (`GreetService` becomes
-`trait GreetService`), and each RPC becomes an async method.
+trait name is the proto service name in UpperCamelCase (`GreetService`
+becomes `trait GreetService`; `greet_service` would too), and each RPC
+becomes an async method.
+
+Every service in a proto package is generated into one Rust module, so
+the names derived from them must be distinct after that normalization:
+two services that differ only in case or underscores (`XGet` and
+`X_Get`), or a service and method pair whose words split differently
+from another's (`XGet.Foo` and `X.GetFoo` both name the
+`X_GET_FOO_SPEC` constant), are rejected at generation time with a
+message naming both sides. Rename one of them in the proto.
 
 ### Handler signatures
 
@@ -503,7 +512,9 @@ request context for the handler to read with
 `ctx.extensions().get::<UserId>()`. For the well-known peer types, prefer
 the typed `ctx.peer_addr()` / `ctx.peer_certs()` accessors — they return
 `None` rather than panicking when the transport didn't insert them. See
-[Tower middleware](#tower-middleware) for the full pattern.
+[Tower middleware](#tower-middleware) for the full pattern, and
+`with_connection_extensions` under [TLS](#tls) for state computed once
+per connection (TLS or plaintext) rather than per request.
 
 ### What you see vs. what you write
 
@@ -1037,18 +1048,23 @@ errors.
 Tower middleware (above) operates on `http::Request` / `http::Response`
 — it's the right level for cross-cutting concerns that don't need to
 know they're wrapping an RPC: connection-scoped tracing, gzip, raw
-header manipulation. **Interceptors** are the typed RPC layer on top: a
-single async hook per call that runs after the request head is parsed
-and the request body has been read and decompressed (under the
+header manipulation. **Interceptors** are the typed RPC layer on top:
+async hooks per call. `intercept_head` runs before the request body is
+read; `intercept_unary` and `intercept_streaming` run after the request
+head is parsed and the body has been read and decompressed (under the
 service's `Limits`), but *before* the message is decoded, and before
 the handler. Interceptors see the resolved
 [`Spec`](#static-method-metadata-spec), the parsed headers, the deadline,
 the negotiated protocol, the request extensions, and a lazily decoded
 message body — what a span builder, validator, rate limiter, or
-authorization check wants. For *authentication* — rejecting a caller
-that has presented no credential — read
+authorization check wants. A check that needs only the resolved `Spec`,
+the headers, and the connection's extensions can run earlier, in
+`Interceptor::intercept_head`, before any of the body is read (see
+[Rejecting before the body is read](#rejecting-before-the-body-is-read)).
+For *authentication* — rejecting a caller that has presented no credential —
+read
 [what an unauthenticated request costs](#authentication-and-the-cost-of-an-unauthenticated-request)
-before choosing between an interceptor and Tower middleware.
+before choosing between the two.
 
 ```rust,ignore
 use connectrpc::interceptor::{UnaryRequest, UnaryResponse};
@@ -1235,26 +1251,89 @@ client-streaming the outbound stream yields exactly one item. Read
 | | Tower middleware | Interceptor |
 |---|---|---|
 | Operates on | `http::Request` / `http::Response` | Decoded RPC: `Spec`, headers, deadline, `Payload` |
-| Runs | Before the body is read | After the body is read, before it is decoded ([details](#authentication-and-the-cost-of-an-unauthenticated-request)) |
-| Sees the RPC method | No (must re-parse the URI) | Yes (`ctx.path()`, `ctx.spec()`) |
+| Runs | Before the body is read | `intercept_head`: before the body is read. `intercept_unary` and `intercept_streaming`: after the body is read, before it is decoded ([details](#authentication-and-the-cost-of-an-unauthenticated-request)) |
+| Sees the RPC method | No (must re-parse the URI) | Yes (`head.path()`, `head.spec()`, `ctx.path()`, `ctx.spec()`) |
 | Sees the message body | Compressed/enveloped wire bytes | Lazily decoded, codec-aware `Payload` |
 | Short-circuits | By returning an `http::Response` | By returning `Err` or a `UnaryResponse` |
-| Best for | Authentication, gzip, raw header rewriting, generic HTTP concerns | Authorization on the `Spec`, RPC-aware tracing, validation, rate limiting |
+| Best for | Authentication, gzip, raw header rewriting, generic HTTP concerns | Authorization on the `Spec` and headers (`intercept_head`), RPC-aware tracing, validation, rate limiting |
 
 Both compose: a Tower layer wraps the whole `ConnectRpcService`
 (including its interceptor chain). An interceptor that needs an
 HTTP-level fact (e.g. the remote socket address) reads it from
 `ctx.extensions()` after a Tower layer inserts it.
 
+### Rejecting before the body is read
+
+`Interceptor::intercept_head` receives a `RequestHead` — the path, the
+resolved `Spec`, the headers, the protocol, and the request extensions —
+before the server reads any of the body or starts a body reader. It returns
+`Ok(())` to continue or an error to reject. The first rejection ends the
+request: later interceptors' head checks do not run, no interceptor's
+`intercept_unary` or `intercept_streaming` runs (so count or trace
+rejections inside the head check or in a Tower layer), the body is not read,
+and the client gets the error in its protocol's format. As with a Tower
+layer that returns a response without calling the service, an HTTP/2 stream
+is reset and an HTTP/1.x connection is usually closed instead of being
+drained, so a client that is still uploading can see a transport error
+instead of the error you returned.
+
+A head check can insert values into `head.extensions_mut()`; later
+interceptors and the handler read them from `ctx.extensions()`. That makes
+it the place to authenticate once and pass the caller on:
+
+```rust,ignore
+use connectrpc::{ConnectError, Interceptor, RequestHead};
+
+struct Caller(String);
+
+struct Authenticate {
+    verifier: Verifier,
+}
+
+#[connectrpc::async_trait]
+impl Interceptor for Authenticate {
+    async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+        let token = head.header("authorization").and_then(|v| v.to_str().ok());
+        let Some(caller) = token.and_then(|t| self.verifier.verify(t)) else {
+            return Err(ConnectError::unauthenticated("missing or invalid token"));
+        };
+        head.extensions_mut().insert(Caller(caller));
+        Ok(())
+    }
+}
+```
+
+`verifier.verify` stands for your own credential check; compare secrets with
+a constant-time comparison, not `==`.
+
+Every interceptor's head check runs before any interceptor's
+`intercept_unary` or `intercept_streaming`, so a head check sees the headers
+as they reached the service, not as an outer interceptor rewrote them with
+`headers_mut`. Decide one policy in one hook rather than splitting it across
+the two. The check also runs for a path that matches no method, with
+`head.spec()` `None`, ahead of the not-found error; gate on `head.path()` or
+treat `None` as a denial. `head.peer_addr()` (and `head.peer_certs()` with
+the `server-tls` feature) return the connection's address and client
+certificates when the transport recorded them.
+
+The check has no message to look at, and it runs before the request
+deadline applies, so wrap a wait on a slow dependency in
+`tokio::time::timeout`. A request the service rejects for an unsupported
+HTTP method or an unrecognized content type never reaches interceptors, and
+so never reaches this check either; the service drains such a request's
+body, bounded by `max_request_body_size` and the request deadline, before it
+answers.
+
 ### Authentication and the cost of an unauthenticated request
 
 A credential check should run as early as the server allows, because
 everything the server does before rejecting a request is work an
-unauthenticated peer can make it do for free. The two hooks sit at
-different points, and the difference is what has been spent by the time
-each one can say no:
+unauthenticated peer can make it do for free. Tower middleware and
+`intercept_head` run before the body is read; `intercept_unary` and
+`intercept_streaming` run after. The difference is what has been spent by
+the time each one can say no:
 
-| Before the hook runs | Tower middleware | Interceptor |
+| Before the hook runs | Tower middleware, `intercept_head` | `intercept_unary`, `intercept_streaming` |
 |---|---|---|
 | Request head parsed | yes | yes |
 | Request body read | no | unary and server-streaming: yes, up to `max_request_body_size` (4 MB by default); client- and bidi-streaming: at most a message or two are read ahead |
@@ -1266,25 +1345,27 @@ The message decode is the step that multiplies memory: a few bytes of
 element, so a 4 MB body can decode into hundreds of MB. In this crate
 that step happens after the interceptor chain, and is bounded by
 `Limits::element_memory_limit` (32 MiB by default) when it does. An
-interceptor that returns `unauthenticated` therefore costs at most the
-bounded body read and inflate; a Tower layer that does the same costs
-only the head. Under the default limits, the worst an unauthenticated
-caller can hold open against an interceptor-based check is
+`intercept_unary` or `intercept_streaming` that returns `unauthenticated`
+therefore costs at most the bounded body read and inflate; a Tower layer or
+`intercept_head` that does the same costs only the head. Under the default
+limits, the worst an unauthenticated caller can hold open against a check in
+`intercept_unary` or `intercept_streaming` is
 `max_request_body_size + max_message_size` per in-flight request (the
 compressed body is held while it inflates), multiplied by the HTTP/2
 concurrent-stream limit per connection.
 
 Put *authentication* — "does this caller hold any credential at all" —
-in Tower middleware, where it runs before a single body byte is read. The [middleware example](../examples/middleware)
+in Tower middleware or in `intercept_head`, where it runs before a single
+body byte is read. The [middleware example](../examples/middleware)
 does this with `axum::middleware::from_fn` for a bearer token. Put
-*authorization* — "may this identity call this method" — in an
-interceptor, where the resolved `Spec` and the parsed headers are
-available and the body is still undecoded; an `Err` from it still
-costs the peer nothing past the limits above. If the same component
-must do both, it can still be an interceptor: keep `max_message_size`
-and `max_request_body_size` at values the deployment can absorb across
-its concurrent-stream budget, and reject before touching
-`req.payload`.
+*authorization* — "may this identity call this method" — in
+`intercept_head` too when it needs only the resolved `Spec`, the headers,
+and the connection's extensions: a rejection there costs the peer only the
+head. An authorization check that must read the message runs in
+`intercept_unary` or `intercept_streaming`, where an `Err` costs the peer
+the bounded reads above and nothing more; keep `max_message_size` and
+`max_request_body_size` at values the deployment can absorb across its
+concurrent-stream budget, and reject before touching `req.payload`.
 
 ## Hosting
 
@@ -1326,20 +1407,129 @@ and graceful shutdown. It's a single dispatcher with no per-route
 configuration, so add things like health endpoints either as RPC
 methods or by mounting the Connect service in axum.
 
-For connection and HTTP/2 settings that `Server` does not expose, drop
-down to raw hyper instead.
+Every per-connection setting (`with_max_connection_age`, the HTTP/2
+knobs, ...) lives on `ConnectionConfig`; `Server`, `BoundServer` and
+`connectrpc::axum::serve` all accept one via `with_connection_config`, so
+a configuration built once applies to any of them.
 
-### Advanced transport configuration
+### Custom accept loops
 
-The built-in `Server` exposes the common connection knobs, but it does
-not try to mirror every hyper option. For long-tail transport tuning —
-flow-control windows, HPACK table size, frame size, or exact keepalive
-behavior — drive the Connect service from your own hyper accept loop.
+When you need a policy at accept time or per connection that the built-in
+loop does not have — admit or refuse by client certificate or source
+address, cap connections per tenant, shed load before HTTP is spoken,
+serve some clients on a different runtime, listen on a Unix socket — write
+the loop yourself and hand each accepted stream to
+`Server::serve_connection` (or the free `server::serve_connection`, which
+takes any tower HTTP service such as an `axum::Router`). You decide which
+connections are served and where; the connection driver still gives each
+one the full lifecycle (settings, timeouts, retirement, GOAWAY on
+shutdown, panic isolation, `PeerAddr` / `PeerCerts` / extensions) and
+tells you why it ended.
 
-Add `hyper-util` as a direct dependency with the `server-auto`,
-`service`, and `tokio` features enabled. Then wrap `ConnectRpcService`
-with `TowerToHyperService` before handing each connection to hyper's
-auto builder:
+```rust,ignore
+use connectrpc::{CloseReason, ConnectionInfo, Server};
+
+let server = Arc::new(Server::new(router).with_max_connection_age(Duration::from_secs(600)));
+let tls = tokio_rustls::TlsAcceptor::from(tls_config);
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+let mut connections = tokio::task::JoinSet::new();
+let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+
+loop {
+    let (stream, peer) = tokio::select! {
+        biased; // a pending shutdown wins over one more accept
+        _ = &mut shutdown => break,
+        Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        // Production: skip WouldBlock, Interrupted, ConnectionAborted and
+        // ConnectionReset, and pause after EMFILE / ENFILE, as Server does.
+        accepted = listener.accept() => accepted?,
+    };
+    // As the built-in loop does: no Nagle delay on small HTTP/2 frames.
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!(%peer, %err, "set_nodelay failed");
+    }
+    // Where this connection runs: say, one `tokio::runtime::Handle` per class
+    // of client.
+    let runtime = runtime_for(peer);
+    // Take the socket off this runtime's I/O driver; the task re-registers it.
+    let stream = match stream.into_std() {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::warn!(%peer, %err, "detaching the socket failed");
+            continue;
+        }
+    };
+    let (server, tls, mut drain) = (Arc::clone(&server), tls.clone(), drain_rx.clone());
+    connections.spawn_on(async move {
+        let stream = match tokio::net::TcpStream::from_std(stream) {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!(%peer, %err, "registering the socket failed");
+                return;
+            }
+        };
+        // TLS handshake on the connection's task, not the loop's, with a bound.
+        let Ok(Ok(stream)) =
+            tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await
+        else { return };
+        let certs: Arc<[_]> = match stream.get_ref().1.peer_certificates() {
+            Some(chain) => chain.iter().map(|c| c.clone().into_owned()).collect(),
+            None => return, // your policy: no client certificate, no service
+        };
+        let mut info = ConnectionInfo::new().with_peer_addr(peer).with_peer_certs(certs);
+        // Anything handlers should see, computed once per connection.
+        let Some(identity) = Identity::from_certs(info.peer_certs()) else { return };
+        info.extensions_mut().insert(identity);
+        // Everything Server::serve does for a connection, on this task.
+        let closed = server
+            .serve_connection(stream, info, async move { let _ = drain.wait_for(|d| *d).await; })
+            .await;
+        // Why it ended, and whether it failed (also while draining). An
+        // expired header-read timeout, routine for idle keep-alive
+        // connections, carries an error but is not a failure.
+        let failed = closed.error().is_some()
+            && closed.reason() != CloseReason::HeaderReadTimeout;
+        metrics::connection_closed(closed.reason(), failed);
+    }, &runtime);
+}
+drop(listener);                   // refuse new connections
+let _ = drain_tx.send(true);      // GOAWAY every live one
+while connections.join_next().await.is_some() {}   // wait for them
+```
+
+Serving a connection on another runtime takes the two steps shown. First,
+spawn its task there with `JoinSet::spawn_on`: the future binds timers,
+hyper's per-stream tasks and every handler to the runtime that polls it,
+and the set can still abort and drain the task. That runtime needs I/O and
+time enabled (`enable_all()`); `from_std` panics without I/O. Second,
+re-register the socket there: `into_std` on the accepting side,
+`TcpStream::from_std` inside the task. A tokio socket stays on the I/O
+driver of the runtime that created it, so without this step a busy
+accepting runtime delays the connection, and shutting that runtime down
+breaks it.
+
+A `TlsStream` cannot be rebuilt around a moved socket, so the loop moves
+the plain `TcpStream` first and picks the runtime from the peer address,
+before the TLS handshake. To place clients by class without inspecting
+certificates, give each class its own listener, with its accept loop on
+that class's runtime. To place them by client certificate, wrap the
+`TcpStream` in your own `AsyncRead + AsyncWrite` type that can detach the
+socket (`into_std`) and re-attach it (`from_std`), and hand that type to
+the TLS acceptor. After the handshake, reach the socket through
+`TlsStream::get_mut`: detach it while the accepting runtime is still
+running, re-attach it inside the task on the target runtime, and don't
+poll the stream in between.
+
+The loop must also outlive what it spawned: track the tasks and drain them
+before returning, as the code above shows.
+
+### Raw hyper
+
+For hyper connection-builder settings `ConnectionConfig` does not expose
+(HPACK table size, max frame size, ...), `ConnectRpcService` is an
+ordinary tower service: wrap it in `hyper_util::service::TowerToHyperService`
+and hand it to `hyper_util::server::conn::auto::Builder` yourself.
 
 ```rust,ignore
 use connectrpc::{ConnectRpcService, Router};
@@ -1349,26 +1539,16 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 
-let connect_router = Router::new().add_service(greeter_service);
-let connect_service = ConnectRpcService::new(connect_router);
-
+let connect_service = ConnectRpcService::new(Router::new().add_service(greeter_service));
 let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 let mut builder = AutoBuilder::new(TokioExecutor::new());
-builder
-    .http2()
-    .max_concurrent_streams(1_000)
-    .max_frame_size(1 << 20)
-    .adaptive_window(true);
+builder.http2().max_frame_size(1 << 20);
 
 loop {
     let (stream, _peer_addr) = listener.accept().await?;
     let conn = builder
-        .serve_connection(
-            TokioIo::new(stream),
-            TowerToHyperService::new(connect_service.clone()),
-        )
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(connect_service.clone()))
         .into_owned();
-
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             eprintln!("connection ended with error: {err}");
@@ -1377,16 +1557,11 @@ loop {
 }
 ```
 
-This is the escape hatch for connection- and protocol-level settings.
-Axum remains the better fit for routing, health checks, ordinary HTTP
-endpoints, and request-level Tower middleware such as auth, timeouts,
-or rate limiting.
-
-Unlike the built-in `Server` and `connectrpc::axum::serve_tls`, a raw
-hyper loop does not automatically insert `PeerAddr` or `PeerCerts` into
-request extensions. If handlers call `ctx.peer_addr()` or
-`ctx.peer_certs()`, insert those extensions in your own Tower layer or
-service wrapper before the request reaches `ConnectRpcService`.
+You then own the whole connection lifecycle — none of the timeouts,
+retirement, graceful shutdown, panic isolation or `PeerAddr` / `PeerCerts`
+stamping described above happens unless you re-implement it — so prefer a
+custom accept loop built on `serve_connection` over raw hyper unless it is
+specifically a hyper knob you are missing.
 
 ### TLS
 
@@ -1407,11 +1582,13 @@ Server::new(connect_router)
 ```
 
 For the axum path, `connectrpc::axum::serve_tls` (requires both the
-`axum` and `server-tls` features) is a drop-in replacement for
-`axum::serve` that owns the rustls accept loop and stamps `PeerAddr` /
-`PeerCerts` into request extensions exactly as the standalone `Server`
-does, so handler code that reads `ctx.peer_certs()` is portable across
-both hosting paths:
+`axum` and `server-tls` features; plaintext `connectrpc::axum::serve`
+needs `axum` and `server`) is a drop-in replacement for `axum::serve`
+that runs the app on the same accept loop and connection driver as the
+standalone `Server` — TLS termination, `PeerAddr` / `PeerCerts` in
+request extensions, every `ConnectionConfig` setting, graceful GOAWAY,
+panic isolation — so handler code that reads `ctx.peer_certs()` is
+portable across both hosting paths:
 
 ```rust
 let app = axum::Router::new()
@@ -1424,6 +1601,45 @@ connectrpc::axum::serve_tls(listener, app, server_config)
     .await?;
 ```
 
+Work that depends only on the connection — parsing a workload identity
+out of the client certificate, say — need not repeat on every request.
+`with_connection_extensions` (on `Server`, `BoundServer` and
+`connectrpc::axum::Serve`) registers a function that runs once per
+accepted connection, after the TLS handshake and before the first
+request. It reads the connection's `ConnectionInfo` (`peer_addr()`,
+`peer_certs()`, `extensions()`) and inserts into the `http::Extensions`
+it is handed. That map starts empty; what the function inserts joins the
+connection's extensions, replacing entries of the same type, is cloned
+into every request on that connection, and is read with
+`ctx.extensions().get::<T>()`. The function cannot remove an entry or
+change the peer: whatever it inserts under `PeerAddr` / `PeerCerts`,
+requests get those types from `ConnectionInfo`'s peer fields, which the
+built-in loops set from the transport. Inserted values must be
+`Clone + Send + Sync + 'static`; wrap large ones in an `Arc`.
+
+`Server::serve_connection` runs the function too, after whatever a
+[custom accept loop](#custom-accept-loops) put in
+`info.extensions_mut()`; a loop around the free
+`server::serve_connection` writes `info.extensions_mut()` itself.
+
+```rust
+#[derive(Clone)]
+struct PeerIdentity(Arc<str>);
+
+Server::new(connect_router)
+    .with_tls(server_config)
+    .with_connection_extensions(|conn, ext| {
+        if let Some(id) = parse_identity(conn.peer_certs()) {
+            ext.insert(PeerIdentity(id));
+        }
+    })
+    .serve("0.0.0.0:8443".parse()?)
+    .await?;
+
+// In a handler:
+let who = ctx.extensions().get::<PeerIdentity>();
+```
+
 The eliza example
 ([`examples/eliza/README.md`](../examples/eliza/README.md)) walks
 through generating self-signed certificates with openssl, configuring
@@ -1431,8 +1647,8 @@ mTLS via `--client-ca`, and the rustls strict-PKI requirement that
 your CA cert must be distinct from the server leaf cert. The
 mtls-identity example
 ([`examples/mtls-identity/README.md`](../examples/mtls-identity/README.md))
-demonstrates `serve_tls` end-to-end with cert-SAN identity extraction
-and an ACL keyed on it.
+demonstrates `serve_tls` end-to-end with cert-SAN identity parsed once
+per connection and an ACL keyed on it.
 
 ## Health checking
 
@@ -1873,6 +2089,16 @@ This is also how the wasm example
 ([`examples/wasm-client/`](../examples/wasm-client)) plugs in a
 browser `fetch`-based transport.
 
+A hand-written `ClientTransport` must give its `ResponseBody` an error
+type that converts into `Box<dyn std::error::Error + Send + Sync>` —
+any `std::error::Error + Send + Sync + 'static` type, or that boxed
+type itself; the call functions and the generated clients require it
+so that a failure while reading the body can be kept as the surfaced
+error's `source()` (see [Errors and status
+codes](#errors-and-status-codes)). If the body you wrap reports a
+`Display`-only error, implement `Error` for it or adapt the body with
+`http_body_util::BodyExt::map_err`.
+
 ## Errors and status codes
 
 `ConnectError` is the error type for both server-returned and
@@ -1925,25 +2151,44 @@ decoded from a server's response therefore always has
 `.source().is_none()`, even when its `message` is populated; only an
 error that code in this process attached a cause to carries one.
 
-On the client, a source is present when the *transport* classified the
-failure and absent when the call path did. The built-in transports
-attach the underlying `hyper` / `rustls` / `std::io` error for DNS
-resolution, connection refused, TLS handshake, HTTP/2 connection
-establishment (including its timeout) and request send, so
-`err.source()` yields the original typed error, which can be downcast
-to inspect an `io::ErrorKind`, for example. Only that error's `Display`
-text reaches `message`, and it is repeated there deliberately so that
-plain `{}` formatting stays informative; a renderer that also walks
-the source chain, such as `anyhow`'s `{:#}`, will print it twice.
-Errors the call path synthesises itself do not carry a source: the
-call deadline (`with_timeout` / `with_default_timeout`) whenever it
-fires, request construction and encoding failures, response decoding,
-and a reset while reading the response body (whose error type the
-public call functions bound only by `Display`). A custom
-`ClientTransport` that returns its own `ConnectError` should call
-`.with_source(..)` itself, or build the error with
-`ConnectError::unavailable_from_transport`, to follow the same
-convention.
+On the client, a source is present whenever the failure came from the
+transport, whether it happened before or after the response headers
+arrived (provided the transport followed the convention at the end of
+this section), and absent when the call path synthesised the error
+itself. The built-in transports attach the underlying `hyper` /
+`rustls` / `std::io` error for DNS resolution, connection refused, TLS
+handshake, HTTP/2 connection establishment (including its timeout)
+and request send; a failure while reading the response body — a
+stream reset mid-body, say — is attached by the call path on every
+RPC shape, which is why the public call functions and the generated
+clients require the transport's body error type to convert into
+`Box<dyn std::error::Error + Send + Sync>` (any
+`std::error::Error + Send + Sync + 'static` type does, and so does that
+boxed type itself). The one exception is a non-2xx gRPC response whose
+body dies while being read for a `grpc-status`: the HTTP status is the
+error reported, and the read failure is dropped rather than attached.
+Either way `err.source()` yields the error the transport reported, as
+its own type: for the built-in transports that is a `hyper` /
+`hyper-util` error whose own `source()` chain leads on to the
+underlying `io::Error` or `h2` reset, so walking the chain (or the
+transport's error directly, for a custom transport that reports
+`io::Error`) reaches an `io::ErrorKind` to inspect. Only that error's
+`Display` text reaches `message`, and it is repeated there
+deliberately so that plain `{}` formatting stays informative; a
+renderer that also walks the source chain, such as `anyhow`'s `{:#}`,
+will print it twice. Errors with no transport cause behind them do not
+carry a source: the call deadline (`with_timeout` /
+`with_default_timeout`) when the local timer fires, request
+construction and encoding failures, and response decoding. A body read
+that fails after the deadline has passed is reported as
+`deadline_exceeded` but keeps the read error as its source, since the
+reset that ended the stream is still the most specific fact about the
+failure. A custom `ClientTransport` that returns its own `ConnectError`
+from `send` should call `.with_source(..)` itself, or build the error
+with `ConnectError::unavailable_from_transport`, to follow the same
+convention; a `ConnectError` its *body* reports is not surfaced
+verbatim the way one from `send` is, but is attached as the source of
+an `internal` (or `deadline_exceeded`) error.
 
 ## Compression
 
@@ -2010,7 +2255,7 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 |---|---|
 | [`streaming-tour/`](../examples/streaming-tour) | All four RPC types (unary, server stream, client stream, bidi) on a trivial NumberService. Smallest demo of handler signatures and client invocation patterns. |
 | [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions()`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
-| [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
+| [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity parsed from the client cert's DNS SAN once per connection with `with_connection_extensions` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
 | [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage, and server reflection mounted from both descriptor sources (`REFLECTION_SOURCE=fds\|pool`; see `reflection-demo.sh`). |
 | [`wasm-client/`](../examples/wasm-client) | Browser fetch transport: same generated client used from `wasm32-unknown-unknown` with a custom `ClientTransport` backed by `web-sys::fetch`. |
