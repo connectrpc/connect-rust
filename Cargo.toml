@@ -15,7 +15,7 @@ categories = ["network-programming", "web-programming::http-server", "web-progra
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-bytes = { version = "1.6", features = ["serde"] }
+bytes = { version = "1.6.1", features = ["serde"] }
 
 # Tower service abstraction
 tower = { version = "0.5", features = ["util", "buffer"] }
@@ -68,9 +68,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 # HTTP server/client
-h2 = "0.4"
-hyper = "1"
-hyper-util = "0"
+# 0.4.15: the header-list-size tests expect its GOAWAY on oversized header lists.
+h2 = "0.4.15"
+# `CloseReason::HeaderReadTimeout` needs `hyper::Error::is_timeout` to cover
+# the HTTP/1.1 header-read timeout (1.6); hyper-util 0.1.20 needs 1.8.
+hyper = "1.8"
+# `ConnectionClosed::error` relies on the auto connection's `Interrupted`
+# "Cancelled" error for a shutdown before protocol detection (checked in
+# 0.1.19 and 0.1.20).
+hyper-util = "0.1.20"
 
 # TLS
 rustls = "0.23"

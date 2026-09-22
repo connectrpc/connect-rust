@@ -1,0 +1,20 @@
+kind: Security
+body: |-
+    **A client- or bidi-streaming call that ends before its request body no
+    longer lets a stalled client hold that body indefinitely.** When the
+    handler stopped reading its request stream (it returned, an interceptor
+    rejected the call, or the request timeout fired), the request-body reader
+    kept the partial message it had buffered, its task and the HTTP/2 stream
+    until the client ended the stream or the connection closed. The reader now
+    frees the partial message once it sees the handler is gone. It discards
+    the rest of the body for at most 5 seconds and 1 MiB (1 MiB only, on
+    `wasm32`), also after the END_STREAM envelope or a decode error, and then
+    drops it. Dropping the body resets an HTTP/2 stream once the response is
+    done and closes an HTTP/1.x connection, so a client still uploading when
+    the limit is reached loses the stream or the connection. A bidi call whose
+    handler stops reading requests but keeps its response open past the limit
+    can still draw a connection-wide `GOAWAY` from h2 if the client keeps
+    sending small frames. The handler's request stream now ends when the
+    request decoder finishes (the END_STREAM envelope or a decode error), not
+    when the body does.
+time: 2026-09-20T18:00:00.000000000+00:00

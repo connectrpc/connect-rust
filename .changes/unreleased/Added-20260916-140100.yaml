@@ -1,0 +1,9 @@
+kind: Added
+body: |-
+    **`connectrpc::axum::serve`: plaintext counterpart of `serve_tls`.**
+    Serves an `axum::Router` on the built-in server's accept loop and
+    connection driver, so an axum app gets `PeerAddr` on every request and
+    every `ConnectionConfig` setting (`Serve::with_connection_config`) without
+    TLS. Available with the `axum` and `server` features; the `connectrpc::axum`
+    module no longer requires `server-tls` (only `serve_tls` does).
+time: 2026-09-16T14:01:00.000000000+00:00
