@@ -6,7 +6,7 @@
 //!
 //! | Transport | Protocol | Use when |
 //! |---|---|---|
-//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** Honest `poll_ready`, composes with `tower::balance`. |
+//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** One multiplexed connection with automatic reconnect; honest `poll_ready`, composes with `tower::balance`. |
 //! | [`HttpClient`] | HTTP/1.1 + HTTP/2 (ALPN) | Connect protocol over h/1.1, or you genuinely don't know which protocol the server speaks. |
 //!
 //! # For gRPC: `SharedHttp2Connection`
@@ -47,9 +47,11 @@
 //! // for dynamic load-aware routing. See the http2 module docs.
 //! ```
 //!
-//! Because `Http2Connection::poll_ready` honestly reports connection state
-//! (connecting / closed / ready), `tower::balance` can route around
-//! failed connections and p2c can make useful decisions.
+//! Because `poll_ready` on both `Http2Connection` and its shared handle
+//! reflects connection state (pending while connecting; a failed connect is
+//! reported by the next call instead of hanging, and retried on the next
+//! `poll_ready`), `tower::balance` keeps steering by load around a connection
+//! that is down and p2c can make useful decisions.
 //!
 //! # For Connect over HTTP/1.1: `HttpClient`
 //!
