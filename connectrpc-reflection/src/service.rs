@@ -85,12 +85,17 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 /// The per-route [`Limits`](connectrpc::Limits) this crate sets on its
 /// routes: message size capped at [`MAX_REQUEST_BYTES`] (and the request
 /// body, which only governs non-streaming calls, at that plus the 5-byte
-/// envelope), decode budget left at the `connectrpc` default.
+/// envelope), and the element-memory decode budget at four times that
+/// instead of the 32 MiB `connectrpc` default. A `ServerReflectionRequest`
+/// has no repeated or map fields, so a decode that charges the budget at all
+/// is one this service was never going to answer; the bound keeps a future
+/// revision of the protocol from changing that quietly.
 #[must_use]
 pub fn request_limits() -> connectrpc::Limits {
     connectrpc::Limits::default()
         .with_max_request_body_size(MAX_REQUEST_BYTES + connectrpc::envelope::HEADER_SIZE)
         .with_max_message_size(MAX_REQUEST_BYTES)
+        .with_element_memory_limit(4 * MAX_REQUEST_BYTES)
 }
 
 /// Set whichever of the `v1` and `v1alpha` reflection routes are registered
@@ -103,7 +108,10 @@ pub fn request_limits() -> connectrpc::Limits {
 /// [`Router::add_service`](connectrpc::Router::add_service), since those
 /// generic registration paths cannot; or call it after either path with your
 /// own [`Limits`](connectrpc::Limits) to tune the reflection routes
-/// specifically. The later call wins.
+/// specifically. The later call wins. Build an override from
+/// [`request_limits`] rather than `Limits::default()`: the replacement is
+/// whole, so anything the profile sets and the override does not is reset
+/// to the `connectrpc` default.
 ///
 /// # Panics
 ///
@@ -342,6 +350,41 @@ mod tests {
         stream.close_send();
         let err = stream.message().await.unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// The largest symbol the bundled profile admits decodes under its decode
+    /// budget and misses in-band with an `ErrorResponse` whose message is a
+    /// small fraction of the request.
+    #[tokio::test]
+    async fn largest_admitted_symbol_misses_with_a_bounded_error() {
+        let client = spawn_reflection_server().await;
+        let mut stream = client.server_reflection_info().await.unwrap();
+        // 64 bytes of slack covers the `host` field, the oneof tag and the
+        // length varints, so the encoded message sits just under
+        // MAX_REQUEST_BYTES.
+        let symbol = "x".repeat(crate::MAX_REQUEST_BYTES - 64);
+        stream
+            .send(request(MessageRequest::FileContainingSymbol(
+                symbol.clone(),
+            )))
+            .await
+            .unwrap();
+        stream.close_send();
+        let resp = stream.message().await.unwrap().unwrap().to_owned_message();
+        match resp.message_response.unwrap() {
+            MessageResponse::ErrorResponse(err) => {
+                assert_eq!(err.error_code, 5);
+                assert!(err.error_message.len() < 512, "{}", err.error_message.len());
+                assert!(
+                    err.error_message
+                        .contains(&format!("[name truncated, {} bytes]", symbol.len())),
+                    "{}",
+                    err.error_message
+                );
+            }
+            other => panic!("expected error_response, got {other:?}"),
+        }
+        assert!(stream.message().await.unwrap().is_none());
     }
 
     #[tokio::test]
