@@ -71,7 +71,11 @@
 //! profile — and a larger request is refused with `resource_exhausted`
 //! before it reaches the [`Checker`]. The profile *replaces* the
 //! service-wide limits on these two routes, whether those are looser or
-//! tighter.
+//! tighter. Within that ceiling, [`StaticChecker`]'s `not_found` error for
+//! an unregistered service echoes at most 128 bytes of the name, so the
+//! error message is bounded by a constant rather than by the size of the
+//! request. A custom [`Checker`] is responsible for bounding its own error
+//! text.
 //!
 //! * [`install_static`] applies [`request_limits`] for you.
 //! * Registering a [`HealthService`] any other way — the generated
@@ -82,14 +86,15 @@
 //!   with your own `Limits` after either path; the later call wins.
 //!
 //! ```no_run
-//! use connectrpc::{Limits, Router};
-//! use connectrpc_health::{apply_request_limits, install_static};
+//! use connectrpc::Router;
+//! use connectrpc_health::{apply_request_limits, install_static, request_limits};
 //!
 //! let (router, health) = install_static(Router::new(), ["acme.user.v1.UserService"]);
 //! // Optional: hold the health routes to 1 KiB instead of the bundled 16 KiB.
+//! // Start from `request_limits()` so the rest of the profile carries over.
 //! let router = apply_request_limits(
 //!     router,
-//!     Limits::default()
+//!     request_limits()
 //!         .with_max_request_body_size(1024)
 //!         .with_max_message_size(1024),
 //! );

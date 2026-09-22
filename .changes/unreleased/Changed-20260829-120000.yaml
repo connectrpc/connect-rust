@@ -1,0 +1,18 @@
+kind: Changed
+body: |-
+    **`connectrpc-health` and `connectrpc-reflection` bound what an error
+    echoes and what a decode may allocate** ([#288]). `StaticChecker`'s
+    `not_found` error and reflection's in-band `ErrorResponse` now echo at
+    most 128 bytes of the peer-supplied service, file, symbol or type name
+    (longer names are cut with `... [name truncated, N bytes]`), so a
+    request-sized name no longer comes back several times over in the
+    `grpc-message` header or error body. Both crates' `request_limits()`
+    profile now also sets the element-memory decode budget to 64 KiB (four
+    times `MAX_REQUEST_BYTES`) instead of leaving it at the 32 MiB
+    `connectrpc` default; neither request type has a repeated or map field,
+    so legitimate requests never charge it. When tuning either profile with
+    `apply_request_limits`, start from `request_limits()` rather than
+    `Limits::default()` so the decode budget carries over.
+
+    [#288]: https://github.com/connectrpc/connect-rust/issues/288
+time: 2026-08-29T12:00:00.000000000+00:00
