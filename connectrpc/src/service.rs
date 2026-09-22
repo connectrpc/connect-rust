@@ -41,7 +41,6 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use futures::{Stream, StreamExt};
 use http::Method;
 use http::Request;
@@ -53,7 +52,6 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use serde::Serialize;
-use tokio_util::codec::Decoder as _;
 use tracing::Instrument;
 
 use crate::codec::CodecFormat;
@@ -63,12 +61,13 @@ use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
 use crate::deadline::DeadlinePolicy;
 use crate::dispatcher::{Dispatcher, MethodDescriptor};
+use crate::envelope::Decoded;
 use crate::envelope::Envelope;
 use crate::envelope::EnvelopeDecoder;
 use crate::error::ConnectError;
 use crate::handler::BoxStream;
 use crate::interceptor::{
-    Interceptor, InterceptorChain, call_bidi_streaming_intercepted,
+    Interceptor, InterceptorChain, RequestHead, call_bidi_streaming_intercepted,
     call_client_streaming_intercepted, call_server_streaming_intercepted, call_unary_intercepted,
 };
 use crate::protocol::Protocol;
@@ -947,9 +946,10 @@ pub struct StreamingResponseBody {
     inner: Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>,
     /// Optional background reader task handle. The task is detached (not aborted)
     /// when the response body is dropped — it continues draining the request body
-    /// until EOF or `MAX_DRAIN_BYTES`, which is critical for HTTP/1.1 keep-alive.
-    /// Aborting the task early was found to cause a race where hyper's dispatcher
-    /// sees the `Incoming` body dropped before EOF and closes the connection.
+    /// until EOF, `MAX_DRAIN_BYTES` or `DRAIN_TIMEOUT`, which is critical for
+    /// HTTP/1.1 keep-alive. Aborting the task early was found to cause a race
+    /// where hyper's dispatcher sees the `Incoming` body dropped before EOF and
+    /// closes the connection.
     _reader_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -1481,15 +1481,15 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// The first interceptor registered runs **outermost**: first on the
     /// way in, last on the way out (matching `connect-go`'s
-    /// `WithInterceptors`). Interceptors run after the request body has
-    /// been read and decompressed under this service's [`Limits`] and
-    /// before it is decoded; a credential check that should run before any
-    /// body byte is read belongs in Tower middleware around the service
-    /// instead. See [`Interceptor`]'s "When it runs".
+    /// `WithInterceptors`). `intercept_unary` and `intercept_streaming` run
+    /// after the request body has been read and decompressed under this
+    /// service's [`Limits`] and before it is decoded; a check that should
+    /// run before any body byte is read belongs in
+    /// [`Interceptor::intercept_head`] or in Tower middleware around the
+    /// service. See [`Interceptor`]'s "When it runs".
     ///
-    /// When no interceptors are registered the dispatch path is identical
-    /// to a build without this call — there is no per-request allocation
-    /// or branch beyond a single `is_empty` check.
+    /// When no interceptors are registered the dispatch path allocates
+    /// nothing for them and only checks that the chain is empty.
     ///
     /// Interceptors run for unary and streaming calls alike. The unary
     /// surface is [`Interceptor::intercept_unary`]; the streaming surface
@@ -1680,7 +1680,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_request<D, B>(
     dispatcher: Arc<D>,
-    req: Request<B>,
+    mut req: Request<B>,
     limits: Limits,
     compression: Arc<CompressionRegistry>,
     compression_policy: &CompressionPolicy,
@@ -1723,6 +1723,9 @@ where
     // detection returns None. Route GET requests directly to the unary handler
     // which handles Connect GET query parameter parsing.
     if req.method() == Method::GET {
+        if !interceptors.is_empty() {
+            intercept_heads(interceptors, &mut req, desc, Protocol::Connect).await?;
+        }
         return handle_unary_request(
             &*dispatcher,
             &path,
@@ -1797,6 +1800,15 @@ where
 
     match request_protocol {
         Some(rp) if rp.is_streaming => {
+            // Head checks run before anything reads the body, the text-mode
+            // rejection's drain included.
+            if !interceptors.is_empty()
+                && let Err(err) = intercept_heads(interceptors, &mut req, desc, rp.protocol).await
+            {
+                return Ok(streaming_error_response(&err, rp.protocol, rp.codec_format)
+                    .map(ConnectRpcBody::Streaming));
+            }
+
             // gRPC-Web text mode (application/grpc-web-text) base64-encodes the
             // entire body. We detect it (protocol.rs) but don't decode it — reject
             // explicitly with a clear error rather than failing with garbage-envelope
@@ -1859,6 +1871,9 @@ where
             Ok(response.map(ConnectRpcBody::Streaming))
         }
         Some(_) | None => {
+            if !interceptors.is_empty() {
+                intercept_heads(interceptors, &mut req, desc, Protocol::Connect).await?;
+            }
             // Unary request (Connect unary) or unknown content type (for error reporting)
             handle_unary_request(
                 &*dispatcher,
@@ -1875,6 +1890,38 @@ where
             .map(|r| r.map(ConnectRpcBody::Full))
         }
     }
+}
+
+/// Run every interceptor's [`Interceptor::intercept_head`] on a request whose
+/// body has not been read, stopping at the first error. Callers skip it when
+/// no interceptor is registered, so that path builds no [`RequestHead`].
+///
+/// The request's extensions are moved into the head for the duration and put
+/// back afterwards, so a value a head check inserts reaches the handler.
+/// Taking `&mut Request<B>` needs only `B: Send`; a shared reference held
+/// across the `.await` would need `B: Sync`.
+async fn intercept_heads<B>(
+    interceptors: &[Arc<dyn Interceptor>],
+    req: &mut Request<B>,
+    desc: Option<MethodDescriptor>,
+    protocol: Protocol,
+) -> Result<(), ConnectError> {
+    let mut extensions = std::mem::take(req.extensions_mut());
+    let result = {
+        let mut head = RequestHead::new(req.uri().path(), req.headers(), &mut extensions)
+            .with_spec(desc.and_then(|desc| desc.spec))
+            .with_protocol(protocol);
+        let mut result = Ok(());
+        for interceptor in interceptors {
+            result = interceptor.intercept_head(&mut head).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        result
+    };
+    *req.extensions_mut() = extensions;
+    result
 }
 
 /// `Accept-Post` advertised on a 415 response: the content types this server
@@ -2274,8 +2321,8 @@ where
         let err = ConnectError::unimplemented("request body is empty: expected a message");
         return grpc_unary_error(&err);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
-        let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
+        let mut buf = post_body;
+        let envelope = match Envelope::decode_bytes_with_limit(&mut buf, limits.max_message_size) {
             Ok(Some(env)) => env,
             Ok(None) => {
                 let err = ConnectError::invalid_argument("incomplete request envelope");
@@ -2578,8 +2625,8 @@ where
         let err = ConnectError::unimplemented("server streaming request requires a message");
         return streaming_error_response(&err, protocol, codec_format);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
-        let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
+        let mut buf = post_body;
+        let envelope = match Envelope::decode_bytes_with_limit(&mut buf, limits.max_message_size) {
             Ok(Some(env)) => env,
             Ok(None) => {
                 let err = ConnectError::invalid_argument("incomplete request envelope");
@@ -2736,7 +2783,8 @@ where
 ///
 /// If the handler returns early (e.g., on error) without consuming the full
 /// request stream, the reader task drains remaining body bytes (up to
-/// [`MAX_DRAIN_BYTES`]) to allow HTTP/1.1 connection reuse.
+/// [`MAX_DRAIN_BYTES`] and [`DRAIN_TIMEOUT`]) to allow HTTP/1.1 connection
+/// reuse.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_streaming_request<D, B>(
     dispatcher: &D,
@@ -2775,10 +2823,8 @@ where
         .with_path(format!("/{path}"))
         .with_decode_options(limits.decode_options());
 
-    // Call the handler. On error paths, the reader task is left running
-    // (detached) so it can finish draining the request body — aborting it
-    // early races with hyper's body-EOF detection and breaks HTTP/1.1
-    // keep-alive. The task is bounded by MAX_DRAIN_BYTES.
+    // Call the handler. On error paths the reader task is left running
+    // (detached) rather than aborted; see `spawn_body_reader`.
     let handler_result = if let Some(timeout) = metadata.timeout {
         match tokio::time::timeout(
             timeout,
@@ -2871,14 +2917,47 @@ where
 /// envelope (after which any further body bytes are trailing garbage).
 const MAX_DRAIN_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// How long a drain may take, however few bytes arrive. Bytes alone do not
+/// bound the drain: a client that sends less than [`MAX_DRAIN_BYTES`] and then
+/// stalls would otherwise hold the reader task and the request body for as
+/// long as it keeps the connection open.
+///
+/// The deadline is absolute, not an idle timeout, so a client that trickles
+/// data cannot extend it. A client still uploading when it passes loses the
+/// stream (HTTP/2, reset with `NO_ERROR`) or the connection (HTTP/1.x). If the
+/// response outlives the drain, as in a bidi call whose handler stopped reading
+/// requests, the stream is not reset and the body is dropped anyway; see
+/// [`spawn_body_reader`] for what that costs an HTTP/2 connection.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A timer for one drain. `wasm32-unknown-unknown` has no clock, so a drain
+/// there is bounded by [`MAX_DRAIN_BYTES`] alone.
+fn drain_timeout() -> impl Future<Output = ()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::time::sleep(DRAIN_TIMEOUT)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::future::pending()
+    }
+}
+
 /// Whether a [`BodyReader`] is still decoding messages or draining trailing
 /// body bytes.
 enum ReadMode {
-    /// Decoding envelopes and forwarding messages to the handler.
-    Decoding,
+    /// Decoding envelopes and forwarding messages on `tx` to the handler.
+    /// The decoder and the sender live here so that leaving this mode frees
+    /// whatever partial message the decoder has buffered and ends the
+    /// handler's request stream, without waiting for the drain.
+    Decoding {
+        decoder: EnvelopeDecoder,
+        tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
+    },
     /// The decoder is finished (END_STREAM, a decode error, or the handler
     /// dropped the request stream); remaining body bytes are discarded,
-    /// bounded by [`MAX_DRAIN_BYTES`].
+    /// bounded by [`MAX_DRAIN_BYTES`] and [`DRAIN_TIMEOUT`].
     Draining {
         /// Bytes discarded so far.
         drained: usize,
@@ -2891,12 +2970,10 @@ enum ReadMode {
 }
 
 /// Decoding state for the background task spawned by [`spawn_body_reader`]:
-/// turns request body frames into decoded messages on `tx`, then drains the
-/// rest of the body (bounded) once the decoder is finished.
+/// turns request body frames into decoded messages for the handler's request
+/// stream, then drains the rest of the body (bounded) once the decoder is
+/// finished.
 struct BodyReader {
-    decoder: EnvelopeDecoder,
-    buf: BytesMut,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
     mode: ReadMode,
 }
 
@@ -2908,10 +2985,110 @@ impl BodyReader {
         tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
     ) -> Self {
         Self {
-            decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
-            buf: BytesMut::new(),
-            tx,
-            mode: ReadMode::Decoding,
+            mode: ReadMode::Decoding {
+                decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
+                tx,
+            },
+        }
+    }
+
+    /// Read the body until it ends, fails, or the drain is over.
+    ///
+    /// While decoding, a body with nothing ready is also raced against the
+    /// handler's end of the channel, so a handler that goes away (returns, is
+    /// rejected by an interceptor, or is cancelled by its deadline) is noticed
+    /// while the client is stalled, not only at the next complete message. A
+    /// client that keeps sending is noticed at the next complete message, with
+    /// at most `max_message_size` buffered meanwhile.
+    async fn run<B>(&mut self, mut body: Pin<&mut B>)
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: std::fmt::Display + Send,
+    {
+        /// What the reader woke up for.
+        enum Event<E> {
+            HandlerGone,
+            Frame(Option<Result<Frame<Bytes>, E>>),
+        }
+
+        // A clone of the sender, so that its `closed()` future can stay
+        // registered across frames instead of being registered and cancelled
+        // for each one, and does not borrow `self`. It goes out of scope
+        // before the drain, which must not keep the handler's stream open.
+        if let ReadMode::Decoding { tx, .. } = &self.mode {
+            let watcher = tx.clone();
+            let mut handler_gone = std::pin::pin!(watcher.closed());
+            while matches!(self.mode, ReadMode::Decoding { .. }) {
+                let event = tokio::select! {
+                    // The body first: the handler's end of the channel is
+                    // only consulted when the body has nothing to give, which
+                    // is when a client can be stalled.
+                    biased;
+                    frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)) => {
+                        Event::Frame(frame)
+                    }
+                    () = &mut handler_gone => Event::HandlerGone,
+                };
+                match event {
+                    Event::HandlerGone => self.enter_drain_mode(false),
+                    Event::Frame(frame) => {
+                        if self.on_frame(frame).await.is_break() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.drain(body).await;
+    }
+
+    /// Discard the rest of the body until it ends, [`MAX_DRAIN_BYTES`] have
+    /// been discarded, or [`DRAIN_TIMEOUT`] has passed.
+    async fn drain<B>(&mut self, mut body: Pin<&mut B>)
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: std::fmt::Display + Send,
+    {
+        // One timer for the whole drain, so trickled data cannot extend it.
+        let mut timeout = std::pin::pin!(drain_timeout());
+        loop {
+            tokio::select! {
+                // The timer first, so a body that always has data ready
+                // cannot postpone it.
+                biased;
+                () = &mut timeout => {
+                    tracing::debug!("body drain timed out, stopping");
+                    return;
+                }
+                frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)) => {
+                    if self.on_frame(frame).await.is_break() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle what the body produced: [`ControlFlow::Break`] once there is
+    /// nothing more to read — the body ended or failed, or the drain limit was
+    /// exceeded.
+    async fn on_frame<E: std::fmt::Display + Send>(
+        &mut self,
+        frame: Option<Result<Frame<Bytes>, E>>,
+    ) -> ControlFlow<()> {
+        match frame {
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(data) => self.on_data(data).await,
+                Err(_trailers) => ControlFlow::Continue(()),
+            },
+            Some(Err(e)) => {
+                self.on_body_error(e).await;
+                ControlFlow::Break(())
+            }
+            None => {
+                self.on_eof().await;
+                ControlFlow::Break(())
+            }
         }
     }
 
@@ -2919,17 +3096,17 @@ impl BodyReader {
     ///
     /// Returns [`ControlFlow::Break`] when the reader should stop reading the
     /// body because the post-decoder drain limit was exceeded.
-    async fn on_data(&mut self, data: Bytes) -> ControlFlow<()> {
+    async fn on_data(&mut self, mut data: Bytes) -> ControlFlow<()> {
+        if matches!(self.mode, ReadMode::Decoding { .. }) {
+            // May switch to draining; what is left of `data` (bytes after
+            // END_STREAM or a decode error) is drained below with the frame.
+            self.decode_available(&mut data).await;
+        }
         match &mut self.mode {
-            ReadMode::Decoding => {
-                self.buf.extend_from_slice(&data);
-                self.decode_available().await;
-                ControlFlow::Continue(())
-            }
             ReadMode::Draining {
                 drained,
                 pending_trailing_data_warn,
-            } => {
+            } if !data.is_empty() => {
                 if *pending_trailing_data_warn {
                     tracing::warn!(
                         trailing_bytes = data.len(),
@@ -2947,83 +3124,58 @@ impl BodyReader {
                 }
                 ControlFlow::Continue(())
             }
+            _ => ControlFlow::Continue(()),
         }
     }
 
-    /// Handle the end of the request body: flush any remaining complete
-    /// messages out of the decoder. A client may end the body without an
+    /// Handle the end of the request body. Every complete message has already
+    /// been forwarded frame by frame; a client may end the body without an
     /// END_STREAM envelope — the body ending is itself the end-of-stream
-    /// signal.
+    /// signal — but not part-way through an envelope. Nothing to do once the
+    /// reader is draining.
     async fn on_eof(&mut self) {
-        if !matches!(self.mode, ReadMode::Decoding) {
+        let ReadMode::Decoding { decoder, tx } = &self.mode else {
             return;
-        }
-        loop {
-            match self.decoder.decode_eof(&mut self.buf) {
-                Ok(Some(data)) => {
-                    // A send failure (handler dropped the stream) just ends
-                    // the flush early — the caller breaks out of the read
-                    // loop right after `on_eof`, so no mode change is needed.
-                    if self.tx.send(Ok(data)).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => return,
-                Err(e) => {
-                    let _ = self.tx.send(Err(e)).await;
-                    return;
-                }
-            }
+        };
+        if let Err(e) = decoder.finish() {
+            let _ = tx.send(Err(e)).await;
         }
     }
 
-    /// Decode and forward every complete message currently buffered,
-    /// switching to drain mode if the decoder finishes.
-    async fn decode_available(&mut self) {
-        loop {
-            match self.decoder.decode(&mut self.buf) {
-                Ok(Some(data)) => {
-                    if self.tx.send(Ok(data)).await.is_err() {
+    /// Decode and forward every complete message in `frame`, switching to
+    /// drain mode if the decoder finishes.
+    async fn decode_available(&mut self, frame: &mut Bytes) {
+        while let ReadMode::Decoding { decoder, tx } = &mut self.mode {
+            match decoder.decode(frame) {
+                Ok(Some(Decoded::Message(data))) => {
+                    if tx.send(Ok(data)).await.is_err() {
                         // The handler dropped the request stream; the rest of
-                        // the body is drained without inspection.
+                        // the body is not inspected.
                         self.enter_drain_mode(false);
-                        return;
                     }
                 }
-                Ok(None) if self.decoder.is_done() => {
-                    // The END_STREAM envelope was decoded — the stream is
-                    // finished, and any further request data is a protocol
-                    // violation by the client.
+                Ok(Some(Decoded::EndStream)) => {
+                    // The stream is finished; any further request data is a
+                    // protocol violation by the client.
                     self.enter_drain_mode(true);
-                    return;
                 }
                 Ok(None) => return, // need more data from the body
                 Err(e) => {
-                    let _ = self.tx.send(Err(e)).await;
+                    let _ = tx.send(Err(e)).await;
                     self.enter_drain_mode(false);
-                    return;
                 }
             }
         }
     }
 
-    /// Switch to bounded drain mode, releasing any bytes the decoder still
-    /// holds (e.g. trailing data that arrived in the same body frame as
-    /// END_STREAM, or an undecoded partial envelope after a decode error)
-    /// instead of keeping them resident for the duration of the drain.
+    /// Switch to bounded drain mode, dropping the decoder (and any partial
+    /// message it holds) and the sender (which ends the handler's request
+    /// stream); `end_stream` arms the one-time warning for request data
+    /// after END_STREAM.
     fn enter_drain_mode(&mut self, end_stream: bool) {
-        let mut pending_trailing_data_warn = end_stream;
-        if pending_trailing_data_warn && !self.buf.is_empty() {
-            tracing::warn!(
-                trailing_bytes = self.buf.len(),
-                "client sent request data after the END_STREAM envelope; discarding"
-            );
-            pending_trailing_data_warn = false;
-        }
-        self.buf = BytesMut::new();
         self.mode = ReadMode::Draining {
             drained: 0,
-            pending_trailing_data_warn,
+            pending_trailing_data_warn: end_stream,
         };
     }
 
@@ -3047,9 +3199,8 @@ impl BodyReader {
 
         // Only the decoding path allocates the message; the drain path logs
         // via `Display` above and returns without touching the handler.
-        if matches!(self.mode, ReadMode::Decoding) {
-            let _ = self
-                .tx
+        if let ReadMode::Decoding { tx, .. } = &self.mode {
+            let _ = tx
                 .send(Err(ConnectError::internal(format!(
                     "failed to read request body: {err}"
                 ))))
@@ -3064,15 +3215,27 @@ impl BodyReader {
 /// Returns a `(request_stream, reader_task)` pair. The `request_stream` yields
 /// decoded message payloads. The `reader_task` should be attached to the
 /// response via [`StreamingResponseBody::with_reader_task`]. The handle is
-/// held for lifetime association but is NOT aborted when the response drops —
-/// the task must be allowed to finish draining or hyper's dispatcher will see
-/// the body dropped before EOF and close the connection.
+/// held for lifetime association but is NOT aborted when the response drops.
 ///
-/// When the channel receiver is dropped (e.g., the handler finishes or
-/// encounters an error), the reader task continues consuming remaining body
-/// bytes (up to [`MAX_DRAIN_BYTES`]) before completing. This is critical for
-/// HTTP/1.1 where the server must read the entire request body before it can
-/// send the response.
+/// The task ends on its own once the handler has no further use for the body.
+/// When the channel receiver is dropped (the handler finished, was rejected
+/// or timed out), the task drops the partial message it has buffered and stops
+/// decoding, without waiting for the next complete message. It then only
+/// drains the body, for up to [`MAX_DRAIN_BYTES`] and [`DRAIN_TIMEOUT`], and
+/// drops it. The drain matters on HTTP/1.1, where the server must read the
+/// request body before the connection can serve another request, and dropping
+/// an unread body makes hyper close the connection. On HTTP/2 dropping the
+/// body resets the stream once the response is done, so the stream's slot is
+/// held until the drain ends. The drain is not only a delay: h2 charges each
+/// small DATA frame it receives for a stream nobody reads to connection-wide
+/// budgets that only frames of 256 bytes or more refill, and answers with
+/// `GOAWAY(ENHANCE_YOUR_CALM)` when they run out. Dropping the body at once
+/// therefore takes the connection down once enough calls end early while their
+/// clients are still sending (see
+/// `http2_early_return_keeps_connection_alive_under_small_frames`). The same
+/// applies to frames that arrive after the drain has ended and the stream is
+/// still open, as when a bidi handler stops reading requests but keeps
+/// streaming its response for longer than [`DRAIN_TIMEOUT`].
 fn spawn_body_reader<B>(
     body: B,
     max_message_size: usize,
@@ -3090,32 +3253,9 @@ where
 
     let reader_future = async move {
         let mut body = std::pin::pin!(body);
-        let mut reader = BodyReader::new(max_message_size, streaming_encoding, compression, tx);
-
-        // Read body frames until EOF, a body error, or the drain limit.
-        // Continuing to read (bounded) after the decoder finishes is critical
-        // for HTTP/1.1, where the server must consume the request body before
-        // the response can be sent.
-        loop {
-            match std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data()
-                        && reader.on_data(data).await.is_break()
-                    {
-                        break;
-                    }
-                }
-                Some(Err(e)) => {
-                    reader.on_body_error(e).await;
-                    break;
-                }
-                None => {
-                    // Body EOF — flush any remaining buffered messages.
-                    reader.on_eof().await;
-                    break;
-                }
-            }
-        }
+        BodyReader::new(max_message_size, streaming_encoding, compression, tx)
+            .run(body.as_mut())
+            .await;
     };
 
     // The reader runs detached — it has to outlive the response stream so it
@@ -3138,8 +3278,9 @@ where
 /// The reader task is attached to the response body via
 /// [`StreamingResponseBody::with_reader_task`]. When the response body drops,
 /// the task is **detached** (not aborted) — it continues draining the request
-/// body until EOF or [`MAX_DRAIN_BYTES`]. Aborting early was found to race
-/// with hyper's HTTP/1.1 body-EOF detection (see `_reader_task` field docs).
+/// body until EOF, [`MAX_DRAIN_BYTES`] or [`DRAIN_TIMEOUT`]. Aborting early was
+/// found to race with hyper's HTTP/1.1 body-EOF detection (see `_reader_task`
+/// field docs).
 #[allow(clippy::too_many_arguments)]
 async fn handle_bidi_streaming_request<D, B>(
     dispatcher: &D,
@@ -3536,6 +3677,8 @@ pub mod axum_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Every limit must survive the builder chain and come back out of the
     /// accessor of the same name. Setting all three in one chain also pins
@@ -4778,7 +4921,6 @@ mod tests {
     async fn interceptor_runs_on_connect_get_request() {
         use crate::interceptor::{Interceptor, Next, UnaryRequest, UnaryResponse};
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         let intercepted = Arc::new(AtomicBool::new(false));
         let handler_ran = Arc::new(Mutex::new(false));
@@ -5415,6 +5557,417 @@ mod tests {
             "reader pulled {pulled} bytes after END_STREAM (expected at most \
              {max_expected}); trailing data is being buffered without bound"
         );
+    }
+
+    /// Test body that yields its frames, then stays pending forever, and
+    /// records when it is dropped: a client that stalls part-way through a
+    /// request.
+    struct StalledBody {
+        frames: std::collections::VecDeque<Bytes>,
+        _dropped: DropFlag,
+    }
+
+    impl Body for StalledBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.get_mut().frames.pop_front() {
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Body fed by the test through a channel.
+    struct FedBody {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        _dropped: DropFlag,
+    }
+
+    impl Body for FedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.get_mut()
+                .rx
+                .poll_recv(cx)
+                .map(|data| data.map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    /// A body reader on a test body, seen from the handler's side.
+    struct Reader {
+        request_stream: Option<BoxStream<Result<Bytes, ConnectError>>>,
+        reader_task: tokio::task::JoinHandle<()>,
+        body_dropped: Arc<AtomicBool>,
+        /// Held by the decoder while the reader is decoding.
+        registry: Arc<CompressionRegistry>,
+    }
+
+    impl Reader {
+        /// A reader on a body that yields `frames` and then stalls.
+        fn stalled(frames: impl IntoIterator<Item = Bytes>) -> Self {
+            let body_dropped = Arc::new(AtomicBool::new(false));
+            Self::on(
+                StalledBody {
+                    frames: frames.into_iter().collect(),
+                    _dropped: DropFlag(Arc::clone(&body_dropped)),
+                },
+                body_dropped,
+            )
+        }
+
+        fn on<B>(body: B, body_dropped: Arc<AtomicBool>) -> Self
+        where
+            B: Body<Data = Bytes, Error = Infallible> + Send + 'static,
+        {
+            let registry = Arc::new(CompressionRegistry::new());
+            let (request_stream, reader_task) =
+                spawn_body_reader(body, DEFAULT_MAX_MESSAGE_SIZE, None, Arc::clone(&registry));
+            Self {
+                request_stream: Some(request_stream),
+                reader_task: reader_task.expect("tests run inside a tokio runtime"),
+                body_dropped,
+                registry,
+            }
+        }
+
+        /// The next item the handler would see.
+        async fn next(&mut self) -> Option<Result<Bytes, ConnectError>> {
+            self.request_stream
+                .as_mut()
+                .expect("stream not dropped")
+                .next()
+                .await
+        }
+
+        /// Assert that the handler's stream has ended now, not when a timer
+        /// the reader is waiting on fires: with time paused, awaiting the
+        /// stream would auto-advance the clock and hide the difference.
+        async fn assert_stream_ended(&mut self) {
+            Self::settle().await;
+            assert!(
+                matches!(self.next().now_or_never(), Some(None)),
+                "the handler's stream must have ended"
+            );
+        }
+
+        /// The handler is done with the request stream.
+        fn handler_drops_stream(&mut self) {
+            self.request_stream = None;
+        }
+
+        fn body_dropped(&self) -> bool {
+            self.body_dropped.load(Ordering::Relaxed)
+        }
+
+        /// Let the reader run until it is waiting on the body.
+        async fn settle() {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Assert that the reader drains the stalled body for
+        /// [`DRAIN_TIMEOUT`] and then drops it, without panicking. The
+        /// decoder, and with it any partial message, is gone from the start
+        /// of the drain. Time is paused, so a reader that never lets go
+        /// fails at an `assert` instead of hanging.
+        async fn assert_drains_then_releases(self) {
+            Self::settle().await;
+            assert_eq!(
+                Arc::strong_count(&self.registry),
+                1,
+                "the decoder must be dropped when the drain starts"
+            );
+            tokio::time::advance(DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+            Self::settle().await;
+            assert!(!self.reader_task.is_finished(), "the reader drains");
+            assert!(!self.body_dropped(), "the body is held while draining");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            Self::settle().await;
+            assert!(self.body_dropped(), "the body must be dropped");
+            self.reader_task.await.expect("reader task must not panic");
+        }
+    }
+
+    /// A client declares a message, sends all but its last byte, and
+    /// stalls. Once the handler drops the request stream the reader must not
+    /// wait for the rest of the message.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_partial_envelope_released_when_handler_drops() {
+        let mut wire = Envelope::data(Bytes::from(vec![7_u8; 4096]))
+            .encode()
+            .to_vec();
+        wire.pop();
+        let mut reader = Reader::stalled([Bytes::from(wire)]);
+        Reader::settle().await;
+        assert!(!reader.reader_task.is_finished());
+        assert!(
+            !reader.body_dropped(),
+            "held while the handler holds the stream"
+        );
+        assert_eq!(
+            Arc::strong_count(&reader.registry),
+            2,
+            "the decoder is alive while the handler holds the stream"
+        );
+
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// The handler is gone before the client has sent anything.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_no_data_released_when_handler_drops() {
+        let mut reader = Reader::stalled([]);
+        Reader::settle().await;
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// The handler has read a whole message and then goes away while the
+    /// client stalls.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_complete_message_then_stall_released_when_handler_drops() {
+        let frame = Envelope::data(Bytes::from_static(b"hello")).encode();
+        let mut reader = Reader::stalled([frame]);
+        let first = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&first[..], b"hello");
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A handler that keeps its request stream open and idle is not cut off:
+    /// waiting for the client is the handler's business (and its deadline's).
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_waits_while_handler_holds_stream() {
+        let reader = Reader::stalled([]);
+        Reader::settle().await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        Reader::settle().await;
+        assert!(!reader.reader_task.is_finished());
+        assert!(!reader.body_dropped());
+    }
+
+    /// The reader is woken by frames that arrive while it waits, and hands
+    /// them to the handler.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_wakes_for_frames_arriving_later() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = Reader::on(
+            FedBody {
+                rx,
+                _dropped: DropFlag(Arc::clone(&dropped)),
+            },
+            dropped,
+        );
+        Reader::settle().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        feed.send(Envelope::data(Bytes::from_static(b"late")).encode())
+            .unwrap();
+        let msg = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&msg[..], b"late");
+    }
+
+    /// After a decode error the decoder is finished whether or not the
+    /// handler has dropped the stream: the reader drains, bounded in time.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_decode_error_then_stall_released() {
+        // A header declaring more than the message limit.
+        let mut header = vec![0_u8];
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut reader = Reader::stalled([Bytes::from(header)]);
+        let err = reader
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("oversize message is an error");
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// Likewise after the END_STREAM envelope: the client has said it is
+    /// done, and anything it sends afterwards is discarded.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_end_stream_then_stall_released() {
+        let frame = Envelope::end_stream(Bytes::from_static(b"{}")).encode();
+        let mut reader = Reader::stalled([frame]);
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A message that arrives in the same frame as END_STREAM is still
+    /// delivered, ahead of the end of the stream.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_message_before_end_stream_is_delivered() {
+        let mut wire = Envelope::data(Bytes::from_static(b"hello"))
+            .encode()
+            .to_vec();
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let mut reader = Reader::stalled([Bytes::from(wire)]);
+        let first = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&first[..], b"hello");
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A client that trickles data during the drain cannot extend it: the
+    /// deadline is absolute, not an idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_drain_deadline_is_not_extended_by_trickled_data() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = Reader::on(
+            FedBody {
+                rx,
+                _dropped: DropFlag(Arc::clone(&dropped)),
+            },
+            dropped,
+        );
+        Reader::settle().await;
+        reader.handler_drops_stream();
+        Reader::settle().await;
+
+        for _ in 0..4 {
+            feed.send(Bytes::from_static(&[0xAA; 8])).unwrap();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            Reader::settle().await;
+        }
+        assert!(
+            !reader.reader_task.is_finished(),
+            "still draining before the deadline"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        Reader::settle().await;
+        assert!(reader.body_dropped(), "trickled data extended the drain");
+        reader
+            .reader_task
+            .await
+            .expect("reader task must not panic");
+    }
+
+    fn test_reader() -> (
+        BodyReader,
+        tokio::sync::mpsc::Receiver<Result<Bytes, ConnectError>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+            tx,
+        );
+        (reader, rx)
+    }
+
+    /// A large message that arrives over many transport frames reaches the
+    /// handler as the sole owner of its allocation: the reader keeps no
+    /// buffer that shares it, and nothing is left buffered once it is out.
+    #[tokio::test]
+    async fn test_body_reader_large_message_owns_its_allocation() {
+        let (mut reader, mut rx) = test_reader();
+        let payload = Bytes::from(vec![0x42_u8; 1024 * 1024]);
+        let wire = Envelope::data(payload.clone()).encode();
+        for chunk in wire.chunks(16 * 1024) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue()
+            );
+        }
+
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert_eq!(msg, payload, "message must arrive intact");
+        assert!(msg.is_unique(), "reader shares the message's allocation");
+        let ReadMode::Decoding { decoder, .. } = &reader.mode else {
+            panic!("reader has left decoding");
+        };
+        assert!(decoder.finish().is_ok(), "nothing left buffered");
+    }
+
+    /// A compressed envelope split across frames is reassembled and
+    /// decompressed.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn test_body_reader_compressed_message_across_frames() {
+        let registry = Arc::new(CompressionRegistry::default());
+        let payload = Bytes::from(vec![b'z'; 64 * 1024]);
+        let compressed = registry
+            .compress("gzip", &payload)
+            .expect("gzip compresses");
+        let wire = Envelope::compressed(compressed).encode();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut reader = BodyReader::new(
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Some("gzip".to_owned()),
+            registry,
+            tx,
+        );
+        for chunk in wire.chunks(7) {
+            assert!(
+                reader
+                    .on_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .is_continue()
+            );
+        }
+        let msg = rx.recv().await.expect("message").expect("decodes");
+        assert_eq!(msg, payload);
+    }
+
+    /// A body that ends part-way through an envelope surfaces
+    /// `invalid_argument` to the handler rather than a clean end of stream.
+    #[tokio::test]
+    async fn test_body_reader_incomplete_envelope_at_eof() {
+        let wire = Envelope::data(Bytes::from_static(b"hello world")).encode();
+        let mut frames = std::collections::VecDeque::new();
+        frames.push_back(wire.slice(..3));
+        frames.push_back(wire.slice(3..9));
+        let body = CountingBody {
+            frames,
+            pulled: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let (mut request_stream, reader_task) = spawn_body_reader(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        let err = request_stream
+            .next()
+            .await
+            .expect("an item must be delivered")
+            .expect_err("a truncated envelope is an error");
+        assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
+        assert_eq!(err.message.as_deref(), Some("incomplete request envelope"));
+        assert!(request_stream.next().await.is_none());
+        reader_task
+            .expect("tests run inside a tokio runtime")
+            .await
+            .expect("reader task must not panic");
     }
 
     /// An END_STREAM envelope with no preceding messages (the typical
@@ -6278,5 +6831,447 @@ mod tests {
             .expect("miss");
             assert_eq!(err.code, crate::ErrorCode::Unimplemented);
         }
+    }
+}
+
+#[cfg(test)]
+mod intercept_head_tests {
+    use super::*;
+    use crate::interceptor::Interceptor;
+    use crate::spec::{Spec, StreamType};
+    use crate::{ServiceStream, client_streaming_handler_fn, handler_fn};
+    use buffa_types::Empty;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    const UNARY: Spec = Spec::server("/svc/Unary", StreamType::Unary);
+
+    /// A request body that counts how often it is polled.
+    struct CountedBody(Arc<AtomicUsize>);
+
+    impl Body for CountedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(None)
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        Accept,
+        Reject,
+    }
+
+    /// Records its name in `log`, then accepts or rejects in `intercept_head`.
+    struct Head {
+        name: &'static str,
+        verdict: Verdict,
+        log: Log,
+    }
+
+    #[async_trait::async_trait]
+    impl Interceptor for Head {
+        async fn intercept_head(&self, _head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+            self.log.lock().unwrap().push(self.name);
+            match self.verdict {
+                Verdict::Accept => Ok(()),
+                Verdict::Reject => Err(ConnectError::unauthenticated("no credential")),
+            }
+        }
+    }
+
+    fn head(name: &'static str, verdict: Verdict, log: &Log) -> Arc<dyn Interceptor> {
+        Arc::new(Head {
+            name,
+            verdict,
+            log: Arc::clone(log),
+        })
+    }
+
+    /// One handler of each kind; each records that it ran.
+    fn router(ran: &Arc<AtomicBool>) -> Router {
+        let unary = Arc::clone(ran);
+        let get = Arc::clone(ran);
+        let client = Arc::clone(ran);
+        Router::new()
+            .route(
+                "svc",
+                "Unary",
+                handler_fn(move |_ctx: RequestContext, _req: Empty| {
+                    unary.store(true, Ordering::SeqCst);
+                    async { crate::Response::ok(Empty::default()) }
+                }),
+            )
+            .with_spec(UNARY)
+            .route_idempotent(
+                "svc",
+                "Get",
+                handler_fn(move |_ctx: RequestContext, _req: Empty| {
+                    get.store(true, Ordering::SeqCst);
+                    async { crate::Response::ok(Empty::default()) }
+                }),
+            )
+            .route_client_stream(
+                "svc",
+                "Client",
+                client_streaming_handler_fn(
+                    move |_ctx: RequestContext, requests: ServiceStream<Empty>| {
+                        client.store(true, Ordering::SeqCst);
+                        async move {
+                            drop(requests);
+                            crate::Response::ok(Empty::default())
+                        }
+                    },
+                ),
+            )
+    }
+
+    async fn dispatch(
+        router: Router,
+        interceptors: &[Arc<dyn Interceptor>],
+        req: Request<CountedBody>,
+    ) -> Result<Response<ConnectRpcBody>, ConnectError> {
+        handle_request(
+            Arc::new(router),
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+            interceptors,
+        )
+        .await
+    }
+
+    fn post(path: &str, content_type: &str, polls: &Arc<AtomicUsize>) -> Request<CountedBody> {
+        Request::post(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(CountedBody(Arc::clone(polls)))
+            .unwrap()
+    }
+
+    /// How a rejection reaches the client in each protocol.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Connect unary: an HTTP error status.
+        HttpStatus,
+        /// gRPC: `grpc-status: 16` in the trailers.
+        GrpcTrailer,
+        /// gRPC-Web: a trailers frame in the body carrying `grpc-status: 16`.
+        GrpcWebFrame,
+        /// Connect streaming: an end-of-stream envelope carrying the code.
+        ConnectEndStream,
+    }
+
+    async fn assert_rejected(result: Result<Response<ConnectRpcBody>, ConnectError>, reply: Reply) {
+        match reply {
+            Reply::HttpStatus => {
+                let Err(err) = result else {
+                    panic!("a Connect unary rejection is an error");
+                };
+                assert_eq!(err.http_status(), StatusCode::UNAUTHORIZED);
+            }
+            Reply::GrpcTrailer => {
+                let response = result.expect("a gRPC rejection is a response");
+                let collected = response.into_body().collect().await.unwrap();
+                let trailers = collected.trailers().expect("gRPC status trailers");
+                assert_eq!(trailers.get("grpc-status").unwrap(), "16");
+            }
+            Reply::GrpcWebFrame => {
+                let response = result.expect("a gRPC-Web rejection is a response");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("grpc-status: 16"),
+                    "the trailers frame must carry the code: {body:?}"
+                );
+            }
+            Reply::ConnectEndStream => {
+                let response = result.expect("a Connect streaming rejection is a response");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("unauthenticated"),
+                    "the end-of-stream envelope must carry the code: {body:?}"
+                );
+            }
+        }
+    }
+
+    /// A rejection in `intercept_head` must leave the body unread and the
+    /// handler unrun, in every dispatch shape, and reach the client in that
+    /// shape's own error format. The streaming shapes are the ones where a
+    /// body reader would otherwise start before any interceptor runs, so the
+    /// polls are counted after the runtime has had time to run a spawned
+    /// reader. The gRPC-Web text-mode shape is one the service rejects with
+    /// its own drain unless the hook runs first.
+    #[tokio::test]
+    async fn head_rejection_reads_no_body_and_runs_no_handler() {
+        const SHAPES: [(&str, &str, &str, Reply); 6] = [
+            (
+                "connect unary",
+                "/svc/Unary",
+                "application/proto",
+                Reply::HttpStatus,
+            ),
+            (
+                "grpc unary",
+                "/svc/Unary",
+                "application/grpc+proto",
+                Reply::GrpcTrailer,
+            ),
+            (
+                "connect client stream",
+                "/svc/Client",
+                "application/connect+proto",
+                Reply::ConnectEndStream,
+            ),
+            (
+                "grpc client stream",
+                "/svc/Client",
+                "application/grpc+proto",
+                Reply::GrpcTrailer,
+            ),
+            (
+                "grpc-web client stream",
+                "/svc/Client",
+                "application/grpc-web+proto",
+                Reply::GrpcWebFrame,
+            ),
+            (
+                "grpc-web text mode",
+                "/svc/Client",
+                "application/grpc-web-text+proto",
+                Reply::GrpcWebFrame,
+            ),
+        ];
+
+        for (name, path, content_type, reply) in SHAPES {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let ran = Arc::new(AtomicBool::new(false));
+            let log = Log::default();
+            let chain = [head("gate", Verdict::Reject, &log)];
+
+            let result = dispatch(router(&ran), &chain, post(path, content_type, &polls)).await;
+            for _ in 0..YIELDS {
+                tokio::task::yield_now().await;
+            }
+
+            assert_rejected(result, reply).await;
+            assert_eq!(polls.load(Ordering::SeqCst), 0, "{name}: body was read");
+            assert!(!ran.load(Ordering::SeqCst), "{name}: handler ran");
+            assert_eq!(*log.lock().unwrap(), ["gate"], "{name}");
+        }
+
+        // Connect GET has no content type, so it gets its own request.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [head("gate", Verdict::Reject, &log)];
+        let req = Request::get("/svc/Get?message=&encoding=proto&base64=1&connect=v1")
+            .body(CountedBody(Arc::clone(&polls)))
+            .unwrap();
+        let result = dispatch(router(&ran), &chain, req).await;
+        assert_rejected(result, Reply::HttpStatus).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "connect get: body was read"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "connect get: handler ran");
+    }
+
+    /// Enough turns for a spawned body reader to poll the body.
+    const YIELDS: usize = 5;
+
+    /// Every interceptor's head check runs, outermost first, until one
+    /// rejects; interceptors after the rejecting one are not consulted.
+    #[tokio::test]
+    async fn head_checks_run_in_registration_order_and_stop_at_the_first_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [
+            head("first", Verdict::Accept, &log),
+            head("second", Verdict::Reject, &log),
+            head("third", Verdict::Accept, &log),
+        ];
+
+        let result = dispatch(
+            router(&ran),
+            &chain,
+            post("/svc/Unary", "application/proto", &polls),
+        )
+        .await;
+
+        assert_rejected(result, Reply::HttpStatus).await;
+        assert_eq!(*log.lock().unwrap(), ["first", "second"]);
+    }
+
+    /// What the head shows for one request.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        path: String,
+        spec: Option<Spec>,
+        protocol: Protocol,
+        authorization: Option<String>,
+        peer: Option<Peer>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Peer(u32);
+
+    struct Inspect(Arc<Mutex<Option<Seen>>>);
+
+    #[async_trait::async_trait]
+    impl Interceptor for Inspect {
+        async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+            *self.0.lock().unwrap() = Some(Seen {
+                path: head.path().to_owned(),
+                spec: head.spec(),
+                protocol: head.protocol(),
+                authorization: head
+                    .header("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                peer: head.extensions().get::<Peer>().copied(),
+            });
+            Ok(())
+        }
+    }
+
+    /// Dispatch `req` through an accepting `Inspect` and return what it saw.
+    async fn inspect(
+        req: Request<CountedBody>,
+    ) -> (Option<Seen>, Result<StatusCode, ConnectError>) {
+        let seen = Arc::new(Mutex::new(None));
+        let chain: [Arc<dyn Interceptor>; 1] = [Arc::new(Inspect(Arc::clone(&seen)))];
+        let ran = Arc::new(AtomicBool::new(false));
+        let status = dispatch(router(&ran), &chain, req)
+            .await
+            .map(|response| response.status());
+        (seen.lock().unwrap().take(), status)
+    }
+
+    /// The head shows the path, the resolved `Spec`, the headers and the
+    /// transport's extensions, and accepting it lets the call run.
+    #[tokio::test]
+    async fn head_exposes_the_request_and_an_accepted_call_proceeds() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut req = post("/svc/Unary", "application/proto", &polls);
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer token".parse().unwrap());
+        req.extensions_mut().insert(Peer(7));
+
+        let (seen, status) = inspect(req).await;
+
+        assert_eq!(
+            status.expect("an accepted call is dispatched"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            seen,
+            Some(Seen {
+                path: "/svc/Unary".to_owned(),
+                spec: Some(UNARY),
+                protocol: Protocol::Connect,
+                authorization: Some("Bearer token".to_owned()),
+                peer: Some(Peer(7)),
+            })
+        );
+    }
+
+    /// The protocol the head reports follows the request's content type.
+    #[tokio::test]
+    async fn head_reports_the_protocol_of_the_request() {
+        for (path, content_type, expected) in [
+            ("/svc/Unary", "application/proto", Protocol::Connect),
+            (
+                "/svc/Client",
+                "application/connect+proto",
+                Protocol::Connect,
+            ),
+            ("/svc/Unary", "application/grpc+proto", Protocol::Grpc),
+            (
+                "/svc/Client",
+                "application/grpc-web+proto",
+                Protocol::GrpcWeb,
+            ),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let (seen, _) = inspect(post(path, content_type, &polls)).await;
+            let seen = seen.unwrap_or_else(|| panic!("{content_type}: the hook did not run"));
+            assert_eq!(seen.protocol, expected, "{content_type}");
+        }
+    }
+
+    /// A path that matches no method still reaches the head, with no `Spec`,
+    /// so a rejecting hook answers before the not-found error does.
+    #[tokio::test]
+    async fn head_runs_for_an_unknown_path_before_the_not_found_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (seen, status) = inspect(post("/svc/Missing", "application/proto", &polls)).await;
+        let seen = seen.expect("the hook must run for an unknown path");
+        assert_eq!((seen.path.as_str(), seen.spec), ("/svc/Missing", None));
+        assert_eq!(status.unwrap_err().http_status(), StatusCode::NOT_FOUND);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [head("gate", Verdict::Reject, &log)];
+        let result = dispatch(
+            router(&ran),
+            &chain,
+            post("/svc/Missing", "application/proto", &polls),
+        )
+        .await;
+        assert_rejected(result, Reply::HttpStatus).await;
+    }
+
+    /// A value a head check inserts reaches the handler through the request
+    /// context, so authentication can hand the caller's identity on.
+    #[tokio::test]
+    async fn head_extensions_reach_the_handler() {
+        #[derive(Clone)]
+        struct Caller(&'static str);
+
+        struct Authenticate;
+
+        #[async_trait::async_trait]
+        impl Interceptor for Authenticate {
+            async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+                head.extensions_mut().insert(Caller("alice"));
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let router = Router::new().route(
+            "svc",
+            "Unary",
+            handler_fn(move |ctx: RequestContext, _req: Empty| {
+                *handler_seen.lock().unwrap() = ctx.extensions().get::<Caller>().map(|c| c.0);
+                async { crate::Response::ok(Empty::default()) }
+            }),
+        );
+        let chain: [Arc<dyn Interceptor>; 1] = [Arc::new(Authenticate)];
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        dispatch(
+            router,
+            &chain,
+            post("/svc/Unary", "application/proto", &polls),
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(*seen.lock().unwrap(), Some("alice"));
     }
 }

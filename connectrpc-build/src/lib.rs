@@ -365,6 +365,9 @@ impl Config {
     /// - a precompiled descriptor set cannot be read or decoded
     /// - codegen fails (unsupported proto feature, or a method type absent
     ///   from the descriptor set — see [`Config::descriptor_set`])
+    /// - two services in one package, or two of their methods, would
+    ///   generate the same Rust identifier (`XGet` and `X_Get`; `XGet.Foo`
+    ///   and `X.GetFoo`) — rename one in the proto
     /// - the output directory cannot be created or written to
     /// - [`Config::emit_descriptor_set`] was given a name containing path
     ///   separators, or the descriptor set cannot be written

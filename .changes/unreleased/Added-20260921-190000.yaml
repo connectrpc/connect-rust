@@ -1,0 +1,19 @@
+kind: Added
+body: |-
+    **`Interceptor::intercept_head` rejects a request from its head, before
+    any of the body is read.** It receives a `&mut RequestHead` with the
+    path, the resolved `Spec`, the headers, the protocol, and the request
+    extensions (`peer_addr()` and `peer_certs()` read the connection's
+    address and client certificates), and returns `Ok(())` or the error the
+    client should see. Interceptors already ran after the body was read
+    (unary) or after a body reader had started (streaming), so only Tower
+    middleware could reject early, and middleware cannot see the resolved
+    `Spec`. The method has a default that accepts every request, so existing
+    interceptors are unchanged. It runs on the server only, for every
+    registered interceptor in registration order, and the first error ends
+    the request: the body is not read, an HTTP/2 stream is reset, and an
+    HTTP/1.x connection is usually closed. A head check can insert values
+    with `RequestHead::extensions_mut`, which later interceptors and the
+    handler read from the request context. `RequestHead::new` builds a head
+    for unit tests.
+time: 2026-09-21T19:11:00.000000000+00:00
