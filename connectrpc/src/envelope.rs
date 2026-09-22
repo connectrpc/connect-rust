@@ -868,6 +868,50 @@ mod tests {
         }
     }
 
+    /// The `Bytes` and `BytesMut` decoders agree on every input: same
+    /// outcome, same envelope, same remainder left in the buffer.
+    #[test]
+    fn decode_bytes_and_decode_with_limit_agree() {
+        fn frame(flags: u8, payload: &[u8], trailing: &[u8]) -> Vec<u8> {
+            let mut v = vec![flags];
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v.extend_from_slice(trailing);
+            v
+        }
+        const LIMIT: usize = 8;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("exact fit", frame(0, b"12345", b"")),
+            ("zero-length payload", frame(0, b"", b"")),
+            ("end-stream flag", frame(flags::END_STREAM, b"{}", b"")),
+            ("compressed flag", frame(flags::COMPRESSED, b"zz", b"")),
+            ("trailing bytes", frame(0, b"abc", b"next")),
+            ("length == limit", frame(0, &[7; LIMIT], b"")),
+            ("length == limit + 1", frame(0, &[7; LIMIT + 1], b"")),
+            ("short header", vec![0, 0, 0]),
+            ("truncated payload", vec![0, 0, 0, 0, 4, 1, 2]),
+            ("empty", vec![]),
+        ];
+        for (name, input) in cases {
+            let mut as_mut = BytesMut::from(&input[..]);
+            let mut as_bytes = Bytes::from(input.clone());
+            let from_mut = Envelope::decode_with_limit(&mut as_mut, LIMIT);
+            let from_bytes = Envelope::decode_bytes_with_limit(&mut as_bytes, LIMIT);
+            match (from_mut, from_bytes) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(
+                        a.as_ref().map(|e| (e.flags, e.data.clone())),
+                        b.as_ref().map(|e| (e.flags, e.data.clone())),
+                        "{name}: envelope"
+                    );
+                }
+                (Err(a), Err(b)) => assert_eq!(a.code, b.code, "{name}: error code"),
+                (a, b) => panic!("{name}: {a:?} vs {b:?}"),
+            }
+            assert_eq!(&as_mut[..], &as_bytes[..], "{name}: remainder");
+        }
+    }
+
     /// De-framing an immutable `Bytes` body hands the payload over as a
     /// slice of the input rather than a copy, and advances past the envelope.
     #[test]

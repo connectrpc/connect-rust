@@ -626,7 +626,7 @@ use bytes::Bytes;
 struct MyCompression;
 
 impl CompressionProvider for MyCompression {
-    fn name(&self) -> &'static str { "my-algo" }
+    fn name(&self) -> &'static str { "my-algo" } // an HTTP token; `register` panics otherwise
     fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> { /* ... */ }
     fn decompressor<'a>(&self, data: &'a [u8]) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
         // Return a reader that yields decompressed bytes. The framework
