@@ -9,17 +9,23 @@ body: |-
     resolves to a `ConnectionClosed` whose `reason()` says how it ended
     (`CloseReason::{Closed, Shutdown, MaxAge, Idle, MaxRequests,
     HeaderReadTimeout, Error}`) and whose `error()` / `error_arc()` return the
-    error that ended it, including one hit while draining. It runs on
-    whichever runtime polls it; a tokio socket's I/O stays on the runtime that
-    created it until moved with `into_std` / `TcpStream::from_std`. The new
-    public `ConnectionInfo` (also at the crate root) describes the connection:
-    `peer_addr()`, `peer_certs()`, and connection-scoped `extensions_mut()`
-    that the loop fills once — a parsed client-certificate identity, say — and
-    that are cloned into every request on the connection. `PeerAddr` /
-    `PeerCerts` on requests always come from `ConnectionInfo`'s typed fields,
-    never from its extensions. A loop that admits connections by client
-    identity, caps them per tenant, or places them on different runtimes keeps
-    every guarantee of `Server::serve` ([#191], [#49]).
+    error that ended it, including one hit while draining, in which case
+    `reason()` stays the one that started the drain. `HeaderReadTimeout` means
+    the header-read timeout expired: before the peer had sent enough to pick
+    HTTP/1.1 or HTTP/2, partway through an HTTP/1.1 request head, or while a
+    keep-alive connection was idle, which is routine for HTTP/1.1 client
+    pools. The future runs on whichever runtime polls it; a tokio socket's I/O
+    stays on the runtime that created it until moved with `into_std` /
+    `TcpStream::from_std`.
+
+    The new public `ConnectionInfo` (also at the crate root) describes the
+    connection: `peer_addr()`, `peer_certs()`, and connection-scoped
+    `extensions_mut()` that the loop fills once — a parsed client-certificate
+    identity, say — and that are cloned into every request on the connection.
+    `PeerAddr` / `PeerCerts` on requests always come from `ConnectionInfo`'s
+    typed fields, never from its extensions. A loop that admits connections by
+    client identity, caps them per tenant, or places them on different
+    runtimes keeps every guarantee of `Server::serve` ([#191], [#49]).
 
     [#191]: https://github.com/connectrpc/connect-rust/issues/191
     [#49]: https://github.com/connectrpc/connect-rust/issues/49

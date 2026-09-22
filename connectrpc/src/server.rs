@@ -5193,25 +5193,44 @@ mod tests {
         )
     }
 
+    /// Wait for more flow-control capacity on an h2 client stream: the new
+    /// capacity, or `None` once the server has ended the stream.
+    async fn await_h2_capacity(send: &mut h2::SendStream<Bytes>) -> Option<usize> {
+        let capacity = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| send.poll_capacity(cx)),
+        )
+        .await
+        .expect("no send window: the server is not releasing flow control");
+        capacity.and_then(Result::ok)
+    }
+
     /// Send `data` on an h2 client stream, waiting for flow-control capacity.
     /// Stops quietly if the server has already ended the stream.
     async fn send_h2_data(send: &mut h2::SendStream<Bytes>, mut data: Bytes) {
         while !data.is_empty() {
             send.reserve_capacity(data.len());
-            let capacity = tokio::time::timeout(
-                Duration::from_secs(5),
-                std::future::poll_fn(|cx| send.poll_capacity(cx)),
-            )
-            .await
-            .expect("no send window: the server is not releasing flow control");
-            let Some(Ok(capacity)) = capacity else {
-                return; // reset by the server
+            let Some(capacity) = await_h2_capacity(send).await else {
+                return;
             };
             let chunk = data.split_to(capacity.min(data.len()));
             if send.send_data(chunk, false).is_err() {
                 return;
             }
         }
+    }
+
+    /// Send `data` on an h2 client stream as a single DATA frame, waiting
+    /// until the stream holds flow-control capacity for all of it. Stops
+    /// quietly if the server has already ended the stream.
+    async fn send_h2_frame(send: &mut h2::SendStream<Bytes>, data: Bytes) {
+        send.reserve_capacity(data.len());
+        while send.capacity() < data.len() {
+            if await_h2_capacity(send).await.is_none() {
+                return;
+            }
+        }
+        let _ = send.send_data(data, false);
     }
 
     /// A server for [`refusing_upload_router`], shut down with [`Self::stop`].
@@ -5343,56 +5362,62 @@ mod tests {
     }
 
     /// Small DATA frames that are still in flight when a call ends early
-    /// must not cost the connection. h2 charges small frames it receives
-    /// for a stream nobody reads to connection-wide budgets, and closes the
-    /// connection with `GOAWAY(ENHANCE_YOUR_CALM)` when they run out, so a
-    /// reader that gave up on the body as soon as the handler returned would
-    /// take every other call on the connection down with it.
+    /// must not cost the connection. h2 charges each non-final DATA frame
+    /// shorter than 256 bytes `256 - len` against a connection-wide budget
+    /// until the frame is read or discarded, and answers a frame for a
+    /// stream nobody reads any more with a reset that counts against another
+    /// budget; it closes the connection with `GOAWAY(ENHANCE_YOUR_CALM)`
+    /// when either runs out. A reader that gave up on the body as soon as
+    /// the handler returned would take every other call on the connection
+    /// down with it, and fails this test well before its last call.
     ///
-    /// A 105-byte frame costs 151 bytes of a budget of at least 25,600, so
-    /// about 170 ignored frames are enough to trip it; the drop-at-once
-    /// design fails this test after roughly 1700 calls.
+    /// A busy machine can leave a whole connection window of frames unread.
+    /// Pinning the server's window at 65,535 bytes caps that at 354 frames of
+    /// 185 bytes, each charged 256 − 185 = 71, for 25,134 in total. That is
+    /// under 25,600, h2's minimum budget (h2 0.4.19 gives this window
+    /// 32,767), and 185 is the shortest frame length that fits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn http2_early_return_keeps_connection_alive_under_small_frames() {
         const CALLS: usize = 3000;
         const CONCURRENCY: usize = 20;
         const FRAMES_PER_CALL: usize = 10;
+        const FRAME_LEN: usize = 185;
 
-        let server = RefusingServer::start(Server::bind("127.0.0.1:0").await.unwrap()).await;
+        let server = RefusingServer::start(
+            Server::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .with_http2_initial_connection_window_size(65_535),
+        )
+        .await;
         let (send_request, h2_task) = server.connect_h2().await;
         let request = server.upload_request();
         let next = Arc::new(AtomicUsize::new(0));
-        let answered = Arc::new(AtomicUsize::new(0));
         let callers: Vec<_> = (0..CONCURRENCY)
             .map(|_| {
-                let (send_request, request, next, answered) = (
-                    send_request.clone(),
-                    request.clone(),
-                    Arc::clone(&next),
-                    Arc::clone(&answered),
-                );
+                let (send_request, request, next) =
+                    (send_request.clone(), request.clone(), Arc::clone(&next));
                 tokio::spawn(async move {
-                    let frame = Bytes::from(vec![0_u8; 105]);
+                    let frame = Bytes::from(vec![0_u8; FRAME_LEN]);
                     while next.fetch_add(1, Ordering::Relaxed) < CALLS {
-                        let Ok(mut send_request) = send_request.clone().ready().await else {
-                            return;
-                        };
-                        let Ok((resp, mut send)) =
-                            send_request.send_request(request.clone(), false)
-                        else {
-                            return;
-                        };
+                        let mut send_request = send_request
+                            .clone()
+                            .ready()
+                            .await
+                            .expect("connection closed");
+                        let (resp, mut send) = send_request
+                            .send_request(request.clone(), false)
+                            .expect("connection closed");
                         for _ in 0..FRAMES_PER_CALL {
-                            send_h2_data(&mut send, frame.clone()).await;
+                            send_h2_frame(&mut send, frame.clone()).await;
                             tokio::time::sleep(Duration::from_micros(100)).await;
                         }
                         let _ = send.send_data(Bytes::new(), true);
-                        let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(5), resp).await
-                        else {
-                            return;
-                        };
+                        let resp = tokio::time::timeout(Duration::from_secs(5), resp)
+                            .await
+                            .expect("response did not arrive")
+                            .expect("response failed");
                         drain_h2_body(resp).await;
-                        answered.fetch_add(1, Ordering::Relaxed);
                     }
                 })
             })
@@ -5400,10 +5425,18 @@ mod tests {
         for caller in callers {
             caller.await.unwrap();
         }
-        assert_eq!(answered.load(Ordering::Relaxed), CALLS, "calls were lost");
+
+        // All but the last few frames above were sent before this call, so a
+        // server that ran out of budget has refused it.
+        let mut send_request = send_request
+            .ready()
+            .await
+            .expect("the connection was closed");
+        let (send, resp) = server.start_upload(&mut send_request).await;
+        drain_h2_body(resp).await;
         assert!(!h2_task.is_finished(), "the connection was closed");
 
-        drop(send_request);
+        drop((send, send_request));
         server.stop().await;
         h2_task.await.expect("h2 connection task panicked").ok();
     }
