@@ -6,7 +6,7 @@
 //!
 //! | Transport | Protocol | Use when |
 //! |---|---|---|
-//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** Honest `poll_ready`, composes with `tower::balance`. |
+//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** One multiplexed connection with automatic reconnect; honest `poll_ready`, composes with `tower::balance`. |
 //! | [`HttpClient`] | HTTP/1.1 + HTTP/2 (ALPN) | Connect protocol over h/1.1, or you genuinely don't know which protocol the server speaks. |
 //!
 //! # For gRPC: `SharedHttp2Connection`
@@ -47,9 +47,11 @@
 //! // for dynamic load-aware routing. See the http2 module docs.
 //! ```
 //!
-//! Because `Http2Connection::poll_ready` honestly reports connection state
-//! (connecting / closed / ready), `tower::balance` can route around
-//! failed connections and p2c can make useful decisions.
+//! Because `poll_ready` on both `Http2Connection` and its shared handle
+//! reflects connection state (pending while connecting; a failed connect is
+//! reported by the next call instead of hanging, and retried on the next
+//! `poll_ready`), `tower::balance` keeps steering by load around a connection
+//! that is down and p2c can make useful decisions.
 //!
 //! # For Connect over HTTP/1.1: `HttpClient`
 //!
@@ -2109,9 +2111,8 @@ where
         );
     }
     // Accept-Encoding so the server can compress the response.
-    let accept = config.compression.accept_encoding_header();
-    if !accept.is_empty() {
-        builder = builder.header(http::header::ACCEPT_ENCODING, accept);
+    if let Some(accept) = config.compression.accept_encoding_value() {
+        builder = builder.header(http::header::ACCEPT_ENCODING, accept.clone());
     }
 
     // Merge user-provided headers
@@ -4793,39 +4794,39 @@ fn add_unary_request_headers(
 ) -> http::request::Builder {
     builder = builder.header(
         http::header::CONTENT_TYPE,
-        unary_request_content_type(config),
+        http::HeaderValue::from_static(unary_request_content_type(config)),
     );
 
     match config.protocol {
         Protocol::Connect => {
-            builder = builder.header(connect_header::PROTOCOL_VERSION, "1");
+            builder = builder.header(
+                connect_header::PROTOCOL_VERSION,
+                http::HeaderValue::from_static("1"),
+            );
             // Connect unary uses standard content-encoding / accept-encoding.
             // Only set Content-Encoding if compression was actually applied.
             if let Some(encoding) = applied_content_encoding {
                 builder = builder.header(http::header::CONTENT_ENCODING, encoding);
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header(http::header::ACCEPT_ENCODING, accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header(http::header::ACCEPT_ENCODING, accept.clone());
             }
         }
         Protocol::Grpc => {
-            builder = builder.header("te", "trailers");
+            builder = builder.header("te", http::HeaderValue::from_static("trailers"));
             if let Some(ref encoding) = config.request_compression {
                 builder = builder.header("grpc-encoding", encoding.as_str());
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header("grpc-accept-encoding", accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header("grpc-accept-encoding", accept.clone());
             }
         }
         Protocol::GrpcWeb => {
             if let Some(ref encoding) = config.request_compression {
                 builder = builder.header("grpc-encoding", encoding.as_str());
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header("grpc-accept-encoding", accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header("grpc-accept-encoding", accept.clone());
             }
         }
     }
@@ -4848,15 +4849,18 @@ fn add_streaming_request_headers(
 ) -> http::request::Builder {
     builder = builder.header(
         http::header::CONTENT_TYPE,
-        streaming_request_content_type(config),
+        http::HeaderValue::from_static(streaming_request_content_type(config)),
     );
 
     match config.protocol {
         Protocol::Connect => {
-            builder = builder.header(connect_header::PROTOCOL_VERSION, "1");
+            builder = builder.header(
+                connect_header::PROTOCOL_VERSION,
+                http::HeaderValue::from_static("1"),
+            );
         }
         Protocol::Grpc => {
-            builder = builder.header("te", "trailers");
+            builder = builder.header("te", http::HeaderValue::from_static("trailers"));
         }
         Protocol::GrpcWeb => {}
     }
@@ -4867,9 +4871,8 @@ fn add_streaming_request_headers(
     if let Some(ref encoding) = config.request_compression {
         builder = builder.header(encoding_header, encoding.as_str());
     }
-    let accept = config.compression.accept_encoding_header();
-    if !accept.is_empty() {
-        builder = builder.header(accept_header, accept);
+    if let Some(accept) = config.compression.accept_encoding_value() {
+        builder = builder.header(accept_header, accept.clone());
     }
 
     if let Some(timeout) = timeout {
