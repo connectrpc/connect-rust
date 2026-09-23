@@ -1,0 +1,18 @@
+kind: Fixed
+body: |-
+  **A view response whose fields are all small no longer pays for a rope
+  that captures nothing** ([#278]). The segmented encode was gated on the
+  size of the whole message, but a rope only captures an individual `bytes`
+  or `string` field at or above the 16 KiB framing threshold, so a message
+  made of many small fields — a chunk of log records, a metrics batch — took
+  the rope, captured nothing, and copied itself into a doubling tail before
+  collapsing back to one contiguous buffer, once per item on a stream. The
+  gate now also walks the view's fields without copying a byte and takes the
+  rope only when at least one field would be captured; everything else goes
+  straight to a single sized buffer. The walk costs a pass over the fields
+  and a second size computation, proportional to the field count rather
+  than the payload, and a message below the threshold pays neither. The
+  encoded bytes are unchanged.
+
+  [#278]: https://github.com/connectrpc/connect-rust/issues/278
+time: 2026-08-25T20:32:39.333194520+00:00

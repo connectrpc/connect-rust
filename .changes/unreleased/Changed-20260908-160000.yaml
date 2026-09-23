@@ -1,0 +1,9 @@
+kind: Changed
+body: |-
+    **Connect failures through `SharedHttp2Connection` keep their own error
+    code.** Failures the transport classified itself (such as the
+    `invalid_argument` scheme check or the establishment timeout) used to reach
+    the caller re-wrapped as `unavailable: h2 send failed: …`; they now arrive
+    with their original code and message. Unclassified connect failures read
+    `h2 connect failed: …` rather than `h2 send failed: …`.
+time: 2026-09-08T16:00:00.000000000+00:00

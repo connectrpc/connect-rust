@@ -61,7 +61,8 @@ serde_json = { workspace = true }
 flate2 = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
-# Envelope framing (`Encoder`/`Decoder` for the 5-byte message header)
+# Envelope framing (`Encoder`/`Decoder` for the 5-byte message header) and
+# `PollSemaphore` for the shared h2 client handle
 tokio-util = { workspace = true, features = ["codec"] }
 
 # Error handling
