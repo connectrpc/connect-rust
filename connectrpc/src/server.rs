@@ -5492,7 +5492,7 @@ mod tests {
 
     /// Over HTTP/1.1 the request body is the connection: a call that ends
     /// early while the client is still sending must leave the connection
-    /// reusable, so the reader drains what the client sends after the
+    /// reusable, so the server drains what the client sends after the
     /// response.
     #[tokio::test]
     async fn http1_early_return_keeps_connection_reusable() {

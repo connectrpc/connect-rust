@@ -1,13 +1,12 @@
 //! Request-body reader cost for client-streaming calls, without a network.
 //!
 //! Envelope-framed messages are fed to `ConnectRpcService` through an
-//! in-memory body, so what is timed is the reader task decoding the body and
-//! passing messages to the handler, plus the call and response around it. A
-//! client and a server sharing one machine would time each other instead.
+//! in-memory body, so what is timed is the handler's request stream decoding
+//! the body, plus the call and response around it. A client and a server
+//! sharing one machine would time each other instead.
 //!
-//! - `light` handlers count 5-byte messages, so the per-message reader and
-//!   channel cost dominates; `real` runs the `BenchService` handler on
-//!   ~100-byte messages.
+//! - `light` handlers count 5-byte messages, so the per-message decoding cost
+//!   dominates; `real` runs the `BenchService` handler on ~100-byte messages.
 //! - `body_ready` hands over one message per body frame that is always ready;
 //!   `body_chunked` hands over 16 KiB frames; `body_yielding` returns pending
 //!   once before every frame, as a network body does between DATA frames.

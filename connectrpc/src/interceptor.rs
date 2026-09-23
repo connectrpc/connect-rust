@@ -147,8 +147,8 @@ pub trait Interceptor: Send + Sync + 'static {
     /// body is read. The default accepts every request.
     ///
     /// Called once per request, on the server only, for every registered
-    /// interceptor in registration order (outermost first), before the body
-    /// is read or a body reader starts, for unary and streaming calls alike.
+    /// interceptor in registration order (outermost first), before any of
+    /// the body is read, for unary and streaming calls alike.
     /// It runs for a path that matches no method too, with
     /// [`spec()`](RequestHead::spec) `None`, ahead of the not-found error.
     /// Returning `Err` stops the chain: no later interceptor's
