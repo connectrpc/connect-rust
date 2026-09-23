@@ -1266,10 +1266,10 @@ HTTP-level fact (e.g. the remote socket address) reads it from
 
 `Interceptor::intercept_head` receives a `RequestHead` — the path, the
 resolved `Spec`, the headers, the protocol, and the request extensions —
-before the server reads any of the body or starts a body reader. It returns
-`Ok(())` to continue or an error to reject. The first rejection ends the
-request: later interceptors' head checks do not run, no interceptor's
-`intercept_unary` or `intercept_streaming` runs (so count or trace
+before the server reads any of the body. It returns `Ok(())` to continue or
+an error to reject. The first rejection ends the request: later
+interceptors' head checks do not run, no interceptor's `intercept_unary` or
+`intercept_streaming` runs (so count or trace
 rejections inside the head check or in a Tower layer), the body is not read,
 and the client gets the error in its protocol's format. As with a Tower
 layer that returns a response without calling the service, an HTTP/2 stream

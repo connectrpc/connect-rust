@@ -1,0 +1,14 @@
+kind: Changed
+body: |-
+    **Client-streaming and bidi handlers receive request messages without a
+    task hand-off per message** ([#298]). The request stream handed to the
+    handler now decodes envelopes from the HTTP body as the handler polls it,
+    instead of being fed through a bounded channel by a reader task spawned
+    for each call, so the body is read only while the handler polls. Whatever
+    the handler leaves unread is still drained in the background, for at most
+    1 MiB and 5 seconds (1 MiB only, on `wasm32`), starting when the request
+    stream ends (the END_STREAM envelope or a decode error) or when the
+    handler drops it.
+
+    [#298]: https://github.com/connectrpc/connect-rust/issues/298
+time: 2026-09-22T12:00:00.000000000+00:00

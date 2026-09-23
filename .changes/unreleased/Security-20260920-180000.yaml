@@ -5,7 +5,7 @@ body: |-
     handler stopped reading its request stream (it returned, an interceptor
     rejected the call, or the request timeout fired), the request-body reader
     kept the partial message it had buffered, its task and the HTTP/2 stream
-    until the client ended the stream or the connection closed. The reader now
+    until the client ended the stream or the connection closed. The server now
     frees the partial message once it sees the handler is gone. It discards
     the rest of the body for at most 5 seconds and 1 MiB (1 MiB only, on
     `wasm32`), also after the END_STREAM envelope or a decode error, and then
