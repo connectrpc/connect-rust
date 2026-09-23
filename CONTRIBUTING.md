@@ -164,6 +164,31 @@ task buffa:unlink   # removes the override; reverts to crates.io / [patch]
 
 The override is gitignored and never reaches CI or `cargo publish`.
 
+## Cargo.lock
+
+The workspace `Cargo.lock` is committed and CI builds with `--locked` (the
+example scripts and `task generate:all` add it when `CI` is set), so a new
+release of a dependency never changes what CI builds
+until a PR bumps the lockfile. Dependabot opens that PR weekly for
+semver-compatible updates (lockfile only; a semver-incompatible upgrade is a
+hand-written `Cargo.toml` change), and the scheduled *Latest dependencies* workflow
+runs the test suite against a fresh `cargo update`, which is what a crate
+depending on `connectrpc` resolves, so a release that breaks downstream users
+is noticed there. The lockfile only governs this
+repository's own builds; crates that depend on `connectrpc` resolve against
+the version requirements in `Cargo.toml` as usual, so keep those floors
+truthful.
+
+To bump one dependency: `cargo update -p <crate>` and commit the lockfile
+change. A buffa bump is `cargo update -p buffa -p buffa-types -p
+buffa-codegen -p buffa-descriptor` followed by `task generate:all`, in the
+same PR, because the generated-code check builds the buffa plugins from the
+tag matching the locked version; the locked version is the regen baseline,
+and the `buffa` requirements in `Cargo.toml` only move when the new code
+needs something the old floor lacks. `task buffa:link` rewrites the lockfile
+to path dependencies; run `task buffa:unlink` and `git restore Cargo.lock`
+before committing.
+
 ## Continuous Integration
 
 GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
@@ -180,8 +205,9 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
   across releases. Use the same dated nightly locally
   (`rustup toolchain install nightly-2026-02-27 -c rustfmt`); bump it
   together with the `fmt` job in `.github/workflows/ci.yml`
-- **Check generated code** — runs `task generate:all` and verifies the
-  checked-in generated directories have no diff
+- **Check generated code** — builds the buffa plugins at the version in
+  `Cargo.lock`, runs `task generate:all`, and verifies the checked-in
+  generated directories have no diff
 - **Documentation** — `cargo doc` with broken-intra-doc-links denied
 - **MSRV** — `cargo check` on the minimum toolchain, read from `rust-version`
   in the workspace `Cargo.toml` so the declaration and the check cannot drift
@@ -192,4 +218,6 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
   `#[cfg(feature = "...")]`-gated or it fails here while passing the
   default-feature suite
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
+- **Latest dependencies** (weekly, separate workflow) — `cargo update` to
+  the newest compatible versions, then the test suite
 - **Conformance (server)** / **Conformance (client)** — full suites
