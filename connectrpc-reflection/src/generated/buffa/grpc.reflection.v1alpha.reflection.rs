@@ -17,9 +17,6 @@ pub struct ServerReflectionRequest {
     pub message_request: ::core::option::Option<
         __buffa::oneof::server_reflection_request::MessageRequest,
     >,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ServerReflectionRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -93,7 +90,6 @@ impl ::buffa::Message for ServerReflectionRequest {
                 }
             }
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -140,7 +136,6 @@ impl ::buffa::Message for ServerReflectionRequest {
                 }
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -227,8 +222,7 @@ impl ::buffa::Message for ServerReflectionRequest {
                 );
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
@@ -236,16 +230,6 @@ impl ::buffa::Message for ServerReflectionRequest {
     fn clear(&mut self) {
         self.host.clear();
         self.message_request = ::core::option::Option::None;
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ServerReflectionRequest {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ServerReflectionRequest";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl<'de> ::serde::Deserialize<'de> for ServerReflectionRequest {
@@ -489,9 +473,6 @@ pub struct ExtensionRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i32"
     )]
     pub extension_number: i32,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ExtensionRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -538,7 +519,6 @@ impl ::buffa::Message for ExtensionRequest {
                 += 1u64
                     + ::buffa::types::int32_encoded_len(self.extension_number) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -554,7 +534,6 @@ impl ::buffa::Message for ExtensionRequest {
         if self.extension_number != 0i32 {
             ::buffa::types::put_int32_field(2u32, self.extension_number, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -582,8 +561,7 @@ impl ::buffa::Message for ExtensionRequest {
                 self.extension_number = ::buffa::types::decode_int32(buf)?;
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
@@ -591,16 +569,6 @@ impl ::buffa::Message for ExtensionRequest {
     fn clear(&mut self) {
         self.containing_type.clear();
         self.extension_number = 0i32;
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ExtensionRequest {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ExtensionRequest";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for ExtensionRequest {
@@ -650,9 +618,6 @@ pub struct ServerReflectionResponse {
     pub message_response: ::core::option::Option<
         __buffa::oneof::server_reflection_response::MessageResponse,
     >,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ServerReflectionResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -745,7 +710,6 @@ impl ::buffa::Message for ServerReflectionResponse {
                 }
             }
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -810,7 +774,6 @@ impl ::buffa::Message for ServerReflectionResponse {
                 }
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -930,8 +893,7 @@ impl ::buffa::Message for ServerReflectionResponse {
                 }
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
@@ -940,16 +902,6 @@ impl ::buffa::Message for ServerReflectionResponse {
         self.valid_host.clear();
         self.original_request = ::buffa::MessageField::none();
         self.message_response = ::core::option::Option::None;
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ServerReflectionResponse {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ServerReflectionResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl<'de> ::serde::Deserialize<'de> for ServerReflectionResponse {
@@ -1176,9 +1128,6 @@ pub struct FileDescriptorResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec"
     )]
     pub file_descriptor_proto: ::buffa::alloc::vec::Vec<::buffa::alloc::vec::Vec<u8>>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for FileDescriptorResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -1217,7 +1166,6 @@ impl ::buffa::Message for FileDescriptorResponse {
         for v in &self.file_descriptor_proto {
             size += 1u64 + ::buffa::types::bytes_encoded_len(v) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -1230,7 +1178,6 @@ impl ::buffa::Message for FileDescriptorResponse {
         for v in &self.file_descriptor_proto {
             ::buffa::types::put_shared_bytes_field(1u32, v, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -1255,24 +1202,13 @@ impl ::buffa::Message for FileDescriptorResponse {
                 self.file_descriptor_proto.push(__elem);
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
         self.file_descriptor_proto.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for FileDescriptorResponse {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.FileDescriptorResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for FileDescriptorResponse {
@@ -1320,9 +1256,6 @@ pub struct ExtensionNumberResponse {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub extension_number: ::buffa::alloc::vec::Vec<i32>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ExtensionNumberResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -1372,7 +1305,6 @@ impl ::buffa::Message for ExtensionNumberResponse {
                 .sum::<u64>();
             size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -1396,7 +1328,6 @@ impl ::buffa::Message for ExtensionNumberResponse {
                 ::buffa::types::encode_int32(v, buf);
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -1457,8 +1388,7 @@ impl ::buffa::Message for ExtensionNumberResponse {
                 }
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
@@ -1466,16 +1396,6 @@ impl ::buffa::Message for ExtensionNumberResponse {
     fn clear(&mut self) {
         self.base_type_name.clear();
         self.extension_number.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ExtensionNumberResponse {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ExtensionNumberResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for ExtensionNumberResponse {
@@ -1513,9 +1433,6 @@ pub struct ListServiceResponse {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub service: ::buffa::alloc::vec::Vec<ServiceResponse>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ListServiceResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -1557,7 +1474,6 @@ impl ::buffa::Message for ListServiceResponse {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -1575,7 +1491,6 @@ impl ::buffa::Message for ListServiceResponse {
             );
             v.write_to(__cache, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -1601,24 +1516,13 @@ impl ::buffa::Message for ListServiceResponse {
                 self.service.push(elem);
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
         self.service.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ListServiceResponse {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ListServiceResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for ListServiceResponse {
@@ -1657,9 +1561,6 @@ pub struct ServiceResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ServiceResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -1696,7 +1597,6 @@ impl ::buffa::Message for ServiceResponse {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -1709,7 +1609,6 @@ impl ::buffa::Message for ServiceResponse {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -1730,24 +1629,13 @@ impl ::buffa::Message for ServiceResponse {
                 ::buffa::types::merge_string(&mut self.name, buf)?;
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
         self.name.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ServiceResponse {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ServiceResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for ServiceResponse {
@@ -1793,9 +1681,6 @@ pub struct ErrorResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub error_message: ::buffa::alloc::string::String,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for ErrorResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -1839,7 +1724,6 @@ impl ::buffa::Message for ErrorResponse {
             size
                 += 1u64 + ::buffa::types::string_encoded_len(&self.error_message) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -1855,7 +1739,6 @@ impl ::buffa::Message for ErrorResponse {
         if !self.error_message.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.error_message, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -1883,8 +1766,7 @@ impl ::buffa::Message for ErrorResponse {
                 ::buffa::types::merge_string(&mut self.error_message, buf)?;
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
@@ -1892,16 +1774,6 @@ impl ::buffa::Message for ErrorResponse {
     fn clear(&mut self) {
         self.error_code = 0i32;
         self.error_message.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for ErrorResponse {
-    const PROTO_FQN: &'static str = "grpc.reflection.v1alpha.ErrorResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for ErrorResponse {

@@ -12,9 +12,6 @@ pub struct HealthCheckRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub service: ::buffa::alloc::string::String,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for HealthCheckRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -51,7 +48,6 @@ impl ::buffa::Message for HealthCheckRequest {
         if !self.service.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.service) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -64,7 +60,6 @@ impl ::buffa::Message for HealthCheckRequest {
         if !self.service.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.service, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -85,24 +80,13 @@ impl ::buffa::Message for HealthCheckRequest {
                 ::buffa::types::merge_string(&mut self.service, buf)?;
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
         self.service.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for HealthCheckRequest {
-    const PROTO_FQN: &'static str = "grpc.health.v1.HealthCheckRequest";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for HealthCheckRequest {
@@ -136,9 +120,6 @@ pub struct HealthCheckResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_default_enum_value"
     )]
     pub status: ::buffa::EnumValue<health_check_response::ServingStatus>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for HealthCheckResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -178,7 +159,6 @@ impl ::buffa::Message for HealthCheckResponse {
                 size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
@@ -194,7 +174,6 @@ impl ::buffa::Message for HealthCheckResponse {
                 ::buffa::types::put_int32_field(1u32, val, buf);
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
         &mut self,
@@ -217,24 +196,13 @@ impl ::buffa::Message for HealthCheckResponse {
                 );
             }
             _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                ::buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
         self.status = ::buffa::EnumValue::from(0);
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for HealthCheckResponse {
-    const PROTO_FQN: &'static str = "grpc.health.v1.HealthCheckResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
     }
 }
 impl ::buffa::json_helpers::ProtoElemJson for HealthCheckResponse {
