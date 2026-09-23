@@ -562,7 +562,6 @@ mod tests {
         // encoded message sits just under MAX_REQUEST_BYTES.
         let request = HealthCheckRequest {
             service: "x".repeat(crate::MAX_REQUEST_BYTES - 8),
-            ..Default::default()
         };
         let config = || ClientConfig::new(format!("http://{addr}").parse().unwrap());
         for (transport, config) in [
