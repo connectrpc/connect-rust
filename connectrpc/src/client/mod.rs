@@ -4963,6 +4963,12 @@ fn parse_grpc_error_from_trailers(trailers: &http::HeaderMap) -> Option<ConnectE
 /// Returns `ResourceExhausted` if the accumulated data exceeds `max_size`,
 /// `DeadlineExceeded` if the body fails after the deadline has passed, and
 /// `Internal` if it fails before.
+///
+/// A body with one non-empty data frame is returned as that frame, without
+/// a copy, so the result may be a slice of the transport's read buffer and
+/// keeps that whole buffer alive while it is held. A body with several
+/// non-empty frames is concatenated into a new buffer that does not alias
+/// the transport.
 async fn collect_body_bounded<B>(
     body: B,
     max_size: usize,
@@ -5021,6 +5027,10 @@ where
         }
     }
 
+    debug_assert!(
+        head.is_none() || joined.is_none(),
+        "head and joined are never both set"
+    );
     Ok(match (head, joined) {
         (_, Some(buf)) => buf.freeze(),
         (Some(first), None) => first,
@@ -9829,12 +9839,13 @@ mod tests {
     }
 
     /// A one-frame body must be handed back by reference count, not copied.
-    /// This is the point of the single-frame path, and nothing else pins it.
+    /// This is the point of the single-frame path. `src` holds the second
+    /// reference, so the pointer comparison cannot pass by coincidence.
     #[tokio::test]
     async fn collect_body_bounded_single_frame_does_not_copy() {
         let src = Bytes::from(vec![9u8; 4096]);
 
-        let got = collect_body_bounded(Full::new(src.clone()), 8192)
+        let got = collect_body_bounded(Full::new(src.clone()), 8192, None)
             .await
             .unwrap();
 
@@ -9845,23 +9856,63 @@ mod tests {
         );
     }
 
-    /// The promotion path still concatenates correctly once a second frame
-    /// arrives, and the result no longer aliases the first frame.
+    /// An empty frame ahead of the only data frame adds nothing, so the data
+    /// frame is still returned by reference count.
     #[tokio::test]
-    async fn collect_body_bounded_multi_frame_promotes() {
+    async fn collect_body_bounded_leading_empty_frame_does_not_copy() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let body = ChannelBody { rx };
-        let first = Bytes::from_static(b"foo");
-        tx.send(Ok(first.clone())).await.unwrap();
-        tx.send(Ok(Bytes::from_static(b"bar"))).await.unwrap();
-        tx.send(Ok(Bytes::from_static(b"baz"))).await.unwrap();
+        let src = Bytes::from(vec![7u8; 64]);
+        tx.send(Ok(Bytes::new())).await.unwrap();
+        tx.send(Ok(src.clone())).await.unwrap();
         drop(tx);
 
-        let got = collect_body_bounded(body, 100).await.unwrap();
-        assert_eq!(&got[..], b"foobarbaz");
+        let got = collect_body_bounded(body, 128, None).await.unwrap();
+        assert_eq!(got, src);
         assert!(
-            !std::ptr::addr_eq(got.as_ptr(), first.as_ptr()),
-            "a promoted body must be a fresh buffer"
+            std::ptr::addr_eq(got.as_ptr(), src.as_ptr()),
+            "an empty frame must not force a copy"
+        );
+    }
+
+    /// An empty frame after the only data frame must not promote the body to
+    /// a buffer either.
+    #[tokio::test]
+    async fn collect_body_bounded_trailing_empty_frame_does_not_copy() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        let src = Bytes::from(vec![7u8; 64]);
+        tx.send(Ok(src.clone())).await.unwrap();
+        tx.send(Ok(Bytes::new())).await.unwrap();
+        drop(tx);
+
+        let got = collect_body_bounded(body, 128, None).await.unwrap();
+        assert_eq!(got, src);
+        assert!(
+            std::ptr::addr_eq(got.as_ptr(), src.as_ptr()),
+            "an empty frame must not force a copy"
+        );
+    }
+
+    /// A body of several frames is joined into a new buffer, even when the
+    /// frames are contiguous slices of one allocation, and a frame after the
+    /// second is appended to it. `base` stays alive, so the address
+    /// comparison cannot pass by coincidence.
+    #[tokio::test]
+    async fn collect_body_bounded_multi_frame_joins_into_a_new_buffer() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        let base = Bytes::from(b"foobarbaz".to_vec());
+        for range in [0..3, 3..6, 6..9] {
+            tx.send(Ok(base.slice(range))).await.unwrap();
+        }
+        drop(tx);
+
+        let got = collect_body_bounded(body, 100, None).await.unwrap();
+        assert_eq!(got, base);
+        assert!(
+            !base[..].as_ptr_range().contains(&got.as_ptr()),
+            "a body of several frames must not alias its first frame"
         );
     }
 

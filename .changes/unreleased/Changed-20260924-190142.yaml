@@ -1,0 +1,14 @@
+kind: Changed
+body: |-
+    **Connect unary and client-streaming responses that arrive in one frame
+    are no longer copied** ([#265]). A response body that arrives whole, which
+    is the common case, is now used as received instead of being copied into
+    a new buffer. With the proto codec, the response `OwnedView` can
+    therefore share memory with the transport's read buffer, and keeps that
+    buffer alive while it is held. `to_owned_message()` does not detach
+    `bytes` fields, which still point into that buffer, so copy those with
+    `Bytes::copy_from_slice` if you keep them long-term. Bodies of several
+    frames are concatenated as before.
+
+    [#265]: https://github.com/connectrpc/connect-rust/pull/265
+time: 2026-09-24T19:01:42.699416714+00:00
