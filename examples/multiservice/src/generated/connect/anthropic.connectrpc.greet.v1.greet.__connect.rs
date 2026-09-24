@@ -54,10 +54,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const GREET_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.greet.v1.GreetService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Greet` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Greet` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const GREET_SERVICE_GREET_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.greet.v1.GreetService/Greet",
         ::connectrpc::StreamType::Unary,
@@ -351,10 +348,14 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -414,7 +415,9 @@ pub struct GreetServiceClient<T> {
 impl<T> GreetServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -463,8 +466,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                GREET_SERVICE_SERVICE_NAME,
-                "Greet",
+                GREET_SERVICE_GREET_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

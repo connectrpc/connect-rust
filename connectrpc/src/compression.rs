@@ -7,11 +7,14 @@
 //! - `gzip` - Gzip compression via flate2 (enabled by default)
 //! - `zstd` - Zstandard compression via zstd (enabled by default)
 //!
-//! # Streaming Compression
-//!
-//! When the `streaming` feature is enabled (default), providers can also
-//! support streaming compression/decompression for handling large payloads
-//! without buffering the entire message in memory.
+//! Compression is always applied a whole message at a time, on every wire
+//! shape. The enveloped framings — Connect streaming, gRPC, and gRPC-Web —
+//! are length-prefixed: the 5-byte header carries the *compressed* length, so
+//! a message must be fully compressed before its own header can be written.
+//! Connect unary has no envelope, just a `content-encoding` body, but that
+//! body is collected in full and size-checked before it is decompressed. So
+//! neither direction ever holds a partial message, and there is no point in
+//! the pipeline at which an incremental compressor could attach.
 //!
 //! # Example
 //!
@@ -53,15 +56,9 @@
 //! ```
 
 use std::collections::HashMap;
-#[cfg(feature = "streaming")]
-use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(feature = "streaming")]
-use tokio::io::AsyncBufRead;
-#[cfg(feature = "streaming")]
-use tokio::io::AsyncRead;
 
 use crate::error::ConnectError;
 
@@ -70,19 +67,14 @@ fn malformed_compressed_payload(message: impl Into<String>) -> ConnectError {
     ConnectError::invalid_argument(message)
 }
 
-// ============================================================================
-// Streaming Types
-// ============================================================================
-
-/// A boxed async reader for streaming compression/decompression.
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send>>;
-
-/// A boxed async buffered reader for streaming input.
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub type BoxedAsyncBufRead = Pin<Box<dyn AsyncBufRead + Send>>;
+/// Whether `s` is an RFC 9110 `token`: one or more `tchar`s. Encoding names
+/// have to be tokens to appear in `content-encoding` / `accept-encoding`
+/// headers, and a token is always a valid `HeaderValue`.
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
 
 /// Trait for compression algorithm implementations.
 ///
@@ -99,8 +91,10 @@ pub type BoxedAsyncBufRead = Pin<Box<dyn AsyncBufRead + Send>>;
 pub trait CompressionProvider: Send + Sync + 'static {
     /// The encoding name for this algorithm.
     ///
-    /// This should match the value used in Content-Encoding headers
-    /// (e.g., "gzip", "zstd", "br").
+    /// This is the value used in Content-Encoding headers (e.g., "gzip",
+    /// "zstd", "br") and must be an HTTP token: non-empty ASCII without
+    /// whitespace, quotes or separators. [`CompressionRegistry::register`]
+    /// panics on a name that is not one.
     fn name(&self) -> &'static str;
 
     /// Compress the given data.
@@ -155,26 +149,6 @@ pub trait CompressionProvider: Send + Sync + 'static {
     }
 }
 
-/// Trait for streaming compression support.
-///
-/// This trait extends [`CompressionProvider`] with streaming methods that
-/// process data incrementally without buffering the entire payload in memory.
-///
-/// Available when the `streaming` feature is enabled (default).
-#[cfg(feature = "streaming")]
-#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-pub trait StreamingCompressionProvider: CompressionProvider {
-    /// Create a streaming decompressor.
-    ///
-    /// Returns an `AsyncRead` that decompresses data from the input reader.
-    fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead;
-
-    /// Create a streaming compressor.
-    ///
-    /// Returns an `AsyncRead` that compresses data from the input reader.
-    fn compress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead;
-}
-
 /// Registry of compression providers.
 ///
 /// The registry maps encoding names to their provider implementations.
@@ -183,12 +157,10 @@ pub trait StreamingCompressionProvider: CompressionProvider {
 #[derive(Clone)]
 pub struct CompressionRegistry {
     providers: Arc<HashMap<&'static str, Arc<dyn CompressionProvider>>>,
-    #[cfg(feature = "streaming")]
-    streaming_providers: Arc<HashMap<&'static str, Arc<dyn StreamingCompressionProvider>>>,
-    /// Cached, sorted, comma-joined list of supported encodings for
-    /// Accept-Encoding headers. Recomputed when providers are registered
-    /// (rather than on every request).
-    accept_encoding: Arc<str>,
+    /// Sorted, comma-joined list of supported encodings as an
+    /// `accept-encoding` header value, rebuilt when providers are registered
+    /// rather than on every request; `None` while no providers are registered.
+    accept_encoding: Option<http::HeaderValue>,
 }
 
 impl std::fmt::Debug for CompressionRegistry {
@@ -207,22 +179,46 @@ impl CompressionRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(HashMap::new()),
-            #[cfg(feature = "streaming")]
-            streaming_providers: Arc::new(HashMap::new()),
-            accept_encoding: Arc::from(""),
+            accept_encoding: None,
         }
     }
 
-    /// Recompute the cached accept-encoding string from the current provider set.
+    /// Recompute the cached accept-encoding value from the current provider set.
     fn rebuild_accept_encoding(&mut self) {
         let mut encodings: Vec<_> = self.providers.keys().copied().collect();
         encodings.sort_unstable();
-        self.accept_encoding = Arc::from(encodings.join(", "));
+        self.accept_encoding = if encodings.is_empty() {
+            None
+        } else {
+            // `register` only admits token names, so the joined list is always
+            // a valid header value.
+            http::HeaderValue::from_str(&encodings.join(", ")).ok()
+        };
+    }
+
+    /// The supported encodings as a ready-made `accept-encoding` /
+    /// `grpc-accept-encoding` header value (sorted, comma-separated), or
+    /// `None` when no providers are registered. Built once when providers
+    /// are registered, so attaching it to a request costs no allocation.
+    #[must_use]
+    pub fn accept_encoding_value(&self) -> Option<&http::HeaderValue> {
+        self.accept_encoding.as_ref()
     }
 
     /// Register a compression provider.
     ///
-    /// Returns self for method chaining.
+    /// Returns self for method chaining. Registering a provider whose
+    /// `name()` matches an existing entry replaces it, so
+    /// `CompressionRegistry::default().register(MyGzip)` overrides the
+    /// built-in gzip.
+    ///
+    /// # Panics
+    ///
+    /// If [`provider.name()`](CompressionProvider::name) is empty or contains
+    /// any byte outside the RFC 9110 `tchar` set (ASCII alphanumerics and
+    /// ``!#$%&'*+-.^_`|~``). Such a name could never be negotiated or carried
+    /// in an encoding header, so it is rejected when the registry is built
+    /// rather than on each request.
     ///
     /// # Example
     ///
@@ -238,8 +234,16 @@ impl CompressionRegistry {
     /// ```
     #[must_use]
     pub fn register<P: CompressionProvider>(mut self, provider: P) -> Self {
+        let name = provider.name();
+        assert!(
+            is_http_token(name),
+            "CompressionProvider::name() returned {name:?} for {}: an encoding name must be a \
+             non-empty HTTP token (ASCII alphanumerics and !#$%&'*+-.^_`|~), because it is sent \
+             in content-encoding and accept-encoding headers",
+            std::any::type_name::<P>()
+        );
         let providers = Arc::make_mut(&mut self.providers);
-        providers.insert(provider.name(), Arc::new(provider));
+        providers.insert(name, Arc::new(provider));
         self.rebuild_accept_encoding();
         self
     }
@@ -264,10 +268,15 @@ impl CompressionRegistry {
 
     /// Get a comma-separated string of supported encodings.
     ///
-    /// Useful for Accept-Encoding headers. The string is computed once when
-    /// providers are registered and cached, so this is a cheap lookup.
+    /// The string form of [`accept_encoding_value`](Self::accept_encoding_value):
+    /// computed once when providers are registered, so this is a cheap
+    /// lookup; empty when no providers are registered. To set a header, use
+    /// `accept_encoding_value`, which needs no re-parse.
     pub fn accept_encoding_header(&self) -> &str {
-        &self.accept_encoding
+        self.accept_encoding
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
     }
 
     /// Negotiate a response encoding based on the client's accept-encoding header.
@@ -367,96 +376,6 @@ impl CompressionRegistry {
 
         provider.compress(data)
     }
-
-    /// Register a streaming compression provider.
-    ///
-    /// This also registers the provider for buffered compression.
-    /// Returns self for method chaining.
-    ///
-    /// Available when the `streaming` feature is enabled.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    #[must_use]
-    pub fn register_streaming<P: StreamingCompressionProvider>(mut self, provider: P) -> Self {
-        let name = provider.name();
-        let provider = Arc::new(provider);
-
-        // Register for both buffered and streaming
-        let providers = Arc::make_mut(&mut self.providers);
-        providers.insert(name, provider.clone());
-
-        let streaming_providers = Arc::make_mut(&mut self.streaming_providers);
-        streaming_providers.insert(name, provider);
-
-        self.rebuild_accept_encoding();
-        self
-    }
-
-    /// Get a streaming provider by encoding name.
-    ///
-    /// Returns `None` if no streaming provider is registered for the given name.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn get_streaming(&self, name: &str) -> Option<Arc<dyn StreamingCompressionProvider>> {
-        self.streaming_providers.get(name).cloned()
-    }
-
-    /// Check if streaming compression is supported for the given encoding name.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn supports_streaming(&self, name: &str) -> bool {
-        self.streaming_providers.contains_key(name)
-    }
-
-    /// Create a streaming decompressor for the specified encoding.
-    ///
-    /// Returns an `AsyncRead` that decompresses data from the input reader.
-    /// Returns an error if the encoding is not supported for streaming.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn decompress_stream(
-        &self,
-        encoding: &str,
-        reader: BoxedAsyncBufRead,
-    ) -> Result<BoxedAsyncRead, ConnectError> {
-        // "identity" means no compression - just return the reader as-is
-        if encoding == "identity" {
-            return Ok(reader);
-        }
-
-        let provider = self.get_streaming(encoding).ok_or_else(|| {
-            ConnectError::unimplemented(format!(
-                "streaming decompression not supported for encoding: {encoding}"
-            ))
-        })?;
-
-        Ok(provider.decompress_stream(reader))
-    }
-
-    /// Create a streaming compressor for the specified encoding.
-    ///
-    /// Returns an `AsyncRead` that compresses data from the input reader.
-    /// Returns an error if the encoding is not supported for streaming.
-    #[cfg(feature = "streaming")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
-    pub fn compress_stream(
-        &self,
-        encoding: &str,
-        reader: BoxedAsyncBufRead,
-    ) -> Result<BoxedAsyncRead, ConnectError> {
-        // "identity" means no compression - just return the reader as-is
-        if encoding == "identity" {
-            return Ok(reader);
-        }
-
-        let provider = self.get_streaming(encoding).ok_or_else(|| {
-            ConnectError::unimplemented(format!(
-                "streaming compression not supported for encoding: {encoding}"
-            ))
-        })?;
-
-        Ok(provider.compress_stream(reader))
-    }
 }
 
 /// Policy controlling when compression is applied.
@@ -472,7 +391,7 @@ impl CompressionRegistry {
 /// use connectrpc::CompressionPolicy;
 ///
 /// // Only compress messages >= 4 KiB
-/// let policy = CompressionPolicy::default().min_size(4096);
+/// let policy = CompressionPolicy::default().with_min_size(4096);
 /// assert!(!policy.should_compress(1024));
 /// assert!(policy.should_compress(8192));
 ///
@@ -518,10 +437,22 @@ impl CompressionPolicy {
     ///
     /// Messages smaller than this (in bytes, before compression) will
     /// be sent uncompressed even if compression is negotiated.
+    ///
+    /// Default: 1 KiB ([`DEFAULT_COMPRESSION_MIN_SIZE`]).
     #[must_use]
-    pub fn min_size(mut self, size: usize) -> Self {
+    pub fn with_min_size(mut self, size: usize) -> Self {
         self.min_size = size;
         self
+    }
+
+    /// The minimum message size, in bytes, before compression is applied.
+    ///
+    /// Set via [`Self::with_min_size`]. This is the threshold alone, so it
+    /// says nothing about whether compression is enabled at all — ask
+    /// [`Self::should_compress`] for the decision about a given message.
+    #[must_use]
+    pub fn min_size(&self) -> usize {
+        self.min_size
     }
 
     /// Check whether compression should be applied for a message of the given size.
@@ -558,23 +489,12 @@ impl Default for CompressionRegistry {
     fn default() -> Self {
         let mut registry = Self::new();
 
-        // When streaming is enabled, use register_streaming to get both capabilities
-        #[cfg(all(feature = "gzip", feature = "streaming"))]
-        {
-            registry = registry.register_streaming(GzipProvider::default());
-        }
-
-        #[cfg(all(feature = "gzip", not(feature = "streaming")))]
+        #[cfg(feature = "gzip")]
         {
             registry = registry.register(GzipProvider::default());
         }
 
-        #[cfg(all(feature = "zstd", feature = "streaming"))]
-        {
-            registry = registry.register_streaming(ZstdProvider::default());
-        }
-
-        #[cfg(all(feature = "zstd", not(feature = "streaming")))]
+        #[cfg(feature = "zstd")]
         {
             registry = registry.register(ZstdProvider::default());
         }
@@ -586,6 +506,29 @@ impl Default for CompressionRegistry {
 // ============================================================================
 // Built-in Providers
 // ============================================================================
+
+/// Bytes the gzip container adds around the deflate stream: a 10-byte header
+/// and an 8-byte CRC32 + ISIZE trailer.
+#[cfg(feature = "gzip")]
+const GZIP_FRAMING_LEN: usize = 18;
+
+/// Hand a finished compressed buffer over as the response frame's `Bytes`,
+/// giving back the slack first when the buffer is mostly slack.
+///
+/// The buffer was sized to the codec's worst-case bound, a little over the
+/// input length, but compressible payloads finish far below that, and
+/// `Bytes::from` keeps the whole allocation alive for as long as the frame
+/// is queued. Shrinking when more than half the buffer is unused bounds
+/// what a queued frame pins to about twice its compressed size; the copy it
+/// costs is at most the compressed length, which is the small case by
+/// construction.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+fn compressed_output(mut output: Vec<u8>) -> Bytes {
+    if output.capacity() > 2 * output.len() {
+        output.shrink_to_fit();
+    }
+    Bytes::from(output)
+}
 
 /// Gzip compression provider with internal state pooling.
 ///
@@ -715,7 +658,19 @@ impl GzipProvider {
         compressor: &mut flate2::Compress,
         data: &[u8],
     ) -> Result<Bytes, ConnectError> {
-        let mut output = Vec::with_capacity(data.len() + 32);
+        // Size the buffer once from deflate's worst case, as zstd's
+        // `compress_bound` does. This is zlib-rs's own conservative bound
+        // (`zlib_rs::deflate::bound`, the non-default-window branch), about
+        // `len * 1.14`; it is at or above every branch that function can
+        // take for flate2's configuration here (raw deflate, 15-bit window)
+        // at every level 0-9, so one call with the whole input and `Finish`
+        // always fits. The fast level this provider defaults to really does
+        // grow incompressible input by a few percent, so the tighter figure
+        // classic zlib quotes for its default parameters would not do. The
+        // buffer becomes the returned `Bytes`, so it is also what a queued
+        // response frame pins until it is written (see `compressed_output`).
+        let deflate_bound = data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
+        let mut output = Vec::with_capacity(GZIP_FRAMING_LEN + deflate_bound);
 
         // Gzip header (RFC 1952): fixed 10 bytes, no optional fields
         output.extend_from_slice(&[
@@ -727,11 +682,17 @@ impl GzipProvider {
             0xff, // OS = unknown
         ]);
 
-        // Deflate-compress the data
+        // Deflate-compress the data. The bound above leaves room for the
+        // whole stream, so the reserve below only fires if it was wrong;
+        // `reserve_exact` so that even then the buffer grows by what is
+        // needed rather than doubling back to the over-allocation this
+        // sizing exists to avoid.
         let start_in = compressor.total_in();
         loop {
             let consumed = (compressor.total_in() - start_in) as usize;
-            output.reserve(output.capacity().max(4096));
+            if output.len() == output.capacity() {
+                output.reserve_exact(4096);
+            }
             let status = compressor
                 .compress_vec(
                     &data[consumed..],
@@ -750,7 +711,7 @@ impl GzipProvider {
         output.extend_from_slice(&crc.sum().to_le_bytes());
         output.extend_from_slice(&(data.len() as u32).to_le_bytes());
 
-        Ok(Bytes::from(output))
+        Ok(compressed_output(output))
     }
 
     fn decompress_inner(
@@ -937,23 +898,6 @@ impl CompressionProvider for GzipProvider {
     }
 }
 
-#[cfg(all(feature = "gzip", feature = "streaming"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "gzip", feature = "streaming"))))]
-impl StreamingCompressionProvider for GzipProvider {
-    fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(async_compression::tokio::bufread::GzipDecoder::new(reader))
-    }
-
-    fn compress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(
-            async_compression::tokio::bufread::GzipEncoder::with_quality(
-                reader,
-                async_compression::Level::Precise(self.level as i32),
-            ),
-        )
-    }
-}
-
 /// Zstandard compression provider with internal compressor pooling.
 ///
 /// Pools `zstd::bulk::Compressor` objects to avoid repeated allocation of
@@ -1095,7 +1039,7 @@ impl CompressionProvider for ZstdProvider {
         let mut compressor = self.take_compressor()?;
         let result = compressor
             .compress(data)
-            .map(Bytes::from)
+            .map(compressed_output)
             .map_err(|e| ConnectError::internal(format!("zstd compression failed: {e}")));
         self.return_compressor(compressor);
         result
@@ -1112,23 +1056,6 @@ impl CompressionProvider for ZstdProvider {
 
     fn decompress_with_limit(&self, data: &[u8], max_size: usize) -> Result<Bytes, ConnectError> {
         Self::decompress_impl(data, Some(max_size))
-    }
-}
-
-#[cfg(all(feature = "zstd", feature = "streaming"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "zstd", feature = "streaming"))))]
-impl StreamingCompressionProvider for ZstdProvider {
-    fn decompress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(async_compression::tokio::bufread::ZstdDecoder::new(reader))
-    }
-
-    fn compress_stream(&self, reader: BoxedAsyncBufRead) -> BoxedAsyncRead {
-        Box::pin(
-            async_compression::tokio::bufread::ZstdEncoder::with_quality(
-                reader,
-                async_compression::Level::Precise(self.level),
-            ),
-        )
     }
 }
 
@@ -1270,29 +1197,21 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "gzip", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_gzip_streaming_honors_level() {
-        use tokio::io::AsyncReadExt;
-        async fn stream_compress(p: &GzipProvider, data: &[u8]) -> Vec<u8> {
-            let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(data.to_vec()));
-            let mut enc = p.compress_stream(reader);
-            let mut out = Vec::new();
-            enc.read_to_end(&mut out).await.unwrap();
-            out
-        }
-        let data = b"hello world, streaming gzip at the configured level".repeat(200);
-        let fast = stream_compress(&GzipProvider::with_level(1), &data).await;
-        let best = stream_compress(&GzipProvider::with_level(9), &data).await;
-        // Both must round-trip via the buffered decoder.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_honors_level() {
+        let data = b"hello world, gzip at the configured level".repeat(200);
+        let fast = GzipProvider::with_level(1).compress(&data).unwrap();
+        let best = GzipProvider::with_level(9).compress(&data).unwrap();
+        // Both must round-trip.
         for c in [&fast, &best] {
             let out = GzipProvider::default()
                 .decompress_with_limit(c, usize::MAX)
                 .unwrap();
             assert_eq!(&out[..], &data[..]);
         }
-        // Level must actually affect output (previously ignored): level 9 on
-        // highly repetitive input compresses strictly smaller than level 1.
+        // Level must actually affect output: level 9 on highly repetitive
+        // input compresses strictly smaller than level 1.
         assert!(
             best.len() < fast.len(),
             "level 9 ({}) should be smaller than level 1 ({})",
@@ -1506,6 +1425,73 @@ mod tests {
         assert!(
             capacity < SMALL_MESSAGE_RETENTION_BOUND,
             "small zstd message retained a {capacity}-byte backing buffer"
+        );
+    }
+
+    /// A compressible 1 MiB payload compresses to a few KiB; the frame that
+    /// carries it must not keep an input-sized working buffer alive behind
+    /// it.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_compress_does_not_retain_the_working_buffer() {
+        let provider = GzipProvider::default();
+        let data = vec![0u8; 1024 * 1024];
+        let compressed = provider.compress(&data).unwrap();
+        let len = compressed.len();
+        assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
+        let capacity = backing_capacity(compressed);
+        assert!(
+            capacity <= 2 * len,
+            "compressed frame of {len} bytes retained a {capacity}-byte buffer"
+        );
+    }
+
+    /// Incompressible input is the worst case for the output bound: the
+    /// frame must still come out at about the input size, not a multiple.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_compress_incompressible_input_is_sized_once() {
+        // A simple LCG: byte-level noise deflate cannot shrink.
+        let mut state = 0x9e37_79b9_u32;
+        let data: Vec<u8> = (0..1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        // The initial sizing, exactly: any capacity above it means the
+        // buffer grew, which is the regression this test exists to catch.
+        // Every level is covered because the bound is claimed for all of
+        // them and only a realloc would betray a level it does not hold for.
+        let sized_once =
+            GZIP_FRAMING_LEN + data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
+        for level in [0, 1, 6, 9] {
+            let provider = GzipProvider::with_level(level);
+            let compressed = provider.compress(&data).unwrap();
+            let len = compressed.len();
+            assert!(len >= data.len(), "noise should not compress: {len} bytes");
+            let capacity = backing_capacity(compressed);
+            assert!(
+                capacity <= sized_once,
+                "level {level}: incompressible frame of {len} bytes retained a \
+                 {capacity}-byte buffer, sized for {sized_once}"
+            );
+        }
+    }
+
+    /// Same as the gzip retention test, for the zstd provider.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_zstd_compress_does_not_retain_the_working_buffer() {
+        let provider = ZstdProvider::default();
+        let data = vec![0u8; 1024 * 1024];
+        let compressed = provider.compress(&data).unwrap();
+        let len = compressed.len();
+        assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
+        let capacity = backing_capacity(compressed);
+        assert!(
+            capacity <= 2 * len,
+            "compressed frame of {len} bytes retained a {capacity}-byte buffer"
         );
     }
 
@@ -1777,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "zstd")]
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
     fn test_decompress_empty_body_with_encoding_header() {
         // Connect spec: "Servers must not attempt to decompress zero-length
         // HTTP request content." Clients may set Content-Encoding but skip
@@ -1824,6 +1810,69 @@ mod tests {
             let registry = CompressionRegistry::new().register(GzipProvider::default());
             assert_eq!(registry.accept_encoding_header(), "gzip");
         }
+    }
+
+    #[test]
+    fn accept_encoding_value_is_none_for_an_empty_registry() {
+        assert!(CompressionRegistry::new().accept_encoding_value().is_none());
+    }
+
+    /// A provider whose only interesting property is its name.
+    struct Named(&'static str);
+
+    impl CompressionProvider for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> {
+            Ok(Bytes::copy_from_slice(data))
+        }
+        fn decompressor<'a>(
+            &self,
+            data: &'a [u8],
+        ) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
+            Ok(Box::new(data))
+        }
+    }
+
+    #[test]
+    fn register_accepts_token_names_and_advertises_them_sorted() {
+        let registry = CompressionRegistry::new()
+            .register(Named("x-snappy"))
+            .register(Named("br"));
+        assert_eq!(registry.accept_encoding_header(), "br, x-snappy");
+        assert_eq!(registry.accept_encoding_value().unwrap(), "br, x-snappy");
+    }
+
+    #[test]
+    fn http_token_rule_matches_rfc9110_tchar() {
+        for good in ["gzip", "br", "x-snappy", "zstd", "A1!#$%&'*+-.^_`|~"] {
+            assert!(is_http_token(good), "{good:?} is a token");
+        }
+        for bad in [
+            "", "my algo", "gzip\n", "gzíp", "a,b", "\"q\"", "a/b", "gzip;q=1",
+        ] {
+            assert!(!is_http_token(bad), "{bad:?} is not a token");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a non-empty HTTP token")]
+    fn register_rejects_a_name_that_is_not_an_http_token() {
+        let _ = CompressionRegistry::new().register(Named("my algo"));
+    }
+
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    #[test]
+    fn accept_encoding_value_tracks_the_header_string() {
+        let registry = CompressionRegistry::new()
+            .register(GzipProvider::default())
+            .register(ZstdProvider::default());
+        assert_eq!(
+            registry.accept_encoding_value().unwrap(),
+            registry.accept_encoding_header()
+        );
+        assert_eq!(registry.accept_encoding_value().unwrap(), "gzip, zstd");
     }
 
     #[cfg(all(feature = "gzip", feature = "zstd"))]
@@ -1916,81 +1965,6 @@ mod tests {
         let decompressed = registry
             .decompress_with_limit("mock", compressed, usize::MAX)
             .unwrap();
-        assert_eq!(&decompressed[..], data);
-    }
-
-    #[cfg(all(feature = "gzip", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_gzip_streaming() {
-        use tokio::io::AsyncReadExt;
-
-        let registry = CompressionRegistry::default();
-        assert!(registry.supports_streaming("gzip"));
-
-        // Create test data
-        let data = b"hello world, this is a test of streaming gzip compression";
-
-        // Compress using buffered method
-        let compressed = registry.compress("gzip", data).unwrap();
-
-        // Decompress using streaming
-        let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(compressed.to_vec()));
-        let mut decompressor = registry.decompress_stream("gzip", reader).unwrap();
-
-        let mut decompressed = Vec::new();
-        decompressor.read_to_end(&mut decompressed).await.unwrap();
-
-        assert_eq!(&decompressed[..], data);
-    }
-
-    #[cfg(all(feature = "zstd", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_zstd_streaming() {
-        use tokio::io::AsyncReadExt;
-
-        let registry = CompressionRegistry::default();
-        assert!(registry.supports_streaming("zstd"));
-
-        // Create test data
-        let data = b"hello world, this is a test of streaming zstd compression";
-
-        // Compress using buffered method
-        let compressed = registry.compress("zstd", data).unwrap();
-
-        // Decompress using streaming
-        let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(compressed.to_vec()));
-        let mut decompressor = registry.decompress_stream("zstd", reader).unwrap();
-
-        let mut decompressed = Vec::new();
-        decompressor.read_to_end(&mut decompressed).await.unwrap();
-
-        assert_eq!(&decompressed[..], data);
-    }
-
-    #[cfg(all(feature = "gzip", feature = "streaming"))]
-    #[tokio::test]
-    async fn test_streaming_compress_decompress_roundtrip() {
-        use tokio::io::AsyncReadExt;
-
-        let registry = CompressionRegistry::default();
-
-        // Create test data
-        let data = b"hello world, this is a roundtrip test of streaming compression";
-
-        // Compress using streaming
-        let input: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(data.to_vec()));
-        let mut compressor = registry.compress_stream("gzip", input).unwrap();
-
-        let mut compressed = Vec::new();
-        compressor.read_to_end(&mut compressed).await.unwrap();
-
-        // Decompress using streaming
-        let reader: BoxedAsyncBufRead = Box::pin(std::io::Cursor::new(compressed));
-        let mut decompressor = registry.decompress_stream("gzip", reader).unwrap();
-
-        let mut decompressed = Vec::new();
-        decompressor.read_to_end(&mut decompressed).await.unwrap();
-
         assert_eq!(&decompressed[..], data);
     }
 
@@ -2093,11 +2067,26 @@ mod tests {
 
     #[test]
     fn test_compression_policy_custom_min_size() {
-        let policy = CompressionPolicy::default().min_size(4096);
+        let policy = CompressionPolicy::default().with_min_size(4096);
         assert!(!policy.should_compress(1024));
         assert!(!policy.should_compress(4095));
         assert!(policy.should_compress(4096));
         assert!(policy.should_compress(8192));
+    }
+
+    /// The threshold must be readable back, not just observable by probing
+    /// `should_compress` either side of it.
+    #[test]
+    fn compression_policy_min_size_reads_back_through_the_accessor() {
+        assert_eq!(
+            CompressionPolicy::default().min_size(),
+            DEFAULT_COMPRESSION_MIN_SIZE
+        );
+        assert_eq!(
+            CompressionPolicy::default().with_min_size(4096).min_size(),
+            4096
+        );
+        assert_eq!(CompressionPolicy::disabled().min_size(), 0);
     }
 
     #[test]
@@ -2109,7 +2098,7 @@ mod tests {
         // min_size=0 compresses even empty bodies — the Connect spec permits
         // this (receivers skip decompression for zero-length content), and
         // conformance runners check that advertised encodings are applied.
-        let zero_min = CompressionPolicy::default().min_size(0);
+        let zero_min = CompressionPolicy::default().with_min_size(0);
         assert!(zero_min.should_compress(0));
 
         let disabled = CompressionPolicy::disabled();

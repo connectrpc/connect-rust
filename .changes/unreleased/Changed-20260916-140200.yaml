@@ -1,0 +1,13 @@
+kind: Changed
+body: |-
+    **`connectrpc::axum::serve_tls` runs on the shared connection driver.**
+    A handler that panics before returning its response now yields a `500`
+    with a Connect `internal` error body and the connection survives, where
+    previously the connection was dropped (HTTP/1.1) or the stream was reset
+    (HTTP/2), as under `axum::serve`. The standalone server's connection
+    defaults now apply, including HTTP/2 adaptive flow-control windows, as do
+    any max connection age / idle / requests, keepalive or stream limits set
+    through `with_connection_config`. Connection tasks are owned by the
+    `Serve` future, so dropping or timing it out aborts live connections
+    instead of leaving them detached.
+time: 2026-09-16T14:02:00.000000000+00:00

@@ -38,10 +38,7 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const BLOAT_ECHO_SERVICE_SERVICE_NAME: &str = "bench.v1.BloatEchoService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Echo` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Echo` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BLOAT_ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BloatEchoService/Echo",
         ::connectrpc::StreamType::Unary,
@@ -327,10 +324,14 @@ impl<T: BloatEchoService> ::connectrpc::Dispatcher for BloatEchoServiceServer<T>
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -390,7 +391,9 @@ pub struct BloatEchoServiceClient<T> {
 impl<T> BloatEchoServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -435,8 +438,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                BLOAT_ECHO_SERVICE_SERVICE_NAME,
-                "Echo",
+                BLOAT_ECHO_SERVICE_ECHO_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

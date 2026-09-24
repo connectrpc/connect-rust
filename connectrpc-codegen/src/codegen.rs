@@ -188,7 +188,9 @@ fn emit_service_files(
     // - OwnedFooView aliases keyed on (package, fqn) (else two files in
     //   the same package collide with E0428);
     // - colliding-alias detection (issue #75) needs full-batch visibility
-    //   because the stitcher mounts sibling files into one module.
+    //   because the stitcher mounts sibling files into one module;
+    // - module-scope service and method identifiers (issue #279), for the
+    //   same reason.
     let mut batch = BatchState {
         colliding_aliases: collect_alias_collisions(proto_file, file_to_generate),
         gate_client_feature: options.gate_client_feature,
@@ -267,8 +269,12 @@ fn emit_service_files(
 /// # Errors
 ///
 /// Returns an error if buffa-codegen fails (e.g. unsupported proto
-/// feature) or if the generated service binding Rust does not parse
-/// under `syn` (indicates a bug in this crate).
+/// feature), if a method input/output type is absent from `proto_file`
+/// (an import missing from the descriptor set), if two services of one
+/// package — or two of their methods — would generate the same Rust
+/// identifier (`XGet` and `X_Get`; `XGet.Foo` and `X.GetFoo`), or if the
+/// generated service binding Rust does not parse under `syn` (indicates a
+/// bug in this crate).
 pub fn generate_files(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -407,7 +413,9 @@ fn inline_companions_into_package_mods(
 /// # Errors
 ///
 /// Errors if any method input/output type is not covered by an extern_path
-/// mapping, or is absent from `proto_file` (missing import).
+/// mapping, or is absent from `proto_file` (missing import), or if two
+/// services of one package — or two of their methods — would generate the
+/// same Rust identifier (`XGet` and `X_Get`; `XGet.Foo` and `X.GetFoo`).
 pub fn generate_services(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -800,16 +808,15 @@ impl<'a> TypeResolver<'a> {
     /// Resolve a proto FQN (e.g. `.google.protobuf.Empty`) to a Rust type-path
     /// string relative to `current_package`.
     ///
-    /// In `require_extern` mode, errors if the path is not absolute or the
-    /// type is absent from the descriptor set. Otherwise falls back to the
-    /// bare type name for unknown types (rustc will point at the use site).
+    /// Errors if the type is absent from the descriptor set, and — in
+    /// `require_extern` mode — if the resolved path is not absolute.
     fn resolve_path(&self, proto_fqn: &str, current_package: &str) -> Result<String> {
         match self.ctx.rust_type_relative(proto_fqn, current_package, 0) {
             Some(path) => {
                 self.check_extern_coverage(proto_fqn, &path)?;
                 Ok(path)
             }
-            None => self.fallback_unresolved(proto_fqn).map(str::to_string),
+            None => Err(self.unresolved_type_error(proto_fqn)),
         }
     }
 
@@ -830,14 +837,21 @@ impl<'a> TypeResolver<'a> {
         Ok(())
     }
 
-    /// Fallback when a FQN is absent from the descriptor set: error in
-    /// `require_extern` mode, otherwise return the bare type name (rustc
-    /// will point at the use site if it's wrong).
-    fn fallback_unresolved<'f>(&self, proto_fqn: &'f str) -> Result<&'f str> {
-        if self.require_extern {
-            anyhow::bail!("type {proto_fqn} not found in descriptor set (missing proto import?)");
-        }
-        Ok(bare_type_name(proto_fqn))
+    /// Error for a proto FQN absent from the descriptor set. Shared by the
+    /// type and view resolution paths so both report the same fix.
+    ///
+    /// The precompiled-set hint is for [`generate_files`] only: protoc
+    /// hands the plugin path a complete import closure, so a plugin user
+    /// has no descriptor set of their own to rebuild.
+    fn unresolved_type_error(&self, proto_fqn: &str) -> anyhow::Error {
+        let hint = if self.require_extern {
+            ""
+        } else {
+            " for a precompiled descriptor set, rebuild it with --include_imports"
+        };
+        anyhow::anyhow!(
+            "type {proto_fqn} not found in descriptor set (missing proto import?{hint})"
+        )
     }
 
     /// Resolve a proto FQN to Rust type-path tokens.
@@ -863,10 +877,7 @@ impl<'a> TypeResolver<'a> {
                     self.check_extern_coverage(proto_fqn, &s.to_package)?;
                     (s.to_package, s.within_package)
                 }
-                None => (
-                    String::new(),
-                    self.fallback_unresolved(proto_fqn)?.to_string(),
-                ),
+                None => return Err(self.unresolved_type_error(proto_fqn)),
             };
         let prefix = if to_package.is_empty() {
             format!("{SENTINEL_MOD}::view")
@@ -878,7 +889,6 @@ impl<'a> TypeResolver<'a> {
 }
 
 /// Last segment of a proto FQN, e.g. `.google.protobuf.Empty` → `"Empty"`.
-/// Fallback for types absent from the resolver context.
 fn bare_type_name(proto_fqn: &str) -> &str {
     proto_fqn
         .strip_prefix('.')
@@ -892,7 +902,6 @@ fn bare_type_name(proto_fqn: &str) -> &str {
 // ConnectRPC service code generation
 // ---------------------------------------------------------------------------
 
-/// Generate ConnectRPC service bindings for a file.
 /// Per-batch dedup state passed through the per-file emission loop.
 #[derive(Default)]
 struct BatchState {
@@ -916,6 +925,13 @@ struct BatchState {
     ///
     /// [#75]: https://github.com/anthropics/connect-rust/issues/75
     colliding_aliases: std::collections::BTreeSet<(String, String)>,
+    /// Per package, identifier → proto producer (`service pkg.Svc in
+    /// x.proto` or `method pkg.Svc.Method in x.proto`) for every
+    /// module-scope item a service stub has emitted so far. Filled and
+    /// consulted by [`check_module_collisions`]; keyed per package because
+    /// every service of a package lands in one Rust module. Message types
+    /// and `Owned*View` aliases share that module but are not tracked here.
+    module_idents: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// Mirrors [`Options::gate_client_feature`]. When `true`, prefix
     /// each emitted `FooClient<T>` struct + `impl` with
     /// `#[cfg(feature = "...")]`. Threaded here so it propagates
@@ -1295,21 +1311,24 @@ fn generate_all_message_encodable_impls(
     Ok(out)
 }
 
-/// Generate code for a single service.
-/// Reject RPC method sets whose generated Rust identifiers collide.
+/// Reject RPC method sets whose generated Rust identifiers collide within
+/// one service.
 ///
-/// Each proto method `Foo` produces both `foo` and `foo_with_options` on the
-/// client. Two methods that normalize to the same snake_case name (e.g.
-/// `GetFoo` and `get_foo`), or one whose snake form equals another's
-/// `_with_options` form, would emit duplicate definitions and fail to
-/// compile with an error pointing at generated code rather than the proto.
+/// Each proto method `Foo` produces `foo` and `foo_with_options` on the
+/// client and the module-scope constant `{SVC}_FOO_SPEC`. Two methods that
+/// normalize to the same snake_case name (e.g. `GetFoo` and `get_foo`), or
+/// one whose snake form equals another's plus a generated suffix (`Get` +
+/// `GetWithOptions`), would emit duplicate definitions
+/// and fail to compile with an error pointing at generated code rather than
+/// the proto. Collisions between services sharing a module are
+/// [`check_module_collisions`]'s job.
 fn check_method_collisions(service_name: &str, service: &ServiceDescriptorProto) -> Result<()> {
     let mut seen: HashMap<String, String> = HashMap::new();
     for m in &service.method {
         let proto_name = m.name.as_deref().unwrap_or("");
         let snake = proto_name.to_snake_case();
-        let with_opts = format!("{snake}_with_options");
-        for ident in [snake.as_str(), with_opts.as_str()] {
+        let idents = [snake.clone(), format!("{snake}_with_options")];
+        for ident in &idents {
             if let Some(prev) = seen.get(ident) {
                 anyhow::bail!(
                     "service {service_name}: RPC methods {prev:?} and {proto_name:?} \
@@ -1317,17 +1336,141 @@ fn check_method_collisions(service_name: &str, service: &ServiceDescriptorProto)
                 );
             }
         }
-        seen.insert(snake, proto_name.to_string());
-        seen.insert(with_opts, proto_name.to_string());
+        for ident in idents {
+            seen.insert(ident, proto_name.to_string());
+        }
     }
     Ok(())
 }
 
+/// The module-scope items [`generate_service`] emits for one service,
+/// named in one place so the emission and the cross-service collision
+/// check ([`check_module_collisions`]) cannot drift apart. The per-method
+/// `{SERVICE}_{METHOD}_SPEC` constants come from
+/// [`method_spec_const_ident`] for the same reason.
+struct ServiceIdents {
+    trait_name: Ident,
+    ext_trait_name: Ident,
+    register_marker_name: Ident,
+    client_name: Ident,
+    server_name: Ident,
+    service_name_const: Ident,
+}
+
+impl ServiceIdents {
+    fn new(service_name: &str) -> Self {
+        let service_upper = service_name.to_upper_camel_case();
+        // `Self` is the only PascalCase Rust keyword, and cannot be a raw
+        // ident; suffix it so `service Self {}` (accepted by protoc)
+        // generates a valid trait. The suffixed derivatives below are
+        // already keyword-safe.
+        let trait_name = if service_upper == "Self" {
+            format_ident!("Self_")
+        } else {
+            format_ident!("{}", service_upper)
+        };
+        Self {
+            trait_name,
+            ext_trait_name: format_ident!("{}Ext", service_upper),
+            register_marker_name: format_ident!("{}RegisterMarker", service_upper),
+            client_name: format_ident!("{}Client", service_upper),
+            server_name: format_ident!("{}Server", service_upper),
+            service_name_const: format_ident!(
+                "{}_SERVICE_NAME",
+                service_name.to_snake_case().to_uppercase()
+            ),
+        }
+    }
+
+    /// Every module-scope identifier, trait first so a whole-service clash
+    /// (`XGet` / `X_Get`) is reported against the name the user recognizes.
+    fn iter(&self) -> impl Iterator<Item = &Ident> {
+        [
+            &self.trait_name,
+            &self.ext_trait_name,
+            &self.register_marker_name,
+            &self.client_name,
+            &self.server_name,
+            &self.service_name_const,
+        ]
+        .into_iter()
+    }
+}
+
+/// Reject a service whose module-scope items collide with one already
+/// claimed by another service of the same package (issue [#279]).
+///
+/// Each service emits its trait, `*Ext`, `*RegisterMarker`, `*Client`,
+/// `*Server`, `*_SERVICE_NAME`, and one `{SERVICE}_{METHOD}_SPEC` per
+/// method, all at module scope; every service in a package shares one
+/// module (the stitcher `include!`s each of the package's companions into
+/// it; `file_per_package` concatenates them). Two services that normalize
+/// to the same name (`XGet` and `X_Get`) duplicate every service-level
+/// item, and two `(service, method)` pairs that split the same words
+/// differently (`XGet.Foo` and `X.GetFoo`) duplicate a `*_SPEC` constant;
+/// [`check_method_collisions`] sees one service at a time and catches
+/// neither. Records this service's identifiers in
+/// [`BatchState::module_idents`] and fails on the first duplicate, naming
+/// both producers, so the error points at the proto rather than at E0428
+/// in generated code.
+///
+/// [#279]: https://github.com/connectrpc/connect-rust/issues/279
+fn check_module_collisions(
+    file: &FileDescriptorProto,
+    full_service_name: &str,
+    service: &ServiceDescriptorProto,
+    idents: &ServiceIdents,
+    batch: &mut BatchState,
+) -> Result<()> {
+    use std::collections::btree_map::Entry;
+
+    let file_name = file.name.as_deref().unwrap_or("");
+    let module = batch
+        .module_idents
+        .entry(file.package.clone().unwrap_or_default())
+        .or_default();
+    // Producers are rendered for the message up front, with their kind
+    // and file, so the user can find both sides without guessing whether
+    // `pkg.XGet.Foo` is a service or a method.
+    let service_items = idents.iter().map(|ident| {
+        (
+            ident.to_string(),
+            format!("service {full_service_name} in {file_name}"),
+        )
+    });
+    let method_items = service.method.iter().map(|m| {
+        let method_name = m.name.as_deref().unwrap_or("");
+        (
+            method_spec_const_ident(service, method_name).to_string(),
+            format!("method {full_service_name}.{method_name} in {file_name}"),
+        )
+    });
+    for (ident, producer) in service_items.chain(method_items) {
+        match module.entry(ident) {
+            Entry::Occupied(prev) if *prev.get() == producer => anyhow::bail!(
+                "{producer} was generated twice; is {file_name} listed more than \
+                 once in the files to generate?"
+            ),
+            Entry::Occupied(prev) => anyhow::bail!(
+                "{} and {producer} both generate Rust identifier `{}`; \
+                 rename one in the proto",
+                prev.get(),
+                prev.key()
+            ),
+            Entry::Vacant(slot) => {
+                slot.insert(producer);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Generate code for a single service.
 fn generate_service(
     file: &FileDescriptorProto,
     service: &ServiceDescriptorProto,
     resolver: &TypeResolver<'_>,
-    batch: &BatchState,
+    batch: &mut BatchState,
 ) -> Result<TokenStream> {
     let package = file.package.as_deref().unwrap_or("");
     let service_name = service.name.as_deref().unwrap_or("");
@@ -1339,23 +1482,16 @@ fn generate_service(
     } else {
         format!("{package}.{service_name}")
     };
-    let service_upper = service_name.to_upper_camel_case();
-    // `Self` is the only PascalCase Rust keyword, and cannot be a raw ident;
-    // suffix it so `service Self {}` (accepted by protoc) generates a valid
-    // trait. The suffixed derivatives below are already keyword-safe.
-    let trait_name = if service_upper == "Self" {
-        format_ident!("Self_")
-    } else {
-        format_ident!("{}", service_upper)
-    };
-    let ext_trait_name = format_ident!("{}Ext", service_upper);
-    let register_marker_name = format_ident!("{}RegisterMarker", service_upper);
-    let client_name = format_ident!("{}Client", service_upper);
-    let server_name = format_ident!("{}Server", service_upper);
-    let service_name_const = format_ident!(
-        "{}_SERVICE_NAME",
-        service_name.to_snake_case().to_uppercase()
-    );
+    let idents = ServiceIdents::new(service_name);
+    check_module_collisions(file, &full_service_name, service, &idents, batch)?;
+    let ServiceIdents {
+        trait_name,
+        ext_trait_name,
+        register_marker_name,
+        client_name,
+        server_name,
+        service_name_const,
+    } = idents;
 
     // Get service documentation and append async impl guidance
     let service_doc = get_service_comment(file, service).unwrap_or_default();
@@ -1566,15 +1702,7 @@ fn generate_service(
     let client_methods: Vec<TokenStream> = service
         .method
         .iter()
-        .map(|m| {
-            generate_client_method(
-                &service_name_const,
-                &full_service_name,
-                m,
-                resolver,
-                package,
-            )
-        })
+        .map(|m| generate_client_method(service, &full_service_name, m, resolver, package))
         .collect::<Result<Vec<_>>>()?;
 
     // Generate monomorphic FooServiceServer<T> dispatcher.
@@ -1600,10 +1728,14 @@ fn generate_service(
     let client_doc = format!(
         r#"Client for this service.
 
-Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-`Http2Connection` — it has honest `poll_ready` and composes with
-`tower::balance` for multi-connection load balancing. For **Connect
-over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+Generic over `T: ClientTransport` whose response body error type
+converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+transports qualify; a function generic over this client must repeat that
+bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+Into<Box<dyn std::error::Error + Send + Sync>>`). For
+**gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+and composes with `tower::balance` for multi-connection load balancing.
+For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 
 # Example (gRPC / HTTP/2)
 
@@ -1672,8 +1804,9 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
     };
 
     // Per-method `Spec` constants. Stable, allocation-free metadata that the
-    // dispatcher threads into `RequestContext::spec` and that user code can
-    // reference directly (e.g. for tracing labels or routing tables).
+    // dispatcher threads into `RequestContext::spec`, that generated client
+    // methods pass to `call_*` (with `origin` flipped to `Client`), and that
+    // user code can reference directly.
     let spec_consts = generate_spec_consts(&full_service_name, service);
 
     Ok(quote! {
@@ -1748,7 +1881,7 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
         impl<T> #client_name<T>
         where
             T: ::connectrpc::client::ClientTransport,
-            <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+            <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<Box<dyn ::std::error::Error + Send + Sync>>,
         {
             /// Create a new client with the given transport and configuration.
             pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -1770,12 +1903,10 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
     })
 }
 
-/// Construct the identifier for a per-method `Spec` constant.
-///
-/// The name is derived from the service and method names, e.g.
-/// `ELIZA_SERVICE_SAY_SPEC` for `ElizaService.Say`. Lives at module scope so
-/// both the server dispatcher and (later) the generated client can reference
-/// the same constant.
+/// Construct the identifier for the per-method `Spec` constant,
+/// `{SERVICE}_{METHOD}_SPEC`, e.g. `ELIZA_SERVICE_SAY_SPEC` for
+/// `ElizaService.Say`. Referenced by the generated `Dispatcher::lookup` and,
+/// with `.with_origin(SpecOrigin::Client)`, by generated client methods.
 fn method_spec_const_ident(service: &ServiceDescriptorProto, method_name: &str) -> Ident {
     let service_name = service.name.as_deref().unwrap_or("");
     format_ident!(
@@ -1788,11 +1919,10 @@ fn method_spec_const_ident(service: &ServiceDescriptorProto, method_name: &str) 
 /// Emit one `pub const … : ::connectrpc::Spec` per method.
 ///
 /// Each constant captures the method's procedure path, stream type, and
-/// idempotency level. Constructed via `Spec::server(...)` so
-/// `Spec::origin == SpecOrigin::Server`; a future generated client will
-/// emit a sibling constant via `Spec::client(...)`. The constants are
-/// referenced by the generated `Dispatcher::lookup` impl and are also
-/// stable public API for user code.
+/// idempotency level, constructed via `Spec::server(...)`. It is the single
+/// source of a method's static facts: the dispatcher surfaces it on
+/// `RequestContext::spec`, and generated client methods pass the same
+/// constant with `origin` flipped to `Client`.
 fn generate_spec_consts(
     full_service_name: &str,
     service: &ServiceDescriptorProto,
@@ -1821,14 +1951,14 @@ fn generate_spec_consts(
                 }
                 _ => quote! { ::connectrpc::IdempotencyLevel::Unknown },
             };
-            let doc = format!(
-                "Static [`Spec`](::connectrpc::Spec) for the server-side `{method_name}` RPC.\n\n\
-                 The dispatcher surfaces this on\n\
-                 [`RequestContext::spec`](::connectrpc::RequestContext::spec)."
-            );
-            let doc_tokens = doc_attrs(&doc);
+            let doc = doc_attrs(&format!(
+                "Static [`Spec`](::connectrpc::Spec) for the `{method_name}` RPC, as seen \
+                 by the server; the generated client passes it with \
+                 [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with \
+                 [`Spec::same_method`](::connectrpc::Spec::same_method))."
+            ));
             quote! {
-                #doc_tokens
+                #doc
                 pub const #spec_const: ::connectrpc::Spec =
                     ::connectrpc::Spec::server(#procedure, #stream_type)
                         .with_idempotency_level(#idempotency_level);
@@ -2241,13 +2371,17 @@ fn generate_trait_method(
 /// ClientConfig defaults, so the no-options variant still picks up any
 /// client-wide defaults the user configured.
 fn generate_client_method(
-    service_name_const: &Ident,
+    service: &ServiceDescriptorProto,
     full_service_name: &str,
     method: &MethodDescriptorProto,
     resolver: &TypeResolver<'_>,
     package: &str,
 ) -> Result<TokenStream> {
     let method_name = method.name.as_deref().unwrap_or("");
+    // The method's module-scope `*_SPEC` constant, passed to the runtime with
+    // `origin` flipped to `Client` (see `generate_spec_consts`).
+    let spec_const = method_spec_const_ident(service, method_name);
+    let client_spec = quote! { #spec_const.with_origin(::connectrpc::SpecOrigin::Client) };
     let method_snake = make_field_ident(&method_name.to_snake_case());
     let method_with_opts = format_ident!("{}_with_options", method_name.to_snake_case());
     let input_type = resolver.rust_type(method.input_type.as_deref().unwrap_or(""), package)?;
@@ -2300,7 +2434,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_client_stream(
                 &self.transport, &self.config,
-                #service_name_const, #method_name,
+                #client_spec,
                 requests, options,
             ).await
         };
@@ -2321,7 +2455,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_bidi_stream(
                 &self.transport, &self.config,
-                #service_name_const, #method_name, options,
+                #client_spec, options,
             ).await
         };
         short_args = quote! {};
@@ -2338,7 +2472,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_server_stream(
                 &self.transport, &self.config,
-                #service_name_const, #method_name,
+                #client_spec,
                 request, options,
             ).await
         };
@@ -2356,7 +2490,7 @@ fn generate_client_method(
         call_body = quote! {
             ::connectrpc::client::call_unary(
                 &self.transport, &self.config,
-                #service_name_const, #method_name,
+                #client_spec,
                 request, options,
             ).await
         };
@@ -2588,11 +2722,11 @@ mod tests {
         let resolver = TypeResolver::new(files, &target_name, &config, require_extern);
         let file = &files[target_idx];
         let service = &file.service[0];
-        let batch = BatchState {
+        let mut batch = BatchState {
             colliding_aliases: collect_alias_collisions(files, &target_name),
             ..BatchState::default()
         };
-        Ok(generate_service(file, service, &resolver, &batch)?.to_string())
+        Ok(generate_service(file, service, &resolver, &mut batch)?.to_string())
     }
 
     /// Assert that `formatted` (a Rust source string) contains no `use`
@@ -3536,6 +3670,90 @@ mod tests {
     }
 
     #[test]
+    fn missing_descriptor_type_errors_on_build_script_path() {
+        // A descriptor set built without `--include_imports` carries the
+        // service but not the imported request type. The build-script path
+        // must fail here rather than emit a reference to a type that exists
+        // nowhere (issue #244).
+        let file = minimal_file(
+            Some("example.v1"),
+            ".dep.v1.Dep",
+            ".example.v1.PingResp",
+            &["PingResp"],
+        );
+        let err = generate_files(
+            std::slice::from_ref(&file),
+            &["ping.proto".into()],
+            &Options::default(),
+        )
+        .expect_err("a dangling method type must not generate successfully");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".dep.v1.Dep") && msg.contains("descriptor set"),
+            "error message should name the missing type: {msg}"
+        );
+        assert!(
+            msg.contains("--include_imports"),
+            "error message should point at the precompiled-set fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn imported_type_outside_file_to_generate_still_resolves() {
+        // The strictness above keys on presence in the descriptor set, not
+        // on membership in `file_to_generate`: an imported proto carried by
+        // the set resolves even though no code is generated for it here.
+        // This is how every WKT reference works, so it must keep working.
+        let wkt = FileDescriptorProto {
+            name: Some("google/protobuf/empty.proto".into()),
+            package: Some("google.protobuf".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Empty".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let svc = minimal_file(
+            Some("example.v1"),
+            ".google.protobuf.Empty",
+            ".example.v1.PingResp",
+            &["PingResp"],
+        );
+        let generated = generate_files(&[wkt, svc], &["ping.proto".into()], &Options::default())
+            .expect("an imported type present in the set resolves");
+        let all: String = generated.iter().map(|f| f.content.as_str()).collect();
+        assert!(
+            all.contains("buffa_types :: google :: protobuf :: Empty")
+                || all.contains("buffa_types::google::protobuf::Empty"),
+            "imported WKT should resolve through its extern mapping: {all}"
+        );
+    }
+
+    #[test]
+    fn missing_descriptor_type_on_plugin_path_omits_precompiled_hint() {
+        // protoc hands the plugin a complete import closure, so a plugin
+        // user has no descriptor set of their own to rebuild — only the
+        // missing-import half of the message applies.
+        let file = minimal_file(
+            Some("example.v1"),
+            ".dep.v1.Dep",
+            ".example.v1.PingResp",
+            &["PingResp"],
+        );
+        let extern_paths = [(".".into(), "crate::proto".into())];
+        let err = gen_service(std::slice::from_ref(&file), 0, &extern_paths, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".dep.v1.Dep") && msg.contains("missing proto import"),
+            "error message should name the missing type: {msg}"
+        );
+        assert!(
+            !msg.contains("--include_imports"),
+            "precompiled-set hint does not apply to the plugin path: {msg}"
+        );
+    }
+
+    #[test]
     fn keyword_package_escaped() {
         // `google.type` -> `google::r#type` via idents::rust_path_to_tokens.
         let file = minimal_file(
@@ -3658,6 +3876,213 @@ mod tests {
         syn::parse_str::<syn::File>(&code).expect("generated code parses");
     }
 
+    /// Build a proto file holding several services, each with the given
+    /// method names, all typed `Empty` -> `Empty`. Used for the cross-service
+    /// collision tests, where the service and method *names* are what's
+    /// under test.
+    fn services_file(
+        name: &str,
+        package: &str,
+        services: &[(&str, &[&str])],
+    ) -> FileDescriptorProto {
+        let empty = format!(".{package}.Empty");
+        let service = services
+            .iter()
+            .map(|(service_name, method_names)| ServiceDescriptorProto {
+                name: Some((*service_name).into()),
+                method: method_names
+                    .iter()
+                    .map(|n| MethodDescriptorProto {
+                        name: Some((*n).into()),
+                        input_type: Some(empty.clone()),
+                        output_type: Some(empty.clone()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        FileDescriptorProto {
+            name: Some(name.into()),
+            package: Some(package.into()),
+            service,
+            message_type: vec![DescriptorProto {
+                name: Some("Empty".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Run `files` through the unified generation path exactly as the plugin
+    /// does, returning the error message for a batch that must be rejected.
+    fn generate_files_err(files: &[FileDescriptorProto]) -> String {
+        let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
+        generate_files(files, &targets, &Options::default())
+            .expect_err("a colliding batch must fail generation")
+            .to_string()
+    }
+
+    /// `XGet.Foo` and `X.GetFoo` are distinct (service, method) pairs whose
+    /// `{SERVICE}_{METHOD}_SPEC` constants coincide (issue #279); the
+    /// message must name both producers and the shared identifier.
+    #[test]
+    fn spec_const_collision_across_services_errors() {
+        let file = services_file(
+            "pkg.proto",
+            "pkg",
+            &[("XGet", &["Foo"]), ("X", &["GetFoo"])],
+        );
+        let msg = generate_files_err(std::slice::from_ref(&file));
+        assert_eq!(
+            msg,
+            "method pkg.XGet.Foo in pkg.proto and method pkg.X.GetFoo in pkg.proto both \
+             generate Rust identifier `X_GET_FOO_SPEC`; rename one in the proto"
+        );
+    }
+
+    /// `XGet` and `X_Get` are distinct proto service names that normalize to
+    /// the same Rust name, duplicating every service-level item; the error
+    /// names the trait, the identifier a user recognises as the service.
+    #[test]
+    fn service_name_collision_across_services_errors() {
+        let file = services_file(
+            "pkg.proto",
+            "pkg",
+            &[("XGet", &["Foo"]), ("X_Get", &["Bar"])],
+        );
+        let msg = generate_files_err(std::slice::from_ref(&file));
+        assert_eq!(
+            msg,
+            "service pkg.XGet in pkg.proto and service pkg.X_Get in pkg.proto both \
+             generate Rust identifier `XGet`; rename one in the proto"
+        );
+    }
+
+    /// The stitcher mounts every companion of a package into one module, so
+    /// the collision is just as real when the two services live in different
+    /// proto files — the check must be batch-wide, not per file.
+    #[test]
+    fn spec_const_collision_across_files_in_one_package_errors() {
+        let files = [
+            services_file("a.proto", "pkg", &[("XGet", &["Foo"])]),
+            // `b.proto` reuses `a.proto`'s `Empty` rather than redefining
+            // it, so the descriptor set is one protoc would accept.
+            FileDescriptorProto {
+                message_type: vec![],
+                dependency: vec!["a.proto".into()],
+                ..services_file("b.proto", "pkg", &[("X", &["GetFoo"])])
+            },
+        ];
+        let msg = generate_files_err(&files);
+        assert!(
+            msg.contains("in a.proto and method pkg.X.GetFoo in b.proto"),
+            "{msg}"
+        );
+    }
+
+    /// A proto listed twice in the files to generate is emitted twice into
+    /// the same module; that is not a naming collision, and the message
+    /// must say what to fix instead of telling the user to rename a service
+    /// that clashes with itself.
+    #[test]
+    fn file_listed_twice_is_reported_as_such() {
+        let file = services_file("pkg.proto", "pkg", &[("X", &["Foo"])]);
+        let targets = vec!["pkg.proto".to_string(), "pkg.proto".to_string()];
+        let msg = generate_files(std::slice::from_ref(&file), &targets, &Options::default())
+            .expect_err("a twice-listed proto must fail generation")
+            .to_string();
+        assert_eq!(
+            msg,
+            "service pkg.X in pkg.proto was generated twice; is pkg.proto listed more \
+             than once in the files to generate?"
+        );
+    }
+
+    /// A service named after another's generated item (`Foo` + `FooClient`)
+    /// is the likeliest real-world clash; the blame names the trait side so
+    /// the user sees which service owns the `FooClient` name.
+    #[test]
+    fn service_named_after_sibling_client_struct_errors() {
+        let file = services_file(
+            "pkg.proto",
+            "pkg",
+            &[("Foo", &["Ping"]), ("FooClient", &["Ping"])],
+        );
+        let msg = generate_files_err(std::slice::from_ref(&file));
+        assert_eq!(
+            msg,
+            "service pkg.Foo in pkg.proto and service pkg.FooClient in pkg.proto both \
+             generate Rust identifier `FooClient`; rename one in the proto"
+        );
+    }
+
+    /// The plugin path (`generate_services` under `file_per_package`) groups
+    /// stubs by package through its own code, not the stitcher; the check
+    /// must reject the same batch there.
+    #[test]
+    fn plugin_path_rejects_cross_service_collision() {
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,file_per_package".into()),
+            file_to_generate: vec!["a.proto".into(), "b.proto".into()],
+            proto_file: vec![
+                services_file("a.proto", "pkg", &[("XGet", &["Foo"])]),
+                FileDescriptorProto {
+                    message_type: vec![],
+                    dependency: vec!["a.proto".into()],
+                    ..services_file("b.proto", "pkg", &[("X", &["GetFoo"])])
+                },
+            ],
+            ..Default::default()
+        };
+        let msg = generate(&request)
+            .expect_err("the plugin must refuse a colliding batch")
+            .to_string();
+        assert!(msg.contains("`X_GET_FOO_SPEC`"), "{msg}");
+    }
+
+    /// Packages are separate Rust modules, so identical identifiers in two
+    /// packages are not a collision; the check must be keyed per package,
+    /// not across the whole batch.
+    #[test]
+    fn same_identifiers_in_different_packages_do_not_collide() {
+        let files = [
+            services_file("a.proto", "alpha", &[("XGet", &["Foo"])]),
+            services_file("b.proto", "beta", &[("X", &["GetFoo"])]),
+        ];
+        let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
+        let out = generate_files(&files, &targets, &Options::default())
+            .expect("distinct packages must not be reported as colliding");
+        let consts = out
+            .iter()
+            .filter(|f| f.kind == GeneratedFileKind::Companion)
+            .map(|f| f.content.matches("pub const X_GET_FOO_SPEC:").count())
+            .sum::<usize>();
+        assert_eq!(consts, 2, "one constant per package module");
+    }
+
+    /// Two services that merely share a prefix (`X` / `XGet`) produce
+    /// distinct identifiers throughout and must keep generating.
+    #[test]
+    fn shared_prefix_services_do_not_collide() {
+        let file = services_file("pkg.proto", "pkg", &[("X", &["Foo"]), ("XGet", &["Bar"])]);
+        let targets = vec!["pkg.proto".to_string()];
+        let out = generate_files(std::slice::from_ref(&file), &targets, &Options::default())
+            .expect("a shared prefix is not a collision");
+        let companion = out
+            .iter()
+            .find(|f| f.kind == GeneratedFileKind::Companion)
+            .expect("service file emitted");
+        for ident in [
+            "X_FOO_SPEC",
+            "X_GET_BAR_SPEC",
+            "pub trait X:",
+            "pub trait XGet:",
+        ] {
+            assert!(companion.content.contains(ident), "missing {ident}");
+        }
+    }
+
     #[test]
     fn options_default_buffa_config() {
         let cfg = Options::default().to_buffa_config();
@@ -3760,13 +4185,14 @@ mod tests {
         let target = file.name.clone().into_iter().collect::<Vec<_>>();
         let resolver = TypeResolver::new(std::slice::from_ref(&file), &target, &config, false);
         let service = &file.service[0];
-        let batch = BatchState {
+        let mut batch = BatchState {
             colliding_aliases: collect_alias_collisions(std::slice::from_ref(&file), &target),
             gate_client_feature,
             client_feature_name: client_feature_name.to_string(),
             ..BatchState::default()
         };
-        format_token_stream(&generate_service(&file, service, &resolver, &batch).unwrap()).unwrap()
+        format_token_stream(&generate_service(&file, service, &resolver, &mut batch).unwrap())
+            .unwrap()
     }
 
     #[test]
@@ -4870,6 +5296,9 @@ mod tests {
         assert!(say.contains(r#""/pkg.EchoService/Say""#), "{say}");
         assert!(say.contains("StreamType::Unary"), "{say}");
         assert!(say.contains("IdempotencyLevel::NoSideEffects"), "{say}");
+        // One constant per method: no client sibling is emitted.
+        assert!(!say.contains("CLIENT_SPEC"), "{say}");
+        assert!(!say.contains("Spec::client("), "{say}");
 
         let subscribe = render(&consts[1]);
         assert!(
@@ -4887,6 +5316,50 @@ mod tests {
 
         let chat = render(&consts[3]);
         assert!(chat.contains("StreamType::BidiStream"), "{chat}");
+    }
+
+    /// `Get` + `GetSpec` do not collide: their constants are `X_GET_SPEC` and
+    /// `X_GET_SPEC_SPEC`, and `get_spec` is only ever a client method name.
+    /// Methods named `Client` and `Spec` are ordinary too.
+    #[test]
+    fn spec_const_names_do_not_collide_with_method_names() {
+        let m = |name: &str| MethodDescriptorProto {
+            name: Some(name.into()),
+            input_type: Some(".pkg.Req".into()),
+            output_type: Some(".pkg.Resp".into()),
+            ..Default::default()
+        };
+        let service = ServiceDescriptorProto {
+            name: Some("X".into()),
+            method: vec![m("Get"), m("GetSpec"), m("Put"), m("Client"), m("Spec")],
+            ..Default::default()
+        };
+        check_method_collisions("X", &service).unwrap();
+    }
+
+    /// Generated client methods identify the RPC to the runtime by the
+    /// module-scope `*_SPEC` constant with `origin` flipped to `Client`, not
+    /// by service/method strings.
+    #[test]
+    fn client_methods_pass_spec_const_as_client() {
+        let out = format_minimal_service(false);
+        assert!(
+            !out.contains("CLIENT_SPEC"),
+            "no client sibling const: {out}"
+        );
+        // The unary call site: transport, config, then the const as client.
+        let call = out
+            .find("::connectrpc::client::call_unary(")
+            .expect("minimal service has a unary client method");
+        let window = &out[call..(call + 240).min(out.len())];
+        assert!(
+            window.contains("PING_SERVICE_PING_SPEC.with_origin(::connectrpc::SpecOrigin::Client)"),
+            "call_unary must receive the Spec const with client origin:\n{window}"
+        );
+        assert!(
+            !window.contains("PING_SERVICE_SERVICE_NAME"),
+            "the (service, method) string pair is gone from client call sites:\n{window}"
+        );
     }
 
     #[test]

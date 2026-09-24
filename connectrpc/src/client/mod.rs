@@ -6,7 +6,7 @@
 //!
 //! | Transport | Protocol | Use when |
 //! |---|---|---|
-//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** Honest `poll_ready`, composes with `tower::balance`. |
+//! | [`SharedHttp2Connection`] | HTTP/2 only | **Default for gRPC.** One multiplexed connection with automatic reconnect; honest `poll_ready`, composes with `tower::balance`. |
 //! | [`HttpClient`] | HTTP/1.1 + HTTP/2 (ALPN) | Connect protocol over h/1.1, or you genuinely don't know which protocol the server speaks. |
 //!
 //! # For gRPC: `SharedHttp2Connection`
@@ -47,9 +47,11 @@
 //! // for dynamic load-aware routing. See the http2 module docs.
 //! ```
 //!
-//! Because `Http2Connection::poll_ready` honestly reports connection state
-//! (connecting / closed / ready), `tower::balance` can route around
-//! failed connections and p2c can make useful decisions.
+//! Because `poll_ready` on both `Http2Connection` and its shared handle
+//! reflects connection state (pending while connecting; a failed connect is
+//! reported by the next call instead of hanging, and retried on the next
+//! `poll_ready`), `tower::balance` keeps steering by load around a connection
+//! that is down and p2c can make useful decisions.
 //!
 //! # For Connect over HTTP/1.1: `HttpClient`
 //!
@@ -173,10 +175,13 @@ use crate::codec::header as connect_header;
 use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
 use crate::envelope::Envelope;
+use crate::envelope::EnvelopeAssembler;
 use crate::error::ConnectError;
 use crate::error::ErrorCode;
 use crate::error::ErrorDetail;
 use crate::protocol::Protocol;
+use crate::protocol::hdr;
+use crate::spec::{Spec, SpecOrigin, StreamType};
 
 /// Type alias for a boxed future, used in service implementations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -198,10 +203,12 @@ pub fn full_body(b: Bytes) -> ClientBody {
 
 /// Walk an error's `source()` chain looking for a [`ConnectError`].
 ///
-/// Boxed trait objects cannot appear as links in the chain: `Box<dyn Error>`
-/// does not itself implement `Error` (the blanket impl requires a sized
-/// type), so every link is a concrete error type and a plain `downcast_ref`
-/// at each link is exhaustive.
+/// A plain `downcast_ref` at each link is exhaustive as long as no link is a
+/// sized smart-pointer wrapper: `Box<dyn Error>` does not itself implement
+/// `Error` (the blanket impl requires a sized type), so a boxed cause is
+/// stored and walked as the concrete type behind it. `ConnectError`'s own
+/// `Arc`'d source is surfaced by dereferencing (`&**arc`), so that link too
+/// carries the wrapped type's vtable rather than `Arc`'s.
 fn find_connect_error_in_chain(
     mut err: &(dyn std::error::Error + 'static),
 ) -> Option<ConnectError> {
@@ -222,13 +229,15 @@ fn find_connect_error_in_chain(
 /// Both built-in transports already produce classified `ConnectError`s
 /// directly, so for them `context` never appears in the surfaced error.
 /// Errors with no `ConnectError` in their chain are wrapped as `unavailable`
-/// with the `context` prefix.
+/// with the `context` prefix; the original error is retained as the
+/// returned `ConnectError`'s `source()` so its cause (DNS failure,
+/// connection reset, timeout, ...) isn't lost.
 fn map_transport_send_error<E>(err: E, context: &str) -> ConnectError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     find_connect_error_in_chain(&err)
-        .unwrap_or_else(|| ConnectError::unavailable(format!("{context}: {err}")))
+        .unwrap_or_else(|| ConnectError::unavailable_from_transport(context, err))
 }
 
 /// Extra slack added to client-side response buffer caps beyond the message
@@ -237,6 +246,23 @@ where
 /// generous: the gRPC best-practices guide recommends keeping metadata
 /// under 8 KiB per header set.
 const RESPONSE_BUFFER_TRAILER_SLACK: usize = 64 * 1024;
+
+/// Largest gRPC-Web trailer frame payload the client accepts. Caps what a
+/// malicious server can make the client allocate for trailer metadata; 1 MiB
+/// is generous for a trailer block. Distinct from
+/// [`RESPONSE_BUFFER_TRAILER_SLACK`], which only sizes the unary buffer.
+const MAX_GRPC_WEB_TRAILER_SIZE: usize = 1024 * 1024;
+
+/// The envelope assembler for a streaming response body.
+fn response_assembler(protocol: Protocol, max_message_size: usize) -> EnvelopeAssembler {
+    let assembler = EnvelopeAssembler::new(max_message_size);
+    match protocol {
+        // The trailer frame is metadata, bounded by the trailer parser's own
+        // limit rather than the message size.
+        Protocol::GrpcWeb => assembler.with_grpc_web_trailer_limit(MAX_GRPC_WEB_TRAILER_SIZE),
+        _ => assembler,
+    }
+}
 
 /// Return the end offset of a complete gRPC-Web trailer frame, if present.
 fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
@@ -255,7 +281,7 @@ fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
         if frame_end > data.len() {
             return None;
         }
-        if data[offset] & 0x80 != 0 {
+        if data[offset] & crate::envelope::flags::GRPC_WEB_TRAILER != 0 {
             return Some(frame_end);
         }
         offset = frame_end;
@@ -270,6 +296,27 @@ fn grpc_web_trailer_frame_end(data: &[u8]) -> Option<usize> {
 /// HTTP requests with compatible body types.
 pub trait ClientTransport: Clone + Send + Sync + 'static {
     /// The response body type.
+    ///
+    /// The call functions and the generated clients additionally require
+    /// its [`Body::Error`] to convert into
+    /// `Box<dyn std::error::Error + Send + Sync>`, so a failure while
+    /// reading the body is retained as the surfaced [`ConnectError`]'s
+    /// [source](ConnectError::with_source) rather than only stringified
+    /// into its message. Any `std::error::Error + Send + Sync + 'static`
+    /// type qualifies, as does that boxed type itself: `hyper::body::Incoming`
+    /// (`hyper::Error`), `http_body_util`'s `Full` and `Empty`
+    /// (`Infallible`), `Limited` and `Either` (boxed), and `BoxBody` /
+    /// `MapErr` when their error parameter does. A `Display`-only error type
+    /// does not; implement `Error` for it or adapt the body with
+    /// `http_body_util::BodyExt::map_err`. `Send + Sync` is required because
+    /// `ConnectError` holds its source as `Arc<dyn Error + Send + Sync>`; a
+    /// body error holding a non-`Send` handle must be stringified first, as
+    /// `examples/wasm-client` does with `JsValue`.
+    ///
+    /// Unlike [`Error`](Self::Error), a `ConnectError` the body reports is
+    /// not surfaced verbatim: it is attached as the source of the
+    /// `internal` (or, past the deadline, `deadline_exceeded`) error the
+    /// call path builds for the read failure.
     type ResponseBody: Body<Data = Bytes> + Send + 'static;
     /// The error type.
     ///
@@ -279,7 +326,10 @@ pub trait ClientTransport: Clone + Send + Sync + 'static {
     /// discarding any outer wrappers' `Display` context. A transport can use
     /// this to control the surfaced error classification, for example
     /// returning `deadline_exceeded` from a timeout middleware. Errors with
-    /// no `ConnectError` in their chain are wrapped as `unavailable`.
+    /// no `ConnectError` in their chain are wrapped as `unavailable` with the
+    /// original retained as the [source](ConnectError::with_source); a
+    /// transport that builds its own `ConnectError` for such a failure can
+    /// use [`ConnectError::unavailable_from_transport`] to match.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Send an HTTP request and receive a response.
@@ -327,7 +377,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
     S::Future: Send + 'static,
     ResBody: Body<Data = Bytes> + Send + 'static,
-    ResBody::Error: std::error::Error + Send + Sync + 'static,
+    ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     type ResponseBody = ResBody;
     type Error = S::Error;
@@ -794,10 +844,9 @@ impl ClientTransport for HttpClient {
                 }
                 let client = client.clone();
                 Box::pin(async move {
-                    client
-                        .request(request)
-                        .await
-                        .map_err(|e| ConnectError::unavailable(format!("HTTP request failed: {e}")))
+                    client.request(request).await.map_err(|e| {
+                        ConnectError::unavailable_from_transport("HTTP request failed", e)
+                    })
                 })
             }
             #[cfg(feature = "client-tls")]
@@ -815,7 +864,7 @@ impl ClientTransport for HttpClient {
                 let client = client.clone();
                 Box::pin(async move {
                     client.request(request).await.map_err(|e| {
-                        ConnectError::unavailable(format!("HTTPS request failed: {e}"))
+                        ConnectError::unavailable_from_transport("HTTPS request failed", e)
                     })
                 })
             }
@@ -851,13 +900,17 @@ pub struct ClientConfig {
     pub(crate) compression_policy: CompressionPolicy,
     pub(crate) default_timeout: Option<Duration>,
     pub(crate) default_max_message_size: Option<usize>,
+    pub(crate) default_element_memory_limit: Option<usize>,
     pub(crate) default_headers: http::HeaderMap,
 }
 
 impl ClientConfig {
     /// Create a new client configuration with the given base URI.
     ///
-    /// Uses Connect protocol with protobuf encoding by default.
+    /// Uses Connect protocol with protobuf encoding by default. Request
+    /// URIs are the base's scheme, authority and path prefix (trailing
+    /// slash trimmed) followed by the method's `/package.Service/Method`;
+    /// a query string on the base URI is not carried over.
     pub fn new(base_uri: Uri) -> Self {
         Self {
             base_uri,
@@ -868,6 +921,7 @@ impl ClientConfig {
             compression_policy: CompressionPolicy::default(),
             default_timeout: None,
             default_max_message_size: None,
+            default_element_memory_limit: None,
             default_headers: http::HeaderMap::new(),
         }
     }
@@ -957,11 +1011,45 @@ impl ClientConfig {
 
     /// Set a default maximum decompressed response message size.
     ///
+    /// This bounds decompressed bytes, not element footprint. A response of
+    /// very many small elements can sit inside this limit and still exhaust
+    /// memory; that is what
+    /// [`Self::with_default_element_memory_limit`] defends against, and
+    /// raising this one will not help with it.
+    ///
     /// Read via [`Self::default_max_message_size`]. Per-call
     /// [`CallOptions::with_max_message_size`] overrides this.
     #[must_use]
     pub fn with_default_max_message_size(mut self, size: usize) -> Self {
         self.default_max_message_size = Some(size);
+        self
+    }
+
+    /// Set a default budget for the memory a response decode may commit to
+    /// repeated, map, string and bytes elements.
+    ///
+    /// Distinct from [`Self::with_default_max_message_size`], which bounds
+    /// decompressed bytes: this bounds the in-memory footprint those bytes
+    /// ask for. A response of very many small elements can be well inside
+    /// the size limit and still expand by orders of magnitude, which is the
+    /// amplification this defends against. Unset means buffa's 32 MiB
+    /// default; raise it for a server that legitimately returns such
+    /// responses.
+    ///
+    ///
+    /// Set on both codecs, but it defends less on JSON. A JSON response is
+    /// parsed by `serde_json` into an owned message first, and that parse is
+    /// bounded only by `max_message_size` — the amplification has already
+    /// happened by the time the budget is checked on the view decode. On
+    /// JSON the budget therefore bounds the second materialization and makes
+    /// the knob behave the same way it does on proto; it is not an
+    /// equivalent defence.
+    ///
+    /// Read via [`Self::default_element_memory_limit`]. Per-call
+    /// [`CallOptions::with_element_memory_limit`] overrides this.
+    #[must_use]
+    pub fn with_default_element_memory_limit(mut self, bytes: usize) -> Self {
+        self.default_element_memory_limit = Some(bytes);
         self
     }
 
@@ -1054,6 +1142,14 @@ impl ClientConfig {
         self.default_max_message_size
     }
 
+    /// The default response element-memory budget, if set.
+    ///
+    /// Set via [`Self::with_default_element_memory_limit`]. Per-call
+    /// [`CallOptions::with_element_memory_limit`] overrides this when set.
+    pub fn default_element_memory_limit(&self) -> Option<usize> {
+        self.default_element_memory_limit
+    }
+
     /// The headers applied to every request through this config.
     ///
     /// Useful for auth tokens, user-agent, tracing context.
@@ -1093,6 +1189,7 @@ pub struct CallOptions {
     pub(crate) headers: http::HeaderMap,
     pub(crate) timeout: Option<Duration>,
     pub(crate) max_message_size: Option<usize>,
+    pub(crate) element_memory_limit: Option<usize>,
     pub(crate) compress: Option<bool>,
 }
 
@@ -1166,10 +1263,37 @@ impl CallOptions {
 
     /// Set the maximum decompressed message size in bytes.
     ///
+    /// This bounds decompressed bytes, not element footprint. A response of
+    /// very many small elements can sit inside this limit and still exhaust
+    /// memory; that is what
+    /// [`Self::with_element_memory_limit`] defends against, and raising this
+    /// one will not help with it.
+    ///
     /// Read via [`Self::max_message_size`].
     #[must_use]
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = Some(size);
+        self
+    }
+
+    /// Set the budget for the memory this call's response decode may commit
+    /// to repeated, map, string and bytes elements.
+    ///
+    /// Overrides [`ClientConfig::with_default_element_memory_limit`]; see
+    /// there for how this differs from the message-size limit.
+    ///
+    /// Set on both codecs, but it defends less on JSON. A JSON response is
+    /// parsed by `serde_json` into an owned message first, and that parse is
+    /// bounded only by `max_message_size` — the amplification has already
+    /// happened by the time the budget is checked on the view decode. On
+    /// JSON the budget therefore bounds the second materialization and makes
+    /// the knob behave the same way it does on proto; it is not an
+    /// equivalent defence.
+    ///
+    /// Read via [`Self::element_memory_limit`].
+    #[must_use]
+    pub fn with_element_memory_limit(mut self, bytes: usize) -> Self {
+        self.element_memory_limit = Some(bytes);
         self
     }
 
@@ -1213,6 +1337,25 @@ impl CallOptions {
         self.max_message_size
     }
 
+    /// The response element-memory budget for this call.
+    ///
+    /// When unset the decode uses buffa's 32 MiB default. Exceeding it fails
+    /// the call rather than truncating.
+    ///
+    /// Set via [`Self::with_element_memory_limit`].
+    pub fn element_memory_limit(&self) -> Option<usize> {
+        self.element_memory_limit
+    }
+
+    /// The buffa decode options this call's response decode uses.
+    pub(crate) fn decode_options(&self) -> buffa::DecodeOptions {
+        let options = buffa::DecodeOptions::new();
+        match self.element_memory_limit {
+            Some(bytes) => options.with_element_memory_limit(bytes),
+            None => options,
+        }
+    }
+
     /// The per-call compression override. `Some(true)` forces compression,
     /// `Some(false)` disables it, `None` defers to the policy.
     ///
@@ -1235,6 +1378,9 @@ fn effective_options(config: &ClientConfig, options: CallOptions) -> CallOptions
     CallOptions {
         timeout: options.timeout.or(config.default_timeout),
         max_message_size: options.max_message_size.or(config.default_max_message_size),
+        element_memory_limit: options
+            .element_memory_limit
+            .or(config.default_element_memory_limit),
         compress: options.compress,
         headers: merge_headers(&config.default_headers, options.headers),
     }
@@ -1351,6 +1497,101 @@ fn client_deadline(timeout: Option<Duration>, protocol: Protocol) -> Option<std:
         .and_then(|t| std::time::Instant::now().checked_add(t))
 }
 
+/// Build the request URI for `procedure` against `config.base_uri`, with an
+/// optional query string (the Connect GET path).
+///
+/// Reuses the base URI's already-parsed scheme and authority and only builds
+/// a new path-and-query: any path prefix on the base (trailing slash
+/// trimmed) followed by `procedure`, which carries its own leading slash
+/// (callers run [`check_client_spec`] first). A query string on the *base*
+/// URI is not carried over. In the common case — no base path prefix, no
+/// query — the path is the `&'static` procedure itself and nothing is
+/// allocated.
+fn procedure_uri(
+    config: &ClientConfig,
+    procedure: &'static str,
+    query: Option<&str>,
+) -> Result<Uri, ConnectError> {
+    use http::uri::PathAndQuery;
+    let base_path = config.base_uri.path().trim_end_matches('/');
+    let path_and_query = if base_path.is_empty() && query.is_none() {
+        // `from_static` would panic on a byte that is illegal in a path (a
+        // space, `#`, non-ASCII); `check_client_spec` only checks the slash
+        // shape, so validate here and report it like every other bad URI.
+        // `Bytes::from_static` keeps this branch allocation-free.
+        PathAndQuery::from_maybe_shared(Bytes::from_static(procedure.as_bytes()))
+            .map_err(|e| ConnectError::internal(format!("invalid request path: {e}")))?
+    } else {
+        let mut s = String::with_capacity(
+            base_path.len() + procedure.len() + query.map_or(0, |q| q.len() + 1),
+        );
+        s.push_str(base_path);
+        s.push_str(procedure);
+        if let Some(q) = query {
+            s.push('?');
+            s.push_str(q);
+        }
+        PathAndQuery::from_maybe_shared(Bytes::from(s))
+            .map_err(|e| ConnectError::internal(format!("invalid request path: {e}")))?
+    };
+    let mut parts = http::uri::Parts::default();
+    parts.scheme = config.base_uri.scheme().cloned();
+    parts.authority = config.base_uri.authority().cloned();
+    parts.path_and_query = Some(path_and_query);
+    Uri::from_parts(parts).map_err(|e| {
+        ConnectError::internal(format!(
+            "invalid request URI from base {}: {e}",
+            config.base_uri
+        ))
+    })
+}
+
+/// The entry point that matches a stream shape, for error messages.
+fn entry_point_for(stream_type: StreamType) -> &'static str {
+    match stream_type {
+        StreamType::Unary => "call_unary",
+        StreamType::ClientStream => "call_client_stream",
+        StreamType::ServerStream => "call_server_stream",
+        StreamType::BidiStream => "call_bidi_stream",
+    }
+}
+
+/// Validate a caller-supplied [`Spec`] against the entry point it reached.
+///
+/// Generated clients always pass a matching client-origin spec; these checks
+/// exist for hand-written callers, where the mistakes below would otherwise
+/// surface far from their cause (a protocol error from the server, a client
+/// interceptor observing `SpecOrigin::Server`, a mangled request URI). All
+/// are caller bugs, so the error is `Internal`, in every build profile.
+fn check_client_spec(
+    spec: Spec,
+    expected: StreamType,
+    entry_point: &str,
+) -> Result<(), ConnectError> {
+    if spec.stream_type != expected {
+        return Err(ConnectError::internal(format!(
+            "{entry_point} called with a {:?} Spec for {}; use {}",
+            spec.stream_type,
+            spec.procedure,
+            entry_point_for(spec.stream_type),
+        )));
+    }
+    if spec.origin != SpecOrigin::Client {
+        return Err(ConnectError::internal(format!(
+            "{entry_point} called with a server-side Spec for {}; pass \
+             FOO_SPEC.with_origin(SpecOrigin::Client) or Spec::client(..)",
+            spec.procedure,
+        )));
+    }
+    if !crate::spec::procedure_is_well_formed(spec.procedure) {
+        return Err(ConnectError::internal(format!(
+            "Spec::procedure {:?} must look like \"/package.Service/Method\"",
+            spec.procedure,
+        )));
+    }
+    Ok(())
+}
+
 /// Enforce a client-side deadline by wrapping a future in `timeout_at`.
 ///
 /// gRPC deadline semantics: the deadline applies to the **entire call** from
@@ -1379,6 +1620,68 @@ where
                 .map_err(|_| ConnectError::deadline_exceeded("client-side deadline exceeded"))?
         }
     }
+}
+
+/// Has the call's deadline passed?
+///
+/// The single definition of "past the deadline" for classifying errors that
+/// surface around a timeout. `with_deadline` decides when to *stop* waiting;
+/// this decides how to *describe* a failure that arrived on its own, which
+/// several paths need and which must agree between them.
+/// Note for tests: this reads the real clock, while `with_deadline` runs on
+/// tokio's. Under `#[tokio::test(start_paused = true)]` virtual time advances
+/// and this does not, so a paused-time test that delivers a body *error* and
+/// expects the timeout classification will not get it. Use real time for
+/// those; paused time is fine when the timer is what you are exercising.
+fn deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|d| std::time::Instant::now() >= d)
+}
+
+/// Classify a transport error that surfaced while reading a response body.
+///
+/// A server enforcing the same deadline aborts the RPC independently, so its
+/// RST_STREAM can beat the local timer: the body read fails first and the
+/// call reports a transport fault for what is really a timeout. Which of the
+/// two wins is down to timer coarseness and scheduler delay, so the same call
+/// can report either code run to run.
+///
+/// The missing-`grpc-status` path a few hundred lines below already resolves
+/// this by deadline rather than by arrival order; this applies the same rule
+/// to the body-read sites, and both now share [`deadline_elapsed`] so they
+/// cannot disagree.
+///
+/// `internal` is the wrong answer here because it attributes the failure to
+/// this client when the cause was a timeout the caller asked for.
+///
+/// Either way the read error is kept as the result's
+/// [source](ConnectError::with_source), the shape
+/// [`ConnectError::unavailable_from_transport`] gives send-time failures:
+/// its `Display` text goes in `message`, the typed error is retained for
+/// `downcast_ref`. Unlike [`map_transport_send_error`], a `ConnectError`
+/// found in the read error is not surfaced verbatim — the read failure is
+/// always reported as this client's, with that error as its cause. That
+/// holds for the `deadline_exceeded` arm too — the deadline only explains
+/// *why* the stream died, and the error that reported it (a reset, a closed
+/// connection) is still the most specific fact available. The deadline
+/// errors that stay source-less are those [`with_deadline`] synthesises
+/// when the local timer fires first; there is nothing to attach.
+///
+/// The bound is `Into<Box<dyn Error>>` rather than `Error` so that bodies
+/// whose error type is already the boxed form (`http_body_util::Limited`,
+/// `Either`, a `BoxBody<_, Box<dyn Error + Send + Sync>>`) qualify; the
+/// concrete type behind the box still downcasts.
+fn classify_body_read_error(
+    context: &str,
+    error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    deadline: Option<std::time::Instant>,
+) -> ConnectError {
+    let error = error.into();
+    if deadline_elapsed(deadline) {
+        ConnectError::deadline_exceeded(format!("{context} after the deadline elapsed: {error}"))
+    } else {
+        ConnectError::internal(format!("{context}: {error}"))
+    }
+    .with_source(error)
 }
 
 /// Response from a unary RPC call.
@@ -1489,6 +1792,32 @@ where
     }
 }
 
+/// Report a failed response decode.
+///
+/// Exceeding the element-memory budget is the one decode failure the caller
+/// can act on — the response is well-formed, just larger than this client
+/// agreed to materialize — so it says which knob to raise. Every other
+/// variant keeps the bare message, because naming a limit there would send
+/// someone chasing a setting that cannot help. `DecodeError` is
+/// `#[non_exhaustive]`, hence the catch-all arm.
+fn decode_response_error(e: buffa::DecodeError) -> ConnectError {
+    match e {
+        // `ResourceExhausted`, not `internal`, and deliberately: this is the
+        // same class as the `max_message_size` overflow above it, which
+        // already uses that code. `internal` reads as "the client broke" and
+        // would route a raise-and-retry caller into an on-call page.
+        buffa::DecodeError::ElementMemoryLimitExceeded => ConnectError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "failed to decode response: {e}; if this server is trusted, raise \
+                 CallOptions::with_element_memory_limit or \
+                 ClientConfig::with_default_element_memory_limit"
+            ),
+        ),
+        _ => ConnectError::internal(format!("failed to decode response: {e}")),
+    }
+}
+
 /// Decode a response message as an `OwnedView` from bytes.
 ///
 /// For proto-encoded responses, this is a true zero-copy decode — the view borrows
@@ -1496,24 +1825,42 @@ where
 /// deserialized to an owned message, then re-encoded to proto bytes and decoded as
 /// a view. This JSON round-trip adds overhead relative to owned-type decoding, but
 /// is negligible compared to JSON parsing itself.
+///
+/// `options` carries the caller's decode limits, and bounds the protobuf
+/// decode on both paths — the JSON arm re-encodes and decodes under the same
+/// limits rather than taking buffa's defaults. The `serde_json` parse that
+/// precedes it is bounded by `max_message_size` alone.
 fn decode_response_view<RespView>(
     data: Bytes,
     format: CodecFormat,
+    options: &buffa::DecodeOptions,
 ) -> Result<OwnedView<RespView>, ConnectError>
 where
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     match format {
-        CodecFormat::Proto => OwnedView::<RespView>::decode(data)
-            .map_err(|e| ConnectError::internal(format!("failed to decode response: {e}"))),
+        CodecFormat::Proto => {
+            OwnedView::<RespView>::decode_with_options(data, options).map_err(decode_response_error)
+        }
         #[cfg(feature = "json")]
         CodecFormat::Json => {
             let owned: RespView::Owned = serde_json::from_slice(&data).map_err(|e| {
                 ConnectError::internal(format!("failed to decode JSON response: {e}"))
             })?;
-            OwnedView::<RespView>::from_owned(&owned)
-                .map_err(|e| ConnectError::internal(format!("failed to re-encode for view: {e}")))
+            // This is `OwnedView::from_owned` inlined so the decode half can
+            // take the caller's limits — `from_owned` uses buffa's defaults,
+            // which made the knob a silent no-op for JSON clients. The
+            // round-trip itself is not new: a view has to borrow from proto
+            // bytes, and serde hands us an owned message.
+            //
+            // `try_encode_to_vec`, not `encode_to_vec`: the latter panics
+            // past 2 GiB, and this size is chosen by the peer.
+            let bytes = Bytes::from(buffa::Message::try_encode_to_vec(&owned).map_err(|e| {
+                ConnectError::internal(format!("failed to re-encode for view: {e}"))
+            })?);
+            OwnedView::<RespView>::decode_with_options(bytes, options)
+                .map_err(decode_response_error)
         }
         #[cfg(not(feature = "json"))]
         CodecFormat::Json => Err(ConnectError::unimplemented(
@@ -1526,30 +1873,42 @@ where
 ///
 /// This is the core function used by generated clients to make RPC calls.
 /// It handles encoding, compression, and protocol details.
+///
+/// `spec` identifies the method and must have
+/// [`SpecOrigin::Client`]. Generated clients pass
+/// their per-method `*_SPEC` constant with
+/// [`.with_origin(SpecOrigin::Client)`](Spec::with_origin); a hand-written
+/// caller does the same, or builds one with
+/// [`Spec::client("/pkg.Service/Method", StreamType::Unary)`](Spec::client),
+/// chaining [`with_idempotency_level`](Spec::with_idempotency_level) when
+/// known (see [`Spec::client`] for callers whose method names are only
+/// known at runtime). The request path is `spec.procedure` under
+/// `config.base_uri`.
+///
+/// # Errors
+///
+/// Besides transport, protocol, and decode failures: `Internal`, before
+/// anything is sent, if `spec` is not a client-side [`StreamType::Unary`]
+/// spec with a well-formed procedure — a caller bug that generated clients
+/// cannot produce. The other entry points apply the same check for their
+/// stream shape.
 pub async fn call_unary<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     request: Req,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::Unary, "call_unary")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     // Encode the request body
     let body = match config.codec_format {
@@ -1628,7 +1987,9 @@ where
             .map_err(|e| map_transport_send_error(e, "request failed"))?;
 
         match config.protocol {
-            Protocol::Connect => parse_connect_unary_response(response, config, &options).await,
+            Protocol::Connect => {
+                parse_connect_unary_response(response, config, &options, deadline).await
+            }
             Protocol::Grpc | Protocol::GrpcWeb => {
                 parse_grpc_unary_response(response, config, &options, deadline).await
             }
@@ -1651,6 +2012,10 @@ where
 /// side-effect-free queries. Only the Connect protocol supports this;
 /// gRPC/gRPC-Web are POST-only.
 ///
+/// `spec` identifies the method as for [`call_unary`]. Its
+/// [`idempotency_level`](Spec::idempotency_level) is **not** consulted:
+/// choosing GET is the caller's decision.
+///
 /// # Deterministic encoding
 ///
 /// For effective caching, the encoded message should be deterministic (same
@@ -1660,22 +2025,23 @@ where
 ///
 /// # Errors
 ///
-/// Returns `invalid_argument` if `config.protocol` is not `Connect`.
+/// Returns `invalid_argument` if `config.protocol` is not `Connect`;
+/// `Internal` for a mismatched `spec` (see [`call_unary`]).
 pub async fn call_unary_get<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     request: Req,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::Unary, "call_unary_get")?;
     // Connect GET is a Connect-protocol-only feature.
     if !matches!(config.protocol, Protocol::Connect) {
         return Err(ConnectError::invalid_argument(
@@ -1684,10 +2050,6 @@ where
     }
 
     let options = effective_options(config, options);
-
-    // Build the base URI (no query yet)
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
 
     // Encode the request body
     let body = match config.codec_format {
@@ -1734,10 +2096,7 @@ where
     let query =
         build_connect_get_query(use_base64, compressed_with, encoding_name, &encoded_message);
 
-    let full_uri = format!("{base_str}/{service}/{method}?{query}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid GET URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, Some(&query))?;
 
     let deadline = client_deadline(options.timeout, Protocol::Connect);
 
@@ -1752,9 +2111,8 @@ where
         );
     }
     // Accept-Encoding so the server can compress the response.
-    let accept = config.compression.accept_encoding_header();
-    if !accept.is_empty() {
-        builder = builder.header(http::header::ACCEPT_ENCODING, accept);
+    if let Some(accept) = config.compression.accept_encoding_value() {
+        builder = builder.header(http::header::ACCEPT_ENCODING, accept.clone());
     }
 
     // Merge user-provided headers
@@ -1774,7 +2132,7 @@ where
             .map_err(|e| map_transport_send_error(e, "GET request failed"))?;
 
         // Response format is identical to POST unary Connect.
-        parse_connect_unary_response(response, config, &options).await
+        parse_connect_unary_response(response, config, &options, deadline).await
     })
     .await
 }
@@ -1817,6 +2175,25 @@ fn build_connect_get_query(
     query
 }
 
+/// Stamp a terminal error with the metadata its response delivered.
+///
+/// The response-parsing paths build errors several layers from the
+/// response — a bounded body read, a decompression provider, a codec — and
+/// none of those layers has the headers. Rather than teach each of them,
+/// the parse functions map their errors through this on the way out.
+fn with_response_metadata<'a>(
+    headers: &'a http::HeaderMap,
+    trailers: &'a http::HeaderMap,
+) -> impl Fn(ConnectError) -> ConnectError + 'a {
+    move |mut err| {
+        err.set_response_headers(headers.clone());
+        if !trailers.is_empty() {
+            err.set_trailers(trailers.clone());
+        }
+        err
+    }
+}
+
 /// Remap decompression error codes for payloads received from the server.
 ///
 /// The compression providers classify malformed input as `invalid_argument`
@@ -1845,10 +2222,11 @@ async fn parse_connect_unary_response<B, RespView>(
     response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
+    deadline: Option<std::time::Instant>,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -1876,7 +2254,7 @@ where
             .max_message_size
             .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-        let body = collect_body_bounded(response.into_body(), max_err_body_size)
+        let body = collect_body_bounded(response.into_body(), max_err_body_size, deadline)
             .await
             .map_err(|mut e| {
                 e.set_response_headers(headers.clone());
@@ -1950,21 +2328,11 @@ where
         }
     }
 
-    let expected_content_type = config.codec_format.content_type();
-    if let Some(resp_content_type) = response.headers().get(http::header::CONTENT_TYPE) {
-        let ct = resp_content_type.to_str().unwrap_or("");
-        if !ct.starts_with(expected_content_type) {
-            let code = if ct.starts_with(content_type::PROTO) || ct.starts_with(content_type::JSON)
-            {
-                ErrorCode::Internal
-            } else {
-                ErrorCode::Unknown
-            };
-            return Err(ConnectError::new(
-                code,
-                format!("unexpected content-type: {ct}"),
-            ));
-        }
+    if let Err(mut err) =
+        validate_connect_response_content_type(&resp_headers, config.codec_format, false)
+    {
+        err.set_trailers(resp_trailers);
+        return Err(err);
     }
 
     let response_encoding = response
@@ -1977,29 +2345,39 @@ where
         .max_message_size
         .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-    let body = collect_body_bounded(response.into_body(), max_message_size).await?;
+    // Everything below fails after a complete response was received, so
+    // every error out of it carries that response's metadata.
+    let attach = with_response_metadata(&resp_headers, &resp_trailers);
+
+    let body = collect_body_bounded(response.into_body(), max_message_size, deadline)
+        .await
+        .map_err(&attach)?;
 
     let body = if let Some(encoding) = response_encoding {
         config
             .compression
             .decompress_with_limit(&encoding, body, max_message_size)
-            .map_err(map_response_decompression_error)?
+            .map_err(map_response_decompression_error)
+            .map_err(&attach)?
     } else {
         body
     };
 
     if body.len() > max_message_size {
-        return Err(ConnectError::new(
+        return Err(attach(ConnectError::new(
             ErrorCode::ResourceExhausted,
             format!(
                 "message size {} exceeds limit {}",
                 body.len(),
                 max_message_size
             ),
-        ));
+        )));
     }
 
-    let message = decode_response_view::<RespView>(body, config.codec_format)?;
+    let message =
+        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options())
+            .map_err(&attach)?;
+    drop(attach);
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -2020,22 +2398,14 @@ async fn parse_grpc_unary_response<B, RespView>(
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     let status = response.status();
     let resp_headers = response.headers().clone();
 
-    // Non-200 HTTP status (connection-level error)
-    if !status.is_success() {
-        let code = http_status_to_error_code(status);
-        let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
-        err.set_response_headers(resp_headers);
-        return Err(err);
-    }
-
-    validate_grpc_response_content_type(&resp_headers, config)?;
+    check_grpc_response_head(status, &resp_headers, config.protocol, config.codec_format)?;
 
     // Check for unsupported compression before reading the body
     let response_encoding = resp_headers
@@ -2096,9 +2466,19 @@ where
                 }
             }
             Some(Err(e)) => {
-                return Err(ConnectError::internal(format!(
-                    "failed to read response body: {e}"
-                )));
+                // The body of a non-200 response is read only to find a gRPC
+                // status, and the HTTP status is reported below when there is
+                // none, so a read that dies part-way through (a proxy that
+                // resets the stream after its error headers) still reports the
+                // status rather than the read failure.
+                if status.is_success() {
+                    return Err(classify_body_read_error(
+                        "failed to read response body",
+                        e,
+                        deadline,
+                    ));
+                }
+                break;
             }
             None => break,
         }
@@ -2113,8 +2493,22 @@ where
     let mut message_count = 0u32;
 
     while !buf.is_empty() {
-        // Check for gRPC-Web trailer frame (flag 0x80)
-        if buf[0] & 0x80 != 0 {
+        // A set high bit marks a gRPC-Web trailer frame.
+        if buf[0] & crate::envelope::flags::GRPC_WEB_TRAILER != 0 {
+            if !matches!(config.protocol, Protocol::GrpcWeb) {
+                // Plain gRPC defines no flag in the high bit, and envelope
+                // decoding ignores unknown bits, so accepting the frame here
+                // would let a data envelope overwrite the HTTP/2 trailers.
+                return Err(body_parse_error(
+                    status,
+                    resp_headers,
+                    format!(
+                        "invalid gRPC response framing: envelope flag {:#04x} \
+                         (gRPC-Web trailer marker) is not valid on a plain gRPC response",
+                        buf[0]
+                    ),
+                ));
+            }
             let decompression = response_encoding
                 .as_deref()
                 .map(|enc| (&config.compression, enc));
@@ -2134,9 +2528,11 @@ where
             Ok(Some(env)) => env,
             Ok(None) => break,
             Err(e) => {
-                return Err(ConnectError::internal(format!(
-                    "envelope decode failed: {e}"
-                )));
+                return Err(body_parse_error(
+                    status,
+                    resp_headers,
+                    format!("envelope decode failed: {e}"),
+                ));
             }
         };
 
@@ -2172,16 +2568,35 @@ where
     // Check for errors in trailers (HTTP/2 trailers or gRPC-Web trailer frame).
     // If we have trailers from HTTP/2 or gRPC-Web, those take precedence.
     // Only fall back to initial headers if no body data was received (trailers-only).
-    let effective_trailers = if !grpc_trailers.is_empty() {
-        &grpc_trailers
-    } else if !has_body_data {
+    let status_from_headers = grpc_trailers.is_empty() && !has_body_data;
+    let effective_trailers = if status_from_headers {
         // Trailers-only response: initial headers contain the status
         &resp_headers
     } else {
-        &grpc_trailers // empty — no trailers found
+        &grpc_trailers // empty when no trailers were found
     };
 
     if let Some(mut err) = parse_grpc_error_from_trailers(effective_trailers) {
+        if status_from_headers {
+            // The status came from the initial headers, so the entries copied
+            // alongside it are response metadata, not trailing metadata:
+            // `content-type` and friends must not surface from
+            // `ConnectError::trailers()`. They stay reachable through
+            // `response_headers()`, set below.
+            err.trailers_mut().clear();
+        }
+        err.set_response_headers(resp_headers);
+        return Err(err);
+    }
+
+    // A non-200 response is an error even when the gRPC status says otherwise
+    // or is missing entirely; an error status found above is the more specific
+    // report, so this is only reached when there was none. Refusing a success
+    // delivered on a non-200 is the one place this is stricter than grpc-go,
+    // which having decided the reply is gRPC accepts it.
+    if !status.is_success() {
+        let code = http_status_to_error_code(status);
+        let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
         err.set_response_headers(resp_headers);
         return Err(err);
     }
@@ -2191,8 +2606,9 @@ where
     // spec: RST_STREAM CANCEL is upgraded to DeadlineExceeded when the deadline
     // has elapsed (matching grpc-go and connect-go behavior).
     if effective_trailers.get("grpc-status").is_none() {
-        let is_deadline_exceeded = deadline.is_some_and(|d| std::time::Instant::now() >= d);
-        let mut err = if is_deadline_exceeded {
+        let mut err = if deadline_elapsed(deadline) {
+            // Terser than the body-read path's message on purpose: there is
+            // no transport error here to carry, only a missing trailer.
             ConnectError::deadline_exceeded("request timeout")
         } else {
             ConnectError::internal("gRPC response missing grpc-status trailer")
@@ -2220,7 +2636,8 @@ where
         ));
     }
 
-    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+    let message =
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options())?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -2229,25 +2646,87 @@ where
     })
 }
 
-/// Validate the `content-type` of a gRPC / gRPC-Web response against the
-/// client's configured protocol and codec, mirroring connect-go's
-/// `grpcValidateResponseContentType`.
+/// Validate the `content-type` of a 200 Connect response against the
+/// client's configured codec and the RPC shape it was made for.
 ///
-/// Parameters (`; charset=...`) are stripped before comparison. The bare
-/// family types `application/grpc` / `application/grpc-web` are accepted for
-/// any codec, because the bare type means "proto by default" and proxies that
-/// synthesize trailers-only error responses (such as Envoy local replies)
-/// send it regardless of the request's subtype. A missing `content-type`
-/// header is also accepted, preserving this client's previous leniency. A
-/// same-family subtype that doesn't match the configured codec is rejected as
-/// `internal` (a broken server or intermediary); anything else is `unknown`
-/// (not a gRPC response at all), matching connect-go's classification.
+/// A response that is a Connect content-type for the shape but not the
+/// configured codec's is `internal`, because the peer speaks Connect and the
+/// two sides disagree; anything else is `unknown`, because the peer —
+/// typically a proxy's error page — is not speaking Connect at all. For a
+/// stream "a Connect content-type" is the `application/connect+*` family,
+/// as in connect-go's `validateResponse`; for unary it is exactly
+/// `application/proto` or `application/json`, where connect-go draws the
+/// line at `application/*`. Media-type parameters (`; charset=utf-8`) are
+/// ignored, and the match is exact and case-sensitive after they are
+/// stripped (as in connect-go and the gRPC validator), so
+/// `application/protobuf` is `unknown` rather than a prefix match for
+/// `application/proto`.
+///
+/// A missing header is accepted, the same policy as the gRPC validator and
+/// the unary Connect path. connect-go rejects an absent header as `unknown`,
+/// but an intermediary that strips `content-type` from an otherwise
+/// well-formed reply would then turn a success into an error for no gain.
+/// The cost is that a header-less body that is not Connect fails on its
+/// framing instead, with whatever code the framing failure carries.
+///
+/// Only meaningful on the 200 path: a non-200 Connect response carries a
+/// JSON error body whatever its content-type, and the callers parse that
+/// first so HTTP status keeps precedence.
+fn validate_connect_response_content_type(
+    resp_headers: &http::HeaderMap,
+    codec_format: CodecFormat,
+    is_streaming: bool,
+) -> Result<(), ConnectError> {
+    let Some(resp_content_type) = resp_headers.get(http::header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+
+    let ct = resp_content_type.to_str().unwrap_or("");
+    let ct_normalized = ct
+        .split_once(';')
+        .map_or(ct, |(media_type, _params)| media_type)
+        .trim();
+    let expected = Protocol::Connect.response_content_type(codec_format, is_streaming);
+    if ct_normalized == expected {
+        return Ok(());
+    }
+
+    let same_family = if is_streaming {
+        ct_normalized.starts_with("application/connect+")
+    } else {
+        ct_normalized == content_type::PROTO || ct_normalized == content_type::JSON
+    };
+    let code = if same_family {
+        ErrorCode::Internal
+    } else {
+        ErrorCode::Unknown
+    };
+    let mut err = ConnectError::new(
+        code,
+        format!("unexpected content-type: {ct} (expected {expected})"),
+    );
+    err.set_response_headers(resp_headers.clone());
+    Err(err)
+}
+
+/// Validate the `content-type` of a gRPC / gRPC-Web response against the
+/// client's configured protocol and codec.
+///
+/// The family/error-code classification follows connect-go: same-family codec
+/// mismatches are `internal`, while responses outside the configured gRPC
+/// family are `unknown`. Connect-rust deliberately preserves its existing
+/// compatibility behavior: parameters are ignored, a missing header is
+/// accepted, and the bare `application/grpc` / `application/grpc-web` family
+/// is accepted for every configured codec. In particular, proxies such as
+/// Envoy can synthesize trailers-only replies using the bare family type
+/// regardless of the request subtype.
 fn validate_grpc_response_content_type(
     resp_headers: &http::HeaderMap,
-    config: &ClientConfig,
+    protocol: Protocol,
+    codec_format: CodecFormat,
 ) -> Result<(), ConnectError> {
     debug_assert!(
-        matches!(config.protocol, Protocol::Grpc | Protocol::GrpcWeb),
+        matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb),
         "gRPC response content-type validation is only for gRPC/gRPC-Web"
     );
 
@@ -2260,10 +2739,9 @@ fn validate_grpc_response_content_type(
         .split_once(';')
         .map_or(ct, |(media_type, _params)| media_type)
         .trim();
-    let expected = config
-        .protocol
-        .response_content_type(config.codec_format, false);
-    let (bare, family_prefix) = match config.protocol {
+    // gRPC and gRPC-Web use the same response media type for every RPC shape.
+    let expected = protocol.response_content_type(codec_format, false);
+    let (bare, family_prefix) = match protocol {
         Protocol::Grpc => ("application/grpc", "application/grpc+"),
         Protocol::GrpcWeb => ("application/grpc-web", "application/grpc-web+"),
         // Unreachable per the debug_assert above; treat as valid rather than
@@ -2288,6 +2766,58 @@ fn validate_grpc_response_content_type(
     Err(err)
 }
 
+/// Gate a gRPC / gRPC-Web response on its HTTP status and `content-type`
+/// before anything reads `grpc-status`, so the unary and streaming parsers
+/// classify the same response head the same way.
+///
+/// grpc-go decides gRPC-ness from the content-type and then discards the HTTP
+/// status entirely; connect-go decides from the HTTP status and never reads
+/// the gRPC one. This sits between them: a non-2xx reply that is not speaking
+/// gRPC reports its HTTP status, because that is the code telling the caller
+/// whether to retry, and a `text/html` rejection would flatten every proxy
+/// failure to `unknown`.
+///
+/// A wrong content-type is positive evidence the peer is not speaking gRPC,
+/// so it is rejected here even when a `grpc-status` header is present. An
+/// absent one is not: a proxy that drops `content-type` from its local reply
+/// may still send `grpc-status`, so that reply passes and its trailers-only
+/// status is honoured by the caller.
+///
+/// Callers must have established a gRPC-family `protocol`; see
+/// [`validate_grpc_response_content_type`].
+fn check_grpc_response_head(
+    status: http::StatusCode,
+    resp_headers: &http::HeaderMap,
+    protocol: Protocol,
+    codec_format: CodecFormat,
+) -> Result<(), ConnectError> {
+    let content_type = validate_grpc_response_content_type(resp_headers, protocol, codec_format);
+    let speaks_grpc = content_type.is_ok()
+        && (resp_headers.contains_key(http::header::CONTENT_TYPE)
+            || resp_headers.contains_key("grpc-status"));
+    if !status.is_success() && !speaks_grpc {
+        return Err(match content_type {
+            // Reuse the rejection: it already carries the response headers, and
+            // its message becomes the detail on the HTTP status.
+            Err(mut err) => {
+                let detail = err.message.take().unwrap_or_default();
+                err.code = http_status_to_error_code(status);
+                err.message = Some(format!("HTTP error {}: {detail}", status.as_u16()));
+                err
+            }
+            Ok(()) => {
+                let mut err = ConnectError::new(
+                    http_status_to_error_code(status),
+                    format!("HTTP error {}", status.as_u16()),
+                );
+                err.set_response_headers(resp_headers.clone());
+                err
+            }
+        });
+    }
+    content_type
+}
+
 /// Terminal record for a client stream: why it ended and what trailing
 /// metadata arrived. Written exactly once (by `message()`); read by the
 /// sticky replay, [`ServerStream::error()`], and
@@ -2301,6 +2831,25 @@ struct StreamEnd {
 }
 
 impl StreamEnd {
+    /// Give a failed end the metadata the response already delivered: the
+    /// response headers, which a `ServerStream` cannot exist without, and
+    /// the trailing metadata whenever the end carried any. Applied at the
+    /// one site that writes the record rather than at each site that
+    /// builds one, so no construction path can forget it.
+    ///
+    /// `self.trailers` is the wire map, which on the gRPC shapes still
+    /// holds the status-bearing keys; the error gets the filtered view, so
+    /// this recomputes what `parse_grpc_error_from_trailers` already
+    /// derived rather than overwriting it with the raw set.
+    fn attach_metadata(&mut self, headers: &http::HeaderMap) {
+        if let Err(e) = &mut self.outcome {
+            e.set_response_headers(headers.clone());
+            if let Some(trailers) = &self.trailers {
+                e.set_trailers(error_metadata_from_trailers(trailers));
+            }
+        }
+    }
+
     fn replay<T>(&self) -> Result<Option<T>, ConnectError> {
         match &self.outcome {
             Ok(()) => Ok(None),
@@ -2324,8 +2873,8 @@ impl From<ConnectError> for StreamEnd {
 
 /// What one body poll produced.
 enum BodyPoll {
-    /// A DATA frame was appended to the decode buffer.
-    Data,
+    /// A DATA frame.
+    Data(Bytes),
     /// HTTP/2 (or HTTP/1.1 chunked) trailers — the body's final frame.
     Trailers(http::HeaderMap),
     /// Body exhausted.
@@ -2343,7 +2892,7 @@ enum BodyPoll {
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut stream = call_server_stream(&transport, &config, "svc", "method", req, CallOptions::default()).await?;
+/// let mut stream = call_server_stream(&transport, &config, SVC_METHOD_SPEC.with_origin(SpecOrigin::Client), req, CallOptions::default()).await?;
 /// println!("headers: {:?}", stream.headers());
 /// while let Some(msg) = stream.message().await? {
 ///     println!("got message: {:?}", msg);
@@ -2355,12 +2904,17 @@ enum BodyPoll {
 pub struct ServerStream<B, RespView> {
     headers: http::HeaderMap,
     body: B,
-    buf: BytesMut,
+    /// Unconsumed remainder of the current body DATA frame. When one frame
+    /// carries several envelopes this keeps the transport's read block alive
+    /// between `message()` calls, until the next poll or drop.
+    frame: Bytes,
+    assembler: EnvelopeAssembler,
     encoding: Option<String>,
     compression: CompressionRegistry,
     codec_format: CodecFormat,
     protocol: Protocol,
-    max_message_size: Option<usize>,
+    max_message_size: usize,
+    element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
     /// The terminal record; `Some` once the stream has ended, by any cause.
     end: Option<StreamEnd>,
@@ -2371,8 +2925,19 @@ pub struct ServerStream<B, RespView> {
     _phantom: PhantomData<RespView>,
 }
 
+impl<B, RespView> ServerStream<B, RespView> {
+    /// The buffa decode options this stream's per-message decode uses.
+    fn decode_options(&self) -> buffa::DecodeOptions {
+        let options = buffa::DecodeOptions::new();
+        match self.element_memory_limit {
+            Some(bytes) => options.with_element_memory_limit(bytes),
+            None => options,
+        }
+    }
+}
+
 // Manual impl: the body type `B` (typically `hyper::body::Incoming`) isn't
-// `Debug`, and we don't want to dump the partially-consumed `buf` anyway.
+// `Debug`, and we don't want to dump the partially-consumed frame anyway.
 // Print the stream's observable state for test diagnostics.
 impl<B, RespView> std::fmt::Debug for ServerStream<B, RespView> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2389,7 +2954,7 @@ impl<B, RespView> std::fmt::Debug for ServerStream<B, RespView> {
                 "has_trailers",
                 &self.end.as_ref().is_some_and(|e| e.trailers.is_some()),
             )
-            .field("buffered_bytes", &self.buf.len())
+            .field("frame_bytes", &self.frame.len())
             .finish_non_exhaustive()
     }
 }
@@ -2397,7 +2962,7 @@ impl<B, RespView> std::fmt::Debug for ServerStream<B, RespView> {
 impl<B, RespView> ServerStream<B, RespView>
 where
     B: Body<Data = Bytes> + Unpin,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -2442,6 +3007,10 @@ where
     /// matching grpc-go's treatment of each case. A Trailers-Only response
     /// carrying `grpc-status: 0` in the headers (empty body) is a clean
     /// end.
+    ///
+    /// Whatever the cause, the returned error carries the response
+    /// metadata: [`ConnectError::response_headers()`] always, and
+    /// [`ConnectError::trailers()`] whenever termination metadata arrived.
     pub async fn message<M>(&mut self) -> Result<Option<crate::StreamMessage<M>>, ConnectError>
     where
         // `M` is an output parameter pinned to `RespView`'s owned message —
@@ -2462,8 +3031,9 @@ where
             // The single writer of the terminal record. `message_inner`
             // cannot end the stream without producing one — "ended without
             // recording why" is unrepresentable.
-            Err(end) => {
+            Err(mut end) => {
                 debug_assert!(self.end.is_none(), "terminal record written twice");
+                end.attach_metadata(&self.headers);
                 self.end.get_or_insert(end).replay()
             }
         }
@@ -2477,80 +3047,13 @@ where
     /// producing the terminal record.
     async fn next_message_or_end(&mut self) -> Result<OwnedView<RespView>, StreamEnd> {
         loop {
-            // For gRPC-Web, check for a complete trailer frame (flag 0x80)
-            // before attempting envelope decode (which would treat 0x80 as
-            // a data envelope flag rather than the gRPC-Web trailer sentinel).
-            if matches!(self.protocol, Protocol::GrpcWeb)
-                && self.buf.len() >= 5
-                && self.buf[0] & 0x80 != 0
-            {
-                let trailer_len =
-                    u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
-                        as usize;
-                // `saturating_add`: `trailer_len` is a server-controlled u32, so
-                // on a 32-bit target (e.g. the supported `wasm32` gRPC-Web
-                // client) `5 + trailer_len` can overflow `usize` and panic in a
-                // debug build. Matches the sibling framing sites, which already
-                // saturate. A saturated sum is never `<= buf.len()`, so an
-                // over-large prefix simply waits for bytes that never arrive.
-                if self.buf.len() >= trailer_len.saturating_add(5) {
-                    // Complete trailer frame — parse and classify. An
-                    // unparseable frame classifies as `None` (no usable
-                    // termination metadata).
-                    let decompression =
-                        self.encoding.as_deref().map(|enc| (&self.compression, enc));
-                    let parsed =
-                        parse_grpc_web_trailer_frame_with_compression(&self.buf, decompression);
-                    return Err(self.classify_grpc_end(parsed));
-                }
-                // Incomplete trailer frame — need more data, fall through
-                // to poll_body below
-            }
-
-            // Try to decode a complete envelope from the buffer.
-            // Skip this for gRPC-Web when the buffer starts with 0x80 (trailer
-            // flag) to avoid misinterpreting the trailer frame as a data message.
-            let envelope_result = if matches!(self.protocol, Protocol::GrpcWeb)
-                && !self.buf.is_empty()
-                && self.buf[0] & 0x80 != 0
-            {
-                // We know the trailer frame is incomplete (checked above),
-                // so signal that more data is needed.
-                None
-            } else {
-                Envelope::decode_with_limit(
-                    &mut self.buf,
-                    self.max_message_size
-                        .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE),
-                )?
-            };
-
-            match envelope_result {
-                Some(envelope) => {
-                    if envelope.is_end_stream() {
-                        // Connect protocol end-of-stream envelope
-                        return Err(self.process_end_stream(envelope));
-                    }
-
-                    // Data envelope — decompress and decode
-                    let data = self.decompress_envelope(envelope)?;
-
-                    // Check message size limit
-                    if let Some(max_size) = self.max_message_size
-                        && data.len() > max_size
-                    {
-                        return Err(ConnectError::new(
-                            ErrorCode::ResourceExhausted,
-                            format!("message size {} exceeds limit {}", data.len(), max_size),
-                        )
-                        .into());
-                    }
-
-                    let msg = decode_response_view::<RespView>(data, self.codec_format)?;
-                    return Ok(msg);
-                }
-                None => match self.poll_body().await? {
-                    BodyPoll::Data => {} // loop back to try decoding again
+            let Some(envelope) = self.assembler.feed(&mut self.frame)? else {
+                debug_assert!(
+                    self.frame.is_empty(),
+                    "feed returns None only on an empty frame"
+                );
+                match self.poll_body().await? {
+                    BodyPoll::Data(data) => self.frame = data,
                     BodyPoll::Trailers(trailers) => {
                         return Err(self.classify_grpc_end(Some(trailers)));
                     }
@@ -2566,28 +3069,41 @@ where
                             )
                             .into());
                         }
-                        // gRPC-Web: preserved verbatim from the
-                        // pre-refactor shape, and provably dead — the
-                        // loop-top completeness check consumes any complete
-                        // trailer frame before poll_body runs, and EOF
-                        // appends nothing, so the remnant here is absent or
-                        // incomplete and the parse returns `None`. Removal
-                        // is a follow-up; either way classification sees
-                        // "no usable termination metadata".
-                        let parsed = if matches!(self.protocol, Protocol::GrpcWeb)
-                            && !self.buf.is_empty()
-                            && self.buf[0] & 0x80 != 0
-                        {
-                            let decompression =
-                                self.encoding.as_deref().map(|enc| (&self.compression, enc));
-                            parse_grpc_web_trailer_frame_with_compression(&self.buf, decompression)
-                        } else {
-                            None
-                        };
-                        return Err(self.classify_grpc_end(parsed));
+                        // gRPC / gRPC-Web with no HTTP trailers and no complete
+                        // trailer frame: no usable termination metadata.
+                        return Err(self.classify_grpc_end(None));
                     }
-                },
+                }
+                continue;
+            };
+
+            // gRPC-Web carries its trailers as a final 0x80-flagged frame in
+            // the body. (Plain gRPC does not define the bit; the streaming
+            // path ignores unknown flag bits, as it always has.)
+            if matches!(self.protocol, Protocol::GrpcWeb)
+                && envelope.flags & crate::envelope::flags::GRPC_WEB_TRAILER != 0
+            {
+                // An unparseable frame classifies as `None` (no usable
+                // termination metadata).
+                let decompression = self.encoding.as_deref().map(|enc| (&self.compression, enc));
+                let parsed = parse_grpc_web_trailer_payload(
+                    envelope.is_compressed(),
+                    &envelope.data,
+                    decompression,
+                );
+                return Err(self.classify_grpc_end(parsed));
             }
+
+            if envelope.is_end_stream() {
+                // Connect protocol end-of-stream envelope
+                return Err(self.process_end_stream(envelope));
+            }
+
+            // Data envelope — decompress (also bounded by `max_message_size`) and decode.
+            let data = self.decompress_envelope(envelope)?;
+            let msg =
+                decode_response_view::<RespView>(data, self.codec_format, &self.decode_options())?;
+            return Ok(msg);
         }
     }
 
@@ -2624,10 +3140,7 @@ where
                     || (trailers_only && has_status(&self.headers))
                 {
                     Ok(())
-                } else if self
-                    .deadline
-                    .is_some_and(|d| std::time::Instant::now() >= d)
-                {
+                } else if deadline_elapsed(self.deadline) {
                     Err(ConnectError::deadline_exceeded("request timeout"))
                 } else if trailers.is_some() {
                     Err(ConnectError::new(
@@ -2665,23 +3178,10 @@ where
     }
 
     /// Poll the body for the next frame. A pure transport reader: it
-    /// buffers data, returns trailers as a value, and never touches the
-    /// terminal record.
-    ///
-    /// Buffer growth is bounded: if the accumulated bytes exceed the expected
-    /// maximum in-flight envelope size, return `ResourceExhausted` rather than
-    /// continuing to buffer. This prevents a malicious server from trickling
-    /// bytes indefinitely without ever completing an envelope.
+    /// returns data and trailers as values and never touches the terminal
+    /// record. Memory is bounded by the assembler, which checks each
+    /// envelope's declared length before allocating for it.
     async fn poll_body(&mut self) -> Result<BodyPoll, ConnectError> {
-        // Enough for one complete envelope at the max message size, plus
-        // one header's worth of slack (next envelope's header may arrive in
-        // the same TCP frame), plus 64 KiB for gRPC-Web trailer frames.
-        let max_buf_size = self
-            .max_message_size
-            .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE)
-            .saturating_add(2 * crate::envelope::HEADER_SIZE)
-            .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
-
         loop {
             // The whole-call deadline bounds each frame poll. The
             // equivalence with bounding the entire decode loop rests on
@@ -2706,13 +3206,7 @@ where
                             if !data.is_empty() {
                                 self.saw_body_data = true;
                             }
-                            if self.buf.len().saturating_add(data.len()) > max_buf_size {
-                                return Err(ConnectError::resource_exhausted(format!(
-                                    "response buffer exceeds limit {max_buf_size}"
-                                )));
-                            }
-                            self.buf.extend_from_slice(&data);
-                            return Ok(BodyPoll::Data);
+                            return Ok(BodyPoll::Data(data));
                         }
                     } else if frame.is_trailers()
                         && let Ok(trailers) = frame.into_trailers()
@@ -2725,9 +3219,11 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    return Err(ConnectError::internal(format!(
-                        "error reading response body: {e}"
-                    )));
+                    return Err(classify_body_read_error(
+                        "failed to read response body",
+                        e,
+                        deadline,
+                    ));
                 }
             }
         }
@@ -2741,11 +3237,8 @@ where
                     "received compressed message without content-encoding header",
                 )
             })?;
-            let max_size = self
-                .max_message_size
-                .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
             self.compression
-                .decompress_with_limit(encoding, envelope.data, max_size)
+                .decompress_with_limit(encoding, envelope.data, self.max_message_size)
                 .map_err(map_response_decompression_error)
         } else {
             Ok(envelope.data)
@@ -2761,10 +3254,7 @@ where
 
         let end_stream = match parse_connect_end_stream(&end_stream_data) {
             Ok(end_stream) => end_stream,
-            Err(mut e) => {
-                e.set_response_headers(self.headers.clone());
-                return e.into();
-            }
+            Err(e) => return e.into(),
         };
 
         let trailers = end_stream.metadata.map(|metadata| {
@@ -2788,11 +3278,23 @@ where
 /// messages incrementally as they arrive. Use [`ServerStream::message()`] to
 /// read messages one at a time.
 ///
+/// `spec` identifies the method as for [`call_unary`], with
+/// [`StreamType::ServerStream`].
+///
 /// # Errors
 ///
 /// Returns immediately with an error if:
+/// - `spec` is mismatched (`Internal`, see [`call_unary`])
 /// - The request cannot be encoded or sent
 /// - The server responds with a non-200 status (protocol-level error)
+/// - A successful response declares a content type incompatible with the
+///   configured protocol or codec: `Internal` when it is in the right
+///   family (`application/connect+*`, `application/grpc+*`,
+///   `application/grpc-web+*`) but names the wrong codec, `Unknown` when it
+///   is not in the family at all — typically a proxy's error page. Media-type
+///   parameters are ignored, and a response with no `content-type` header is
+///   accepted, so an intermediary that strips the header does not fail an
+///   otherwise well-formed call.
 ///
 /// Errors that occur during the stream (e.g., in gRPC trailers or the
 /// END_STREAM envelope) are returned by [`ServerStream::message()`].
@@ -2805,27 +3307,20 @@ where
 pub async fn call_server_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     request: Req,
     options: CallOptions,
 ) -> Result<ServerStream<T::ResponseBody, RespView>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::ServerStream, "call_server_stream")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     // Encode the request body
     let body = match config.codec_format {
@@ -2881,6 +3376,7 @@ where
             &config.compression,
             config.codec_format,
             options.max_message_size,
+            options.element_memory_limit,
             deadline,
         )
         .await
@@ -2890,10 +3386,14 @@ where
 
 /// Construct a [`ServerStream`] from a streaming HTTP response.
 ///
-/// Handles trailers-only gRPC error detection, non-200 Connect error body
-/// parsing, and response encoding extraction. Used by both [`call_server_stream`]
-/// (passing fields from `&ClientConfig`) and [`BidiStream::message`] (passing
-/// fields from its owned `StreamConfig` snapshot).
+/// Handles gRPC-family HTTP-status and content-type gating (shared with the
+/// unary path via [`check_grpc_response_head`]), trailers-only gRPC error
+/// detection, non-200 Connect error body parsing, Connect content-type
+/// gating on the 200 path (shared with the unary and client-streaming paths
+/// via [`validate_connect_response_content_type`]), and response encoding
+/// extraction. Used by both [`call_server_stream`] (passing fields
+/// from `&ClientConfig`) and [`BidiStream::message`] (passing fields from its
+/// owned `StreamConfig` snapshot).
 ///
 /// Takes individual config fields instead of `&ClientConfig` so callers that
 /// need to capture config by value (like `BidiStream`, which outlives the
@@ -2904,23 +3404,28 @@ async fn make_server_stream<B, RespView>(
     compression: &CompressionRegistry,
     codec_format: CodecFormat,
     max_message_size: Option<usize>,
+    element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
 ) -> Result<ServerStream<B, RespView>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    let max_message_size = max_message_size.unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
     let response_headers = response.headers().clone();
     let status = response.status();
 
-    // For gRPC, check for trailers-only error response
-    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb)
-        && let Some(mut err) = parse_grpc_error_from_trailers(&response_headers)
-    {
-        err.set_response_headers(response_headers);
-        return Err(err);
+    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) {
+        // Same precedence as the unary path: HTTP status and content-type are
+        // settled before `grpc-status` is read, so a trailers-only reply in
+        // the wrong content-type family is rejected rather than believed.
+        check_grpc_response_head(status, &response_headers, protocol, codec_format)?;
+        if let Some(mut err) = parse_grpc_error_from_trailers(&response_headers) {
+            err.set_response_headers(response_headers);
+            return Err(err);
+        }
     }
 
     // Non-200 responses are protocol errors
@@ -2931,16 +3436,14 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_owned());
 
-            let stream_max_err_size =
-                max_message_size.unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
-
-            let body = collect_body_bounded(response.into_body(), stream_max_err_size).await?;
+            let body =
+                collect_body_bounded(response.into_body(), max_message_size, deadline).await?;
 
             // Decompress if the server set Content-Encoding. On failure,
             // fall through to the generic HTTP-status error below.
             let body = match error_encoding {
                 Some(encoding) => {
-                    match compression.decompress_with_limit(&encoding, body, stream_max_err_size) {
+                    match compression.decompress_with_limit(&encoding, body, max_message_size) {
                         Ok(decompressed) => Some(decompressed),
                         Err(e) => {
                             tracing::debug!(
@@ -2974,6 +3477,14 @@ where
         return Err(err);
     }
 
+    if matches!(protocol, Protocol::Connect) {
+        // Connect and gRPC share envelope framing, so without this a gRPC
+        // reply would be read as Connect messages and a proxy's HTML error
+        // page as a corrupt envelope; the gRPC arm settled its content-type
+        // above.
+        validate_connect_response_content_type(&response_headers, codec_format, true)?;
+    }
+
     // Get the response encoding for compressed envelopes (protocol-aware header)
     let encoding = response_headers
         .get(protocol.content_encoding_header())
@@ -2981,9 +3492,11 @@ where
         .map(|s| s.to_owned());
 
     Ok(ServerStream {
+        element_memory_limit,
         headers: response_headers,
         body: response.into_body(),
-        buf: BytesMut::new(),
+        frame: Bytes::new(),
+        assembler: response_assembler(protocol, max_message_size),
         encoding,
         compression: compression.clone(),
         codec_format,
@@ -3169,7 +3682,7 @@ enum RecvState<B, RespView> {
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut stream = call_bidi_stream(&transport, &config, "svc", "method", CallOptions::default()).await?;
+/// let mut stream = call_bidi_stream(&transport, &config, SVC_METHOD_SPEC.with_origin(SpecOrigin::Client), CallOptions::default()).await?;
 /// stream.send(request1).await?;
 /// stream.send(request2).await?;
 /// stream.close_send();
@@ -3284,6 +3797,7 @@ struct StreamConfig {
     codec_format: CodecFormat,
     compression: CompressionRegistry,
     max_message_size: Option<usize>,
+    element_memory_limit: Option<usize>,
     deadline: Option<std::time::Instant>,
 }
 
@@ -3347,7 +3861,7 @@ where
 impl<B, RespView> BidiRecvHalf<B, RespView>
 where
     B: Body<Data = Bytes> + Send + Unpin,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -3365,7 +3879,9 @@ where
     /// Returns `Ok(None)` only when the server finished **cleanly**; a
     /// server error carried in the termination metadata is returned as
     /// `Err`, sticky across calls — see [`ServerStream::message()`] for the
-    /// full contract.
+    /// full contract. The first call also reports the response-head
+    /// rejections [`call_server_stream`] lists — a non-200 status or an
+    /// incompatible content type — since that is where the head arrives.
     pub async fn message<M>(&mut self) -> Result<Option<crate::StreamMessage<M>>, ConnectError>
     where
         // Same output-parameter shape as `ServerStream::message` — see the
@@ -3410,6 +3926,7 @@ where
                     let codec_format = self.stream_config.codec_format;
                     let compression = self.stream_config.compression.clone();
                     let max_message_size = self.stream_config.max_message_size;
+                    let element_memory_limit = self.stream_config.element_memory_limit;
                     let deadline = self.stream_config.deadline;
 
                     let construct_task = tokio::spawn(async move {
@@ -3424,6 +3941,7 @@ where
                                 &compression,
                                 codec_format,
                                 max_message_size,
+                                element_memory_limit,
                                 deadline,
                             ),
                         )
@@ -3550,7 +4068,7 @@ impl<B, Req, RespView> BidiStream<B, Req, RespView> {
 impl<B, Req, RespView> BidiStream<B, Req, RespView>
 where
     B: Body<Data = Bytes> + Send + Unpin,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
@@ -3614,11 +4132,20 @@ where
 /// [`BidiStream::message`] call — this supports full-duplex servers that
 /// wait for the first request message before sending response headers.
 ///
+/// `spec` identifies the method as for [`call_unary`], with
+/// [`StreamType::BidiStream`].
+///
+/// # Errors
+///
+/// Returns `Internal` before opening the stream for a mismatched `spec`
+/// (see [`call_unary`]). Transport and protocol errors surface from
+/// [`BidiStream::message`].
+///
 /// # Example
 ///
 /// ```rust,ignore
 /// let mut stream = call_bidi_stream::<_, MyReq, MyRespView>(
-///     &transport, &config, "my.Service", "Method", CallOptions::default(),
+///     &transport, &config, MY_SERVICE_METHOD_SPEC.with_origin(SpecOrigin::Client), CallOptions::default(),
 /// ).await?;
 /// stream.send(req).await?;
 /// stream.close_send();
@@ -3627,26 +4154,19 @@ where
 pub async fn call_bidi_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     options: CallOptions,
 ) -> Result<BidiStream<T::ResponseBody, Req, RespView>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::BidiStream, "call_bidi_stream")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     // Set up the channel-backed request body. Channel depth 32 matches
     // typical h2 stream window; sends beyond this backpressure naturally.
@@ -3712,6 +4232,7 @@ where
                 codec_format: config.codec_format,
                 compression: config.compression.clone(),
                 max_message_size: options.max_message_size,
+                element_memory_limit: options.element_memory_limit,
                 deadline,
             },
         },
@@ -3742,7 +4263,7 @@ where
 ///
 /// ```rust,ignore
 /// let resp = call_client_stream(
-///     &transport, &config, "svc", "Method",
+///     &transport, &config, SVC_METHOD_SPEC.with_origin(SpecOrigin::Client),
 ///     connectrpc::stream_iter(vec![req1, req2]),
 ///     CallOptions::default(),
 /// ).await?;
@@ -3768,31 +4289,27 @@ where
 ///
 /// Returns an error if a request message cannot be encoded, the transport
 /// fails, the whole-call deadline expires, the server responds with an
-/// error, or the response cannot be decoded.
+/// error, the response declares an incompatible content type (classified
+/// as for [`call_server_stream`]), the response cannot be decoded, or
+/// (`Internal`, before anything is sent) `spec` is mismatched — see
+/// [`call_unary`] for how `spec` identifies the method.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
-    service: &str,
-    method: &str,
+    spec: Spec,
     requests: impl ClientRequestStream<Req>,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     T: ClientTransport,
-    <T::ResponseBody as Body>::Error: std::fmt::Display,
+    <T::ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     Req: buffa::Message + crate::codec::JsonSerialize,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
+    check_client_spec(spec, StreamType::ClientStream, "call_client_stream")?;
     let options = effective_options(config, options);
-
-    // Build the full URI from base_uri and service/method path
-    let base_str = config.base_uri.to_string();
-    let base_str = base_str.trim_end_matches('/');
-    let full_uri = format!("{base_str}/{service}/{method}");
-    let uri: Uri = full_uri
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
+    let uri = procedure_uri(config, spec.procedure, None)?;
 
     let compression_for_encoder = config.request_compression.as_ref().map(|enc| {
         (
@@ -3858,7 +4375,7 @@ where
                 parse_grpc_unary_response(response, config, &options, deadline).await
             }
             Protocol::Connect => {
-                parse_connect_client_stream_response(response, config, &options).await
+                parse_connect_client_stream_response(response, config, &options, deadline).await
             }
         }
     })
@@ -3889,10 +4406,11 @@ async fn parse_connect_client_stream_response<B, RespView>(
     response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
+    deadline: Option<std::time::Instant>,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
     B: Body<Data = Bytes> + Send,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     RespView: MessageView<'static> + Send,
     RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
@@ -3910,7 +4428,7 @@ where
             .max_message_size
             .unwrap_or(crate::service::DEFAULT_MAX_MESSAGE_SIZE);
 
-        let body = collect_body_bounded(response.into_body(), max_err_size).await?;
+        let body = collect_body_bounded(response.into_body(), max_err_size, deadline).await?;
 
         // Decompress if the server set Content-Encoding. On failure,
         // fall through to the generic HTTP-status error below.
@@ -3952,13 +4470,13 @@ where
         return Err(err);
     }
 
-    let encoding = response
-        .headers()
+    let resp_headers = response.headers().clone();
+    validate_connect_response_content_type(&resp_headers, config.codec_format, true)?;
+
+    let encoding = resp_headers
         .get(config.protocol.content_encoding_header())
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
-
-    let resp_headers = response.headers().clone();
 
     let max_msg_size = options
         .max_message_size
@@ -3971,7 +4489,12 @@ where
     let body_limit = max_msg_size
         .saturating_add(2 * crate::envelope::HEADER_SIZE)
         .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
-    let body = collect_body_bounded(response.into_body(), body_limit).await?;
+    let body = collect_body_bounded(response.into_body(), body_limit, deadline)
+        .await
+        .map_err(with_response_metadata(
+            &resp_headers,
+            &http::HeaderMap::new(),
+        ))?;
 
     let (data, trailers) = parse_connect_client_stream_envelopes(
         body,
@@ -3980,7 +4503,10 @@ where
         max_msg_size,
         &resp_headers,
     )?;
-    let message = decode_response_view::<RespView>(data, config.codec_format)?;
+    // The trailers are parsed by now, so a decode failure reports them too.
+    let message =
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options())
+            .map_err(with_response_metadata(&resp_headers, &trailers))?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -4005,6 +4531,10 @@ where
 /// decoded. A second data envelope is rejected before its payload is
 /// decompressed, so the client never spends decompression work or memory on
 /// more than the single message the RPC allows.
+///
+/// Every error out of here ends the RPC, so all of them carry the response
+/// headers — attached here rather than inside the scan, so no failure mode
+/// can omit them.
 fn parse_connect_client_stream_envelopes(
     body: Bytes,
     compression: &crate::compression::CompressionRegistry,
@@ -4012,13 +4542,29 @@ fn parse_connect_client_stream_envelopes(
     max_msg_size: usize,
     resp_headers: &http::HeaderMap,
 ) -> Result<(Bytes, http::HeaderMap), ConnectError> {
-    let mut buf = BytesMut::from(body.as_ref());
+    scan_connect_client_stream_envelopes(body, compression, encoding, max_msg_size).map_err(
+        |mut err| {
+            err.set_response_headers(resp_headers.clone());
+            err
+        },
+    )
+}
+
+/// The envelope scan behind [`parse_connect_client_stream_envelopes`].
+/// Errors leave here without response headers; the caller attaches them.
+fn scan_connect_client_stream_envelopes(
+    body: Bytes,
+    compression: &crate::compression::CompressionRegistry,
+    encoding: Option<&str>,
+    max_msg_size: usize,
+) -> Result<(Bytes, http::HeaderMap), ConnectError> {
+    let mut buf = body;
     let mut message: Option<Bytes> = None;
     let mut trailers = http::HeaderMap::new();
     let mut saw_end_stream = false;
 
     while !buf.is_empty() {
-        let envelope = match Envelope::decode_with_limit(&mut buf, max_msg_size)? {
+        let envelope = match Envelope::decode_bytes_with_limit(&mut buf, max_msg_size)? {
             Some(env) => env,
             None => break,
         };
@@ -4036,10 +4582,7 @@ fn parse_connect_client_stream_envelopes(
                 envelope.data
             };
 
-            let end_stream = parse_connect_end_stream(&end_stream_data).map_err(|mut err| {
-                err.set_response_headers(resp_headers.clone());
-                err
-            })?;
+            let end_stream = parse_connect_end_stream(&end_stream_data)?;
 
             if let Some(metadata) = end_stream.metadata {
                 append_metadata_capped(&mut trailers, metadata);
@@ -4047,8 +4590,12 @@ fn parse_connect_client_stream_envelopes(
 
             if let Some(err) = end_stream.error {
                 let mut connect_error = end_stream_error_to_connect_error(err);
-                connect_error.set_response_headers(resp_headers.clone());
-                connect_error.set_trailers(trailers);
+                // Same filter as the server-streaming shape, so identical
+                // wire bytes give identical `ConnectError::trailers()`
+                // whichever kind of call carried them. A gateway that
+                // translates gRPC to Connect can put a `grpc-status` into
+                // END_STREAM metadata, and it means the same thing there.
+                connect_error.set_trailers(error_metadata_from_trailers(&trailers));
                 return Err(connect_error);
             }
 
@@ -4164,6 +4711,33 @@ struct ConnectErrorResponse {
 ///
 /// Only specific HTTP status codes have defined mappings. All other codes map to
 /// `Unknown` per the specification.
+/// Build the error for a gRPC response body that could not be parsed.
+///
+/// On a non-2xx the HTTP status is the more useful report — it is the code that
+/// says whether the request may be retried — so the parse failure is appended
+/// to it as detail rather than replacing it, matching how a content-type
+/// rejection is reported. A proxy serves its error page under whatever
+/// content-type suits the request, so an HTML 502 can arrive under
+/// `application/grpc` and fail framing rather than the content-type check;
+/// reporting that as `internal` would make two spellings of one 502 give
+/// opposite retry answers.
+fn body_parse_error(
+    status: http::StatusCode,
+    resp_headers: http::HeaderMap,
+    detail: String,
+) -> ConnectError {
+    let mut err = if status.is_success() {
+        ConnectError::internal(detail)
+    } else {
+        ConnectError::new(
+            http_status_to_error_code(status),
+            format!("HTTP error {}: {detail}", status.as_u16()),
+        )
+    };
+    err.set_response_headers(resp_headers);
+    err
+}
+
 fn http_status_to_error_code(status: http::StatusCode) -> ErrorCode {
     match status.as_u16() {
         400 => ErrorCode::Internal,
@@ -4220,39 +4794,39 @@ fn add_unary_request_headers(
 ) -> http::request::Builder {
     builder = builder.header(
         http::header::CONTENT_TYPE,
-        unary_request_content_type(config),
+        http::HeaderValue::from_static(unary_request_content_type(config)),
     );
 
     match config.protocol {
         Protocol::Connect => {
-            builder = builder.header(connect_header::PROTOCOL_VERSION, "1");
+            builder = builder.header(
+                connect_header::PROTOCOL_VERSION,
+                http::HeaderValue::from_static("1"),
+            );
             // Connect unary uses standard content-encoding / accept-encoding.
             // Only set Content-Encoding if compression was actually applied.
             if let Some(encoding) = applied_content_encoding {
                 builder = builder.header(http::header::CONTENT_ENCODING, encoding);
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header(http::header::ACCEPT_ENCODING, accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header(http::header::ACCEPT_ENCODING, accept.clone());
             }
         }
         Protocol::Grpc => {
-            builder = builder.header("te", "trailers");
+            builder = builder.header("te", http::HeaderValue::from_static("trailers"));
             if let Some(ref encoding) = config.request_compression {
                 builder = builder.header("grpc-encoding", encoding.as_str());
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header("grpc-accept-encoding", accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header("grpc-accept-encoding", accept.clone());
             }
         }
         Protocol::GrpcWeb => {
             if let Some(ref encoding) = config.request_compression {
                 builder = builder.header("grpc-encoding", encoding.as_str());
             }
-            let accept = config.compression.accept_encoding_header();
-            if !accept.is_empty() {
-                builder = builder.header("grpc-accept-encoding", accept);
+            if let Some(accept) = config.compression.accept_encoding_value() {
+                builder = builder.header("grpc-accept-encoding", accept.clone());
             }
         }
     }
@@ -4275,15 +4849,18 @@ fn add_streaming_request_headers(
 ) -> http::request::Builder {
     builder = builder.header(
         http::header::CONTENT_TYPE,
-        streaming_request_content_type(config),
+        http::HeaderValue::from_static(streaming_request_content_type(config)),
     );
 
     match config.protocol {
         Protocol::Connect => {
-            builder = builder.header(connect_header::PROTOCOL_VERSION, "1");
+            builder = builder.header(
+                connect_header::PROTOCOL_VERSION,
+                http::HeaderValue::from_static("1"),
+            );
         }
         Protocol::Grpc => {
-            builder = builder.header("te", "trailers");
+            builder = builder.header("te", http::HeaderValue::from_static("trailers"));
         }
         Protocol::GrpcWeb => {}
     }
@@ -4294,9 +4871,8 @@ fn add_streaming_request_headers(
     if let Some(ref encoding) = config.request_compression {
         builder = builder.header(encoding_header, encoding.as_str());
     }
-    let accept = config.compression.accept_encoding_header();
-    if !accept.is_empty() {
-        builder = builder.header(accept_header, accept);
+    if let Some(accept) = config.compression.accept_encoding_value() {
+        builder = builder.header(accept_header, accept.clone());
     }
 
     if let Some(timeout) = timeout {
@@ -4307,6 +4883,30 @@ fn add_streaming_request_headers(
     }
 
     builder
+}
+
+/// The trailers that carry the status itself rather than user metadata.
+/// Their content reaches the caller as the error's `code`, `message` and
+/// `details`, so repeating them as metadata would duplicate the status and
+/// re-expose the raw `grpc-status-details-bin` bytes. The server side
+/// writes these same three names via `hdr`.
+fn is_status_trailer(name: &http::HeaderName) -> bool {
+    *name == hdr::GRPC_STATUS || *name == hdr::GRPC_MESSAGE || *name == hdr::GRPC_STATUS_DETAILS_BIN
+}
+
+/// The trailing metadata a terminal error should expose: the trailers that
+/// arrived, minus the status-bearing ones. `ServerStream::trailers()` still
+/// reports the wire trailers verbatim — the error's view and the stream's
+/// differ deliberately, and every write of an error's trailers on the
+/// response path goes through here so the two protocols agree.
+fn error_metadata_from_trailers(trailers: &http::HeaderMap) -> http::HeaderMap {
+    let mut out = http::HeaderMap::new();
+    for (key, value) in trailers {
+        if !is_status_trailer(key) {
+            out.append(key, value.clone());
+        }
+    }
+    out
 }
 
 /// Parse a gRPC error from HTTP/2 trailers or gRPC-Web trailer frame headers.
@@ -4348,25 +4948,29 @@ fn parse_grpc_error_from_trailers(trailers: &http::HeaderMap) -> Option<ConnectE
         }
     }
 
-    // Include other trailers as error metadata
-    let out = err.trailers_mut();
-    for (key, value) in trailers.iter() {
-        let name = key.as_str();
-        if name != "grpc-status" && name != "grpc-message" && name != "grpc-status-details-bin" {
-            out.append(key, value.clone());
-        }
-    }
+    err.set_trailers(error_metadata_from_trailers(trailers));
 
     Some(err)
 }
 
 /// Collect an HTTP response body into `Bytes`, enforcing a size limit.
 ///
-/// Returns `ResourceExhausted` if the accumulated data exceeds `max_size`.
-async fn collect_body_bounded<B>(body: B, max_size: usize) -> Result<Bytes, ConnectError>
+/// `deadline` is the call's absolute deadline, used only to classify a
+/// transport failure — see [`classify_body_read_error`]. Pass `None` for a
+/// call without one; this function does not enforce the deadline, which
+/// [`with_deadline`] does around the whole read.
+///
+/// Returns `ResourceExhausted` if the accumulated data exceeds `max_size`,
+/// `DeadlineExceeded` if the body fails after the deadline has passed, and
+/// `Internal` if it fails before.
+async fn collect_body_bounded<B>(
+    body: B,
+    max_size: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<Bytes, ConnectError>
 where
     B: Body<Data = Bytes>,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let mut stream = std::pin::pin!(body);
     // Hold the first frame by refcount so a one-frame body is never copied.
@@ -4407,9 +5011,11 @@ where
                 }
             }
             Some(Err(e)) => {
-                return Err(ConnectError::internal(format!(
-                    "failed to read response body: {e}",
-                )));
+                return Err(classify_body_read_error(
+                    "failed to read response body",
+                    e,
+                    deadline,
+                ));
             }
             None => break,
         }
@@ -4438,19 +5044,24 @@ fn parse_grpc_web_trailer_frame_with_compression(
     data: &[u8],
     decompression: Option<(&CompressionRegistry, &str)>,
 ) -> Option<http::HeaderMap> {
-    if data.len() < 5 || data[0] & 0x80 == 0 {
+    if data.len() < 5 || data[0] & crate::envelope::flags::GRPC_WEB_TRAILER == 0 {
         return None;
     }
-    let is_compressed = data[0] & 0x01 != 0;
+    let is_compressed = data[0] & crate::envelope::flags::COMPRESSED != 0;
     let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-    // Cap trailer frame size to prevent a malicious server from forcing
-    // unbounded memory allocation. 1 MB is generous for trailer metadata.
-    const MAX_TRAILER_SIZE: usize = 1024 * 1024;
-    if len > MAX_TRAILER_SIZE || data.len() < 5 + len {
+    if len > MAX_GRPC_WEB_TRAILER_SIZE || data.len() < len.saturating_add(5) {
         return None;
     }
-    let raw_payload = &data[5..5 + len];
+    parse_grpc_web_trailer_payload(is_compressed, &data[5..5 + len], decompression)
+}
 
+/// Parse the payload of a gRPC-Web trailer frame (the bytes after its 5-byte
+/// header) into a header map.
+fn parse_grpc_web_trailer_payload(
+    is_compressed: bool,
+    raw_payload: &[u8],
+    decompression: Option<(&CompressionRegistry, &str)>,
+) -> Option<http::HeaderMap> {
     // Decompress if the compressed flag is set
     let payload_bytes;
     let payload = if is_compressed {
@@ -4459,7 +5070,7 @@ fn parse_grpc_web_trailer_frame_with_compression(
                 .decompress_with_limit(
                     encoding,
                     Bytes::copy_from_slice(raw_payload),
-                    MAX_TRAILER_SIZE,
+                    MAX_GRPC_WEB_TRAILER_SIZE,
                 )
                 .ok()?;
             std::str::from_utf8(&payload_bytes).ok()?
@@ -4488,7 +5099,7 @@ fn parse_grpc_web_trailer_frame_with_compression(
             // `append` once the number of stored entries would exceed its
             // hard ceiling (`MAX_SIZE = 1 << 15`). A hostile server can pack
             // tens of thousands of short trailer lines into a payload that
-            // stays under `MAX_TRAILER_SIZE` (bytes, not entries), so the
+            // stays under `MAX_GRPC_WEB_TRAILER_SIZE` (bytes, not entries), so the
             // byte cap alone does not prevent the panic. Stop accumulating at
             // the ceiling rather than crashing the RPC task.
             if headers.try_append(name, val).is_err() {
@@ -4526,6 +5137,406 @@ fn append_metadata_capped(trailers: &mut http::HeaderMap, metadata: HashMap<Stri
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct StaticResponseTransport {
+        headers: http::HeaderMap,
+    }
+
+    impl ClientTransport for StaticResponseTransport {
+        type ResponseBody = Full<Bytes>;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            let headers = self.headers.clone();
+            Box::pin(async move {
+                let mut response = Response::builder()
+                    .status(http::StatusCode::OK)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                *response.headers_mut() = headers;
+                Ok(response)
+            })
+        }
+    }
+
+    fn streaming_response(content_type: Option<&'static str>) -> Response<Full<Bytes>> {
+        let mut builder = Response::builder()
+            .status(http::StatusCode::OK)
+            .header("x-request-id", "abc123");
+        if let Some(content_type) = content_type {
+            builder = builder.header(http::header::CONTENT_TYPE, content_type);
+        }
+        builder.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    /// Every streaming protocol gates the 200 path on its content-type, and
+    /// all of them classify a mismatch the same way: a recognised family with
+    /// the wrong codec is `internal`, anything else is `unknown`. The Connect
+    /// rows are the pin for #275 — Connect and gRPC share envelope framing,
+    /// so without the gate a gRPC reply decodes as Connect messages and a
+    /// proxy's HTML error page decodes as an oversized envelope.
+    #[tokio::test]
+    async fn streaming_response_content_type_rejects_mismatches() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let compression = CompressionRegistry::new();
+        let rejected = [
+            (
+                Protocol::Grpc,
+                CodecFormat::Proto,
+                "application/grpc-web+proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::GrpcWeb,
+                CodecFormat::Proto,
+                "application/grpc+proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Grpc,
+                CodecFormat::Json,
+                "application/grpc+proto",
+                ErrorCode::Internal,
+            ),
+            (
+                Protocol::GrpcWeb,
+                CodecFormat::Json,
+                "application/grpc-web+proto",
+                ErrorCode::Internal,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/grpc+proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "text/html",
+                ErrorCode::Unknown,
+            ),
+            // The unary Connect type is the wrong shape, not the wrong codec,
+            // and the bare family type has no codec at all.
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/connect",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                "application/connect+json",
+                ErrorCode::Internal,
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Json,
+                "application/connect+proto",
+                ErrorCode::Internal,
+            ),
+        ];
+
+        for (protocol, codec_format, actual, expected_code) in rejected {
+            let expected = protocol.response_content_type(codec_format, true);
+            let err = make_server_stream::<_, StringValueView<'static>>(
+                streaming_response(Some(actual)),
+                protocol,
+                &compression,
+                codec_format,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("incompatible content type must reject stream construction");
+
+            assert_eq!(err.code, expected_code, "{protocol} content-type {actual}");
+            assert!(
+                err.message.as_deref().is_some_and(|message| {
+                    message.contains(actual) && message.contains(expected)
+                }),
+                "{protocol} content-type {actual}: {:?}",
+                err.message
+            );
+            assert_eq!(err.response_headers()["x-request-id"], "abc123");
+            assert_eq!(err.response_headers()[http::header::CONTENT_TYPE], actual);
+        }
+    }
+
+    /// The lenient cases the gate must keep accepting: media-type parameters
+    /// are ignored, a missing header is tolerated for proxies that strip it,
+    /// and the bare gRPC family type stands in for any codec.
+    #[tokio::test]
+    async fn streaming_response_content_type_preserves_compatibility() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let compression = CompressionRegistry::new();
+        let accepted = [
+            (
+                Protocol::Grpc,
+                CodecFormat::Proto,
+                Some("application/grpc+proto"),
+            ),
+            (
+                Protocol::GrpcWeb,
+                CodecFormat::Json,
+                Some("application/grpc-web"),
+            ),
+            (
+                Protocol::Grpc,
+                CodecFormat::Json,
+                Some("application/grpc; charset=utf-8"),
+            ),
+            (
+                Protocol::Grpc,
+                CodecFormat::Json,
+                Some("application/grpc+json"),
+            ),
+            (Protocol::GrpcWeb, CodecFormat::Proto, None),
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                Some("application/connect+proto"),
+            ),
+            (
+                Protocol::Connect,
+                CodecFormat::Json,
+                Some("application/connect+json; charset=utf-8"),
+            ),
+            (Protocol::Connect, CodecFormat::Proto, None),
+        ];
+
+        for (protocol, codec_format, content_type) in accepted {
+            make_server_stream::<_, StringValueView<'static>>(
+                streaming_response(content_type),
+                protocol,
+                &compression,
+                codec_format,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!("{protocol} content-type {content_type:?} must stay accepted: {err}")
+            });
+        }
+    }
+
+    /// The unary Connect path shares the streaming classifier, so its rules
+    /// are pinned here in one place: the other codec's unary type is
+    /// `internal`, a streaming type or a prefix superstring of the expected
+    /// type is `unknown`, parameters are ignored, and a missing header is
+    /// accepted.
+    #[test]
+    fn unary_connect_response_content_type_classification() {
+        let classify = |content_type: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_str(content_type).unwrap(),
+                );
+            }
+            validate_connect_response_content_type(&headers, CodecFormat::Proto, false)
+                .map_err(|err| (err.code, err.message))
+        };
+
+        assert_eq!(classify(Some("application/proto")), Ok(()));
+        assert_eq!(classify(Some("application/proto; charset=utf-8")), Ok(()));
+        assert_eq!(classify(None), Ok(()));
+        assert_eq!(
+            classify(Some("application/json")),
+            Err((
+                ErrorCode::Internal,
+                Some(
+                    "unexpected content-type: application/json (expected application/proto)".into()
+                )
+            ))
+        );
+        for not_connect_unary in [
+            "application/protobuf",
+            "application/connect+proto",
+            "text/html",
+        ] {
+            assert_eq!(
+                classify(Some(not_connect_unary)).unwrap_err().0,
+                ErrorCode::Unknown,
+                "{not_connect_unary}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_content_type_validation_preserves_http_status_precedence() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let err = make_server_stream::<_, StringValueView<'static>>(
+            response,
+            Protocol::Grpc,
+            &CompressionRegistry::new(),
+            CodecFormat::Proto,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("HTTP status must be classified before content type");
+
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "HTTP error 502: unexpected content-type: text/html (expected application/grpc+proto)"
+            )
+        );
+
+        // Connect keeps the same precedence: a non-200 reply is an error body
+        // to parse, whatever content-type it arrived under, so the gate only
+        // sees 200s.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .body(Full::new(Bytes::from_static(
+                br#"{"code":"unavailable","message":"upstream down"}"#,
+            )))
+            .unwrap();
+        let err = make_server_stream::<_, StringValueView<'static>>(
+            response,
+            Protocol::Connect,
+            &CompressionRegistry::new(),
+            CodecFormat::Proto,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a non-200 Connect reply is an error whatever its content-type");
+
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("upstream down"));
+    }
+
+    /// The unary and streaming parsers see the same response head and must
+    /// classify it the same way: HTTP status and content-type are settled
+    /// before `grpc-status` is read, so a trailers-only reply in the wrong
+    /// family is rejected on its content-type rather than believed for its
+    /// status, while a proxy reply that plausibly speaks gRPC keeps its status.
+    #[tokio::test]
+    async fn unary_and_streaming_classify_a_grpc_response_head_identically() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // (HTTP status, content-type, grpc-status) -> expected code
+        let cases: [(u16, Option<&str>, Option<&str>, ErrorCode); 5] = [
+            // Wrong family outranks the status it carries.
+            (
+                200,
+                Some("application/grpc-web+proto"),
+                Some("3"),
+                ErrorCode::Unknown,
+            ),
+            // Non-2xx that is not speaking gRPC reports the HTTP status.
+            (503, Some("text/html"), None, ErrorCode::Unavailable),
+            (503, None, None, ErrorCode::Unavailable),
+            // Non-2xx that plausibly speaks gRPC keeps its trailers-only status,
+            // with or without a content-type (a proxy may drop it).
+            (
+                503,
+                Some("application/grpc"),
+                Some("3"),
+                ErrorCode::InvalidArgument,
+            ),
+            (503, None, Some("3"), ErrorCode::InvalidArgument),
+        ];
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        for (status, content_type, grpc_status, expected) in cases {
+            let head = || {
+                let mut b = Response::builder().status(status);
+                if let Some(ct) = content_type {
+                    b = b.header(http::header::CONTENT_TYPE, ct);
+                }
+                if let Some(gs) = grpc_status {
+                    b = b
+                        .header("grpc-status", gs)
+                        .header("grpc-message", "from the peer");
+                }
+                b.body(Full::new(Bytes::new())).unwrap()
+            };
+            let case = format!("{status} {content_type:?} {grpc_status:?}");
+
+            let streaming = make_server_stream::<_, StringValueView<'static>>(
+                head(),
+                config.protocol,
+                &config.compression,
+                config.codec_format,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err(&case);
+            let unary = parse_grpc_unary_response::<_, StringValueView<'static>>(
+                head(),
+                &config,
+                &CallOptions::default(),
+                None,
+            )
+            .await
+            .expect_err(&case);
+
+            assert_eq!(streaming.code, expected, "streaming {case}");
+            assert_eq!(unary.code, expected, "unary {case}");
+            assert_eq!(streaming.message, unary.message, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn call_server_stream_rejects_cross_protocol_trailers_only_response() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc-web+proto"),
+        );
+        headers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let transport = StaticResponseTransport { headers };
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = call_server_stream::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/ServerStream", StreamType::ServerStream),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("wrong-family response must fail before a ServerStream is returned");
+
+        assert_eq!(err.code, ErrorCode::Unknown);
+    }
+
     #[test]
     fn overflow_payload_is_internal_at_response_decode() {
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
@@ -4535,8 +5546,12 @@ mod tests {
         // the deleted fallible `into_owned` used, so the wire-visible
         // behavior for an over-limit response is pinned here.
         let body = crate::request::tests::unknown_field_overflow_body();
-        let err =
-            decode_response_view::<StringValueView<'static>>(body, CodecFormat::Proto).unwrap_err();
+        let err = decode_response_view::<StringValueView<'static>>(
+            body,
+            CodecFormat::Proto,
+            &buffa::DecodeOptions::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
     }
 
@@ -4705,6 +5720,68 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_plaintext_send_failure_preserves_source() {
+        let http = HttpClient::plaintext();
+        // Port 1 should not have a listener — the OS refuses immediately.
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://127.0.0.1:1/")
+            .body(full_body(Bytes::new()))
+            .unwrap();
+
+        let err = http
+            .send(req)
+            .await
+            .expect_err("connect to port 1 must fail");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("HTTP request failed"),
+            "unexpected message: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "connection-refused failure must retain its cause as source(): {err:?}"
+        );
+    }
+
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn http_client_tls_send_failure_preserves_source() {
+        let tls_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let http = HttpClient::with_tls(tls_config);
+        // Port 1 should not have a listener — the OS refuses before any TLS
+        // handshake starts.
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://127.0.0.1:1/")
+            .body(full_body(Bytes::new()))
+            .unwrap();
+
+        let err = http
+            .send(req)
+            .await
+            .expect_err("connect to port 1 must fail");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("HTTPS request failed"),
+            "unexpected message: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "connection-refused failure must retain its cause as source(): {err:?}"
+        );
+    }
+
     #[test]
     fn client_config_builders_round_trip_through_accessors() {
         // Each `with_*` builder must be readable back through the bare-name
@@ -4866,6 +5943,7 @@ mod tests {
             recv: BidiRecvHalf {
                 recv: RecvState::AwaitingHeaders(response_task),
                 stream_config: StreamConfig {
+                    element_memory_limit: None,
                     protocol: Protocol::Connect,
                     codec_format: CodecFormat::Proto,
                     compression: CompressionRegistry::new(),
@@ -5215,6 +6293,263 @@ mod tests {
             .expect_err("guard sender should be dropped by the abort");
     }
 
+    /// The streaming path carries its own copy of the budget, so a
+    /// construction site that forgot to populate it would leave streamed
+    /// messages decoding under buffa's default while the unary tests stayed
+    /// green. Drive a real over-budget envelope through `ServerStream` to
+    /// pin that the field is actually consulted.
+    #[tokio::test]
+    async fn server_stream_per_message_decode_honours_the_element_budget() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::{ListValueView, ValueView};
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        // Sized from the view type, since that is what `message()` decodes.
+        let n = crate::test_budget::elements_over_default_budget::<ValueView<'_>>();
+        let list = ListValue {
+            values: (0..n).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let envelope = Envelope::data(list.encode_to_bytes()).encode();
+
+        let make = |element_memory_limit| ServerStream::<_, ListValueView<'static>> {
+            element_memory_limit,
+            headers: http::HeaderMap::new(),
+            body: Full::new(envelope.clone()),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(64 * 1024 * 1024),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: 64 * 1024 * 1024,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = make(None)
+            .message()
+            .await
+            .expect_err("a streamed message must be rejected at buffa's default budget");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+
+        let msg = make(Some(usize::MAX))
+            .message()
+            .await
+            .expect("raising the stream's budget must admit the same envelope")
+            .expect("the envelope carries a data frame");
+        assert_eq!(msg.view().values.len(), n);
+    }
+
+    type FramesBody = http_body_util::StreamBody<
+        futures::stream::Iter<
+            std::vec::IntoIter<Result<http_body::Frame<Bytes>, std::convert::Infallible>>,
+        >,
+    >;
+
+    /// A `ServerStream` over the given body frames, as the call path builds it.
+    fn frames_stream<V>(
+        protocol: Protocol,
+        encoding: Option<&str>,
+        frames: Vec<Bytes>,
+    ) -> ServerStream<FramesBody, V> {
+        let frames: Vec<_> = frames
+            .into_iter()
+            .map(|b| Ok(http_body::Frame::data(b)))
+            .collect();
+        ServerStream {
+            element_memory_limit: None,
+            headers: http::HeaderMap::new(),
+            body: http_body_util::StreamBody::new(futures::stream::iter(frames)),
+            frame: Bytes::new(),
+            assembler: response_assembler(protocol, 1024 * 1024),
+            encoding: encoding.map(str::to_owned),
+            compression: CompressionRegistry::default(),
+            codec_format: CodecFormat::Proto,
+            protocol,
+            max_message_size: 1024 * 1024,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// A large streamed message split across transport frames arrives as
+    /// the sole owner of its allocation; the stream keeps no buffer that
+    /// shares it.
+    #[tokio::test]
+    async fn server_stream_large_message_owns_its_allocation() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        const LEN: usize = 512 * 1024;
+        let wire =
+            Envelope::data(StringValue::from("x".repeat(LEN).as_str()).encode_to_bytes()).encode();
+        let frames = wire.chunks(16 * 1024).map(Bytes::copy_from_slice).collect();
+        let mut stream = frames_stream::<StringValueView<'static>>(Protocol::Connect, None, frames);
+
+        let msg = stream.message().await.unwrap().expect("data envelope");
+        assert_eq!(msg.view().value.len(), LEN);
+        assert!(
+            msg.bytes().is_unique(),
+            "stream shares the message's allocation"
+        );
+        assert!(stream.frame.is_empty());
+    }
+
+    /// Several messages in one body frame are each their own allocation, and
+    /// the stream releases the transport frame once it is consumed.
+    #[tokio::test]
+    async fn server_stream_messages_in_one_frame_are_independent() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut wire = BytesMut::new();
+        for v in ["one", "two"] {
+            wire.extend_from_slice(
+                &Envelope::data(StringValue::from(v).encode_to_bytes()).encode(),
+            );
+        }
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let body_frame = wire.freeze();
+        let backing = body_frame.clone();
+        let mut stream =
+            frames_stream::<StringValueView<'static>>(Protocol::Connect, None, vec![body_frame]);
+
+        let one = stream.message().await.unwrap().expect("first");
+        let two = stream.message().await.unwrap().expect("second");
+        assert_eq!((one.view().value, two.view().value), ("one", "two"));
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "clean END_STREAM"
+        );
+        assert!(backing.is_unique(), "consumed transport frame is released");
+    }
+
+    /// gRPC-Web trailers arrive as a 0x80-flagged frame in the body; split
+    /// across transport frames at arbitrary points it still ends the stream
+    /// cleanly with the trailers exposed.
+    #[tokio::test]
+    async fn grpc_web_server_stream_trailer_frame_split_across_frames() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&Envelope::data(StringValue::from("hi").encode_to_bytes()).encode());
+        let trailer = Envelope {
+            flags: crate::envelope::flags::GRPC_WEB_TRAILER,
+            data: Bytes::from_static(b"grpc-status: 0\r\nx-custom: yes\r\n"),
+        };
+        wire.extend_from_slice(&trailer.encode());
+        // Split inside the data payload, inside the trailer header, and
+        // inside the trailer block.
+        let frames = [0, 8, 12, 25, wire.len()]
+            .windows(2)
+            .map(|w| Bytes::copy_from_slice(&wire[w[0]..w[1]]))
+            .collect();
+        let mut stream = frames_stream::<StringValueView<'static>>(Protocol::GrpcWeb, None, frames);
+
+        let msg = stream.message().await.unwrap().expect("data message");
+        assert_eq!(msg.view().value, "hi");
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "grpc-status 0 is a clean end"
+        );
+        assert_eq!(stream.trailers().unwrap()["x-custom"], "yes");
+    }
+
+    /// A gRPC-Web trailer frame carrying an error status fails the stream
+    /// with that status; a compressed trailer block is decompressed first.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn grpc_web_server_stream_compressed_error_trailer() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let registry = CompressionRegistry::default();
+        let block = registry
+            .compress("gzip", b"grpc-status: 8\r\ngrpc-message: slow%20down\r\n")
+            .unwrap();
+        let trailer = Envelope {
+            flags: crate::envelope::flags::GRPC_WEB_TRAILER | crate::envelope::flags::COMPRESSED,
+            data: block,
+        };
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            Some("gzip"),
+            vec![trailer.encode()],
+        );
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("error status ends the stream");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+        assert_eq!(err.message.as_deref(), Some("slow down"));
+        assert!(stream.trailers().is_some());
+    }
+
+    /// The trailer frame is metadata, not a message: it is accepted past
+    /// `max_message_size` (within the slack), while a data envelope of the
+    /// same size is rejected on its header.
+    #[tokio::test]
+    async fn grpc_web_server_stream_trailer_not_bound_by_message_limit() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let mut block = b"grpc-status: 0\r\n".to_vec();
+        block.extend(std::iter::repeat_n(b'\n', 2000));
+        let trailer = Envelope {
+            flags: crate::envelope::flags::GRPC_WEB_TRAILER,
+            data: Bytes::from(block.clone()),
+        };
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            None,
+            vec![trailer.encode()],
+        );
+        stream.assembler = response_assembler(Protocol::GrpcWeb, 1024);
+        stream.max_message_size = 1024;
+        assert!(stream.message().await.unwrap().is_none(), "clean end");
+
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            None,
+            vec![Envelope::data(Bytes::from(block)).encode()],
+        );
+        stream.assembler = response_assembler(Protocol::GrpcWeb, 1024);
+        stream.max_message_size = 1024;
+        let err = stream
+            .message()
+            .await
+            .expect_err("over-limit data envelope");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+
+        // A trailer frame larger than the trailer parser accepts is rejected
+        // on its header, as a trailer, not against the message limit.
+        let mut header = vec![crate::envelope::flags::GRPC_WEB_TRAILER];
+        header.extend_from_slice(&(MAX_GRPC_WEB_TRAILER_SIZE as u32 + 1).to_be_bytes());
+        let mut stream = frames_stream::<StringValueView<'static>>(
+            Protocol::GrpcWeb,
+            None,
+            vec![Bytes::from(header)],
+        );
+        stream.assembler = response_assembler(Protocol::GrpcWeb, 1024);
+        stream.max_message_size = 1024;
+        let err = stream.message().await.expect_err("over-limit trailer");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+        assert!(
+            err.message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("grpc-web trailer size")),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn connect_server_stream_truncated_after_data_errors() {
         use buffa::Message;
@@ -5223,14 +6558,16 @@ mod tests {
 
         let body = Full::new(Envelope::data(StringValue::from("hello").encode_to_bytes()).encode());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5273,14 +6610,16 @@ mod tests {
 
         let body = Full::new(Bytes::new());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5326,14 +6665,16 @@ mod tests {
             .encode(),
         );
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body: Full::new(body.freeze()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5393,14 +6734,16 @@ mod tests {
         headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers,
             body: Full::new(body.freeze()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Connect,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5437,6 +6780,225 @@ mod tests {
         );
     }
 
+    /// A server error carried by a well-formed Connect END_STREAM is still
+    /// an error the caller inspects for context: it must arrive with the
+    /// response headers and with the trailing metadata the same envelope
+    /// supplied, on the first read and on every sticky replay after it.
+    #[tokio::test]
+    async fn connect_end_stream_error_carries_response_metadata() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(
+            &Envelope::end_stream(Bytes::from_static(
+                b"{\"error\":{\"code\":\"permission_denied\",\"message\":\"nope\"},\
+                  \"metadata\":{\"x-from-trailers\":[\"also\"]}}",
+            ))
+            .encode(),
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
+            headers,
+            body: Full::new(body.freeze()),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Connect,
+            max_message_size: 1024,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("errored END_STREAM must surface as Err");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert_eq!(err.trailers().get("x-from-trailers").unwrap(), "also");
+
+        let again = stream
+            .message()
+            .await
+            .expect_err("terminal error is sticky");
+        assert_eq!(
+            again.response_headers().get("x-from-headers").unwrap(),
+            "yes"
+        );
+        assert_eq!(again.trailers().get("x-from-trailers").unwrap(), "also");
+
+        // The stored record is the same one `message()` replayed, so the
+        // post-hoc accessor cannot disagree with it.
+        let stored = stream.error().expect("terminal error stays inspectable");
+        assert_eq!(
+            stored.response_headers().get("x-from-headers").unwrap(),
+            "yes"
+        );
+        assert_eq!(stored.trailers().get("x-from-trailers").unwrap(), "also");
+    }
+
+    /// The same guarantee on the gRPC shape: a `grpc-status` error in the
+    /// trailers reaches the caller with the response headers attached, not
+    /// just the trailers it was parsed from.
+    ///
+    /// The error's metadata and the stream's trailers are deliberately
+    /// different views of the same frame: the status-bearing keys are
+    /// already the error's `code` and `message`, so they stay out of the
+    /// metadata while `trailers()` keeps reporting the wire map verbatim.
+    #[tokio::test]
+    async fn grpc_stream_error_carries_response_metadata() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "7".parse().unwrap()); // PERMISSION_DENIED
+        trailers.insert("grpc-message", "nope".parse().unwrap());
+        trailers.insert("x-from-trailers", "also".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::trailers(trailers))];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
+            headers,
+            body: StreamBody::new(futures::stream::iter(frames)),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Grpc,
+            max_message_size: 1024,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("grpc-status 7 must surface as Err");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.message.as_deref(), Some("nope"));
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert_eq!(err.trailers().get("x-from-trailers").unwrap(), "also");
+
+        // The status keys stay out of the error metadata — they are the
+        // error's own code and message — but remain in the wire trailers.
+        for key in [
+            &hdr::GRPC_STATUS,
+            &hdr::GRPC_MESSAGE,
+            &hdr::GRPC_STATUS_DETAILS_BIN,
+        ] {
+            assert!(
+                !err.trailers().contains_key(key),
+                "{key} must not be duplicated into the error metadata"
+            );
+        }
+        let wire = stream.trailers().expect("wire trailers stay available");
+        assert_eq!(wire.get("grpc-status").unwrap(), "7");
+        assert_eq!(wire.get("x-from-trailers").unwrap(), "also");
+    }
+
+    /// The corner that makes the filter, not an "already has trailers"
+    /// check, the right guard: when the frame carries nothing but status
+    /// keys the curated metadata is legitimately empty, and the raw map
+    /// must not be substituted for it.
+    #[tokio::test]
+    async fn grpc_stream_error_metadata_is_empty_when_only_status_arrives() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "7".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::trailers(trailers))];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
+            headers,
+            body: StreamBody::new(futures::stream::iter(frames)),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol: Protocol::Grpc,
+            max_message_size: 1024,
+            deadline: None,
+            end: None,
+            saw_body_data: false,
+            _phantom: PhantomData,
+        };
+
+        let err = stream
+            .message()
+            .await
+            .expect_err("grpc-status 7 must surface as Err");
+        assert!(
+            err.trailers().is_empty(),
+            "status-only trailers carry no user metadata: {:?}",
+            err.trailers()
+        );
+        // The empty metadata must not read as "nothing was attached": the
+        // headers still arrive, which is what distinguishes the filtered
+        // map from a record that skipped attachment altogether.
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert!(
+            stream
+                .trailers()
+                .is_some_and(|t| t.contains_key("grpc-status")),
+            "the wire trailers are still reported verbatim"
+        );
+    }
+
+    /// A Connect unary response whose content-type is not the configured
+    /// codec's is rejected without reading the body. The rejection still
+    /// carries the headers (and the `trailer-`-prefixed metadata) that
+    /// arrived, so a caller can see what the intermediary actually sent.
+    #[tokio::test]
+    async fn connect_unary_content_type_rejection_carries_response_metadata() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .header("x-from-headers", "yes")
+            .header("trailer-x-from-trailers", "also")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let config = ClientConfig::new("http://localhost".parse().unwrap());
+        let err = parse_connect_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("text/html is not a Connect response");
+
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
+        assert_eq!(err.trailers().get("x-from-trailers").unwrap(), "also");
+    }
+
     /// Same contract for gRPC: an error in HTTP/2 trailers is a failed RPC
     /// and must come back as `Err` from `message()` — not the silent
     /// `Ok(None)` that callers mistake for a clean close.
@@ -5460,14 +7022,16 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5517,14 +7081,16 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: Some(std::time::Instant::now() + Duration::from_secs(5)),
             end: None,
             saw_body_data: false,
@@ -5544,14 +7110,16 @@ mod tests {
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body: Full::new(Bytes::new()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5589,14 +7157,16 @@ mod tests {
         headers.insert("grpc-status", "0".parse().unwrap());
         let body = Full::new(Envelope::data(StringValue::from("hello").encode_to_bytes()).encode());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers,
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5628,14 +7198,16 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("grpc-status", "0".parse().unwrap());
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers,
             body: Full::new(Bytes::new()),
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5664,14 +7236,16 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5728,14 +7302,16 @@ mod tests {
         let body = StreamBody::new(frames);
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
             end: None,
             saw_body_data: false,
@@ -5782,14 +7358,16 @@ mod tests {
         let body = StreamBody::new(futures::stream::iter(frames));
 
         let mut stream: ServerStream<_, StringValueView<'static>> = ServerStream {
+            element_memory_limit: None,
             headers: http::HeaderMap::new(),
             body,
-            buf: BytesMut::new(),
+            frame: Bytes::new(),
+            assembler: EnvelopeAssembler::new(1024),
             encoding: None,
             compression: CompressionRegistry::new(),
             codec_format: CodecFormat::Proto,
             protocol: Protocol::Grpc,
-            max_message_size: Some(1024),
+            max_message_size: 1024,
             deadline: None,
             end: None,
             saw_body_data: false,
@@ -5845,6 +7423,258 @@ mod tests {
         assert_eq!(mapped.message.as_deref(), Some("bad client config"));
     }
 
+    #[test]
+    fn transport_send_error_mapper_preserves_source_when_no_connect_error_in_chain() {
+        #[derive(Debug)]
+        struct PlainTransportError;
+
+        impl std::fmt::Display for PlainTransportError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection reset by peer")
+            }
+        }
+
+        impl std::error::Error for PlainTransportError {}
+
+        let mapped = map_transport_send_error(PlainTransportError, "request failed");
+        assert_eq!(mapped.code, ErrorCode::Unavailable);
+        let source = std::error::Error::source(&mapped).expect("source must be preserved");
+        assert_eq!(source.to_string(), "connection reset by peer");
+    }
+
+    /// A response body whose first poll fails with a typed `std::io::Error`,
+    /// standing in for the reset a transport reports after the response
+    /// headers have arrived.
+    struct ResetOnFirstPollBody;
+
+    impl Body for ResetOnFirstPollBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+            std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ))))
+        }
+    }
+
+    /// Answers every request with the given status and content type and a
+    /// [`ResetOnFirstPollBody`].
+    #[derive(Clone)]
+    struct ResetBodyTransport {
+        status: http::StatusCode,
+        content_type: &'static str,
+    }
+
+    impl ClientTransport for ResetBodyTransport {
+        type ResponseBody = ResetOnFirstPollBody;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            let status = self.status;
+            let content_type = self.content_type;
+            Box::pin(async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .body(ResetOnFirstPollBody)
+                    .unwrap())
+            })
+        }
+    }
+
+    /// The typed cause a body-read failure must surface: the same
+    /// `io::Error` that `map_transport_send_error` keeps for a send-time
+    /// failure, so a caller can downcast to the `ErrorKind` either way.
+    fn assert_body_read_error_keeps_io_source(err: &ConnectError) {
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("connection reset by peer"),
+            "message must still carry the cause's text: {err:?}"
+        );
+        let source = std::error::Error::source(err)
+            .unwrap_or_else(|| panic!("body-read failure must retain its cause: {err:?}"));
+        let io = source
+            .downcast_ref::<std::io::Error>()
+            .unwrap_or_else(|| panic!("source must be the transport's io::Error: {source}"));
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// A reset while reading a unary response must surface the transport's
+    /// typed error as `source()`, matching what `map_transport_send_error`
+    /// keeps for a send-time failure — otherwise it is the one transport
+    /// fault a caller cannot inspect.
+    #[tokio::test]
+    async fn call_unary_body_read_failure_keeps_the_io_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::OK,
+            content_type: "application/proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("the body read must fail the call");
+        assert_body_read_error_keeps_io_source(&err);
+    }
+
+    /// The streaming read path goes through `ServerStream::message` rather
+    /// than `collect_body_bounded`, so the source has to be attached there
+    /// as well.
+    #[tokio::test]
+    async fn server_stream_body_read_failure_keeps_the_io_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::OK,
+            content_type: "application/connect+proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        let mut stream = call_server_stream::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/ServerStream", StreamType::ServerStream),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("headers arrive before the body fails");
+        let err = stream
+            .message::<StringValue>()
+            .await
+            .expect_err("the first body poll must fail the read");
+        assert_body_read_error_keeps_io_source(&err);
+    }
+
+    /// The gRPC unary path reads the body in its own loop (it has to find a
+    /// `grpc-status` in trailers), so it is a third `classify_body_read_error`
+    /// site and must keep the source like the other two.
+    #[tokio::test]
+    async fn grpc_unary_body_read_failure_keeps_the_io_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::OK,
+            content_type: "application/grpc+proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap())
+            .with_protocol(Protocol::Grpc);
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("the body read must fail the call");
+        assert_body_read_error_keeps_io_source(&err);
+    }
+
+    /// On a non-2xx gRPC response the body is read only to look for a
+    /// `grpc-status`, and the HTTP status is what the caller is told about;
+    /// a read that dies part-way through must not displace it, so this one
+    /// error shape stays source-less by design.
+    #[tokio::test]
+    async fn grpc_unary_body_read_failure_on_http_error_reports_the_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let transport = ResetBodyTransport {
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            content_type: "application/grpc+proto",
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap())
+            .with_protocol(Protocol::Grpc);
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("a 503 must fail the call");
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+        assert!(
+            err.message.as_deref().unwrap().contains("503"),
+            "the HTTP status must win over the read failure: {err:?}"
+        );
+        assert!(std::error::Error::source(&err).is_none(), "{err:?}");
+    }
+
+    /// The real transport, end to end: a server that sends the response head
+    /// and part of a chunked body, then closes the socket. `hyper` reports
+    /// that as a body-read error, and the caller must get it back as the
+    /// `hyper::Error` itself, not just its text.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_mid_body_close_keeps_the_hyper_error_as_source() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Consume the request head; the body is small enough to have
+            // arrived with it.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      content-type: application/proto\r\n\
+                      transfer-encoding: chunked\r\n\r\n\
+                      5\r\nhello\r\n",
+                )
+                .await
+                .unwrap();
+            // Drop without the terminating chunk: an incomplete message.
+        });
+
+        let config = ClientConfig::new(format!("http://{addr}").parse().unwrap());
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &HttpClient::plaintext(),
+            &config,
+            Spec::client("/test.Service/Unary", StreamType::Unary),
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("a body cut short must fail the call");
+        server.await.unwrap();
+
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        let source = std::error::Error::source(&err)
+            .unwrap_or_else(|| panic!("hyper's read error must be retained: {err:?}"));
+        assert!(
+            source.downcast_ref::<hyper::Error>().is_some(),
+            "source must be the transport's hyper::Error, got: {source}"
+        );
+    }
+
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn call_unary_preserves_transport_connect_error() {
@@ -5855,8 +7685,7 @@ mod tests {
         let err = call_unary::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "Unary",
+            Spec::client("/test.Service/Unary", StreamType::Unary),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -5876,8 +7705,7 @@ mod tests {
         let err = call_unary_get::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "UnaryGet",
+            Spec::client("/test.Service/UnaryGet", StreamType::Unary),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -5897,8 +7725,7 @@ mod tests {
         let err = call_server_stream::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "ServerStream",
+            Spec::client("/test.Service/ServerStream", StreamType::ServerStream),
             StringValue::from("hello"),
             CallOptions::default(),
         )
@@ -5918,8 +7745,7 @@ mod tests {
         let mut stream = call_bidi_stream::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "Bidi",
+            Spec::client("/test.Service/Bidi", StreamType::BidiStream),
             CallOptions::default(),
         )
         .await
@@ -5946,8 +7772,7 @@ mod tests {
         let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
             &client,
             &config,
-            "test.Service",
-            "ClientStream",
+            Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
             futures::stream::iter([StringValue::from("hello")]),
             CallOptions::default(),
         )
@@ -6068,8 +7893,7 @@ mod tests {
             call_client_stream::<_, StringValue, StringValueView<'static>>(
                 &transport,
                 &config,
-                "test.Service",
-                "ClientStream",
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
                 futures::stream::empty::<StringValue>(),
                 CallOptions::default().with_timeout(Duration::from_millis(100)),
             ),
@@ -6115,8 +7939,7 @@ mod tests {
             call_client_stream::<_, StringValue, StringValueView<'static>>(
                 &transport,
                 &config,
-                "test.Service",
-                "ClientStream",
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
                 futures::stream::empty::<StringValue>(),
                 CallOptions::default(),
             ),
@@ -6160,8 +7983,7 @@ mod tests {
             call_client_stream::<_, StringValue, StringValueView<'static>>(
                 &transport,
                 &config,
-                "test.Service",
-                "ClientStream",
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
                 stream_iter(requests),
                 CallOptions::default().with_timeout(Duration::from_millis(100)),
             ),
@@ -6185,43 +8007,41 @@ mod tests {
             .expect("drop signal sender vanished without firing");
     }
 
-    // Success path: a well-formed Connect client-streaming response decodes
-    // normally through the directly-awaited transport send.
+    /// Replies with a fixed 200 response, whatever the request.
     #[cfg(feature = "client")]
-    #[tokio::test]
-    async fn client_stream_returns_well_formed_response() {
+    #[derive(Clone)]
+    struct FixedResponseTransport {
+        content_type: &'static str,
+        body: Bytes,
+    }
+
+    #[cfg(feature = "client")]
+    impl ClientTransport for FixedResponseTransport {
+        type ResponseBody = Full<Bytes>;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            let response = Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, self.content_type)
+                .header("x-request-id", "abc123")
+                .body(Full::new(self.body.clone()))
+                .unwrap();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    /// A DATA envelope carrying a `StringValue("ok")`, then an END_STREAM
+    /// envelope with empty (`{}`) trailers — the Connect client-stream
+    /// terminus.
+    #[cfg(feature = "client")]
+    fn well_formed_connect_client_stream_body() -> Bytes {
         use buffa::Message;
-        use buffa_types::google::protobuf::__buffa::view::StringValueView;
         use buffa_types::google::protobuf::StringValue;
 
-        #[derive(Clone)]
-        struct FixedResponseTransport {
-            body: Bytes,
-        }
-
-        impl ClientTransport for FixedResponseTransport {
-            type ResponseBody = Full<Bytes>;
-            type Error = std::io::Error;
-
-            fn send(
-                &self,
-                _request: Request<ClientBody>,
-            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
-                let body = self.body.clone();
-                Box::pin(async move {
-                    let response = Response::builder()
-                        .status(http::StatusCode::OK)
-                        .header(http::header::CONTENT_TYPE, "application/connect+proto")
-                        .body(Full::new(body))
-                        .unwrap();
-                    Ok(response)
-                })
-            }
-        }
-
-        // DATA envelope carrying the response message, then an END_STREAM
-        // envelope with empty (`{}`) trailers — the Connect client-stream
-        // terminus.
         let data =
             crate::envelope::Envelope::data(Bytes::from(StringValue::from("ok").encode_to_vec()))
                 .encode();
@@ -6229,22 +8049,72 @@ mod tests {
         let mut body = BytesMut::new();
         body.extend_from_slice(&data);
         body.extend_from_slice(&end);
+        body.freeze()
+    }
+
+    // Success path: a well-formed Connect client-streaming response decodes
+    // normally through the directly-awaited transport send.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_returns_well_formed_response() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
         let transport = FixedResponseTransport {
-            body: body.freeze(),
+            content_type: "application/connect+proto",
+            body: well_formed_connect_client_stream_body(),
         };
         let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
 
         let response = call_client_stream::<_, StringValue, StringValueView<'static>>(
             &transport,
             &config,
-            "test.Service",
-            "ClientStream",
+            Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
             stream_iter([StringValue::from("req")]),
             CallOptions::default(),
         )
         .await
         .expect("well-formed client-streaming response must decode");
         assert_eq!(response.view().value, "ok");
+    }
+
+    /// The Connect client-streaming path is gated on content-type like the
+    /// other Connect shapes (#275): a 200 whose body happens to frame as
+    /// Connect is still refused when its content-type says the peer is not
+    /// speaking Connect, and the rejection carries the response headers.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_rejects_non_connect_content_type() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        for (content_type, expected_code) in [
+            ("text/html", ErrorCode::Unknown),
+            ("application/grpc+proto", ErrorCode::Unknown),
+            ("application/connect+json", ErrorCode::Internal),
+        ] {
+            let transport = FixedResponseTransport {
+                content_type,
+                body: well_formed_connect_client_stream_body(),
+            };
+            let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
+                &transport,
+                &config,
+                Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
+                stream_iter([StringValue::from("req")]),
+                CallOptions::default(),
+            )
+            .await
+            .expect_err("a non-Connect content-type must be refused before the body is read");
+
+            assert_eq!(err.code, expected_code, "content-type {content_type}");
+            let expected_message = format!(
+                "unexpected content-type: {content_type} (expected application/connect+proto)"
+            );
+            assert_eq!(err.message.as_deref(), Some(expected_message.as_str()));
+            assert_eq!(err.response_headers()["x-request-id"], "abc123");
+        }
     }
 
     // A transport send failure surfaces through the
@@ -6274,8 +8144,7 @@ mod tests {
         let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
             &FailingTransport,
             &config,
-            "test.Service",
-            "ClientStream",
+            Spec::client("/test.Service/ClientStream", StreamType::ClientStream),
             stream_iter([StringValue::from("req")]),
             CallOptions::default(),
         )
@@ -6772,6 +8641,524 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_unary_trailers_only_status_wins_over_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // A proxy pairs a non-200 status with a trailers-only gRPC error in the
+        // initial headers. The gRPC code is the one reported, which for this
+        // pairing is not the code the HTTP status maps to (500 is `unknown`).
+        let response = Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "3")
+            .header("grpc-message", "malformed request")
+            .header("x-request-id", "abc123")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a trailers-only gRPC error must surface as an error");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.message.as_deref(), Some("malformed request"));
+        assert_eq!(
+            err.response_headers().get("x-request-id").unwrap(),
+            "abc123"
+        );
+        // Response headers are not trailing metadata, so nothing from the
+        // header block may surface through `trailers()`.
+        assert!(
+            err.trailers().is_empty(),
+            "initial headers must not be reported as trailers: {:?}",
+            err.trailers()
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_html_error_page_reports_http_status_with_detail() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // The commonest real failure: an nginx or load-balancer error page. The
+        // HTTP status is what says the request may be retried, so it is the
+        // code reported, with the content-type rejection kept as detail.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .header("x-request-id", "abc123")
+            .body(Full::new(Bytes::from_static(
+                b"<html><body>502 Bad Gateway</body></html>",
+            )))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("an HTML error page is an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "HTTP error 502: unexpected content-type: text/html (expected application/grpc+proto)"
+            )
+        );
+        assert_eq!(
+            err.response_headers().get("x-request-id").unwrap(),
+            "abc123"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_error_page_without_content_type_reports_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // No content-type at all is equally not a gRPC reply, and the body must
+        // not be parsed for a status it cannot contain.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .body(Full::new(Bytes::from_static(
+                b"<html><body>502 Bad Gateway</body></html>",
+            )))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("an error page without a content-type is an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("HTTP error 502"));
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_undecodable_body_keeps_response_headers() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // An error page served under a gRPC content-type: the first bytes read
+        // as an oversized length prefix, so the framing error is what surfaces.
+        // The proxy's headers have to survive it.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("x-request-id", "abc123")
+            .body(Full::new(Bytes::from_static(
+                b"<html><body>502 Bad Gateway</body></html>",
+            )))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("an undecodable body is an error");
+        // The same 502 as the `text/html` case, differing only in the
+        // content-type the proxy kept, so it has to reach the same verdict.
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(
+            err.message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("HTTP error 502: envelope decode failed")),
+            "unexpected message: {:?}",
+            err.message
+        );
+        assert_eq!(
+            err.response_headers().get("x-request-id").unwrap(),
+            "abc123"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_trailers_only_without_content_type_keeps_grpc_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // A proxy that omits `content-type` from its local reply but still
+        // sends a gRPC status is speaking gRPC well enough for that status to
+        // be the answer; an absent content-type is not evidence otherwise.
+        let response = Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header("grpc-status", "14")
+            .header("grpc-message", "upstream connect error")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a trailers-only gRPC error must surface as an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("upstream connect error"));
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_ignores_header_status_when_body_present() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        // Conformance `trailers-only/ignore-header-if-body-present`: a status
+        // in the initial headers is only the status of a trailers-only
+        // response. With a message in the body and no trailers, the status is
+        // missing, not `9`.
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "9")
+            .body(Full::new(
+                Envelope::data(StringValue::from("hi").encode_to_bytes()).encode(),
+            ))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a response with body data and no trailers has no status");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("gRPC response missing grpc-status trailer")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_ignores_header_status_when_trailer_present() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        // Conformance `trailers-only/ignore-header-if-trailer-present`: the
+        // HTTP/2 trailer wins over the header.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "9".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(
+                Envelope::data(StringValue::from("hi").encode_to_bytes()).encode(),
+            )),
+            Ok(Frame::trailers(trailers)),
+        ];
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "8")
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the trailer status must be reported");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_ignores_header_status_when_body_present() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        // Conformance `trailers-only/ignore-header-if-body-present` for
+        // gRPC-Web: the trailer frame in the body wins over the header.
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&Envelope::data(StringValue::from("hi").encode_to_bytes()).encode());
+        let trailer_payload = b"grpc-status: 9\r\n";
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc-web")
+            .header("grpc-status", "8")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the trailer-frame status must be reported");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_non_200_with_body_reports_http_status() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        // A body means the header status does not apply, and a non-200 is an
+        // error however successful the trailers claim the call was.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(
+                Envelope::data(StringValue::from("hi").encode_to_bytes()).encode(),
+            )),
+            Ok(Frame::trailers(trailers)),
+        ];
+
+        let response = Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "3")
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a non-200 response is an error");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(err.message.as_deref(), Some("HTTP error 500"));
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_trailers_only_status_wins_over_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // The header check is protocol-agnostic, so gRPC-Web reads a
+        // trailers-only error the same way plain gRPC does.
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "application/grpc-web")
+            .header("grpc-status", "14")
+            .header("grpc-message", "upstream connect error")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a trailers-only gRPC-Web error must surface as an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("upstream connect error"));
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_malformed_grpc_status_on_non_200_is_unknown() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // A present-but-unparseable status must not read as the HTTP status
+        // either: it is a protocol error in its own right.
+        let response = Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", "banana")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a malformed gRPC status must not read as success");
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(
+            err.message.as_deref(),
+            Some("protocol error: malformed grpc-status: \"banana\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_non_200_without_grpc_status_uses_http_status() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a non-200 response without a gRPC status is an error");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("HTTP error 503"));
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_rejects_trailer_flag_in_body() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        // 0x80 is the gRPC-Web trailer marker and is not a gRPC envelope flag.
+        // Honouring it here would replace the HTTP/2 trailers with whatever the
+        // body claims.
+        let trailer_payload = b"grpc-status: 5\r\n";
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(body.freeze())),
+            Ok(Frame::trailers(trailers)),
+        ];
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+            .body(StreamBody::new(futures::stream::iter(frames)))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the trailer flag must be rejected on plain gRPC");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "invalid gRPC response framing: envelope flag 0x80 (gRPC-Web trailer marker) is not valid on a plain gRPC response"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unary_framing_error_names_the_offending_flag_byte() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // Any byte with the high bit set takes the trailer branch, so the
+        // error has to report the byte received rather than a bare 0x80.
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&[0xC1]);
+        body.extend_from_slice(&0u32.to_be_bytes());
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc+proto")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("a high-bit flag byte must be rejected on plain gRPC");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "invalid gRPC response framing: envelope flag 0xc1 (gRPC-Web trailer marker) is not valid on a plain gRPC response"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_web_unary_parses_trailer_frame_after_message() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&Envelope::data(StringValue::from("hi").encode_to_bytes()).encode());
+        let trailer_payload = b"grpc-status: 0\r\nx-trailer: v\r\n";
+        body.extend_from_slice(&[0x80]);
+        body.extend_from_slice(&(trailer_payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer_payload);
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc-web+proto")
+            .body(Full::new(body.freeze()))
+            .unwrap();
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
+
+        let response = parse_grpc_unary_response::<_, StringValueView<'static>>(
+            response,
+            &config,
+            &CallOptions::default(),
+            None,
+        )
+        .await
+        .expect("gRPC-Web trailer frames must still be parsed");
+        assert_eq!(response.view().value, "hi");
+        assert_eq!(response.trailers().get("x-trailer").unwrap(), "v");
+    }
+
+    #[tokio::test]
     async fn grpc_unary_accepts_bare_application_grpc_with_parameters() {
         use buffa::Message;
         use buffa_types::google::protobuf::__buffa::view::StringValueView;
@@ -6873,8 +9260,9 @@ mod tests {
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
 
-        let err = validate_grpc_response_content_type(&headers, &config)
-            .expect_err("non-gRPC content type must be rejected");
+        let err =
+            validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
+                .expect_err("non-gRPC content type must be rejected");
         assert_eq!(err.code, ErrorCode::Unknown);
         assert_eq!(
             err.message.as_deref(),
@@ -6890,15 +9278,20 @@ mod tests {
     fn grpc_response_content_type_accepts_missing_header() {
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
-        validate_grpc_response_content_type(&http::HeaderMap::new(), &config)
-            .expect("missing content-type must remain accepted");
+        validate_grpc_response_content_type(
+            &http::HeaderMap::new(),
+            config.protocol,
+            config.codec_format,
+        )
+        .expect("missing content-type must remain accepted");
     }
 
     #[test]
     fn grpc_response_content_type_accepts_bare_for_json_codec() {
         // Proxies that synthesize trailers-only error replies (e.g. Envoy)
         // send bare `application/grpc` regardless of the request subtype, so
-        // the bare type must be accepted for every codec, as in connect-go.
+        // the bare type is accepted for every codec (connect-go accepts it
+        // only for proto).
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
@@ -6907,7 +9300,7 @@ mod tests {
         let config = ClientConfig::new("http://localhost".parse().unwrap())
             .with_protocol(Protocol::Grpc)
             .with_codec_format(CodecFormat::Json);
-        validate_grpc_response_content_type(&headers, &config)
+        validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
             .expect("bare application/grpc must be accepted for a json-codec client");
     }
 
@@ -6920,7 +9313,7 @@ mod tests {
         );
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
-        validate_grpc_response_content_type(&headers, &config)
+        validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
             .expect("bare application/grpc-web must be accepted as proto");
     }
 
@@ -6934,8 +9327,9 @@ mod tests {
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
 
-        let err = validate_grpc_response_content_type(&headers, &config)
-            .expect_err("gRPC-Web client must reject plain gRPC content type");
+        let err =
+            validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
+                .expect_err("gRPC-Web client must reject plain gRPC content type");
         assert_eq!(err.code, ErrorCode::Unknown);
         assert_eq!(
             err.message.as_deref(),
@@ -6958,6 +9352,97 @@ mod tests {
         assert_eq!(unary_request_content_type(&config), "application/json");
     }
 
+    /// The knob has to be load-bearing in both directions: the same bytes
+    /// rejected under the default budget and accepted once it is raised.
+    /// A one-sided assertion would pass even if the limit were never read.
+    #[test]
+    fn response_element_memory_limit_is_load_bearing() {
+        use buffa_types::google::protobuf::__buffa::view::{ListValueView, ValueView};
+        use buffa_types::google::protobuf::{ListValue, Value};
+
+        // Element footprint is charged, not contents, so this is small on
+        // the wire and large decoded. Sized from the view type, since that
+        // is what `decode_response_view` materialises.
+        let n = crate::test_budget::elements_over_default_budget::<ValueView<'_>>();
+        let list = ListValue {
+            values: (0..n).map(|_| Value::default()).collect(),
+            ..Default::default()
+        };
+        let encoded = Bytes::from(buffa::Message::encode_to_vec(&list));
+
+        let defaults = CallOptions::default();
+        let err = decode_response_view::<ListValueView<'static>>(
+            encoded.clone(),
+            CodecFormat::Proto,
+            &defaults.decode_options(),
+        )
+        .unwrap_err();
+        // Assert the SETTER names: an earlier version of this hint cited the
+        // getters, which do not raise anything.
+        let message = err.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("CallOptions::with_element_memory_limit")
+                && message.contains("ClientConfig::with_default_element_memory_limit"),
+            "an over-budget response must name the setters that fix it, got {message:?}"
+        );
+
+        let raised = CallOptions::default().with_element_memory_limit(usize::MAX);
+        let view = decode_response_view::<ListValueView<'static>>(
+            encoded,
+            CodecFormat::Proto,
+            &raised.decode_options(),
+        )
+        .expect("raising the budget must admit the same bytes");
+        assert_eq!(view.reborrow().values.len(), n);
+    }
+
+    /// A response that is merely malformed must not point at a limit — that
+    /// would send someone chasing a setting that cannot help.
+    #[test]
+    fn a_malformed_response_does_not_name_a_limit() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let err = decode_response_view::<StringValueView<'static>>(
+            Bytes::from_static(&[0xFF, 0xFF, 0xFF]),
+            CodecFormat::Proto,
+            &CallOptions::default().decode_options(),
+        )
+        .unwrap_err();
+        assert!(
+            !err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("element_memory_limit"),
+            "got {:?}",
+            err.message
+        );
+    }
+
+    /// Per-call wins over the config default, and the config default applies
+    /// when the call says nothing — the same precedence `max_message_size`
+    /// already has.
+    #[test]
+    fn element_memory_limit_precedence_matches_max_message_size() {
+        let config = ClientConfig::new("http://example.com".parse().unwrap())
+            .with_default_element_memory_limit(1024);
+
+        let inherited = effective_options(&config, CallOptions::default());
+        assert_eq!(inherited.element_memory_limit(), Some(1024));
+
+        let overridden = effective_options(
+            &config,
+            CallOptions::default().with_element_memory_limit(4096),
+        );
+        assert_eq!(overridden.element_memory_limit(), Some(4096));
+
+        let unset = ClientConfig::new("http://example.com".parse().unwrap());
+        assert_eq!(
+            effective_options(&unset, CallOptions::default()).element_memory_limit(),
+            None,
+            "unset must stay unset so the decode uses buffa's default"
+        );
+    }
+
     #[cfg(not(feature = "json"))]
     #[test]
     fn decode_response_view_json_is_unimplemented_without_feature() {
@@ -6971,13 +9456,21 @@ mod tests {
         let err = decode_response_view::<StringValueView>(
             Bytes::from_static(b"\"x\""),
             CodecFormat::Json,
+            &buffa::DecodeOptions::new(),
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unimplemented);
 
         // Proto decoding still works.
         let bytes = StringValue::from("ok").encode_to_bytes();
-        assert!(decode_response_view::<StringValueView>(bytes, CodecFormat::Proto).is_ok());
+        assert!(
+            decode_response_view::<StringValueView>(
+                bytes,
+                CodecFormat::Proto,
+                &buffa::DecodeOptions::new()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -7106,6 +9599,101 @@ mod tests {
     }
 
     // ========================================================================
+    // procedure_uri / Spec plumbing
+    // ========================================================================
+
+    /// `Spec::procedure` carries the leading slash, so the request path is
+    /// base + procedure with any trailing slash on the base collapsed —
+    /// the same wire path the old `{base}/{service}/{method}` produced.
+    #[test]
+    fn procedure_uri_joins_base_and_procedure() {
+        const P: &str = "/pkg.Svc/Do";
+        for base in [
+            "http://h:8080",
+            "http://h:8080/",
+            "http://h:8080/prefix/",
+            "https://[::1]:8443/prefix",
+        ] {
+            let config = ClientConfig::new(base.parse().unwrap());
+            let uri = procedure_uri(&config, P, None).unwrap();
+            let want = format!("{}/pkg.Svc/Do", base.trim_end_matches('/'));
+            assert_eq!(uri.to_string(), want, "base {base}");
+        }
+        let config = ClientConfig::new("http://h".parse().unwrap());
+        let uri = procedure_uri(&config, P, Some("connect=v1&encoding=proto")).unwrap();
+        assert_eq!(uri.path(), P);
+        assert_eq!(uri.query(), Some("connect=v1&encoding=proto"));
+        // A query on the *base* URI is dropped rather than spliced into the
+        // path (string concatenation used to produce "/?a=1/pkg.Svc/Do").
+        let config = ClientConfig::new("http://h/?a=1".parse().unwrap());
+        let uri = procedure_uri(&config, P, None).unwrap();
+        assert_eq!((uri.path(), uri.query()), (P, None));
+    }
+
+    /// `check_client_spec` accepts exactly a client-side spec of the entry
+    /// point's stream shape, and each caller bug it rejects gets an
+    /// `Internal` error that says what to do instead — in every build
+    /// profile, not just debug.
+    #[test]
+    fn check_client_spec_table() {
+        use StreamType::*;
+        for st in [Unary, ClientStream, ServerStream, BidiStream] {
+            let ok = Spec::client("/pkg.Svc/M", st);
+            assert!(
+                check_client_spec(ok, st, entry_point_for(st)).is_ok(),
+                "{st:?}"
+            );
+        }
+        // Wrong entry point: names the right one.
+        let err = check_client_spec(
+            Spec::client("/pkg.Svc/Watch", ServerStream),
+            Unary,
+            "call_unary",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        let msg = err.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("call_unary called with a ServerStream Spec for /pkg.Svc/Watch")
+                && msg.contains("use call_server_stream"),
+            "{msg}"
+        );
+        // Server-side spec on a client call.
+        let err =
+            check_client_spec(Spec::server("/pkg.Svc/M", Unary), Unary, "call_unary").unwrap_err();
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("server-side Spec"),
+            "{err:?}"
+        );
+        // Malformed procedures share `spec::procedure_is_well_formed` with
+        // `Spec::client`'s debug assertion (tested in spec.rs); a `Spec` that
+        // fails it cannot be built here in a debug test binary.
+    }
+
+    /// End to end through a public entry point: the check runs before any
+    /// transport work, so no request is attempted.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn wrong_stream_type_spec_is_internal_error_before_send() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+        let config = ClientConfig::new("http://unused.invalid".parse().unwrap());
+        let err = call_unary::<_, StringValue, StringValueView<'static>>(
+            &HttpClient::plaintext(),
+            &config,
+            Spec::client("/pkg.Svc/Watch", StreamType::ServerStream),
+            StringValue::from("x"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("mismatched spec must fail fast");
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+    }
+
+    // ========================================================================
     // with_deadline (client-side timeout enforcement)
     // ========================================================================
 
@@ -7191,28 +9779,28 @@ mod tests {
     #[tokio::test]
     async fn collect_body_bounded_within_limit() {
         let body = Full::new(Bytes::from_static(b"hello"));
-        let got = collect_body_bounded(body, 10).await.unwrap();
+        let got = collect_body_bounded(body, 10, None).await.unwrap();
         assert_eq!(&got[..], b"hello");
     }
 
     #[tokio::test]
     async fn collect_body_bounded_at_exact_limit() {
         let body = Full::new(Bytes::from_static(b"hello"));
-        let got = collect_body_bounded(body, 5).await.unwrap();
+        let got = collect_body_bounded(body, 5, None).await.unwrap();
         assert_eq!(&got[..], b"hello");
     }
 
     #[tokio::test]
     async fn collect_body_bounded_exceeds_limit() {
         let body = Full::new(Bytes::from_static(b"hello world"));
-        let err = collect_body_bounded(body, 5).await.unwrap_err();
+        let err = collect_body_bounded(body, 5, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
     }
 
     #[tokio::test]
     async fn collect_body_bounded_empty() {
         let body = Full::new(Bytes::new());
-        let got = collect_body_bounded(body, 0).await.unwrap();
+        let got = collect_body_bounded(body, 0, None).await.unwrap();
         assert!(got.is_empty());
     }
 
@@ -7225,7 +9813,7 @@ mod tests {
         tx.send(Ok(Bytes::from_static(b"ccc"))).await.unwrap();
         drop(tx);
         // limit 7: first two frames (6 bytes) fit, third (3 more → 9) exceeds
-        let err = collect_body_bounded(body, 7).await.unwrap_err();
+        let err = collect_body_bounded(body, 7, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
     }
 
@@ -7236,7 +9824,7 @@ mod tests {
         tx.send(Ok(Bytes::from_static(b"foo"))).await.unwrap();
         tx.send(Ok(Bytes::from_static(b"bar"))).await.unwrap();
         drop(tx);
-        let got = collect_body_bounded(body, 10).await.unwrap();
+        let got = collect_body_bounded(body, 10, None).await.unwrap();
         assert_eq!(&got[..], b"foobar");
     }
 
@@ -7283,8 +9871,91 @@ mod tests {
         let body = ChannelBody { rx };
         tx.send(Err(ConnectError::internal("io"))).await.unwrap();
         drop(tx);
-        let err = collect_body_bounded(body, 1024).await.unwrap_err();
+        let err = collect_body_bounded(body, 1024, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    /// The race this fixes: a server enforcing the same deadline aborts the
+    /// stream, and its RST_STREAM can arrive before the local timer fires.
+    /// The body read then fails first, and the caller sees a transport fault
+    /// for what is really a timeout.
+    #[tokio::test]
+    async fn a_body_error_after_the_deadline_is_deadline_exceeded() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        tx.send(Err(ConnectError::internal("io"))).await.unwrap();
+        drop(tx);
+
+        let elapsed = std::time::Instant::now() - Duration::from_millis(1);
+        let err = collect_body_bounded(body, 1024, Some(elapsed))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+        // The transport cause survives the reclassification: a genuine
+        // transport fault that merely happened after the deadline is still
+        // diagnosable, both in the message and as the typed source.
+        assert!(
+            err.message.as_deref().unwrap_or_default().contains("io"),
+            "got {:?}",
+            err.message
+        );
+        let source = std::error::Error::source(&err).expect("read error must stay attached");
+        assert_eq!(
+            source.downcast_ref::<ConnectError>().map(|e| e.code),
+            Some(ErrorCode::Internal)
+        );
+    }
+
+    /// The contrast with the test above: a `deadline_exceeded` that the local
+    /// timer produced has no transport error behind it, so it must not grow
+    /// a source just because the body-read one did.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_fired_by_the_local_timer_has_no_source() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let err = with_deadline(Some(deadline), std::future::pending::<Result<(), _>>())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+        assert!(std::error::Error::source(&err).is_none(), "{err:?}");
+    }
+
+    /// The other half, and the reason this is a deadline check rather than a
+    /// blanket remap: with the deadline still in the future the same failure
+    /// is a real transport error and must stay `internal`.
+    #[tokio::test]
+    async fn a_body_error_before_the_deadline_stays_internal() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        tx.send(Err(ConnectError::internal("io"))).await.unwrap();
+        drop(tx);
+
+        let future = std::time::Instant::now() + Duration::from_secs(60);
+        let err = collect_body_bounded(body, 1024, Some(future))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    /// A call with no deadline can never be past one, and must not pick up
+    /// the timeout wording either — `collect_body_bounded_propagates_body_error`
+    /// already covers the code, so this covers the message.
+    #[tokio::test]
+    async fn a_body_error_without_a_deadline_is_not_described_as_a_timeout() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let body = ChannelBody { rx };
+        tx.send(Err(ConnectError::internal("io"))).await.unwrap();
+        drop(tx);
+
+        let err = collect_body_bounded(body, 1024, None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            !err.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deadline"),
+            "got {:?}",
+            err.message
+        );
     }
 
     #[test]
@@ -7613,6 +10284,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::DataLoss, "unexpected error: {err}");
+    }
+
+    /// A corrupt END_STREAM payload fails before any trailing metadata can
+    /// be parsed, so the response headers are the only context the caller
+    /// gets — they must be there.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn client_stream_end_stream_decompression_failure_carries_headers() {
+        use crate::envelope::flags;
+
+        let registry = crate::compression::CompressionRegistry::default();
+
+        let mut body = Envelope::data(Bytes::from_static(b"only"))
+            .encode()
+            .to_vec();
+        body.extend_from_slice(
+            &Envelope {
+                flags: flags::COMPRESSED | flags::END_STREAM,
+                data: Bytes::from_static(b"not gzip data"),
+            }
+            .encode(),
+        );
+
+        let mut resp_headers = http::HeaderMap::new();
+        resp_headers.insert("x-from-headers", http::HeaderValue::from_static("yes"));
+
+        let err = parse_connect_client_stream_envelopes(
+            Bytes::from(body),
+            &registry,
+            Some("gzip"),
+            1024 * 1024,
+            &resp_headers,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DataLoss, "unexpected error: {err}");
+        assert_eq!(err.response_headers().get("x-from-headers").unwrap(), "yes");
     }
 
     /// The response-path remap touches only the two decompression codes:

@@ -31,6 +31,7 @@
 //! [h2 #531]: https://github.com/hyperium/h2/issues/531
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -49,7 +50,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // TLS support types and helpers
 // ============================================================================
 
-#[cfg(feature = "client-tls")]
 use std::sync::Arc;
 
 /// A boxed bidirectional IO stream. Used to unify the concrete types
@@ -105,10 +105,10 @@ fn unix_connector(
         let path = path.clone();
         async move {
             let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
-                ConnectError::unavailable(format!(
-                    "unix socket connect to {} failed: {e}",
-                    path.display()
-                ))
+                ConnectError::unavailable_from_transport(
+                    format_args!("unix socket connect to {} failed", path.display()),
+                    e,
+                )
             })?;
             Ok(hyper_util::rt::TokioIo::new(stream))
         }
@@ -513,12 +513,14 @@ impl Http2Connection {
 /// The builder covers every [`Http2Connection`] transport: plaintext, TLS,
 /// caller-supplied connectors, and Unix sockets. HTTP/2 keep-alive and
 /// flow-control knobs are proxied directly; for hyper settings not surfaced
-/// here use [`h2_settings`](Self::h2_settings). [`tcp_connect_timeout`] is the
-/// per-address TCP bound on the built-in connector and is ignored by the
-/// custom-connector / Unix-socket terminals — use [`establishment_timeout`] there
-/// as the establishment bound.
+/// here use [`h2_settings`](Self::h2_settings). [`tcp_connect_timeout`] (the
+/// per-address TCP bound) and [`local_address`] (the source-address bind)
+/// configure the built-in connector and are ignored by the custom-connector /
+/// Unix-socket terminals — use [`establishment_timeout`] there as the
+/// establishment bound, and bind inside your own connector.
 ///
 /// [`tcp_connect_timeout`]: Self::tcp_connect_timeout
+/// [`local_address`]: Self::local_address
 /// [`establishment_timeout`]: Self::establishment_timeout
 ///
 /// [`CallOptions::with_timeout`]: super::CallOptions::with_timeout
@@ -527,6 +529,7 @@ impl Http2Connection {
 pub struct Http2ConnectionBuilder {
     tcp_connect_timeout: Option<Duration>,
     establishment_timeout: Option<Duration>,
+    local_address: Option<IpAddr>,
     h2_builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
 }
 
@@ -563,6 +566,7 @@ impl Default for Http2ConnectionBuilder {
         Self {
             tcp_connect_timeout: Some(DEFAULT_TCP_CONNECT_TIMEOUT),
             establishment_timeout: Some(DEFAULT_ESTABLISHMENT_TIMEOUT),
+            local_address: None,
             h2_builder,
         }
     }
@@ -635,6 +639,33 @@ impl Http2ConnectionBuilder {
     /// can stall `poll_ready` indefinitely — the pre-0.8.0 behaviour.
     pub fn no_establishment_timeout(mut self) -> Self {
         self.establishment_timeout = None;
+        self
+    }
+
+    /// Bind the built-in connector's TCP socket to `addr` before connecting,
+    /// so every connection (including reconnects) originates from that local
+    /// address (IP only; the source port stays ephemeral). For multi-homed
+    /// hosts where the peer derives something from the source address it
+    /// observes, or where egress must leave a specific interface. Unset by
+    /// default: the kernel picks the source address from the route to the
+    /// peer.
+    ///
+    /// Applied via hyper's [`HttpConnector::set_local_address`][hyper-la].
+    /// The resolved peer addresses are filtered to `addr`'s family, so a peer
+    /// with no address of that family fails to connect (rather than
+    /// connecting from a kernel-chosen source); there is currently no
+    /// dual-stack variant. An address this host cannot bind fails every
+    /// connect with the bind error. Like
+    /// [`tcp_connect_timeout`](Self::tcp_connect_timeout), this is
+    /// **ignored** by the custom-connector / Unix-socket terminals.
+    /// [`HttpClientBuilder`](super::HttpClientBuilder) does not expose it; use
+    /// `Http2Connection` when you need a pinned source address.
+    ///
+    /// [hyper-la]: hyper_util::client::legacy::connect::HttpConnector::set_local_address
+    #[doc(alias = "bind")]
+    #[doc(alias = "source_address")]
+    pub fn local_address(mut self, addr: IpAddr) -> Self {
+        self.local_address = Some(addr);
         self
     }
 
@@ -786,9 +817,10 @@ impl Http2ConnectionBuilder {
     ///
     /// `establishment_timeout` bounds the connector's dial *and* the HTTP/2 preface
     /// as one wall-clock budget — the same semantics as the built-in
-    /// transports. `tcp_connect_timeout` is the per-address TCP bound on the
-    /// built-in connector and is **ignored** here; to bound the dial separately
-    /// from the preface, wrap the connector in `tower::timeout::Timeout`.
+    /// transports. `tcp_connect_timeout` and `local_address` configure the
+    /// built-in connector and are **ignored** here; to bound the dial separately
+    /// from the preface, wrap the connector in `tower::timeout::Timeout`, and
+    /// bind inside the connector if you need a source address.
     #[must_use]
     pub fn lazy_with_connector<C>(self, connector: C, authority: Uri) -> Http2Connection
     where
@@ -859,11 +891,16 @@ impl Http2ConnectionBuilder {
     }
 
     /// Built-in TCP connector with `nodelay` and the configured
-    /// `tcp_connect_timeout` applied. Mirrors `HttpClientBuilder::http_connector`.
+    /// `tcp_connect_timeout` / `local_address` applied. Mirrors
+    /// `HttpClientBuilder::http_connector` (which has no `local_address`).
     fn http_connector(&self) -> hyper_util::client::legacy::connect::HttpConnector {
         let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         connector.set_nodelay(true);
         connector.set_connect_timeout(self.tcp_connect_timeout);
+        // The family filtering documented on `local_address` is hyper's
+        // happy-eyeballs path; with it disabled hyper skips a mismatched-family
+        // bind silently. `HttpConnector::new()` enables it — keep it that way.
+        connector.set_local_address(self.local_address);
         connector
     }
 
@@ -910,7 +947,7 @@ impl Http2ConnectionBuilder {
 async fn drive_connect(conn: &mut Http2Connection, ctx: &str) -> Result<(), ConnectError> {
     std::future::poll_fn(|cx| conn.inner.poll_ready(cx))
         .await
-        .map_err(|e| ConnectError::unavailable(format!("{ctx}: {e}")))
+        .map_err(|e| ConnectError::unavailable_from_transport(ctx, e))
 }
 
 impl tower::Service<Request<ClientBody>> for Http2Connection {
@@ -927,51 +964,321 @@ impl tower::Service<Request<ClientBody>> for Http2Connection {
     }
 }
 
-// Http2Connection needs Clone to satisfy ClientTransport, but the inner
-// Reconnect state machine is !Clone by design (each instance tracks one
-// connection). For ClientTransport's shared-access semantics we use an
-// Arc<tokio::Mutex> — but that would serialize requests and defeat the
-// purpose. Instead, we only implement ClientTransport for the wrapped
-// ServiceTransport version, and let users who want to share wrap in
-// Buffer or Balance themselves.
-//
-// For the direct "single connection" use case, the generated FooServiceClient
-// takes `T: ClientTransport` which requires Clone — so direct Http2Connection
-// can't be used without a Buffer layer. This is intentional: a raw h2
-// connection IS !Clone; sharing it requires coordination.
-//
-// Workaround for the common case: provide `Http2Connection::shared()` that
-// returns a Buffer-wrapped, Clone-able handle.
+// Http2Connection is a tower `Service` taking `&mut self`, and its Reconnect
+// state machine is !Clone by design (each instance tracks one connection),
+// while generated clients need `T: ClientTransport`, which is `Clone` and
+// sends through `&self`. `SharedHttp2Connection` bridges the two without a
+// worker task: hyper's h2 `SendRequest` is already a cloneable handle that
+// passes each request to the connection task over a channel, so every request
+// clones the current handle and sends on it directly. A request that finds no
+// live handle (never connected, or the connection dropped), or has its request
+// handed back unsent, takes the reconnect state machine's lock, has it driven
+// to a new connection on a task of its own, and publishes the new handle for
+// everyone else. A semaphore bounds how many requests may wait for that at
+// once; it is the `bound` of `Http2Connection::shared` and the only queue the
+// handle keeps.
+
+type H2SendRequest = hyper::client::conn::http2::SendRequest<ClientBody>;
+
+/// State shared by every clone of a [`SharedHttp2Connection`].
+struct SharedState {
+    /// The endpoint, for `Debug`.
+    uri: Uri,
+    /// The live connection's request handle; cloned per request. `None`
+    /// before the first connect and while a replacement is being
+    /// established. A handle whose connection has gone away reports
+    /// `is_closed()` and sends callers to `conn` to replace it.
+    sender: std::sync::RwLock<Option<H2SendRequest>>,
+    /// The reconnect state machine, locked only to (re)establish the
+    /// connection. `Arc` so that an attempt can own the guard in its own
+    /// task and finish even if the request that started it goes away.
+    conn: Arc<tokio::sync::Mutex<Http2Connection>>,
+    /// Number of completed (re)connect attempts, successful or not. A caller
+    /// that queued for `conn` behind someone else's attempt shares its
+    /// outcome instead of dialling again, so a burst of requests during an
+    /// outage costs one dial, not one per request.
+    attempts: std::sync::atomic::AtomicU64,
+    /// The failure of the most recent attempt, for those callers to share.
+    /// Cleared by the next successful connect.
+    last_failure: std::sync::Mutex<Option<ConnectError>>,
+}
+
+impl SharedState {
+    /// The current request handle if its connection is still open.
+    fn live_sender(&self) -> Option<H2SendRequest> {
+        self.sender
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|s| !s.is_closed())
+            .cloned()
+    }
+
+    /// Whether there is a request handle onto an open connection.
+    fn is_connected(&self) -> bool {
+        self.sender
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|s| !s.is_closed())
+    }
+
+    fn set_sender(&self, sender: Option<H2SendRequest>) {
+        *self
+            .sender
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sender;
+    }
+
+    fn last_failure(&self) -> std::sync::MutexGuard<'_, Option<ConnectError>> {
+        self.last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Get a request handle onto a live connection, establishing one if
+    /// needed, and publish it.
+    ///
+    /// The attempt itself runs in its own task holding the state machine's
+    /// lock, so it completes (and its result is published) even when the
+    /// request that started it is dropped at its deadline; requests queued
+    /// behind it then find either the new handle or the recorded failure
+    /// rather than a half-finished handshake to resume.
+    async fn reconnect(shared: &Arc<Self>) -> Result<H2SendRequest, ConnectError> {
+        use std::sync::atomic::Ordering;
+
+        let seen = shared.attempts.load(Ordering::Acquire);
+        let mut conn = Arc::clone(&shared.conn).lock_owned().await;
+        // Another caller may have reconnected while this one waited for the
+        // lock...
+        if let Some(sender) = shared.live_sender() {
+            return Ok(sender);
+        }
+        // ...or tried to and failed, in which case this caller takes that
+        // answer rather than dialling again straight away.
+        if shared.attempts.load(Ordering::Acquire) != seen
+            && let Some(failure) = shared.last_failure().clone()
+        {
+            return Err(failure);
+        }
+
+        shared.set_sender(None);
+        let owner = Arc::clone(shared);
+        let attempt = tokio::spawn(async move {
+            let ready = std::future::poll_fn(|cx| conn.inner.poll_ready(cx)).await;
+            // `Reconnect` reports a failed (re)connect as Ready plus a deferred
+            // error, so that a balancer can route around it; surface it here.
+            let result = match (ready, conn.inner.deferred_error.take()) {
+                (Err(e), _) | (Ok(()), Some(e)) => Err(e),
+                (Ok(()), None) => match &conn.inner.state {
+                    ReconnectState::Connected(svc) => Ok(svc.inner.clone()),
+                    ReconnectState::Idle | ReconnectState::Connecting(_) => {
+                        Err("Http2Connection ready but not connected".into())
+                    }
+                },
+            };
+            owner.attempts.fetch_add(1, Ordering::Release);
+            let mut last_failure = owner.last_failure();
+            let result = match result {
+                Ok(sender) => {
+                    tracing::debug!(uri = %owner.uri, "shared h2 connection established");
+                    *last_failure = None;
+                    owner.set_sender(Some(sender.clone()));
+                    Ok(sender)
+                }
+                Err(e) => {
+                    let failure = h2_transport_error(e, "h2 connect failed");
+                    tracing::debug!(uri = %owner.uri, error = %failure, "shared h2 connect failed");
+                    *last_failure = Some(failure.clone());
+                    Err(failure)
+                }
+            };
+            // Published; only now let the next waiter in.
+            drop(conn);
+            result
+        });
+        match attempt.await {
+            Ok(result) => result,
+            // The runtime is shutting down; nothing was established.
+            Err(e) if e.is_cancelled() => Err(ConnectError::unavailable(
+                "h2 connect failed: connect task cancelled",
+            )),
+            Err(e) => Err(ConnectError::internal(format!(
+                "h2 connect task failed: {e}"
+            ))),
+        }
+    }
+
+    /// Send `req` on the shared connection, connecting first if needed, and
+    /// await the response head. `queued` is the caller's queue slot, given
+    /// back as soon as the request has been handed to a connection.
+    ///
+    /// A handle can pass the `is_closed()` check and still lose the race with
+    /// a connection that is going away. hyper hands the request back unsent in
+    /// that case, so it is resent on a fresh handle (a bounded number of
+    /// times) instead of failing a request that never reached the wire.
+    async fn send(
+        shared: &Arc<Self>,
+        mut req: Request<ClientBody>,
+        queued: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Response<hyper::body::Incoming>, BoxError> {
+        /// Resends of a request hyper handed back unsent. The window is the
+        /// gap between a connection starting to close and its handle
+        /// reporting `is_closed()`, so one is nearly always enough.
+        const MAX_RESENDS: usize = 2;
+        use std::sync::atomic::Ordering;
+
+        let mut sender = match shared.live_sender() {
+            Some(sender) => sender,
+            None => Self::reconnect(shared).await?,
+        };
+        let mut queued = Some(queued);
+        let mut resends = 0;
+        loop {
+            let generation = shared.attempts.load(Ordering::Acquire);
+            let response = sender.try_send_request(req);
+            // hyper took the request (or refused it) synchronously: from here
+            // it occupies an h2 stream, or the transport's queue for one, and
+            // no longer a slot in the queue for the connection.
+            drop(queued.take());
+            match response.await {
+                Ok(response) => return Ok(response),
+                // hyper hands a request back only if the connection went away
+                // before taking it off its queue, so its body is untouched and
+                // it can be sent again as new.
+                Err(mut unsent) => match unsent.take_message() {
+                    Some(returned) if resends < MAX_RESENDS => {
+                        resends += 1;
+                        req = returned;
+                        tracing::debug!(
+                            uri = %shared.uri,
+                            attempt = resends,
+                            "shared h2 connection closed before taking the request; resending"
+                        );
+                        // Retire the handle that failed, unless a reconnect has
+                        // already replaced it meanwhile.
+                        if shared.attempts.load(Ordering::Acquire) == generation {
+                            shared.set_sender(None);
+                        }
+                        sender = Self::reconnect(shared).await?;
+                    }
+                    Some(_) | None => return Err(unsent.into_error().into()),
+                },
+            }
+        }
+    }
+}
+
+/// Classify a failure from the h2 transport for the caller: a
+/// [`ConnectError`] anywhere in the chain (scheme and ALPN checks, the
+/// establishment timeout, a shared connect failure) is returned as is, and
+/// anything else (socket, TLS, h2 protocol errors) becomes `unavailable` with
+/// `context` and the original error as its source.
+fn h2_transport_error(err: BoxError, context: &str) -> ConnectError {
+    super::find_connect_error_in_chain(&*err)
+        .unwrap_or_else(|| ConnectError::unavailable_from_transport(context, err))
+}
 
 /// A `Clone + ClientTransport` handle to a shared [`Http2Connection`].
 ///
-/// Created via [`Http2Connection::shared`]. The underlying connection is
-/// driven by a background worker task; callers get a cheap-to-clone channel
-/// handle. Unlike [`HttpClient`](super::HttpClient), the underlying readiness
-/// still backpressures correctly through the buffer.
-#[derive(Clone)]
-#[allow(clippy::type_complexity)] // Buffer's type param is what it is
+/// Created via [`Http2Connection::shared`]. Clones are cheap and all use the
+/// one underlying connection and its reconnect state machine; requests from
+/// different clones are multiplexed as concurrent HTTP/2 streams.
+///
+/// As a [`tower::Service`] it keeps [`Http2Connection`]'s readiness contract:
+/// [`poll_ready`](tower::Service::poll_ready) is pending while the connection
+/// is being (re-)established and ready once it is up, and a failed attempt is
+/// reported as ready with the connect error returned by the following
+/// [`call`](tower::Service::call), after which the next `poll_ready` tries
+/// again. A balancer therefore keeps the endpoint and steers by pending load
+/// while it is down, rather than discarding it for good.
 pub struct SharedHttp2Connection {
-    inner: tower::buffer::Buffer<
-        Request<ClientBody>,
-        BoxFuture<'static, Result<Response<hyper::body::Incoming>, BoxError>>,
-    >,
+    shared: Arc<SharedState>,
+    /// Slots for requests waiting to be handed to the connection; `bound` of
+    /// them. See [`Http2Connection::shared`].
+    queue: tokio_util::sync::PollSemaphore,
+    /// Taken in `poll_ready`, consumed by the following `call`.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The connection attempt `poll_ready` is waiting on, having found no
+    /// live connection.
+    connecting: Option<sync_wrapper::SyncFuture<BoxFuture<'static, Result<(), ConnectError>>>>,
+    /// The failure of that attempt, returned by the next `call` (see the
+    /// readiness contract on the type).
+    deferred_error: Option<ConnectError>,
+}
+
+/// A clone shares the connection but not this handle's readiness: it must
+/// get its own `poll_ready` before `call`, as `tower::ServiceExt::oneshot`
+/// and the [`ClientTransport`] impl do.
+impl Clone for SharedHttp2Connection {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            queue: self.queue.clone(),
+            permit: None,
+            connecting: None,
+            deferred_error: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedHttp2Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedHttp2Connection")
+            .field("uri", &self.shared.uri)
+            .field("connected", &self.shared.is_connected())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Http2Connection {
-    /// Wrap this connection in a [`tower::buffer::Buffer`] for `Clone +
-    /// ClientTransport` use.
+    /// Turn this connection into a `Clone + ClientTransport` handle that any
+    /// number of clients and tasks can share.
     ///
-    /// `bound` is the channel capacity — requests beyond this backpressure
-    /// through `poll_ready`. For a single-connection gRPC client, 1024 is
-    /// a reasonable default (covers typical `max_concurrent_streams`).
+    /// Requests are multiplexed onto the one connection as HTTP/2 streams, so
+    /// their concurrency is limited only by the peer's
+    /// `max_concurrent_streams`, past which the transport queues new streams
+    /// itself (in hyper's own, unbounded, queue). `bound` limits something
+    /// narrower: how many requests may be waiting, at once, to be handed to the
+    /// connection. A request holds one of the `bound` slots from `poll_ready`
+    /// (or the start of [`send`](ClientTransport::send)) until hyper has taken
+    /// it, which is immediate while the connection is up and lasts for the
+    /// (re-)establishment while it is not; further callers wait for a free
+    /// slot, in arrival order. A tower handle that has been polled ready and
+    /// not yet called holds its slot too. For a single-connection gRPC client,
+    /// 1024 is a reasonable default. Values above
+    /// `tokio::sync::Semaphore::MAX_PERMITS` are clamped to it.
     ///
-    /// Requires being called from within a tokio runtime (to spawn the
-    /// buffer's worker task).
+    /// Connecting happens on a spawned Tokio task the first time a request
+    /// (or `poll_ready`) finds no live connection, so the handle must be used
+    /// from within a Tokio runtime, as with every transport here.
+    ///
+    /// # Panics
+    ///
+    /// If `bound` is 0.
+    #[must_use]
     pub fn shared(self, bound: usize) -> SharedHttp2Connection {
-        let (buffer, worker) = tower::buffer::Buffer::pair(self, bound);
-        tokio::spawn(worker);
-        SharedHttp2Connection { inner: buffer }
+        assert!(bound > 0, "SharedHttp2Connection bound must be positive");
+        let bound = bound.min(tokio::sync::Semaphore::MAX_PERMITS);
+        let sender = match &self.inner.state {
+            ReconnectState::Connected(svc) => Some(svc.inner.clone()),
+            ReconnectState::Idle | ReconnectState::Connecting(_) => None,
+        };
+        SharedHttp2Connection {
+            shared: Arc::new(SharedState {
+                uri: self.inner.uri.clone(),
+                sender: std::sync::RwLock::new(sender),
+                conn: Arc::new(tokio::sync::Mutex::new(self)),
+                attempts: std::sync::atomic::AtomicU64::new(0),
+                last_failure: std::sync::Mutex::new(None),
+            }),
+            queue: tokio_util::sync::PollSemaphore::new(Arc::new(tokio::sync::Semaphore::new(
+                bound,
+            ))),
+            permit: None,
+            connecting: None,
+            deferred_error: None,
+        }
     }
 }
 
@@ -981,12 +1288,54 @@ impl tower::Service<Request<ClientBody>> for SharedHttp2Connection {
     type Future = BoxFuture<'static, Result<Response<hyper::body::Incoming>, Self::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        <_ as tower::Service<Request<ClientBody>>>::poll_ready(&mut self.inner, cx)
+        if self.permit.is_none() {
+            match futures::ready!(self.queue.poll_acquire(cx)) {
+                Some(permit) => self.permit = Some(permit),
+                // The semaphore is never closed.
+                None => {
+                    return Poll::Ready(Err(ConnectError::internal(
+                        "SharedHttp2Connection queue closed",
+                    )
+                    .into()));
+                }
+            }
+        }
+        loop {
+            if let Some(connecting) = self.connecting.as_mut() {
+                let result = futures::ready!(Pin::new(connecting).poll(cx));
+                self.connecting = None;
+                if let Err(e) = result {
+                    // Ready, with the failure reported by `call`: an `Err` here
+                    // would tell the caller to discard the service for good.
+                    self.deferred_error = Some(e);
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if self.deferred_error.is_some() || self.shared.is_connected() {
+                return Poll::Ready(Ok(()));
+            }
+            let shared = Arc::clone(&self.shared);
+            self.connecting = Some(sync_wrapper::SyncFuture::new(Box::pin(async move {
+                SharedState::reconnect(&shared).await.map(drop)
+            })));
+        }
     }
 
     fn call(&mut self, req: Request<ClientBody>) -> Self::Future {
-        let fut = <_ as tower::Service<Request<ClientBody>>>::call(&mut self.inner, req);
-        Box::pin(fut)
+        let Some(permit) = self.permit.take() else {
+            return Box::pin(async {
+                Err(ConnectError::internal(
+                    "SharedHttp2Connection::call before poll_ready returned Ready",
+                )
+                .into())
+            });
+        };
+        if let Some(e) = self.deferred_error.take() {
+            drop(permit);
+            return Box::pin(async move { Err(e.into()) });
+        }
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move { SharedState::send(&shared, req, permit).await })
     }
 }
 
@@ -998,12 +1347,17 @@ impl ClientTransport for SharedHttp2Connection {
         &self,
         request: Request<ClientBody>,
     ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
-        use tower::ServiceExt;
-        let svc = self.clone();
+        let shared = Arc::clone(&self.shared);
+        let queue = self.queue.clone_inner();
         Box::pin(async move {
-            svc.oneshot(request)
+            // The semaphore is never closed, so this only waits.
+            let permit = queue
+                .acquire_owned()
                 .await
-                .map_err(|e| ConnectError::unavailable(format!("h2 send failed: {e}")))
+                .map_err(|_| ConnectError::internal("SharedHttp2Connection queue closed"))?;
+            SharedState::send(&shared, request, permit)
+                .await
+                .map_err(|e| h2_transport_error(e, "h2 send failed"))
         })
     }
 }
@@ -1150,9 +1504,10 @@ impl tower::Service<Uri> for MakeSendRequest {
                     let tcp = io.into_inner();
                     let connector = tokio_rustls::TlsConnector::from(tls);
                     let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-                        BoxError::from(ConnectError::unavailable(format!(
-                            "TLS handshake failed: {e}"
-                        )))
+                        BoxError::from(ConnectError::unavailable_from_transport(
+                            "TLS handshake failed",
+                            e,
+                        ))
                     })?;
 
                     // Verify ALPN negotiated h2. A server that doesn't speak h2
@@ -1208,9 +1563,10 @@ where
     match timeout {
         Some(dur) => match tokio::time::timeout(dur, fut).await {
             Ok(res) => res.map_err(Into::into),
-            Err(_) => Err(ConnectError::unavailable(format!(
+            Err(elapsed) => Err(ConnectError::unavailable(format!(
                 "connection establishment did not complete within {dur:?}"
             ))
+            .with_source(elapsed)
             .into()),
         },
         None => fut.await.map_err(Into::into),
@@ -1370,8 +1726,13 @@ mod tests {
     #[tokio::test]
     async fn connect_plaintext_to_nonexistent_fails() {
         // Port 1 should not have a listener.
-        let err = Http2Connection::connect_plaintext("http://127.0.0.1:1".parse().unwrap()).await;
-        assert!(err.is_err(), "expected connect to port 1 to fail");
+        let err = Http2Connection::connect_plaintext("http://127.0.0.1:1".parse().unwrap())
+            .await
+            .expect_err("expected connect to port 1 to fail");
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "eager-connect failure must retain its cause as source(): {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1468,6 +1829,379 @@ mod tests {
         assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
     }
 
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn connect_tls_handshake_failure_preserves_source() {
+        // A listener that accepts the TCP connection and immediately closes
+        // it, before any TLS bytes are exchanged — the client's handshake
+        // fails fast on the resulting EOF, without needing a timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let uri: Uri = format!("https://{addr}").parse().unwrap();
+        let err = Http2Connection::connect_tls(uri, tls_config)
+            .await
+            .expect_err("handshake against a closed connection must fail");
+
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("TLS handshake failed"),
+            "expected a TLS-handshake-failure message, got: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "TLS handshake failure must retain its cause as source(): {err:?}"
+        );
+
+        server.abort();
+    }
+
+    fn empty_request() -> Request<ClientBody> {
+        Request::builder()
+            .uri("http://test.invalid/")
+            .body(crate::client::full_body(bytes::Bytes::new()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_send_after_deferred_connect_failure_preserves_source() {
+        // A lazy connection defers its first connect failure (see
+        // Reconnect::poll_ready) — that deferred-error path is exactly what
+        // SharedHttp2Connection::send goes through for a shared connection
+        // that never manages to connect.
+        let conn = Http2Connection::lazy_plaintext("http://127.0.0.1:1".parse().unwrap());
+        let shared = conn.shared(1);
+
+        let err = ClientTransport::send(&shared, empty_request())
+            .await
+            .expect_err("send over a connection that can never connect must fail");
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable, "{err:?}");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .contains("h2 connect failed"),
+            "unexpected message: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "connect failure must retain its cause as source(): {err:?}"
+        );
+    }
+
+    /// A connect failure that the transport classified itself (here the
+    /// plaintext/TLS scheme check, `invalid_argument`) reaches the caller
+    /// with its own code rather than re-wrapped as `unavailable`.
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn shared_send_surfaces_classified_connect_errors_verbatim() {
+        let tls = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let shared =
+            Http2Connection::lazy_tls("http://127.0.0.1:1".parse().unwrap(), tls).shared(1);
+        let err = ClientTransport::send(&shared, empty_request())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::error::ErrorCode::InvalidArgument,
+            "{err:?}"
+        );
+    }
+
+    /// `poll_ready` on a shared handle drives the connect itself and keeps
+    /// `Http2Connection`'s contract for a failed one: ready, with the failure
+    /// returned by the next `call`, and a fresh dial on the next `poll_ready`
+    /// (an `Err` from `poll_ready` would have a balancer discard the endpoint
+    /// for good).
+    #[tokio::test]
+    async fn shared_poll_ready_defers_connect_failure_to_call_and_redials() {
+        use std::future::poll_fn;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::Service as _;
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let refuse = tower::service_fn(move |_uri: Uri| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<hyper_util::rt::TokioIo<tokio::io::DuplexStream>, _>(std::io::Error::other(
+                    "dial refused",
+                ))
+            }
+        });
+        let mut shared = Http2Connection::builder()
+            .lazy_with_connector(refuse, "http://test.invalid".parse().unwrap())
+            .shared(4);
+
+        for expected_dials in [1, 2] {
+            poll_fn(|cx| shared.poll_ready(cx))
+                .await
+                .expect("a failed connect still reports ready");
+            assert_eq!(dials.load(Ordering::SeqCst), expected_dials);
+            let err = shared.call(empty_request()).await.unwrap_err();
+            let err = err.downcast_ref::<ConnectError>().expect("a ConnectError");
+            assert_eq!(err.code, crate::error::ErrorCode::Unavailable, "{err:?}");
+            assert!(
+                err.message.as_deref().unwrap().contains("dial refused"),
+                "{err:?}"
+            );
+            assert_eq!(
+                dials.load(Ordering::SeqCst),
+                expected_dials,
+                "call does not dial"
+            );
+            assert_eq!(shared.queue.available_permits(), 4, "the slot is returned");
+        }
+    }
+
+    /// `bound` counts requests waiting for the connection to be established:
+    /// each `poll_ready` parked on the connect holds a slot, a clone never
+    /// inherits one, a handle that gives up returns its slot, and a caller
+    /// past the bound waits for a slot rather than for the connect.
+    #[tokio::test]
+    async fn shared_bound_limits_requests_queued_for_a_connection() {
+        use tower::Service as _;
+
+        let stall = tower::service_fn(|_uri: Uri| async {
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::io::duplex(1).0))
+        });
+        let mut a = Http2Connection::builder()
+            .no_establishment_timeout()
+            .lazy_with_connector(stall, "http://test.invalid".parse().unwrap())
+            .shared(2);
+        let mut b = a.clone();
+        let mut c = a.clone();
+        let is_pending = |handle: &mut SharedHttp2Connection| {
+            let polled = handle.poll_ready(&mut Context::from_waker(std::task::Waker::noop()));
+            polled.is_pending()
+        };
+
+        assert!(is_pending(&mut a), "a drives the connect");
+        assert!(is_pending(&mut a), "and asking again takes no second slot");
+        assert_eq!(a.queue.available_permits(), 1);
+        assert!(is_pending(&mut b), "b queues behind the same connect");
+        assert_eq!(a.queue.available_permits(), 0);
+        assert!(is_pending(&mut c), "c waits for a slot");
+        assert!(c.permit.is_none() && c.connecting.is_none());
+
+        // b gives up; its slot goes straight to c, which joins the connect.
+        drop(b);
+        assert!(is_pending(&mut c));
+        assert!(c.permit.is_some() && c.connecting.is_some());
+        assert_eq!(a.queue.available_permits(), 0);
+    }
+
+    /// `bound` does not cap concurrent streams: with a bound of 1, two
+    /// requests are open on the server at the same time (the server answers
+    /// neither until it has both, so a cap of one in-flight request would
+    /// deadlock here and trip the timeout).
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn shared_bound_does_not_cap_concurrent_streams() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let both_arrived = Arc::new(tokio::sync::Barrier::new(2));
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let both_arrived = Arc::clone(&both_arrived);
+                tokio::spawn(async move {
+                    let service =
+                        hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                            let both_arrived = Arc::clone(&both_arrived);
+                            async move {
+                                both_arrived.wait().await;
+                                Ok::<_, std::convert::Infallible>(Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::from_static(b"ok")),
+                                ))
+                            }
+                        });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+
+        let uri: Uri = format!("http://{addr}").parse().unwrap();
+        let shared = Http2Connection::lazy_plaintext(uri.clone()).shared(1);
+        let request = || {
+            Request::builder()
+                .uri(uri.clone())
+                .body(crate::client::full_body(bytes::Bytes::new()))
+                .unwrap()
+        };
+        let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                ClientTransport::send(&shared, request()),
+                ClientTransport::send(&shared, request())
+            )
+        })
+        .await
+        .expect("two concurrent streams over a bound of 1");
+        assert_eq!(first.unwrap().status(), http::StatusCode::OK);
+        assert_eq!(second.unwrap().status(), http::StatusCode::OK);
+
+        // The same over the tower interface, one handle per request.
+        use tower::ServiceExt as _;
+        let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                shared.clone().oneshot(request()),
+                shared.clone().oneshot(request())
+            )
+        })
+        .await
+        .expect("two concurrent streams over a bound of 1, via tower");
+        assert_eq!(first.unwrap().status(), http::StatusCode::OK);
+        assert_eq!(second.unwrap().status(), http::StatusCode::OK);
+        server.abort();
+    }
+
+    #[test]
+    fn shared_debug_reports_endpoint_and_connection_state() {
+        let shared =
+            Http2Connection::lazy_plaintext("http://127.0.0.1:1".parse().unwrap()).shared(3);
+        let debug = format!("{shared:?}");
+        assert!(debug.contains("uri: http://127.0.0.1:1/"), "{debug}");
+        assert!(debug.contains("connected: false"), "{debug}");
+    }
+
+    /// A burst of requests against a shared connection that cannot connect
+    /// dials once: the requests queued behind the attempt share its failure
+    /// instead of each dialling in turn. A request made after the burst
+    /// dials again. (Paused time: the connector's delay elapses only once
+    /// every request in the burst is parked, however slow the test host.)
+    #[tokio::test(start_paused = true)]
+    async fn shared_burst_during_outage_dials_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let refuse = tower::service_fn(move |_uri: Uri| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Err::<hyper_util::rt::TokioIo<tokio::io::DuplexStream>, _>(std::io::Error::other(
+                    "dial refused",
+                ))
+            }
+        });
+        let shared = Http2Connection::builder()
+            .no_establishment_timeout()
+            .lazy_with_connector(refuse, "http://test.invalid".parse().unwrap())
+            .shared(64);
+
+        let burst = futures::future::join_all(
+            (0..16).map(|_| ClientTransport::send(&shared, empty_request())),
+        )
+        .await;
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "one dial for the whole burst"
+        );
+        for result in &burst {
+            let err = result.as_ref().unwrap_err();
+            assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+            assert!(
+                err.message.as_deref().unwrap().contains("dial refused"),
+                "every request in the burst reports the shared failure: {err:?}"
+            );
+        }
+
+        let _ = ClientTransport::send(&shared, empty_request()).await;
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            2,
+            "a later request dials afresh"
+        );
+    }
+
+    /// A request abandoned mid-handshake (its deadline passed) neither kills
+    /// the attempt nor leaves it half-finished for the next request to
+    /// resume: the attempt runs to its own conclusion, requests arriving
+    /// meanwhile wait on it rather than dialling again, and a request made
+    /// after it has failed dials afresh instead of inheriting its
+    /// establishment timeout.
+    #[tokio::test(start_paused = true)]
+    async fn shared_connect_attempt_outlives_the_request_that_started_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let stall = tower::service_fn(move |_uri: Uri| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                std::future::pending::<()>().await;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::io::duplex(1).0))
+            }
+        });
+        const ESTABLISHMENT: Duration = Duration::from_secs(3);
+        let shared = Http2Connection::builder()
+            .establishment_timeout(ESTABLISHMENT)
+            .lazy_with_connector(stall, "http://test.invalid".parse().unwrap())
+            .shared(4);
+        let send_within = |limit: Duration| {
+            tokio::time::timeout(limit, ClientTransport::send(&shared, empty_request()))
+        };
+
+        // Give up on the first request well inside the establishment timeout.
+        assert!(send_within(ESTABLISHMENT / 10).await.is_err());
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+        // A second request while that attempt is still running joins it.
+        assert!(send_within(ESTABLISHMENT / 10).await.is_err());
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "no second dial mid-attempt"
+        );
+
+        // Once the attempt has timed out on its own, the next request dials
+        // afresh, and stalls afresh rather than failing at once with the
+        // previous attempt's timeout.
+        tokio::time::sleep(ESTABLISHMENT).await;
+        assert!(
+            send_within(ESTABLISHMENT / 10).await.is_err(),
+            "a fresh attempt, still stalled"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_call_without_poll_ready_is_an_error_not_a_panic() {
+        use tower::Service as _;
+        let mut shared =
+            Http2Connection::lazy_plaintext("http://127.0.0.1:1".parse().unwrap()).shared(4);
+        let err = shared.call(empty_request()).await.unwrap_err();
+        assert!(err.to_string().contains("before poll_ready"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "bound must be positive")]
+    fn shared_rejects_a_zero_bound() {
+        let _ = Http2Connection::lazy_plaintext("http://127.0.0.1:1".parse().unwrap()).shared(0);
+    }
+
     #[test]
     fn lazy_with_connector_starts_idle() {
         let conn = Http2Connection::lazy_with_connector(
@@ -1522,6 +2256,10 @@ mod tests {
             err.message.as_deref().unwrap().contains(path),
             "error should include socket path, got: {err:?}"
         );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "unix-connect failure must retain its cause as source(): {err:?}"
+        );
     }
 
     #[test]
@@ -1562,6 +2300,49 @@ mod tests {
             .establishment_timeout(Duration::MAX);
         assert_eq!(max.tcp_connect_timeout, None);
         assert_eq!(max.establishment_timeout, None);
+    }
+
+    /// `local_address` is what the peer observes as the connection's source.
+    /// Linux routes all of 127/8 to `lo`, so 127.0.0.2 is bindable without
+    /// setup and distinguishable from the default 127.0.0.1 source; macOS/BSD
+    /// configure only 127.0.0.1 on loopback, hence the cfg.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn builder_local_address_is_the_observed_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let local: IpAddr = "127.0.0.2".parse().unwrap();
+        // TCP completes into the listen backlog and the plaintext h2c
+        // handshake resolves locally, so this finishes before `accept()` is
+        // polled — and a bind failure surfaces here as an error, not a hang.
+        let _conn = Http2Connection::builder()
+            .local_address(local)
+            .connect_plaintext(uri)
+            .await
+            .unwrap();
+        let (_stream, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.ip(), local);
+    }
+
+    /// A `local_address` whose family the peer has no address in fails the
+    /// connect rather than falling back to a kernel-chosen source. The peer
+    /// is a live v4 listener, so a fallback would *succeed* — `expect_err`
+    /// is what pins the no-fallback behaviour (and the happy-eyeballs
+    /// dependency noted in `http_connector`).
+    #[tokio::test]
+    async fn builder_local_address_family_mismatch_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let err = Http2Connection::builder()
+            .local_address("::1".parse().unwrap())
+            .connect_plaintext(uri)
+            .await
+            .expect_err("v6 local address to a v4-only peer must not connect");
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
     }
 
     #[tokio::test]
@@ -1652,6 +2433,10 @@ mod tests {
             "expected a handshake-timeout message, got: {err:?}"
         );
         assert!(
+            std::error::Error::source(&err).is_some(),
+            "establishment-timeout failure must retain its cause as source(): {err:?}"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
             "establishment_timeout(150ms) should fire within ~2s, took {elapsed:?}"
         );
@@ -1704,6 +2489,10 @@ mod tests {
             "expected a handshake-timeout message, got: {err:?}"
         );
         assert!(
+            std::error::Error::source(&err).is_some(),
+            "establishment-timeout failure must retain its cause as source(): {err:?}"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
             "establishment_timeout(150ms) should fire within ~2s, took {elapsed:?}"
         );
@@ -1737,6 +2526,10 @@ mod tests {
                 .unwrap()
                 .contains("establishment did not complete"),
             "expected a handshake-timeout message, got: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "establishment-timeout failure must retain its cause as source(): {err:?}"
         );
         assert!(
             elapsed < Duration::from_secs(2),

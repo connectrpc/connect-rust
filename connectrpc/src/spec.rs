@@ -115,8 +115,13 @@ pub enum SpecOrigin {
 /// proto-declared idempotency contract, and which generated artifact
 /// (server or client) produced it.
 ///
-/// `Spec` is `Copy` and contains only `'static` data, so it can be stored,
-/// captured in closures, and compared freely with no allocation.
+/// `Spec` is `Copy` and contains only `'static` data, so it can be stored
+/// and captured in closures with no allocation. `PartialEq` and `Hash`
+/// cover every field, including [`origin`](Spec::origin): the value a
+/// client-side interceptor sees is *not* `==` to the generated
+/// `FOO_SERVICE_BAR_SPEC` constant (origin `Server`), and a `HashMap` keyed
+/// by the constants misses it. Compare method identity across sides with
+/// [`same_method`](Spec::same_method).
 ///
 /// Construct one with [`Spec::server`] or [`Spec::client`]. The struct is
 /// `#[non_exhaustive]` so future fields can be added without a breaking
@@ -161,10 +166,12 @@ impl Spec {
     /// constructor in `const` position, so `Spec` constants live in
     /// `.rodata`.
     ///
-    /// In debug builds, asserts that `procedure` starts with `/` and
-    /// contains a `/Service/Method` separator so a malformed test fixture
-    /// fails loudly rather than producing misleading [`service`](Spec::service)
-    /// / [`method`](Spec::method) accessor results.
+    /// # Panics
+    ///
+    /// In debug builds, if `procedure` does not start with `/` or has no
+    /// `/Service/Method` separator (a `const` fails at compile time), so a
+    /// malformed fixture fails loudly rather than producing misleading
+    /// [`service`](Spec::service) / [`method`](Spec::method) results.
     pub const fn server(procedure: &'static str, stream_type: StreamType) -> Self {
         debug_assert_well_formed(procedure);
         Self {
@@ -183,10 +190,22 @@ impl Spec {
     /// constructor in `const` position, so `Spec` constants live in
     /// `.rodata`.
     ///
-    /// In debug builds, asserts that `procedure` starts with `/` and
-    /// contains a `/Service/Method` separator so a malformed test fixture
-    /// fails loudly rather than producing misleading [`service`](Spec::service)
-    /// / [`method`](Spec::method) accessor results.
+    /// # Panics
+    ///
+    /// In debug builds, if `procedure` does not start with `/` or has no
+    /// `/Service/Method` separator (a `const` fails at compile time). The
+    /// client entry points repeat that check in every build, plus a check
+    /// that the path is a valid URI path, and report `internal` instead.
+    ///
+    /// # Building one without generated code
+    ///
+    /// `procedure` is `&'static str` because a `Spec` is meant to be a
+    /// per-method constant. A hand-written client with a fixed set of
+    /// methods uses string literals. A truly dynamic caller (a proxy or CLI
+    /// that learns method names at runtime) should **intern** each distinct
+    /// procedure once — e.g. keep a `HashMap<String, Spec>` and `Box::leak`
+    /// the string only on first sight — rather than leaking per call, which
+    /// grows without bound.
     pub const fn client(procedure: &'static str, stream_type: StreamType) -> Self {
         debug_assert_well_formed(procedure);
         Self {
@@ -203,6 +222,34 @@ impl Spec {
     pub const fn with_idempotency_level(mut self, idempotency_level: IdempotencyLevel) -> Self {
         self.idempotency_level = idempotency_level;
         self
+    }
+
+    /// Set which side this `Spec` describes. Returns `self` for chaining in
+    /// `const` position.
+    ///
+    /// Code generation emits one constant per method (`FOO_SERVICE_BAR_SPEC`,
+    /// [`SpecOrigin::Server`]); the generated client passes
+    /// `FOO_SERVICE_BAR_SPEC.with_origin(SpecOrigin::Client)` to the runtime,
+    /// so a client-side interceptor observes the same method facts with
+    /// [`origin`](Spec::origin) flipped.
+    #[must_use]
+    pub const fn with_origin(mut self, origin: SpecOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Whether `self` and `other` name the same RPC method: compares
+    /// [`procedure`](Spec::procedure) only, ignoring [`origin`](Spec::origin)
+    /// (and the other fields, which are derived from the method).
+    ///
+    /// `Spec` derives `PartialEq` over *all* fields, so the value a client
+    /// interceptor sees (origin `Client`) is **not** `==` to the generated
+    /// `FOO_SERVICE_BAR_SPEC` constant (origin `Server`). Use this when
+    /// asking "is this the `Bar` method?" regardless of side:
+    /// `spec.same_method(FOO_SERVICE_BAR_SPEC)`.
+    #[must_use]
+    pub fn same_method(self, other: Spec) -> bool {
+        self.procedure == other.procedure
     }
 
     /// The bare service name (`"package.Service"`) from
@@ -241,27 +288,30 @@ impl Spec {
 /// release builds.
 const fn debug_assert_well_formed(procedure: &str) {
     if cfg!(debug_assertions) {
-        let bytes = procedure.as_bytes();
-        // Must start with '/'.
         assert!(
-            !bytes.is_empty() && bytes[0] == b'/',
-            "Spec procedure must start with '/' (e.g. \"/pkg.Service/Method\")"
-        );
-        // Must have a second '/' separating Service from Method.
-        let mut has_inner_slash = false;
-        let mut i = 1;
-        while i < bytes.len() {
-            if bytes[i] == b'/' {
-                has_inner_slash = true;
-                break;
-            }
-            i += 1;
-        }
-        assert!(
-            has_inner_slash,
-            "Spec procedure must contain a '/Service/Method' separator (e.g. \"/pkg.Service/Method\")"
+            procedure_is_well_formed(procedure),
+            "Spec procedure must start with '/' and contain a '/Service/Method' separator (e.g. \"/pkg.Service/Method\")"
         );
     }
+}
+
+/// Whether `procedure` looks like `"/package.Service/Method"`: a leading
+/// slash and at least one interior slash. The one definition of
+/// "well-formed" shared by the constructors' debug assertion above and the
+/// client entry points' release-mode check.
+pub(crate) const fn procedure_is_well_formed(procedure: &str) -> bool {
+    let bytes = procedure.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'/' {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -293,6 +343,38 @@ mod tests {
     }
 
     #[test]
+    fn procedure_well_formedness() {
+        assert!(procedure_is_well_formed("/pkg.Svc/M"));
+        assert!(procedure_is_well_formed("/Svc/M"));
+        assert!(!procedure_is_well_formed("pkg.Svc/M"), "no leading slash");
+        assert!(
+            !procedure_is_well_formed("/pkg.SvcM"),
+            "no method separator"
+        );
+        assert!(!procedure_is_well_formed(""));
+        assert!(!procedure_is_well_formed("/"));
+    }
+
+    /// A constant and its `with_origin(Client)` form are not `==` (origin
+    /// differs) but are `same_method`; different methods are not.
+    #[test]
+    fn same_method_ignores_origin() {
+        const SERVER: Spec = Spec::server("/pkg.Greet/Say", StreamType::Unary)
+            .with_idempotency_level(IdempotencyLevel::NoSideEffects);
+        const CLIENT: Spec = SERVER.with_origin(SpecOrigin::Client);
+        const OTHER: Spec = Spec::client("/pkg.Greet/Shout", StreamType::Unary);
+        assert_eq!(
+            CLIENT,
+            Spec::client("/pkg.Greet/Say", StreamType::Unary)
+                .with_idempotency_level(IdempotencyLevel::NoSideEffects)
+        );
+        assert_ne!(SERVER, CLIENT, "PartialEq includes origin");
+        assert!(SERVER.same_method(CLIENT));
+        assert!(CLIENT.same_method(SERVER));
+        assert!(!CLIENT.same_method(OTHER));
+    }
+
+    #[test]
     fn spec_client_const_construction() {
         const SPEC: Spec = Spec::client("/pkg.Greet/Say", StreamType::Unary);
         assert_eq!(SPEC.origin, SpecOrigin::Client);
@@ -309,7 +391,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "Spec procedure must contain a '/Service/Method' separator")
+        should_panic(expected = "contain a '/Service/Method' separator")
     )]
     fn spec_malformed_path_no_method_separator_debug_asserts() {
         let _ = Spec::server("/nopath", StreamType::Unary);

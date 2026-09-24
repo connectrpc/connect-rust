@@ -1,0 +1,8 @@
+kind: Changed
+body: |-
+    **Fewer allocations per request.** The request's header map is moved into
+    the handler's `RequestContext` rather than cloned, and the `content-type`,
+    encoding, `te` and protocol-version header values on server responses and
+    client requests are static values, with the accept-encoding value built
+    once per `CompressionRegistry` and shared.
+time: 2026-09-06T15:50:00.000000000+00:00

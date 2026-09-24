@@ -1,6 +1,6 @@
 [package]
 name = "connectrpc"
-version = "0.8.1"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -48,7 +48,7 @@ async-trait = { workspace = true }
 # silently drop it. Keep the version in sync with the
 # `[workspace.dependencies]` `buffa` entry, which documents why the floor is
 # where it is.
-buffa = { version = "0.9.1", default-features = false, features = ["std", "fast-utf8"] }
+buffa = { version = "0.9.2", default-features = false, features = ["std", "fast-utf8"] }
 
 # Serialization. Non-optional even in proto-only builds: the Connect error and
 # streaming end-of-stream wire frames are always JSON regardless of the message
@@ -61,9 +61,9 @@ serde_json = { workspace = true }
 flate2 = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
-# Streaming compression (optional)
-async-compression = { workspace = true, optional = true }
-tokio-util = { workspace = true, features = ["codec", "io"] }
+# Envelope framing (`Encoder`/`Decoder` for the 5-byte message header) and
+# `PollSemaphore` for the shared h2 client handle
+tokio-util = { workspace = true, features = ["codec"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -100,7 +100,7 @@ buffa-types = { workspace = true }
 h2 = { workspace = true }
 
 [features]
-default = ["gzip", "zstd", "streaming", "json"]
+default = ["gzip", "zstd", "json"]
 
 # JSON codec for protobuf message types. On by default. Disabling it drops the
 # `serde::Serialize`/`DeserializeOwned` requirement on message types (see
@@ -111,9 +111,8 @@ default = ["gzip", "zstd", "streaming", "json"]
 json = ["buffa/json"]
 
 # Compression algorithms
-gzip = ["dep:flate2", "async-compression?/gzip"]
-zstd = ["dep:zstd", "async-compression?/zstd"]
-streaming = ["dep:async-compression"]
+gzip = ["dep:flate2"]
+zstd = ["dep:zstd"]
 
 # Standalone hyper-based server (convenience feature)
 server = [
@@ -167,9 +166,9 @@ tls = ["server-tls", "client-tls"]
 # Framework integrations
 axum = ["dep:axum"]
 
-# On wasm32 there is no tokio runtime, so the request-body
-# reader for client-streaming / bidi is dispatched via
-# `wasm_bindgen_futures::spawn_local` instead of `tokio::spawn`.
+# On wasm32 there is no tokio runtime, so `spawn_detached` (the request-body
+# drain for client-streaming / bidi) dispatches via
+# `wasm_bindgen_futures::spawn_local`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
 

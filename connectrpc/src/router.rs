@@ -78,7 +78,7 @@ enum Method {
     BidiStreaming(BidiStreamingMethod),
 }
 
-/// A registered method plus its optional static [`Spec`].
+/// A registered method plus its optional static [`Spec`] and per-route [`Limits`](crate::Limits).
 ///
 /// `spec` is `None` until [`Router::with_spec`] runs for the route. The
 /// generated `FooServiceExt::register` always chains `.with_spec(...)`
@@ -88,11 +88,16 @@ enum Method {
 struct RegisteredMethod {
     method: Method,
     spec: Option<Spec>,
+    limits: Option<crate::Limits>,
 }
 
 impl From<Method> for RegisteredMethod {
     fn from(method: Method) -> Self {
-        Self { method, spec: None }
+        Self {
+            method,
+            spec: None,
+            limits: None,
+        }
     }
 }
 
@@ -672,14 +677,65 @@ impl Router {
         self
     }
 
+    /// Give the route registered at `procedure` its own [`Limits`](crate::Limits), replacing
+    /// the service-wide limits from
+    /// [`ConnectRpcService::with_limits`](crate::ConnectRpcService::with_limits)
+    /// for requests to that one method.
+    ///
+    /// Use it to size a method to the request profile it actually has: a
+    /// health check or reflection lookup never legitimately carries more than
+    /// a few KiB, while an upload-shaped method may need more than the
+    /// service-wide default — and neither should set the ceiling for every
+    /// other route. The route's limits apply in full (body size, message size
+    /// and decode budget); they are not combined field-by-field with the
+    /// service-wide ones. Calling it again for the same route replaces the
+    /// earlier value; re-registering the route afterwards (under
+    /// [`allow_overrides`](Self::allow_overrides)) discards it. Per-route
+    /// limits are a `Router` feature: the generated monomorphic
+    /// `FooServiceServer<T>` dispatchers always use the service-wide limits.
+    ///
+    /// `procedure` is the method path, with or without its leading slash —
+    /// `Spec::procedure` and the generated `*_SPEC` constants fit directly:
+    ///
+    /// ```rust,ignore
+    /// let router = service
+    ///     .register(Router::new())
+    ///     .with_route_limits(
+    ///         PING_SERVICE_PING_SPEC.procedure,
+    ///         Limits::default().with_max_message_size(16 * 1024),
+    ///     );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if no route is registered at `procedure` — a mistyped path or a
+    /// call made before the handler was registered. This is a limit that
+    /// exists to be relied on, so a call that could not attach it fails at
+    /// configuration time, in release builds too, rather than leaving the
+    /// route silently on the service-wide limits.
+    #[must_use]
+    pub fn with_route_limits(mut self, procedure: &str, limits: crate::Limits) -> Self {
+        let key = procedure.strip_prefix('/').unwrap_or(procedure);
+        match self.methods.get_mut(key) {
+            Some(m) => m.limits = Some(limits),
+            None => panic!(
+                "Router::with_route_limits: no route registered at {key:?} — \
+                 register the handler before attaching limits to it"
+            ),
+        }
+        self
+    }
+
     /// Get all registered method paths.
     pub fn methods(&self) -> impl Iterator<Item = &str> {
         self.methods.keys().map(String::as_str)
     }
 
-    /// Check if a path is registered.
+    /// Check if a path is registered. `path` may carry its leading slash, so
+    /// `Spec::procedure` and the generated `*_SPEC` constants fit directly.
     pub fn has_method(&self, path: &str) -> bool {
-        self.methods.contains_key(path)
+        self.methods
+            .contains_key(path.strip_prefix('/').unwrap_or(path))
     }
 }
 
@@ -697,9 +753,8 @@ impl crate::dispatcher::Dispatcher for Router {
             Method::ClientStreaming(_) => MethodDescriptor::client_streaming(),
             Method::BidiStreaming(_) => MethodDescriptor::bidi_streaming(),
         };
-        if let Some(spec) = m.spec {
-            desc = desc.with_spec(spec);
-        }
+        desc.spec = m.spec;
+        desc.limits = m.limits;
         Some(desc)
     }
 
@@ -1016,5 +1071,37 @@ mod tests {
         let _ = Router::new()
             .route("test.Svc", "Method", unary_handler())
             .with_spec(SPEC);
+    }
+
+    /// `with_route_limits` attaches per-route limits that `lookup` surfaces,
+    /// accepts the procedure with or without its leading slash, and leaves
+    /// other routes on the service-wide limits (`None`).
+    #[test]
+    fn with_route_limits_round_trips_through_lookup() {
+        let tight = crate::Limits::default().with_max_message_size(1024);
+        let router = Router::new()
+            .route("test.Svc", "Tight", unary_handler())
+            .route("test.Svc", "Slash", unary_handler())
+            .route("test.Svc", "Default", unary_handler())
+            .with_route_limits("test.Svc/Tight", tight)
+            .with_route_limits("/test.Svc/Slash", tight);
+
+        assert_eq!(router.lookup("test.Svc/Tight").unwrap().limits, Some(tight));
+        assert_eq!(router.lookup("test.Svc/Slash").unwrap().limits, Some(tight));
+        assert_eq!(router.lookup("test.Svc/Default").unwrap().limits, None);
+
+        let looser = crate::Limits::unlimited();
+        let router = router.with_route_limits("test.Svc/Tight", looser);
+        assert_eq!(
+            router.lookup("test.Svc/Tight").unwrap().limits,
+            Some(looser),
+            "a second call replaces the earlier limits"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Router::with_route_limits: no route registered")]
+    fn with_route_limits_without_route_panics() {
+        let _ = Router::new().with_route_limits("/test.Svc/Missing", crate::Limits::default());
     }
 }

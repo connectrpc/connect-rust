@@ -54,7 +54,11 @@ impl ReflectionService {
 ///
 /// Unlike `connectrpc_health::install_static`, no handle is returned:
 /// a [`Reflector`] is immutable once built, so there is nothing to flip
-/// at runtime.
+/// at runtime. Both routes are set to [`request_limits`] (16 KiB per
+/// request message) via [`apply_request_limits`], which replaces the
+/// service-wide limits on those routes even when they are tighter; to tune
+/// them, call `apply_request_limits(router, yours)` on the returned router —
+/// the later call wins.
 #[must_use]
 pub fn install(router: Router, reflector: Reflector) -> Router {
     let service = Arc::new(ReflectionService::new(reflector));
@@ -62,7 +66,74 @@ pub fn install(router: Router, reflector: Reflector) -> Router {
         Arc::clone(&service),
         router,
     );
-    crate::connect::grpc::reflection::v1alpha::ServerReflectionExt::register(service, router)
+    let router =
+        crate::connect::grpc::reflection::v1alpha::ServerReflectionExt::register(service, router);
+    apply_request_limits(router, request_limits())
+}
+
+/// The largest request message, after decompression, the reflection routes
+/// accept under [`request_limits`]: 16 KiB.
+///
+/// A `ServerReflectionRequest` carries a host plus one file name, symbol or
+/// type name, so a legitimate request is well under a kilobyte; 16 KiB leaves
+/// generous headroom while sizing the routes to their actual request profile
+/// rather than the general-purpose service-wide default. Reflection is a
+/// bidirectional stream, so this bounds each message, not how many a client
+/// may send.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
+
+/// The per-route [`Limits`](connectrpc::Limits) this crate sets on its
+/// routes: message size capped at [`MAX_REQUEST_BYTES`] (and the request
+/// body, which only governs non-streaming calls, at that plus the 5-byte
+/// envelope), and the element-memory decode budget at four times that
+/// instead of the 32 MiB `connectrpc` default. A `ServerReflectionRequest`
+/// has no repeated or map fields, so a decode that charges the budget at all
+/// is one this service was never going to answer; the bound keeps a future
+/// revision of the protocol from changing that quietly.
+#[must_use]
+pub fn request_limits() -> connectrpc::Limits {
+    connectrpc::Limits::default()
+        .with_max_request_body_size(MAX_REQUEST_BYTES + connectrpc::envelope::HEADER_SIZE)
+        .with_max_message_size(MAX_REQUEST_BYTES)
+        .with_element_memory_limit(4 * MAX_REQUEST_BYTES)
+}
+
+/// Set whichever of the `v1` and `v1alpha` reflection routes are registered
+/// on `router` to `limits`, replacing the service-wide limits for them
+/// (whether looser or tighter).
+///
+/// [`install`] already applies [`request_limits`]. Call this yourself,
+/// usually with [`request_limits`], after registering a [`ReflectionService`]
+/// through the generated `ServerReflectionExt::register` or
+/// [`Router::add_service`](connectrpc::Router::add_service), since those
+/// generic registration paths cannot; or call it after either path with your
+/// own [`Limits`](connectrpc::Limits) to tune the reflection routes
+/// specifically. The later call wins. Build an override from
+/// [`request_limits`] rather than `Limits::default()`: the replacement is
+/// whole, so anything the profile sets and the override does not is reset
+/// to the `connectrpc` default.
+///
+/// # Panics
+///
+/// Panics if neither reflection route is registered on `router`.
+#[must_use]
+pub fn apply_request_limits(mut router: Router, limits: connectrpc::Limits) -> Router {
+    let mut applied = false;
+    for spec in [
+        crate::connect::grpc::reflection::v1::SERVER_REFLECTION_SERVER_REFLECTION_INFO_SPEC,
+        crate::connect::grpc::reflection::v1alpha::SERVER_REFLECTION_SERVER_REFLECTION_INFO_SPEC,
+    ] {
+        if router.has_method(spec.procedure) {
+            router = router.with_route_limits(spec.procedure, limits);
+            applied = true;
+        }
+    }
+    assert!(
+        applied,
+        "connectrpc_reflection::apply_request_limits: no reflection route is registered \
+         on this router — register `ReflectionService` before applying its limits"
+    );
+    router
 }
 
 /// Implements the generated `ServerReflection` trait for one protocol
@@ -128,32 +199,25 @@ macro_rules! impl_server_reflection {
                 Answer::Files(file_descriptor_proto) => {
                     MessageResponse::from(pb::FileDescriptorResponse {
                         file_descriptor_proto,
-                        ..Default::default()
                     })
                 }
                 Answer::ExtensionNumbers { base_type, numbers } => {
                     MessageResponse::from(pb::ExtensionNumberResponse {
                         base_type_name: base_type,
                         extension_number: numbers,
-                        ..Default::default()
                     })
                 }
                 Answer::Services(names) => MessageResponse::from(pb::ListServiceResponse {
                     service: names
                         .into_iter()
-                        .map(|name| pb::ServiceResponse {
-                            name,
-                            ..Default::default()
-                        })
+                        .map(|name| pb::ServiceResponse { name })
                         .collect(),
-                    ..Default::default()
                 }),
                 Answer::NotFound(message) => MessageResponse::from(pb::ErrorResponse {
                     // tonic and grpc-go use the gRPC status code numbering
                     // here; 5 is NOT_FOUND.
                     error_code: 5,
                     error_message: message,
-                    ..Default::default()
                 }),
             };
 
@@ -161,7 +225,6 @@ macro_rules! impl_server_reflection {
                 valid_host: request.host.clone(),
                 original_request: ::buffa::MessageField::some(request),
                 message_response: Some(message_response),
-                ..Default::default()
             })
         }
     };
@@ -219,7 +282,10 @@ mod tests {
     /// client targeting it. The server runs until the test exits.
     async fn spawn_reflection_server() -> ServerReflectionClient<HttpClient> {
         let reflector = Reflector::from_descriptor_set_bytes(&test_set_bytes()).unwrap();
-        let router = install(Router::new(), reflector);
+        spawn_router(install(Router::new(), reflector)).await
+    }
+
+    async fn spawn_router(router: Router) -> ServerReflectionClient<HttpClient> {
         let app = router.into_axum_router();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -234,8 +300,107 @@ mod tests {
         ServerReflectionRequest {
             host: "test-host".into(),
             message_request: Some(message_request),
-            ..Default::default()
         }
+    }
+
+    /// `install` holds both routes to MAX_REQUEST_BYTES per message: an
+    /// oversized request ends the stream with `resource_exhausted`.
+    #[tokio::test]
+    async fn oversized_request_is_refused() {
+        let client = spawn_reflection_server().await;
+        let mut stream = client.server_reflection_info().await.unwrap();
+        stream
+            .send(request(MessageRequest::FileContainingSymbol(
+                "x".repeat(2 * crate::MAX_REQUEST_BYTES),
+            )))
+            .await
+            .unwrap();
+        stream.close_send();
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// An integrator's own `apply_request_limits` after `install` replaces
+    /// the bundled profile: tightened to 1 KiB, a 2 KiB request the default
+    /// 16 KiB would serve is refused.
+    #[tokio::test]
+    async fn integrator_limits_replace_the_bundled_profile() {
+        let reflector = Reflector::from_descriptor_set_bytes(&test_set_bytes()).unwrap();
+        let router = apply_request_limits(
+            install(Router::new(), reflector),
+            connectrpc::Limits::default().with_max_message_size(1024),
+        );
+        let client = spawn_router(router).await;
+        let mut stream = client.server_reflection_info().await.unwrap();
+        stream
+            .send(request(MessageRequest::FileContainingSymbol(
+                "x".repeat(2048),
+            )))
+            .await
+            .unwrap();
+        stream.close_send();
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// The wire types are generated with `unknown_fields=false`: an
+    /// unrecognized field is accepted and skipped on both decode paths, so
+    /// the request the service echoes as `original_request` re-encodes
+    /// without it. Guards against a regeneration silently dropping the
+    /// option.
+    #[test]
+    fn unknown_fields_are_skipped_not_echoed() {
+        use buffa::view::MessageView;
+
+        use crate::proto::grpc::reflection::v1::ServerReflectionRequestView;
+
+        let known = request(MessageRequest::ListServices(String::new())).encode_to_vec();
+        let mut with_unknown = known.clone();
+        // Field 15, varint 0 — not defined by `ServerReflectionRequest`.
+        with_unknown.extend_from_slice(&[0x78, 0x00]);
+
+        let owned = ServerReflectionRequest::decode_from_slice(&with_unknown).unwrap();
+        assert_eq!(owned.host, "test-host");
+        assert_eq!(owned.encode_to_vec(), known);
+
+        // The server decodes a view and echoes `to_owned_message()`.
+        let view = ServerReflectionRequestView::decode_view(&with_unknown).unwrap();
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), known);
+    }
+
+    /// The largest symbol the bundled profile admits decodes under its decode
+    /// budget and misses in-band with an `ErrorResponse` whose message is a
+    /// small fraction of the request.
+    #[tokio::test]
+    async fn largest_admitted_symbol_misses_with_a_bounded_error() {
+        let client = spawn_reflection_server().await;
+        let mut stream = client.server_reflection_info().await.unwrap();
+        // 64 bytes of slack covers the `host` field, the oneof tag and the
+        // length varints, so the encoded message sits just under
+        // MAX_REQUEST_BYTES.
+        let symbol = "x".repeat(crate::MAX_REQUEST_BYTES - 64);
+        stream
+            .send(request(MessageRequest::FileContainingSymbol(
+                symbol.clone(),
+            )))
+            .await
+            .unwrap();
+        stream.close_send();
+        let resp = stream.message().await.unwrap().unwrap().to_owned_message();
+        match resp.message_response.unwrap() {
+            MessageResponse::ErrorResponse(err) => {
+                assert_eq!(err.error_code, 5);
+                assert!(err.error_message.len() < 512, "{}", err.error_message.len());
+                assert!(
+                    err.error_message
+                        .contains(&format!("[name truncated, {} bytes]", symbol.len())),
+                    "{}",
+                    err.error_message
+                );
+            }
+            other => panic!("expected error_response, got {other:?}"),
+        }
+        assert!(stream.message().await.unwrap().is_none());
     }
 
     #[tokio::test]

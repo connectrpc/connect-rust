@@ -5,9 +5,10 @@ service. The server is hosted on axum behind
 `connectrpc::axum::serve_tls`, which terminates TLS, captures the
 verified client certificate chain and remote address, and stamps them
 into request extensions as `PeerCerts` / `PeerAddr` — the same
-convention the standalone `connectrpc::Server::with_tls` uses. The
-handler parses the leaf cert's DNS SAN to derive a workload identity
-and enforces an ACL against it.
+convention the standalone `connectrpc::Server::with_tls` uses. A function
+registered with `with_connection_extensions` parses the leaf cert's DNS
+SAN into a workload identity once per connection; the handler reads that
+identity from the request extensions and enforces an ACL against it.
 
 This is the mTLS twin of [`examples/middleware/`](../middleware): same
 secret-store-with-ACL shape, but the credential is a client certificate
@@ -57,17 +58,38 @@ connectrpc::axum::serve_tls(listener, app, server_config)
     .await?;
 ```
 
-Handler code that reads `ctx.peer_certs()` is then portable
+Handler code that reads the request extensions is then portable
 between the standalone `Server::with_tls` and an axum app.
 
-### Cert-SAN identity (`src/lib.rs::extract_identity`)
+### Cert-SAN identity, parsed once per connection (`src/lib.rs::PeerIdentity`)
 
-The handler reads the leaf cert from `PeerCerts`, parses its DNS SAN
-with `x509-parser`, and derives a short workload name from a SAN under
+`extract_identity` parses the leaf cert's DNS SAN with `x509-parser`
+and derives a short workload name from a SAN under
 `workloads.example.com`. A real deployment would typically match a
 SPIFFE ID (a URI SAN) instead, or hand the whole step to an
-authorization framework — the shape is the same: read `PeerCerts`,
-parse the leaf, derive an identity.
+authorization framework — the shape is the same: take the verified
+chain, parse the leaf, derive an identity.
+
+That parse runs in `with_connection_extensions`, once per TLS connection
+rather than once per request, and the result rides into every request's
+extensions as `PeerIdentity`:
+
+```rust
+connectrpc::axum::serve_tls(listener, app, server_config)
+    .with_connection_extensions(|conn, ext| {
+        ext.insert(PeerIdentity::from_connection(conn));
+    })
+```
+
+Handlers call `PeerIdentity::for_request(&ctx)` to read the pre-parsed
+value. On the standalone `Server::with_tls` path, register the same
+function with `Server::with_connection_extensions`, which
+`Server::serve_connection` also runs for a custom accept loop. A custom
+accept loop that hosts an axum app calls the free
+`connectrpc::server::serve_connection`, which never runs the function, so
+that loop inserts the `PeerIdentity` into
+`ConnectionInfo::extensions_mut()` itself. A hosting path that forgets
+gets an `Internal` error rather than a silent per-request re-parse.
 
 Two failure modes both surface as `Unauthenticated`:
 

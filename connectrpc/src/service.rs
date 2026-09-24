@@ -30,6 +30,7 @@
 //!     .merge(connect_router.into_axum_router());
 //! ```
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -40,7 +41,6 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use futures::{Stream, StreamExt};
 use http::Method;
 use http::Request;
@@ -52,7 +52,6 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use serde::Serialize;
-use tokio_util::codec::Decoder as _;
 use tracing::Instrument;
 
 use crate::codec::CodecFormat;
@@ -61,14 +60,15 @@ use crate::codec::header as connect_header;
 use crate::compression::CompressionPolicy;
 use crate::compression::CompressionRegistry;
 use crate::deadline::DeadlinePolicy;
-use crate::dispatcher::Dispatcher;
+use crate::dispatcher::{Dispatcher, MethodDescriptor};
+use crate::envelope::Decoded;
 use crate::envelope::Envelope;
 use crate::envelope::EnvelopeDecoder;
 use crate::error::ConnectError;
 use crate::handler::BoxStream;
 use crate::interceptor::{
-    Interceptor, call_bidi_streaming_intercepted, call_client_streaming_intercepted,
-    call_server_streaming_intercepted, call_unary_intercepted,
+    Interceptor, InterceptorChain, RequestHead, call_bidi_streaming_intercepted,
+    call_client_streaming_intercepted, call_server_streaming_intercepted, call_unary_intercepted,
 };
 use crate::protocol::Protocol;
 use crate::response::{EncodedResponse, RequestContext};
@@ -147,9 +147,6 @@ fn parse_get_query_params(query: Option<&str>) -> Result<GetQueryParams, Connect
 struct RequestMetadata {
     /// The Content-Type header value.
     content_type: Option<String>,
-    /// The detected protocol. Used for protocol-specific behavior in handlers.
-    #[allow(dead_code)]
-    protocol: Protocol,
     /// The timeout parsed from the protocol's timeout header.
     timeout: Option<Duration>,
     /// Compression encoding for unary requests (from Content-Encoding header).
@@ -163,23 +160,22 @@ struct RequestMetadata {
     /// The Connect protocol version from connect-protocol-version header.
     /// Only meaningful for the Connect protocol.
     protocol_version: Option<String>,
-    /// The original request headers (for passing to handlers).
+    /// The original request headers, handed on to the handler's
+    /// `RequestContext`.
     headers: http::HeaderMap,
 }
 
 impl RequestMetadata {
-    /// Extract metadata from request headers, using the detected protocol to
-    /// determine which header names to read.
-    fn from_headers(headers: &http::HeaderMap, protocol: Protocol) -> Self {
+    /// Extract metadata from the request's headers, using the detected
+    /// protocol to determine which header names to read, and keep the map for
+    /// the handler.
+    fn from_headers(headers: http::HeaderMap, protocol: Protocol) -> Self {
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
 
-        let timeout = headers
-            .get(protocol.timeout_header())
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| parse_timeout(s, protocol));
+        let timeout = timeout_from_headers(&headers, protocol);
 
         let unary_encoding = headers
             .get(header::CONTENT_ENCODING)
@@ -208,14 +204,13 @@ impl RequestMetadata {
 
         Self {
             content_type,
-            protocol,
             timeout,
             unary_encoding,
             streaming_encoding,
             unary_accept_encoding,
             streaming_accept_encoding,
             protocol_version,
-            headers: headers.clone(),
+            headers,
         }
     }
 }
@@ -328,13 +323,25 @@ fn absolute_deadline(timeout: Option<Duration>) -> Option<std::time::Instant> {
     timeout.and_then(|t| std::time::Instant::now().checked_add(t))
 }
 
+/// The client-requested timeout from the protocol's timeout header, if
+/// present and well-formed.
+fn timeout_from_headers(headers: &http::HeaderMap, protocol: Protocol) -> Option<Duration> {
+    headers
+        .get(protocol.timeout_header())
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_timeout(s, protocol))
+}
+
+/// The request deadline for paths that never build a [`RequestMetadata`]
+/// (early rejections that still drain the body under the client's timeout):
+/// the same timeout `RequestMetadata` would parse, moderated by the policy.
 fn deadline_from_headers(
     headers: &http::HeaderMap,
     protocol: Protocol,
     path: &str,
     deadline_policy: &DeadlinePolicy,
 ) -> Option<std::time::Instant> {
-    let timeout = RequestMetadata::from_headers(headers, protocol).timeout;
+    let timeout = timeout_from_headers(headers, protocol);
     absolute_deadline(deadline_policy.moderate(timeout, path))
 }
 
@@ -443,7 +450,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// after decompression.
 ///
 /// For **unary RPCs**, the request body contains a single message (possibly
-/// compressed). Set `max_request_body_size >= max_message_size` to allow
+/// compressed). Keep `max_request_body_size >= max_message_size` to allow
 /// uncompressed messages up to the message limit. Compressed messages may
 /// have a smaller on-wire body that expands up to `max_message_size`.
 ///
@@ -465,47 +472,47 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// `max_message_size` can still expand by orders of magnitude. Raising one
 /// does not raise the other.
 ///
-/// These are **server** limits, applied to received requests. A client
-/// decoding responses currently uses buffa's defaults, with no equivalent
-/// override.
-#[derive(Debug, Clone)]
+/// # Where limits are set
+///
+/// Service-wide, on [`ConnectRpcService::with_limits`] (or the `Server`
+/// builder's `with_limits`), applying to every route. A single route on a
+/// [`Router`] can carry its own `Limits` via [`Router::with_route_limits`],
+/// which replace the service-wide ones for that method in full — so a
+/// method whose requests are always small can be sized to that, and an
+/// upload-shaped method can exceed the default without raising it for the
+/// rest. The bundled `connectrpc-health` and `connectrpc-reflection`
+/// services set a 16 KiB profile on their own routes this way and expose
+/// `apply_request_limits(router, limits)` for tuning it.
+///
+/// These are **server** limits, applied to received requests. The client
+/// side has its own equivalents for received *responses*:
+/// [`ClientConfig::with_default_element_memory_limit`](crate::client::ClientConfig::with_default_element_memory_limit)
+/// and [`CallOptions::with_element_memory_limit`](crate::client::CallOptions::with_element_memory_limit).
+///
+/// # Construction
+///
+/// Start from [`Limits::default`] or [`Limits::unlimited`] and apply the
+/// `with_*` builder methods, then read settings back through the accessor
+/// methods of the same name without the prefix:
+///
+/// ```rust
+/// use connectrpc::Limits;
+///
+/// let limits = Limits::default().with_max_message_size(8 * 1024 * 1024);
+/// assert_eq!(limits.max_message_size(), 8 * 1024 * 1024);
+/// ```
+///
+/// `Limits` is `#[non_exhaustive]`: new limits may be added in minor
+/// releases (it is and will stay `Copy` — a small bundle of plain numeric
+/// bounds, carried by value on [`MethodDescriptor`]).
+/// Struct-literal and functional-update construction are not available
+/// outside the crate; use the builder methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
-    /// Maximum size of the request body on the wire (before decompression).
-    ///
-    /// Applies to RPCs where the body is read in full (unary and server
-    /// streaming). Should be at least `max_message_size` to allow
-    /// uncompressed messages up to the message limit. Does not apply to
-    /// client/bidi streaming where messages are processed incrementally.
-    ///
-    /// Default: 4 MB (matches tonic/grpc-go).
-    pub max_request_body_size: usize,
-
-    /// Maximum size of a single message after decompression.
-    ///
-    /// This applies uniformly to both unary and streaming RPCs, and to both
-    /// compressed and uncompressed messages. Compressed payloads are bounded
-    /// during decompression — the decompressor will never allocate more than
-    /// this limit.
-    ///
-    /// Default: 4 MB.
-    pub max_message_size: usize,
-
-    /// Maximum memory a single decode may commit to repeated, map, string
-    /// and bytes *elements*.
-    ///
-    /// This is an amplification defence, and it is charged on element
-    /// footprint rather than on contents: a few bytes on the wire can ask
-    /// the decoder to materialize a very large number of small elements,
-    /// each with its own allocation overhead, while staying well under
-    /// `max_message_size`. A single large payload is unaffected however big
-    /// it grows, because its contents are not charged.
-    ///
-    /// Raise it for a trusted peer that legitimately sends messages with
-    /// very many small elements; lower it to tighten the defence.
-    ///
-    /// Default: 32 MiB (buffa's `DEFAULT_ELEMENT_MEMORY_LIMIT`).
-    pub element_memory_limit: usize,
+    max_request_body_size: usize,
+    max_message_size: usize,
+    element_memory_limit: usize,
 }
 
 impl Default for Limits {
@@ -530,36 +537,84 @@ impl Limits {
         }
     }
 
-    /// Set the maximum request body size (on-wire, before decompression).
+    // ---- builders ---------------------------------------------------------
+
+    /// Set the maximum size of the request body on the wire (before
+    /// decompression).
     ///
-    /// Applies to unary and server streaming RPCs where the body is buffered.
-    /// See [`Limits`] for details on the relationship between limits.
+    /// Applies to RPCs where the body is read in full (unary and server
+    /// streaming). Should be at least the message size limit to allow
+    /// uncompressed messages up to that limit. Does not apply to client/bidi
+    /// streaming where messages are processed incrementally.
+    ///
+    /// Read via [`Self::max_request_body_size`]. Default: 4 MB (matches
+    /// tonic/grpc-go).
     #[must_use]
-    pub fn max_request_body_size(mut self, size: usize) -> Self {
+    pub fn with_max_request_body_size(mut self, size: usize) -> Self {
         self.max_request_body_size = size;
         self
     }
 
-    /// Set the maximum message size (after decompression).
+    /// Set the maximum size of a single message after decompression.
     ///
-    /// This bounds individual messages in both unary and streaming RPCs.
-    /// It also serves as the decompression limit.
-    /// See [`Limits`] for details on the relationship between limits.
+    /// This applies uniformly to both unary and streaming RPCs, and to both
+    /// compressed and uncompressed messages. Compressed payloads are bounded
+    /// during decompression — the decompressor will never allocate more than
+    /// this limit.
+    ///
+    /// Read via [`Self::max_message_size`]. Default: 4 MB.
     #[must_use]
-    pub fn max_message_size(mut self, size: usize) -> Self {
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
     /// Set the maximum memory a single decode may commit to repeated, map,
-    /// string and bytes elements.
+    /// string and bytes *elements*.
     ///
-    /// See [`Limits`] for what this charges and why it is separate from
-    /// `max_message_size`.
+    /// This is an amplification defence, and it is charged on element
+    /// footprint rather than on contents: a few bytes on the wire can ask
+    /// the decoder to materialize a very large number of small elements,
+    /// each with its own allocation overhead, while staying well under the
+    /// message size limit. A single large payload is unaffected however big
+    /// it grows, because its contents are not charged.
+    ///
+    /// Raise it for a trusted peer that legitimately sends messages with
+    /// very many small elements; lower it to tighten the defence.
+    ///
+    /// Read via [`Self::element_memory_limit`]. Default: 32 MiB (buffa's
+    /// `DEFAULT_ELEMENT_MEMORY_LIMIT`).
     #[must_use]
-    pub fn element_memory_limit(mut self, bytes: usize) -> Self {
+    pub fn with_element_memory_limit(mut self, bytes: usize) -> Self {
         self.element_memory_limit = bytes;
         self
+    }
+
+    // ---- accessors --------------------------------------------------------
+
+    /// The maximum size of the request body on the wire, before decompression.
+    ///
+    /// Set via [`Self::with_max_request_body_size`].
+    #[must_use]
+    pub fn max_request_body_size(&self) -> usize {
+        self.max_request_body_size
+    }
+
+    /// The maximum size of a single message after decompression.
+    ///
+    /// Set via [`Self::with_max_message_size`].
+    #[must_use]
+    pub fn max_message_size(&self) -> usize {
+        self.max_message_size
+    }
+
+    /// The maximum memory a single decode may commit to repeated, map,
+    /// string and bytes elements.
+    ///
+    /// Set via [`Self::with_element_memory_limit`].
+    #[must_use]
+    pub fn element_memory_limit(&self) -> usize {
+        self.element_memory_limit
     }
 
     /// The buffa decode options these limits imply.
@@ -662,6 +717,78 @@ impl EndStreamResponse {
     }
 }
 
+/// Response headers that may never be carried from a propagated error
+/// onto this response. Three classes, none of which describe the response
+/// being built.
+///
+/// Hop-by-hop headers (RFC 9110 §7.6.1) belong to the connection the error
+/// arrived on. Body-framing headers would misdescribe our own body: a
+/// forwarded `content-length` makes hyper's HTTP/1 encoder refuse to
+/// serialize the response at all, and a forwarded content coding tells the
+/// client to decode bytes that were never encoded. `date` would report the
+/// upstream's generation time as ours — hyper emits no `Date` of its own
+/// once one is set, so the false value is the only one on the wire.
+///
+/// `grpc-status-details-bin` is here because the server writes its status
+/// into the trailers, never the header block, so the already-set rule in
+/// `echo_error_headers` cannot save it the way it saves `grpc-status` and
+/// `grpc-message` on the trailers-only path.
+fn is_unforwardable_header(name: &http::HeaderName) -> bool {
+    static KEEP_ALIVE: http::HeaderName = http::HeaderName::from_static("keep-alive");
+
+    // Hop-by-hop: scoped to a single connection.
+    *name == header::CONNECTION
+        || *name == KEEP_ALIVE
+        || *name == header::PROXY_AUTHENTICATE
+        || *name == header::PROXY_AUTHORIZATION
+        || *name == header::TE
+        || *name == header::TRAILER
+        || *name == header::TRANSFER_ENCODING
+        || *name == header::UPGRADE
+        // Body framing: describes bytes other than the ones we write.
+        || *name == header::CONTENT_LENGTH
+        || *name == header::CONTENT_TYPE
+        || *name == header::CONTENT_ENCODING
+        || *name == crate::protocol::hdr::GRPC_ENCODING
+        || *name == crate::protocol::hdr::CONNECT_CONTENT_ENCODING
+        // Provenance and status.
+        || *name == header::DATE
+        || *name == crate::protocol::hdr::GRPC_STATUS_DETAILS_BIN
+}
+
+/// Echo an error's response headers onto a response being built.
+///
+/// A `ConnectError` that came back from a client call carries the headers
+/// of the response it was parsed from, so a handler that propagates one —
+/// the ordinary `client.call(..).await?` in a gateway — is asking to
+/// re-emit another connection's headers. Two rules keep that from
+/// corrupting this response. A header this response already set wins,
+/// because `Builder::header` appends rather than replaces, and a second
+/// `content-type` on the wire is a framing error rather than extra
+/// metadata. Connection-scoped headers are dropped outright. Everything
+/// else is the server metadata the caller meant to forward, and passes
+/// through unchanged.
+fn echo_error_headers(
+    mut response: http::response::Builder,
+    err: &ConnectError,
+) -> http::response::Builder {
+    // Snapshot before appending: a multi-valued error header must still
+    // append all of its values, so the test cannot be against the map as
+    // it grows.
+    let already_set: Vec<http::HeaderName> = response
+        .headers_ref()
+        .map(|headers| headers.keys().cloned().collect())
+        .unwrap_or_default();
+
+    for (key, value) in err.response_headers() {
+        if is_unforwardable_header(key) || already_set.contains(key) {
+            continue;
+        }
+        response = response.header(key, value);
+    }
+    response
+}
+
 /// Create a streaming error response.
 ///
 /// For streaming RPCs, errors should still return HTTP 200 with the error
@@ -701,22 +828,18 @@ fn connect_streaming_error_response(
 
     let body = StreamingResponseBody {
         inner: Box::pin(body_stream),
-        _reader_task: None,
     };
 
-    let mut response = Response::builder().status(StatusCode::OK).header(
+    let response = Response::builder().status(StatusCode::OK).header(
         header::CONTENT_TYPE,
-        Protocol::Connect.response_content_type(codec_format, true),
+        http::HeaderValue::from_static(Protocol::Connect.response_content_type(codec_format, true)),
     );
 
-    for (key, value) in err.response_headers() {
-        response = response.header(key, value);
-    }
+    let response = echo_error_headers(response, err);
 
     response.body(body).unwrap_or_else(|_| {
         Response::new(StreamingResponseBody {
             inner: Box::pin(futures::stream::empty()),
-            _reader_task: None,
         })
     })
 }
@@ -751,14 +874,11 @@ fn grpc_error_response(
             Protocol::Connect => unreachable!("Connect handled separately"),
         };
 
-    let body = StreamingResponseBody {
-        inner: body_stream,
-        _reader_task: None,
-    };
+    let body = StreamingResponseBody { inner: body_stream };
 
     let mut response = Response::builder().status(StatusCode::OK).header(
         header::CONTENT_TYPE,
-        protocol.response_content_type(codec_format, true),
+        http::HeaderValue::from_static(protocol.response_content_type(codec_format, true)),
     );
 
     // For trailers-only gRPC responses, also include grpc-status in headers
@@ -774,14 +894,11 @@ fn grpc_error_response(
         }
     }
 
-    for (key, value) in err.response_headers() {
-        response = response.header(key, value);
-    }
+    let response = echo_error_headers(response, err);
 
     response.body(body).unwrap_or_else(|_| {
         Response::new(StreamingResponseBody {
             inner: Box::pin(futures::stream::empty()),
-            _reader_task: None,
         })
     })
 }
@@ -798,10 +915,10 @@ fn encode_grpc_web_trailers(trailers: &http::HeaderMap) -> Bytes {
         trailer_payload.extend_from_slice(b"\r\n");
     }
 
-    // Envelope: flag=0x80 (trailer), 4-byte big-endian length, payload
+    // Envelope: trailer flag, 4-byte big-endian length, payload
     let len = trailer_payload.len() as u32;
     let mut frame = Vec::with_capacity(5 + trailer_payload.len());
-    frame.push(0x80); // trailer flag
+    frame.push(crate::envelope::flags::GRPC_WEB_TRAILER);
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&trailer_payload);
     Bytes::from(frame)
@@ -828,12 +945,6 @@ fn headers_to_metadata(
 /// This wraps a stream of encoded response bytes and handles envelope framing.
 pub struct StreamingResponseBody {
     inner: Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>,
-    /// Optional background reader task handle. The task is detached (not aborted)
-    /// when the response body is dropped — it continues draining the request body
-    /// until EOF or `MAX_DRAIN_BYTES`, which is critical for HTTP/1.1 keep-alive.
-    /// Aborting the task early was found to cause a race where hyper's dispatcher
-    /// sees the `Incoming` body dropped before EOF and closes the connection.
-    _reader_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl StreamingResponseBody {
@@ -843,7 +954,7 @@ impl StreamingResponseBody {
     /// in the final envelope. For gRPC, trailers are sent as HTTP/2 trailing
     /// HEADERS frames.
     fn new(
-        response_stream: BoxStream<Result<Bytes, ConnectError>>,
+        response_stream: crate::EncodedStream,
         trailers: http::HeaderMap,
         protocol: Protocol,
         compression: Option<(Arc<CompressionRegistry>, &'static str)>,
@@ -870,22 +981,7 @@ impl StreamingResponseBody {
                     compression_policy,
                 )),
             };
-        Self {
-            inner,
-            _reader_task: None,
-        }
-    }
-
-    /// Attach the background reader-task handle returned by [`spawn_body_reader`].
-    /// The handle is stored but never read or aborted — the task is owned by
-    /// the runtime and runs to completion regardless of what happens to this
-    /// `StreamingResponseBody`. The field exists to make the non-aborting
-    /// policy explicit at the call site (see the `_reader_task` field comment
-    /// for the HTTP/1.1 keep-alive race that motivated it). `task` is `None`
-    /// on platforms without a joinable handle (see [`spawn_detached`]).
-    fn with_reader_task(mut self, task: Option<tokio::task::JoinHandle<()>>) -> Self {
-        self._reader_task = task;
-        self
+        Self { inner }
     }
 }
 
@@ -975,14 +1071,20 @@ impl StreamFinalizer {
 /// The 16 KiB threshold bounds memory for the pathological case (fast
 /// synchronous producer with large items).
 ///
+/// A message at or above `MIN_CHAIN_SIZE` is not batched: its envelope header
+/// is flushed with whatever precedes it and each of its large segments becomes
+/// a data frame of its own, by reference count. The small fragments between
+/// or after those segments ride in `buf`, so such a message can add a short
+/// data frame per large field rather than one per poll cycle.
+///
 /// # Terminal state machine
 ///
 /// At stream end (source returns `None` or `Err`), if `buf` is non-empty,
 /// the data frame is emitted FIRST, and the finalizer frame is staged for
 /// the next poll. This ensures partial batches aren't dropped.
 struct BatchingEnvelopeStream {
-    /// Source of encoded message bytes (already proto/JSON encoded).
-    source: futures::stream::Fuse<BoxStream<Result<Bytes, ConnectError>>>,
+    /// Source of encoded messages (already proto/JSON encoded).
+    source: futures::stream::Fuse<crate::EncodedStream>,
     /// Accumulation buffer — envelopes are appended here until flush.
     buf: bytes::BytesMut,
     /// Envelope encoder — writes 5-byte header + optional compression.
@@ -993,20 +1095,20 @@ struct BatchingEnvelopeStream {
     finalizer: StreamFinalizer,
     /// Finalizer frame staged for the next poll (when buf was non-empty at end).
     pending_final: Option<Frame<Bytes>>,
-    /// Large payload (post-compression, when negotiated) staged for the next
-    /// poll: emitted as its
-    /// own data frame (refcount clone) right after the header flush, instead
-    /// of being copied into `buf`. See [`EnvelopeEncoder::encode_chained`].
+    /// Segments of the current envelope not yet emitted, in wire order. Its
+    /// header (and everything before it) is already in `buf` or flushed, so
+    /// these precede anything else the stream produces. See
+    /// [`EnvelopeEncoder::encode_chained`] and [`Self::drain_segments`].
     ///
     /// [`EnvelopeEncoder::encode_chained`]: crate::envelope::EnvelopeEncoder::encode_chained
-    pending_payload: Option<Bytes>,
+    pending_segments: VecDeque<Bytes>,
     /// Fused-done flag.
     done: bool,
 }
 
 impl BatchingEnvelopeStream {
     fn new(
-        source: BoxStream<Result<Bytes, ConnectError>>,
+        source: crate::EncodedStream,
         trailers: http::HeaderMap,
         compression: Option<(Arc<CompressionRegistry>, &'static str)>,
         compression_policy: CompressionPolicy,
@@ -1019,7 +1121,7 @@ impl BatchingEnvelopeStream {
             trailers,
             finalizer,
             pending_final: None,
-            pending_payload: None,
+            pending_segments: VecDeque::new(),
             done: false,
         }
     }
@@ -1028,6 +1130,36 @@ impl BatchingEnvelopeStream {
     #[inline]
     fn flush_buf(&mut self) -> Frame<Bytes> {
         Frame::data(self.buf.split().freeze())
+    }
+
+    /// Advance through `pending_segments`, returning the next data frame to
+    /// emit if one is due.
+    ///
+    /// A segment of at least `MIN_CHAIN_SIZE` becomes its own data frame by
+    /// reference count, after flushing `buf` so the envelope header and any
+    /// earlier bytes go out ahead of it. A smaller segment (the tag/length
+    /// fragment between two large fields, or a short tail) is copied into
+    /// `buf` and rides with whatever is batched next, since a frame of its own
+    /// would cost a 9-byte HTTP/2 frame header to save a copy of a few bytes.
+    /// `None` means every pending segment has been consumed and `buf` may be
+    /// extended with the next envelope.
+    fn drain_segments(&mut self) -> Option<Frame<Bytes>> {
+        while let Some(segment) = self.pending_segments.pop_front() {
+            if segment.len() < crate::envelope::MIN_CHAIN_SIZE {
+                self.buf.extend_from_slice(&segment);
+                // A body made only of small segments must not grow `buf`
+                // past the batch bound the source loop enforces.
+                if self.buf.len() >= STREAM_BATCH_THRESHOLD {
+                    return Some(self.flush_buf());
+                }
+            } else if self.buf.is_empty() {
+                return Some(Frame::data(segment));
+            } else {
+                self.pending_segments.push_front(segment);
+                return Some(self.flush_buf());
+            }
+        }
+        None
     }
 }
 
@@ -1039,15 +1171,19 @@ impl Stream for BatchingEnvelopeStream {
             return Poll::Ready(None);
         }
 
-        // Staged large payload from a prior poll — its envelope header was
-        // already flushed, so this must precede everything else (including
-        // a staged finalizer).
-        if let Some(payload) = self.pending_payload.take() {
-            return Poll::Ready(Some(Ok(Frame::data(payload))));
+        // Segments staged by a prior poll: their envelope header was already
+        // flushed, so they precede everything else (including a staged
+        // finalizer).
+        if let Some(frame) = self.drain_segments() {
+            return Poll::Ready(Some(Ok(frame)));
         }
 
         // Staged finalizer from a prior poll (buf was non-empty at stream end).
+        // Only ever staged once the source has ended, which cannot happen
+        // while segments are pending: the source is not polled until they
+        // drain.
         if let Some(frame) = self.pending_final.take() {
+            debug_assert!(self.pending_segments.is_empty());
             self.done = true;
             return Poll::Ready(Some(Ok(frame)));
         }
@@ -1092,11 +1228,13 @@ impl Stream for BatchingEnvelopeStream {
                         return Poll::Ready(Some(Ok(self.flush_buf())));
                     }
                 }
-                Poll::Ready(Some(Ok(data))) => {
+                Poll::Ready(Some(Ok(body))) => {
                     let me = &mut *self;
+                    debug_assert!(me.pending_segments.is_empty());
                     match me.encoder.encode_chained(
-                        data,
+                        body,
                         &mut me.buf,
+                        &mut me.pending_segments,
                         crate::envelope::MIN_CHAIN_SIZE,
                     ) {
                         Err(err) => {
@@ -1116,14 +1254,14 @@ impl Stream for BatchingEnvelopeStream {
                                 return Poll::Ready(Some(Ok(self.flush_buf())));
                             }
                         }
-                        Ok(Some(payload)) => {
-                            // Large payload: `buf` now ends with
-                            // its 5-byte envelope header. Flush the buffer and
-                            // stage the payload as the next frame, unmoved.
-                            self.pending_payload = Some(payload);
-                            return Poll::Ready(Some(Ok(self.flush_buf())));
+                        Ok(()) => {
+                            // Segments are pending only for a large payload:
+                            // `buf` now ends with its envelope header and the
+                            // segments follow, the large ones unmoved.
+                            if let Some(frame) = self.drain_segments() {
+                                return Poll::Ready(Some(Ok(frame)));
+                            }
                         }
-                        Ok(None) => {}
                     }
                     if self.buf.len() >= STREAM_BATCH_THRESHOLD {
                         return Poll::Ready(Some(Ok(self.flush_buf())));
@@ -1138,7 +1276,7 @@ impl Stream for BatchingEnvelopeStream {
 
 /// Create a Connect-protocol envelope stream (ends with END_STREAM envelope).
 fn create_envelope_stream(
-    response_stream: BoxStream<Result<Bytes, ConnectError>>,
+    response_stream: crate::EncodedStream,
     trailers: http::HeaderMap,
     compression: Option<(Arc<CompressionRegistry>, &'static str)>,
     compression_policy: CompressionPolicy,
@@ -1154,7 +1292,7 @@ fn create_envelope_stream(
 
 /// Create a gRPC envelope stream that sends HTTP/2 trailers.
 fn create_grpc_envelope_stream(
-    response_stream: BoxStream<Result<Bytes, ConnectError>>,
+    response_stream: crate::EncodedStream,
     trailers: http::HeaderMap,
     compression: Option<(Arc<CompressionRegistry>, &'static str)>,
     compression_policy: CompressionPolicy,
@@ -1170,7 +1308,7 @@ fn create_grpc_envelope_stream(
 
 /// Create a gRPC-Web envelope stream that encodes trailers as a body frame.
 fn create_grpc_web_envelope_stream(
-    response_stream: BoxStream<Result<Bytes, ConnectError>>,
+    response_stream: crate::EncodedStream,
     trailers: http::HeaderMap,
     compression: Option<(Arc<CompressionRegistry>, &'static str)>,
     compression_policy: CompressionPolicy,
@@ -1209,7 +1347,7 @@ fn create_grpc_web_envelope_stream(
 ///
 /// ```rust,ignore
 /// let service = ConnectRpcService::new(router)
-///     .with_limits(Limits::default().max_message_size(8 * 1024 * 1024));
+///     .with_limits(Limits::default().with_max_message_size(8 * 1024 * 1024));
 /// ```
 pub struct ConnectRpcService<D = Router> {
     dispatcher: Arc<D>,
@@ -1219,9 +1357,9 @@ pub struct ConnectRpcService<D = Router> {
     compression: Arc<CompressionRegistry>,
     compression_policy: CompressionPolicy,
     deadline_policy: DeadlinePolicy,
-    /// Unary interceptor chain, outermost first. The `Arc<[..]>` is one
-    /// pointer to clone per request regardless of chain length.
-    interceptors: Arc<[Arc<dyn Interceptor>]>,
+    /// Interceptor chain, outermost first. One pointer to clone per
+    /// request regardless of chain length.
+    interceptors: InterceptorChain,
 }
 
 // Manual Clone impl because `#[derive(Clone)]` would add a `D: Clone` bound,
@@ -1230,11 +1368,11 @@ impl<D> Clone for ConnectRpcService<D> {
     fn clone(&self) -> Self {
         Self {
             dispatcher: Arc::clone(&self.dispatcher),
-            limits: self.limits.clone(),
+            limits: self.limits,
             compression: Arc::clone(&self.compression),
             compression_policy: self.compression_policy,
             deadline_policy: self.deadline_policy.clone(),
-            interceptors: Arc::clone(&self.interceptors),
+            interceptors: self.interceptors.clone(),
         }
     }
 }
@@ -1258,13 +1396,19 @@ impl<D: Dispatcher> ConnectRpcService<D> {
             compression: Arc::new(CompressionRegistry::default()),
             compression_policy: CompressionPolicy::default(),
             deadline_policy: DeadlinePolicy::new(),
-            interceptors: Arc::default(),
+            interceptors: InterceptorChain::default(),
         }
     }
 
-    /// Configure request limits.
+    /// Configure the service-wide request limits.
     ///
-    /// See [`Limits`] for available options.
+    /// See [`Limits`] for available options. A route registered on a
+    /// [`Router`] can carry its own limits via
+    /// [`Router::with_route_limits`], and those replace these entirely for
+    /// that method — including upward; [`MethodDescriptor::limits`] reports
+    /// which routes do.
+    ///
+    /// [`MethodDescriptor::limits`]: crate::dispatcher::MethodDescriptor::limits
     #[must_use]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -1316,12 +1460,15 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     ///
     /// The first interceptor registered runs **outermost**: first on the
     /// way in, last on the way out (matching `connect-go`'s
-    /// `WithInterceptors`). Interceptors run after envelope decoding,
-    /// decompression, and header parsing, and before the handler.
+    /// `WithInterceptors`). `intercept_unary` and `intercept_streaming` run
+    /// after the request body has been read and decompressed under this
+    /// service's [`Limits`] and before it is decoded; a check that should
+    /// run before any body byte is read belongs in
+    /// [`Interceptor::intercept_head`] or in Tower middleware around the
+    /// service. See [`Interceptor`]'s "When it runs".
     ///
-    /// When no interceptors are registered the dispatch path is identical
-    /// to a build without this call — there is no per-request allocation
-    /// or branch beyond a single `is_empty` check.
+    /// When no interceptors are registered the dispatch path allocates
+    /// nothing for them and only checks that the chain is empty.
     ///
     /// Interceptors run for unary and streaming calls alike. The unary
     /// surface is [`Interceptor::intercept_unary`]; the streaming surface
@@ -1346,11 +1493,7 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     /// which takes ownership and wraps for you.
     #[must_use]
     pub fn with_interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
-        // The Arc<[..]> is shared across cloned service handles; rebuild
-        // it on registration. Registration is a cold path.
-        let mut v: Vec<Arc<dyn Interceptor>> = self.interceptors.to_vec();
-        v.push(interceptor);
-        self.interceptors = Arc::from(v);
+        self.interceptors.push(interceptor);
         self
     }
 
@@ -1462,11 +1605,11 @@ where
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let dispatcher = Arc::clone(&self.dispatcher);
-        let limits = self.limits.clone();
+        let limits = self.limits;
         let compression = Arc::clone(&self.compression);
         let compression_policy = self.compression_policy;
         let deadline_policy = self.deadline_policy.clone();
-        let interceptors = Arc::clone(&self.interceptors);
+        let interceptors = self.interceptors.clone();
 
         // Only create and attach the tracing span when a subscriber would
         // actually observe it. For disabled-debug (the common production case),
@@ -1516,7 +1659,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_request<D, B>(
     dispatcher: Arc<D>,
-    req: Request<B>,
+    mut req: Request<B>,
     limits: Limits,
     compression: Arc<CompressionRegistry>,
     compression_policy: &CompressionPolicy,
@@ -1537,6 +1680,14 @@ where
         span.record("codec", tracing::field::display(rp.codec_format));
     }
 
+    // Resolve the route once. When it declares its own limits they govern
+    // every body read below, the error-path drains included; the path and
+    // descriptor are handed on so no later stage derives them again.
+    let path = req.uri().path();
+    let path = path.strip_prefix('/').unwrap_or(path).to_owned();
+    let desc = dispatcher.lookup(&path);
+    let limits = desc.and_then(|d| d.limits).unwrap_or(limits);
+
     // Only GET and POST carry RPCs. Reject every other verb uniformly with
     // 405 Method Not Allowed plus an `Allow` header (connect-go parity),
     // regardless of whether a Content-Type is present. Without this, a bodyless
@@ -1544,15 +1695,20 @@ where
     // None) would fall through to the unsupported-media-type path and be
     // misreported as 415. An unknown path still maps to 404.
     if req.method() != Method::GET && req.method() != Method::POST {
-        return reject_unsupported_method(&*dispatcher, req, limits, deadline_policy).await;
+        return reject_unsupported_method(&path, desc, req, limits, deadline_policy).await;
     }
 
     // Connect GET requests don't have a Content-Type header, so protocol
     // detection returns None. Route GET requests directly to the unary handler
     // which handles Connect GET query parameter parsing.
     if req.method() == Method::GET {
+        if !interceptors.is_empty() {
+            intercept_heads(interceptors, &mut req, desc, Protocol::Connect).await?;
+        }
         return handle_unary_request(
             &*dispatcher,
+            &path,
+            desc,
             req,
             limits,
             compression,
@@ -1586,12 +1742,8 @@ where
         } else {
             Protocol::Connect
         };
-        let deadline = deadline_from_headers(
-            req.headers(),
-            timeout_protocol,
-            req.uri().path(),
-            deadline_policy,
-        );
+        let deadline =
+            deadline_from_headers(req.headers(), timeout_protocol, &path, deadline_policy);
 
         // Drain the request body to avoid broken pipe on HTTP/1.1.
         let (_parts, body) = req.into_parts();
@@ -1627,6 +1779,15 @@ where
 
     match request_protocol {
         Some(rp) if rp.is_streaming => {
+            // Head checks run before anything reads the body, the text-mode
+            // rejection's drain included.
+            if !interceptors.is_empty()
+                && let Err(err) = intercept_heads(interceptors, &mut req, desc, rp.protocol).await
+            {
+                return Ok(streaming_error_response(&err, rp.protocol, rp.codec_format)
+                    .map(ConnectRpcBody::Streaming));
+            }
+
             // gRPC-Web text mode (application/grpc-web-text) base64-encodes the
             // entire body. We detect it (protocol.rs) but don't decode it — reject
             // explicitly with a clear error rather than failing with garbage-envelope
@@ -1637,12 +1798,8 @@ where
                     "gRPC-Web text mode (application/grpc-web-text) is not supported",
                 );
                 // Drain the body to preserve HTTP/1.1 keep-alive for the error response.
-                let deadline = deadline_from_headers(
-                    req.headers(),
-                    rp.protocol,
-                    req.uri().path(),
-                    deadline_policy,
-                );
+                let deadline =
+                    deadline_from_headers(req.headers(), rp.protocol, &path, deadline_policy);
                 let (_parts, body) = req.into_parts();
                 let _ = with_request_deadline(
                     deadline,
@@ -1654,34 +1811,32 @@ where
             }
 
             // If so, take the fast path that avoids stream wrapping overhead.
-            if matches!(rp.protocol, Protocol::Grpc | Protocol::GrpcWeb) {
-                let path = req.uri().path();
-                let path = path.strip_prefix('/').unwrap_or(path);
-                if let Some(desc) = dispatcher.lookup(path)
-                    && desc.kind == MethodKind::Unary
-                {
-                    let path = path.to_owned();
-                    let response = handle_grpc_unary_request(
-                        &*dispatcher,
-                        &path,
-                        desc.spec,
-                        req,
-                        rp.protocol,
-                        rp.codec_format,
-                        limits,
-                        compression,
-                        compression_policy,
-                        deadline_policy,
-                        interceptors,
-                    )
-                    .await;
-                    return Ok(response.map(ConnectRpcBody::GrpcUnary));
-                }
+            if matches!(rp.protocol, Protocol::Grpc | Protocol::GrpcWeb)
+                && let Some(desc) = desc
+                && desc.kind == MethodKind::Unary
+            {
+                let response = handle_grpc_unary_request(
+                    &*dispatcher,
+                    &path,
+                    desc.spec,
+                    req,
+                    rp.protocol,
+                    rp.codec_format,
+                    limits,
+                    compression,
+                    compression_policy,
+                    deadline_policy,
+                    interceptors,
+                )
+                .await;
+                return Ok(response.map(ConnectRpcBody::GrpcUnary));
             }
 
             // Streaming request (Connect streaming, gRPC, or gRPC-Web)
             let response = handle_streaming_request(
                 &*dispatcher,
+                &path,
+                desc,
                 req,
                 rp.protocol,
                 rp.codec_format,
@@ -1695,9 +1850,14 @@ where
             Ok(response.map(ConnectRpcBody::Streaming))
         }
         Some(_) | None => {
+            if !interceptors.is_empty() {
+                intercept_heads(interceptors, &mut req, desc, Protocol::Connect).await?;
+            }
             // Unary request (Connect unary) or unknown content type (for error reporting)
             handle_unary_request(
                 &*dispatcher,
+                &path,
+                desc,
                 req,
                 limits,
                 compression,
@@ -1709,6 +1869,38 @@ where
             .map(|r| r.map(ConnectRpcBody::Full))
         }
     }
+}
+
+/// Run every interceptor's [`Interceptor::intercept_head`] on a request whose
+/// body has not been read, stopping at the first error. Callers skip it when
+/// no interceptor is registered, so that path builds no [`RequestHead`].
+///
+/// The request's extensions are moved into the head for the duration and put
+/// back afterwards, so a value a head check inserts reaches the handler.
+/// Taking `&mut Request<B>` needs only `B: Send`; a shared reference held
+/// across the `.await` would need `B: Sync`.
+async fn intercept_heads<B>(
+    interceptors: &[Arc<dyn Interceptor>],
+    req: &mut Request<B>,
+    desc: Option<MethodDescriptor>,
+    protocol: Protocol,
+) -> Result<(), ConnectError> {
+    let mut extensions = std::mem::take(req.extensions_mut());
+    let result = {
+        let mut head = RequestHead::new(req.uri().path(), req.headers(), &mut extensions)
+            .with_spec(desc.and_then(|desc| desc.spec))
+            .with_protocol(protocol);
+        let mut result = Ok(());
+        for interceptor in interceptors {
+            result = interceptor.intercept_head(&mut head).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        result
+    };
+    *req.extensions_mut() = extensions;
+    result
 }
 
 /// `Accept-Post` advertised on a 415 response: the content types this server
@@ -1736,20 +1928,18 @@ application/proto";
 /// `GET` for idempotent unary methods). An unknown path returns the same
 /// `unimplemented` (HTTP 404) as any other route miss. The request body is
 /// drained first so HTTP/1.1 connections stay reusable.
-async fn reject_unsupported_method<D, B>(
-    dispatcher: &D,
+async fn reject_unsupported_method<B>(
+    path: &str,
+    desc: Option<MethodDescriptor>,
     req: Request<B>,
     limits: Limits,
     deadline_policy: &DeadlinePolicy,
 ) -> Result<Response<ConnectRpcBody>, ConnectError>
 where
-    D: Dispatcher,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let raw_path = req.uri().path();
-    let path = raw_path.strip_prefix('/').unwrap_or(raw_path).to_owned();
-    let allow = dispatcher.lookup(&path).map(|desc| {
+    let allow = desc.map(|desc| {
         if desc.kind == MethodKind::Unary && desc.idempotent {
             "GET, POST"
         } else {
@@ -1758,13 +1948,8 @@ where
     });
 
     // Drain the request body so an early response doesn't break HTTP/1.1
-    // keep-alive (see the streaming body-drop race notes).
-    let deadline = deadline_from_headers(
-        req.headers(),
-        Protocol::Connect,
-        req.uri().path(),
-        deadline_policy,
-    );
+    // keep-alive (see `request_body_drain`).
+    let deadline = deadline_from_headers(req.headers(), Protocol::Connect, path, deadline_policy);
     let (_parts, body) = req.into_parts();
     let _ = with_request_deadline(
         deadline,
@@ -1794,6 +1979,8 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_unary_request<D, B>(
     dispatcher: &D,
+    path: &str,
+    desc: Option<MethodDescriptor>,
     req: Request<B>,
     limits: Limits,
     compression: Arc<CompressionRegistry>,
@@ -1806,20 +1993,14 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Parse the path to extract service/method (owned to avoid borrowing req)
-    let path = req.uri().path();
-    let path = path.strip_prefix('/').unwrap_or(path).to_owned();
-    let query_string = req.uri().query().map(|s| s.to_owned());
-    let method = req.method().clone();
+    let (parts, body) = req.into_parts();
+    let method = parts.method;
+    let extensions = parts.extensions;
 
     // Extract metadata from headers using the Connect protocol (unary is always Connect)
-    let mut metadata = RequestMetadata::from_headers(req.headers(), Protocol::Connect);
-    metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
+    let mut metadata = RequestMetadata::from_headers(parts.headers, Protocol::Connect);
+    metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
     let deadline = absolute_deadline(metadata.timeout);
-
-    // Split request to consume the body
-    let (parts, body) = req.into_parts();
-    let extensions = parts.extensions;
 
     // IMPORTANT: Read the full request body BEFORE returning any errors.
     // For HTTP/1.1, returning an error without reading the body causes
@@ -1832,9 +2013,9 @@ where
     )
     .await?;
 
-    // Look up the method descriptor to check idempotency.
+    // A miss is reported only now that the body has been drained.
     // (Non-unary kinds are allowed through — they'll error at the dispatch call.)
-    let desc = dispatcher.lookup(&path).ok_or_else(|| {
+    let desc = desc.ok_or_else(|| {
         ConnectError::unimplemented(format!("method not found: {path}"))
             .with_http_status(StatusCode::NOT_FOUND)
     })?;
@@ -1850,7 +2031,7 @@ where
         }
 
         // Parse query parameters for GET request
-        let params = parse_get_query_params(query_string.as_deref())?;
+        let params = parse_get_query_params(parts.uri.query())?;
 
         // Validate connect version from query param
         if let Some(ref version) = params.connect_version
@@ -1930,13 +2111,13 @@ where
         // The leading slash was stripped for the Dispatcher::lookup key;
         // restore it so RequestContext::path() matches http::Uri::path()
         // and Spec::procedure.
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
     let resp: EncodedResponse = with_request_deadline(
         deadline,
-        call_unary_intercepted(dispatcher, interceptors, &path, ctx, body, codec_format),
+        call_unary_intercepted(dispatcher, interceptors, path, ctx, body, codec_format),
     )
     .await?;
 
@@ -1970,19 +2151,13 @@ where
     };
 
     // Build response with the same content type as the request
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, codec_format.content_type());
-
-    if let Some(encoding) = content_encoding {
-        response = response.header(header::CONTENT_ENCODING, encoding);
-    }
-
-    // Advertise what encodings we accept (optional per spec, informational)
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(header::ACCEPT_ENCODING, accept);
-    }
+    let mut response = response_head(
+        codec_format.content_type(),
+        &header::CONTENT_ENCODING,
+        content_encoding,
+        &header::ACCEPT_ENCODING,
+        &compression,
+    );
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -1995,6 +2170,32 @@ where
     response
         .body(Full::new(final_body))
         .map_err(|e| ConnectError::internal(format!("failed to build response: {e}")))
+}
+
+/// Start a `200 OK` response carrying the negotiated content type, the
+/// response encoding when one was applied, and the accept-encoding
+/// advertisement (optional per spec, informational). Every value is a static
+/// or registry-cached `HeaderValue`, so none is allocated per response.
+fn response_head(
+    content_type: &'static str,
+    encoding_header: &header::HeaderName,
+    encoding: Option<&'static str>,
+    accept_encoding_header: &header::HeaderName,
+    compression: &CompressionRegistry,
+) -> http::response::Builder {
+    let mut response = Response::builder().status(StatusCode::OK).header(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static(content_type),
+    );
+    if let Some(encoding) = encoding {
+        // Encoding names are validated as HTTP tokens by
+        // `CompressionRegistry::register`, which is what `from_static` needs.
+        response = response.header(encoding_header, http::HeaderValue::from_static(encoding));
+    }
+    if let Some(accept) = compression.accept_encoding_value() {
+        response = response.header(accept_encoding_header, accept.clone());
+    }
+    response
 }
 
 /// Handle a gRPC/gRPC-Web unary request via the fast path.
@@ -2021,8 +2222,11 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Extract metadata before any body reads, including error-path drains.
-    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
+    // Take the request apart first: the headers move into the metadata (and
+    // from there into the handler context), the body is read below.
+    let (parts, body) = req.into_parts();
+    let extensions = parts.extensions;
+    let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
     let deadline = absolute_deadline(metadata.timeout);
 
@@ -2038,7 +2242,7 @@ where
         };
         let mut response = Response::builder().status(StatusCode::OK).header(
             header::CONTENT_TYPE,
-            protocol.response_content_type(codec_format, true),
+            http::HeaderValue::from_static(protocol.response_content_type(codec_format, true)),
         );
         // For trailers-only gRPC responses, include grpc-status in headers
         if protocol == Protocol::Grpc {
@@ -2051,9 +2255,7 @@ where
                 response = response.header(&GRPC_MESSAGE, val);
             }
         }
-        for (key, value) in err.response_headers() {
-            response = response.header(key, value);
-        }
+        let response = echo_error_headers(response, err);
         let body = GrpcUnaryBody {
             data: None,
             payload: std::collections::VecDeque::new(),
@@ -2070,10 +2272,9 @@ where
 
     // gRPC requires POST. Backstop: `handle_request` already rejects non-GET/
     // POST verbs upstream, and GET never routes here, so this is defensive.
-    if req.method() != Method::POST {
-        let err = ConnectError::internal(format!("invalid method for gRPC: {}", req.method()));
+    if parts.method != Method::POST {
+        let err = ConnectError::internal(format!("invalid method for gRPC: {}", parts.method));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let _ = with_request_deadline(
             deadline,
             collect_body_limited(body, limits.max_request_body_size),
@@ -2089,7 +2290,6 @@ where
     {
         let err = ConnectError::unimplemented(format!("unsupported compression: {encoding}"));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let _ = with_request_deadline(
             deadline,
             collect_body_limited(body, limits.max_request_body_size),
@@ -2100,8 +2300,6 @@ where
 
     // Read the full body. collect_body_limited bounds allocation during the
     // read, so an oversized body is rejected before it is fully buffered.
-    let (parts, body) = req.into_parts();
-    let extensions = parts.extensions;
     let post_body = match with_request_deadline(
         deadline,
         collect_body_limited(body, limits.max_request_body_size),
@@ -2118,18 +2316,19 @@ where
         let err = ConnectError::unimplemented("request body is empty: expected a message");
         return grpc_unary_error(&err);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
-        let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
-            Ok(Some(env)) => env,
-            Ok(None) => {
-                let err = ConnectError::invalid_argument("incomplete request envelope");
-                return grpc_unary_error(&err);
-            }
-            Err(e) => return grpc_unary_error(&e),
-        };
+        let mut post_body = post_body;
+        let envelope =
+            match Envelope::decode_bytes_with_limit(&mut post_body, limits.max_message_size) {
+                Ok(Some(env)) => env,
+                Ok(None) => {
+                    let err = ConnectError::invalid_argument("incomplete request envelope");
+                    return grpc_unary_error(&err);
+                }
+                Err(e) => return grpc_unary_error(&e),
+            };
 
-        // Reject multiple envelopes in a unary request
-        if !buf.is_empty() {
+        // Reject anything after the one envelope of a unary request
+        if !post_body.is_empty() {
             let err = ConnectError::unimplemented("unary request must have exactly one message");
             return grpc_unary_error(&err);
         }
@@ -2165,7 +2364,7 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with the same deadline used while receiving the body.
@@ -2229,19 +2428,13 @@ where
     };
 
     // Build response headers
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -2281,6 +2474,8 @@ enum StreamingDispatchKind {
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming_request<D, B>(
     dispatcher: &D,
+    path: &str,
+    method_desc: Option<MethodDescriptor>,
     req: Request<B>,
     protocol: Protocol,
     codec_format: CodecFormat,
@@ -2295,20 +2490,18 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Parse the path to extract service/method
-    let path = req.uri().path();
-    let path = path.strip_prefix('/').unwrap_or(path).to_owned();
-
-    // Extract metadata before any body reads, including error-path drains.
-    let mut metadata = RequestMetadata::from_headers(req.headers(), protocol);
-    metadata.timeout = deadline_policy.moderate(metadata.timeout, &path);
+    // Take the request apart first: the headers move into the metadata (and
+    // from there into the handler context), the body is read or streamed below.
+    let (parts, body) = req.into_parts();
+    let extensions = parts.extensions;
+    let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
+    metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
     // gRPC and gRPC-Web require POST method. Backstop: non-GET/POST verbs are
     // already rejected upstream in `handle_request`, and GET never routes here.
-    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) && req.method() != Method::POST {
-        let err = ConnectError::internal(format!("invalid method for gRPC: {}", req.method()));
+    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) && parts.method != Method::POST {
+        let err = ConnectError::internal(format!("invalid method for gRPC: {}", parts.method));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let deadline = absolute_deadline(metadata.timeout);
         let _ = with_request_deadline(
             deadline,
@@ -2325,7 +2518,6 @@ where
     {
         let err = ConnectError::unimplemented(format!("unsupported compression: {encoding}"));
         // Drain the request body to avoid broken pipe on HTTP/1.1.
-        let (_parts, body) = req.into_parts();
         let deadline = absolute_deadline(metadata.timeout);
         let _ = with_request_deadline(
             deadline,
@@ -2335,18 +2527,11 @@ where
         return streaming_error_response(&err, protocol, codec_format);
     }
 
-    // Single lookup to determine method kind.
-    let method_desc = dispatcher.lookup(&path);
-
-    // Split request to consume the body
-    let (parts, body) = req.into_parts();
-    let extensions = parts.extensions;
-
     // For bidi streaming, pass the raw body stream directly (no buffering)
     if matches!(method_desc, Some(d) if d.kind == MethodKind::BidiStreaming) {
         return handle_bidi_streaming_request(
             dispatcher,
-            &path,
+            path,
             method_desc.and_then(|d| d.spec),
             metadata,
             body,
@@ -2366,7 +2551,7 @@ where
     if matches!(method_desc, Some(d) if d.kind == MethodKind::ClientStreaming) {
         return handle_client_streaming_request(
             dispatcher,
-            &path,
+            path,
             method_desc.and_then(|d| d.spec),
             metadata,
             body,
@@ -2427,20 +2612,21 @@ where
         let err = ConnectError::unimplemented("server streaming request requires a message");
         return streaming_error_response(&err, protocol, codec_format);
     } else {
-        let mut buf = bytes::BytesMut::from(&post_body[..]);
-        let envelope = match Envelope::decode_with_limit(&mut buf, limits.max_message_size) {
-            Ok(Some(env)) => env,
-            Ok(None) => {
-                let err = ConnectError::invalid_argument("incomplete request envelope");
-                return streaming_error_response(&err, protocol, codec_format);
-            }
-            Err(e) => {
-                return streaming_error_response(&e, protocol, codec_format);
-            }
-        };
+        let mut post_body = post_body;
+        let envelope =
+            match Envelope::decode_bytes_with_limit(&mut post_body, limits.max_message_size) {
+                Ok(Some(env)) => env,
+                Ok(None) => {
+                    let err = ConnectError::invalid_argument("incomplete request envelope");
+                    return streaming_error_response(&err, protocol, codec_format);
+                }
+                Err(e) => {
+                    return streaming_error_response(&e, protocol, codec_format);
+                }
+            };
 
         // Check for multiple request envelopes (server streaming only allows one)
-        if !buf.is_empty() {
+        if !post_body.is_empty() {
             let err = ConnectError::unimplemented(
                 "server streaming request must have exactly one message",
             );
@@ -2481,7 +2667,7 @@ where
         .with_extensions(extensions)
         .with_spec(method_desc.and_then(|d| d.spec))
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
@@ -2491,7 +2677,7 @@ where
             let fut = call_server_streaming_intercepted(
                 dispatcher,
                 interceptors,
-                &path,
+                path,
                 ctx,
                 request_body,
                 codec_format,
@@ -2505,20 +2691,16 @@ where
             let fut = call_unary_intercepted(
                 dispatcher,
                 interceptors,
-                &path,
+                path,
                 ctx,
                 request_body,
                 codec_format,
             );
             match with_request_deadline(deadline, fut).await {
-                // Wrap single response in a one-item stream
-                // The streaming machinery carries contiguous message bytes,
-                // and re-enveloping happens per item downstream, so a
-                // client-streaming response flattens here.
-                Ok(r) => r.map_body(|body| -> BoxStream<Result<Bytes, ConnectError>> {
-                    Box::pin(futures::stream::once(
-                        async move { Ok(body.into_contiguous()) },
-                    ))
+                // Wrap the single response in a one-item stream. Its
+                // segments, if any, ride through to the framing layer.
+                Ok(r) => r.map_body(|body| -> crate::EncodedStream {
+                    Box::pin(futures::stream::once(async move { Ok(body) }))
                 }),
                 Err(e) => return streaming_error_response(&e, protocol, codec_format),
             }
@@ -2532,20 +2714,13 @@ where
     );
 
     // Build streaming response
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    // Advertise what encodings we accept (optional per spec, informational)
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -2578,18 +2753,8 @@ where
 /// Client streaming RPCs receive multiple envelope-framed request messages
 /// and return a single envelope-framed response with END_STREAM.
 ///
-/// # Incremental Dispatch
-///
-/// The body is consumed incrementally via [`spawn_body_reader`], which runs
-/// a background task that reads HTTP body frames, decodes envelopes, and
-/// sends decoded payloads through an `mpsc` channel. The handler receives
-/// these as a truly async stream.
-///
-/// # Body Draining
-///
-/// If the handler returns early (e.g., on error) without consuming the full
-/// request stream, the reader task drains remaining body bytes (up to
-/// [`MAX_DRAIN_BYTES`]) to allow HTTP/1.1 connection reuse.
+/// The handler's request stream is built by [`decode_request_body`], which
+/// also drains whatever the handler leaves unread.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_streaming_request<D, B>(
     dispatcher: &D,
@@ -2610,7 +2775,7 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::fmt::Display + Send,
 {
-    let (request_stream, reader_task) = spawn_body_reader(
+    let request_stream = decode_request_body(
         body,
         limits.max_message_size,
         metadata.streaming_encoding.clone(),
@@ -2625,13 +2790,9 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
-    // Call the handler. On error paths, the reader task is left running
-    // (detached) so it can finish draining the request body — aborting it
-    // early races with hyper's body-EOF detection and breaks HTTP/1.1
-    // keep-alive. The task is bounded by MAX_DRAIN_BYTES.
     let handler_result = if let Some(timeout) = metadata.timeout {
         match tokio::time::timeout(
             timeout,
@@ -2648,7 +2809,6 @@ where
         {
             Ok(result) => result,
             Err(_) => {
-                drop(reader_task);
                 let err = ConnectError::deadline_exceeded("request timeout");
                 return streaming_error_response(&err, protocol, codec_format);
             }
@@ -2668,7 +2828,6 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
-            drop(reader_task);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -2680,19 +2839,13 @@ where
     );
 
     // Build streaming response with a single data envelope + END_STREAM
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -2700,10 +2853,8 @@ where
     }
 
     let stream_compression = response_encoding.map(|encoding| (compression, encoding));
-    let response_stream: BoxStream<Result<Bytes, ConnectError>> =
-        Box::pin(futures::stream::once(async {
-            Ok(resp.body.into_contiguous())
-        }));
+    let response_stream: crate::EncodedStream =
+        Box::pin(futures::stream::once(async { Ok(resp.body) }));
     let effective_policy = compression_policy.with_override(resp.compress);
     let body = StreamingResponseBody::new(
         response_stream,
@@ -2711,8 +2862,7 @@ where
         protocol,
         stream_compression,
         effective_policy,
-    )
-    .with_reader_task(reader_task);
+    );
 
     response.body(body).unwrap_or_else(|_| {
         let err = ConnectError::internal("failed to build client streaming response");
@@ -2722,267 +2872,295 @@ where
 
 /// Maximum bytes to drain from the request body after the decoder finishes.
 /// This prevents a malicious client from forcing the server to consume unbounded
-/// data after a size-limit error, another decoder failure, or the END_STREAM
-/// envelope (after which any further body bytes are trailing garbage).
+/// data after a size-limit error, another decoder failure, the END_STREAM
+/// envelope (after which any further body bytes are trailing garbage), or the
+/// handler dropping its request stream.
 const MAX_DRAIN_BYTES: usize = 1024 * 1024; // 1 MiB
 
-/// Whether a [`BodyReader`] is still decoding messages or draining trailing
-/// body bytes.
-enum ReadMode {
-    /// Decoding envelopes and forwarding messages to the handler.
-    Decoding,
-    /// The decoder is finished (END_STREAM, a decode error, or the handler
-    /// dropped the request stream); remaining body bytes are discarded,
-    /// bounded by [`MAX_DRAIN_BYTES`].
-    Draining {
-        /// Bytes discarded so far.
-        drained: usize,
-        /// Set when drain mode was entered via END_STREAM and no trailing
-        /// data has been observed yet — the first trailing data logs a
-        /// warning, then the flag is cleared so the warning fires at most
-        /// once per request (avoiding log spam).
-        pending_trailing_data_warn: bool,
-    },
-}
-
-/// Decoding state for the background task spawned by [`spawn_body_reader`]:
-/// turns request body frames into decoded messages on `tx`, then drains the
-/// rest of the body (bounded) once the decoder is finished.
-struct BodyReader {
-    decoder: EnvelopeDecoder,
-    buf: BytesMut,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
-    mode: ReadMode,
-}
-
-impl BodyReader {
-    fn new(
-        max_message_size: usize,
-        streaming_encoding: Option<String>,
-        compression: Arc<CompressionRegistry>,
-        tx: tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>,
-    ) -> Self {
-        Self {
-            decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
-            buf: BytesMut::new(),
-            tx,
-            mode: ReadMode::Decoding,
-        }
-    }
-
-    /// Handle one data frame from the request body.
-    ///
-    /// Returns [`ControlFlow::Break`] when the reader should stop reading the
-    /// body because the post-decoder drain limit was exceeded.
-    async fn on_data(&mut self, data: Bytes) -> ControlFlow<()> {
-        match &mut self.mode {
-            ReadMode::Decoding => {
-                self.buf.extend_from_slice(&data);
-                self.decode_available().await;
-                ControlFlow::Continue(())
-            }
-            ReadMode::Draining {
-                drained,
-                pending_trailing_data_warn,
-            } => {
-                if *pending_trailing_data_warn {
-                    tracing::warn!(
-                        trailing_bytes = data.len(),
-                        "client sent request data after the END_STREAM envelope; discarding"
-                    );
-                    *pending_trailing_data_warn = false;
-                }
-                *drained = drained.saturating_add(data.len());
-                if *drained > MAX_DRAIN_BYTES {
-                    tracing::debug!(
-                        drained_bytes = *drained,
-                        "body drain limit reached, stopping"
-                    );
-                    return ControlFlow::Break(());
-                }
-                ControlFlow::Continue(())
-            }
-        }
-    }
-
-    /// Handle the end of the request body: flush any remaining complete
-    /// messages out of the decoder. A client may end the body without an
-    /// END_STREAM envelope — the body ending is itself the end-of-stream
-    /// signal.
-    async fn on_eof(&mut self) {
-        if !matches!(self.mode, ReadMode::Decoding) {
-            return;
-        }
-        loop {
-            match self.decoder.decode_eof(&mut self.buf) {
-                Ok(Some(data)) => {
-                    // A send failure (handler dropped the stream) just ends
-                    // the flush early — the caller breaks out of the read
-                    // loop right after `on_eof`, so no mode change is needed.
-                    if self.tx.send(Ok(data)).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => return,
-                Err(e) => {
-                    let _ = self.tx.send(Err(e)).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Decode and forward every complete message currently buffered,
-    /// switching to drain mode if the decoder finishes.
-    async fn decode_available(&mut self) {
-        loop {
-            match self.decoder.decode(&mut self.buf) {
-                Ok(Some(data)) => {
-                    if self.tx.send(Ok(data)).await.is_err() {
-                        // The handler dropped the request stream; the rest of
-                        // the body is drained without inspection.
-                        self.enter_drain_mode(false);
-                        return;
-                    }
-                }
-                Ok(None) if self.decoder.is_done() => {
-                    // The END_STREAM envelope was decoded — the stream is
-                    // finished, and any further request data is a protocol
-                    // violation by the client.
-                    self.enter_drain_mode(true);
-                    return;
-                }
-                Ok(None) => return, // need more data from the body
-                Err(e) => {
-                    let _ = self.tx.send(Err(e)).await;
-                    self.enter_drain_mode(false);
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Switch to bounded drain mode, releasing any bytes the decoder still
-    /// holds (e.g. trailing data that arrived in the same body frame as
-    /// END_STREAM, or an undecoded partial envelope after a decode error)
-    /// instead of keeping them resident for the duration of the drain.
-    fn enter_drain_mode(&mut self, end_stream: bool) {
-        let mut pending_trailing_data_warn = end_stream;
-        if pending_trailing_data_warn && !self.buf.is_empty() {
-            tracing::warn!(
-                trailing_bytes = self.buf.len(),
-                "client sent request data after the END_STREAM envelope; discarding"
-            );
-            pending_trailing_data_warn = false;
-        }
-        self.buf = BytesMut::new();
-        self.mode = ReadMode::Draining {
-            drained: 0,
-            pending_trailing_data_warn,
-        };
-    }
-
-    /// Handle a transport-level request body error.
-    ///
-    /// While the reader is still decoding request messages, the failure is
-    /// surfaced to the handler stream as an internal [`ConnectError`] so a
-    /// truncated or failed body is not mistaken for a complete client stream.
-    /// Once the reader is only draining trailing bytes (after END_STREAM, a
-    /// decode error, or the handler dropping the request stream), the error is
-    /// diagnostic-only — the handler has already seen the terminal outcome.
-    ///
-    /// The code is `internal` deliberately, for parity with the unary
-    /// body-read path (`collect_body_limited`): the same transport failure
-    /// reports the same code regardless of RPC shape. connect-go reports
-    /// `unknown` here; if the attribution is ever revisited (a broken
-    /// inbound transport is arguably `unavailable`), change both paths
-    /// together.
-    async fn on_body_error(&mut self, err: impl std::fmt::Display + Send) {
-        tracing::debug!(error = %err, "request body error, stopping reader");
-
-        // Only the decoding path allocates the message; the drain path logs
-        // via `Display` above and returns without touching the handler.
-        if matches!(self.mode, ReadMode::Decoding) {
-            let _ = self
-                .tx
-                .send(Err(ConnectError::internal(format!(
-                    "failed to read request body: {err}"
-                ))))
-                .await;
-        }
-    }
-}
-
-/// Spawn a background task that reads envelope-framed messages from an HTTP
-/// body and forwards them to a channel.
+/// How long a drain may take, however few bytes arrive. Bytes alone do not
+/// bound the drain: a client that sends less than [`MAX_DRAIN_BYTES`] and then
+/// stalls would otherwise hold the drain task and the request body for as
+/// long as it keeps the connection open.
 ///
-/// Returns a `(request_stream, reader_task)` pair. The `request_stream` yields
-/// decoded message payloads. The `reader_task` should be attached to the
-/// response via [`StreamingResponseBody::with_reader_task`]. The handle is
-/// held for lifetime association but is NOT aborted when the response drops —
-/// the task must be allowed to finish draining or hyper's dispatcher will see
-/// the body dropped before EOF and close the connection.
+/// The deadline is absolute, not an idle timeout, so a client that trickles
+/// data cannot extend it. A client still uploading when it passes loses the
+/// stream (HTTP/2, reset with `NO_ERROR`) or the connection (HTTP/1.x). If the
+/// response outlives the drain, as in a bidi call whose handler stopped reading
+/// requests, the stream is not reset and the body is dropped anyway; see
+/// [`request_body_drain`] for what that costs an HTTP/2 connection.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A timer for one drain. `wasm32-unknown-unknown` has no clock, so a drain
+/// there is bounded by [`MAX_DRAIN_BYTES`] alone.
+fn drain_timeout() -> impl Future<Output = ()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::time::sleep(DRAIN_TIMEOUT)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::future::pending()
+    }
+}
+
+/// Turn an envelope-framed request body into the stream of decoded messages
+/// that a client-streaming or bidi handler consumes.
 ///
-/// When the channel receiver is dropped (e.g., the handler finishes or
-/// encounters an error), the reader task continues consuming remaining body
-/// bytes (up to [`MAX_DRAIN_BYTES`]) before completing. This is critical for
-/// HTTP/1.1 where the server must read the entire request body before it can
-/// send the response.
-fn spawn_body_reader<B>(
+/// Decoding happens in whichever task polls the stream, normally the
+/// handler's, so a message passes through no extra task or channel between
+/// hyper and the handler, and the body is read only while the stream is
+/// polled. The stream ends at the end of the body or at the END_STREAM
+/// envelope. A decode error, a body that ends part-way through an envelope,
+/// or a transport-level body error is yielded as one `Err`, after which the
+/// stream ends.
+///
+/// Whatever the handler does not read is still consumed. When the stream
+/// finishes decoding (END_STREAM or a decode error), or is dropped before the
+/// body has ended (the handler returned, an interceptor rejected the call, or
+/// the request timeout fired), it drops the decoder, with any partial message
+/// it holds, and drains the rest of the body (see [`request_body_drain`]) on
+/// a detached task. The task runs on the runtime the stream was created on,
+/// normally the server's, wherever the stream is dropped.
+fn decode_request_body<B>(
     body: B,
     max_message_size: usize,
     streaming_encoding: Option<String>,
     compression: Arc<CompressionRegistry>,
-) -> (
-    BoxStream<Result<Bytes, ConnectError>>,
-    Option<tokio::task::JoinHandle<()>>,
-)
+) -> BoxStream<Result<Bytes, ConnectError>>
 where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::fmt::Display + Send,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ConnectError>>(1);
+    Box::pin(RequestBodyStream {
+        decoding: Some(DecodeState {
+            body: Box::pin(body),
+            decoder: EnvelopeDecoder::new(max_message_size, streaming_encoding, compression),
+            frame: Bytes::new(),
+        }),
+        #[cfg(not(target_arch = "wasm32"))]
+        runtime: tokio::runtime::Handle::try_current().ok(),
+    })
+}
 
-    let reader_future = async move {
-        let mut body = std::pin::pin!(body);
-        let mut reader = BodyReader::new(max_message_size, streaming_encoding, compression, tx);
+/// The stream behind [`decode_request_body`].
+struct RequestBodyStream<B>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display + Send,
+{
+    /// `None` once the stream has ended.
+    decoding: Option<DecodeState<B>>,
+    /// Where the drain runs. `None` if the stream was created outside a Tokio
+    /// runtime; the drain then runs on the runtime the stream is dropped in,
+    /// and is skipped outside one.
+    #[cfg(not(target_arch = "wasm32"))]
+    runtime: Option<tokio::runtime::Handle>,
+}
 
-        // Read body frames until EOF, a body error, or the drain limit.
-        // Continuing to read (bounded) after the decoder finishes is critical
-        // for HTTP/1.1, where the server must consume the request body before
-        // the response can be sent.
+/// What a [`RequestBodyStream`] holds until it ends.
+struct DecodeState<B> {
+    body: Pin<Box<B>>,
+    decoder: EnvelopeDecoder,
+    /// The part of the last body frame the decoder has not consumed yet.
+    frame: Bytes,
+}
+
+impl<B> RequestBodyStream<B>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display + Send,
+{
+    /// End the stream and drain the rest of the body. `end_stream` marks the
+    /// END_STREAM case, after which any further request data is a protocol
+    /// violation by the client.
+    fn finish(&mut self, end_stream: bool) {
+        let Some(DecodeState { body, frame, .. }) = self.decoding.take() else {
+            return;
+        };
+        let Some(drain) = request_body_drain(body, frame.len(), end_stream) else {
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(runtime) = &self.runtime {
+            drop(runtime.spawn(drain));
+            return;
+        }
+        crate::spawn_detached(drain);
+    }
+}
+
+impl<B> Drop for RequestBodyStream<B>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display + Send,
+{
+    fn drop(&mut self) {
+        // The handler let go of the stream before it ended.
+        self.finish(false);
+    }
+}
+
+impl<B> Stream for RequestBodyStream<B>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display + Send,
+{
+    type Item = Result<Bytes, ConnectError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
-            match std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+            let Some(state) = this.decoding.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match state.decoder.decode(&mut state.frame) {
+                Ok(Some(Decoded::Message(data))) => return Poll::Ready(Some(Ok(data))),
+                Ok(Some(Decoded::EndStream)) => {
+                    this.finish(true);
+                    return Poll::Ready(None);
+                }
+                Ok(None) => {} // the frame is used up
+                Err(e) => {
+                    this.finish(false);
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
+            match std::task::ready!(state.body.as_mut().poll_frame(cx)) {
                 Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data()
-                        && reader.on_data(data).await.is_break()
-                    {
-                        break;
+                    debug_assert!(state.frame.is_empty(), "undecoded bytes overwritten");
+                    // Trailers carry nothing for the decoder.
+                    if let Ok(data) = frame.into_data() {
+                        state.frame = data;
                     }
                 }
                 Some(Err(e)) => {
-                    reader.on_body_error(e).await;
-                    break;
+                    // The body is over, so there is nothing to drain. The code
+                    // is `internal` deliberately, for parity with the unary
+                    // body-read path (`collect_body_limited`): the same
+                    // transport failure reports the same code regardless of
+                    // RPC shape. connect-go reports `unknown` here; if the
+                    // attribution is ever revisited (a broken inbound
+                    // transport is arguably `unavailable`), change both paths
+                    // together.
+                    tracing::debug!(error = %e, "request body error, ending request stream");
+                    this.decoding = None;
+                    return Poll::Ready(Some(Err(ConnectError::internal(format!(
+                        "failed to read request body: {e}"
+                    )))));
                 }
                 None => {
-                    // Body EOF — flush any remaining buffered messages.
-                    reader.on_eof().await;
-                    break;
+                    // A client may end the body without an END_STREAM
+                    // envelope, but not part-way through an envelope.
+                    let finished = state.decoder.finish();
+                    this.decoding = None;
+                    return Poll::Ready(finished.err().map(Err));
                 }
             }
         }
+    }
+}
+
+/// The drain of what a request stream left of its body: a future that reads
+/// and discards the rest of the body, then drops it. The drain stops when the
+/// body ends or fails, when more than [`MAX_DRAIN_BYTES`] have been discarded
+/// (counting `discarded`, the bytes of the last frame the decoder left
+/// behind), or when [`DRAIN_TIMEOUT`] has passed. `None`, with the body
+/// dropped at once, if the body has already ended or `discarded` alone
+/// exceeds the limit. `warn_trailing` logs a warning for the first request
+/// data seen after the END_STREAM envelope.
+///
+/// The drain matters on HTTP/1.1, where the server must read the request body
+/// before the connection can serve another request, and dropping an unread
+/// body makes hyper close the connection. On HTTP/2 dropping the body resets
+/// the stream once the response is done, so the stream's slot is held until
+/// the drain ends. The drain is not only a delay: h2 charges each small DATA
+/// frame it receives against connection-wide budgets, refunded only when the
+/// frame is read or discarded, and answers with `GOAWAY(ENHANCE_YOUR_CALM)`
+/// when they run out. Dropping the body at once therefore takes the connection
+/// down once enough calls end early while their clients are still sending (see
+/// `http2_early_return_keeps_connection_alive_under_small_frames`). The same
+/// applies to frames that arrive while the stream is still open and nothing
+/// reads them: while a bidi handler holds a request stream it no longer
+/// polls, or after the drain has ended, if the handler keeps streaming its
+/// response for longer than [`DRAIN_TIMEOUT`].
+fn request_body_drain<B>(
+    mut body: Pin<Box<B>>,
+    discarded: usize,
+    warn_trailing: bool,
+) -> Option<impl Future<Output = ()> + Send + 'static>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display + Send,
+{
+    let mut drained = Drained {
+        bytes: 0,
+        warn_trailing,
     };
+    if discarded > 0 && drained.add(discarded).is_break() {
+        return None;
+    }
+    if body.is_end_stream() {
+        return None;
+    }
+    Some(async move {
+        // One timer for the whole drain, so trickled data cannot extend it.
+        let mut timeout = std::pin::pin!(drain_timeout());
+        loop {
+            let frame = tokio::select! {
+                // The timer first, so a body that always has data ready
+                // cannot postpone it.
+                biased;
+                () = &mut timeout => {
+                    tracing::debug!("body drain timed out, stopping");
+                    return;
+                }
+                frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)) => frame,
+            };
+            let data = match frame {
+                // Trailers discard nothing, like an empty data frame.
+                Some(Ok(frame)) => frame.into_data().unwrap_or_default(),
+                Some(Err(e)) => {
+                    tracing::debug!(error = %e, "request body error while draining");
+                    return;
+                }
+                None => return,
+            };
+            if !data.is_empty() && drained.add(data.len()).is_break() {
+                return;
+            }
+        }
+    })
+}
 
-    // The reader runs detached — it has to outlive the response stream so it
-    // can finish draining the request body.
-    let reader_task = crate::spawn_detached(reader_future);
+/// What one drain has discarded so far.
+struct Drained {
+    bytes: usize,
+    /// The next data is the first the client sent after END_STREAM.
+    warn_trailing: bool,
+}
 
-    let request_stream: BoxStream<Result<Bytes, ConnectError>> =
-        Box::pin(futures::stream::unfold(rx, |mut rx| async {
-            rx.recv().await.map(|item| (item, rx))
-        }));
-
-    (request_stream, reader_task)
+impl Drained {
+    /// Count `len` more discarded bytes: [`ControlFlow::Break`] once past
+    /// [`MAX_DRAIN_BYTES`].
+    fn add(&mut self, len: usize) -> ControlFlow<()> {
+        if self.warn_trailing {
+            tracing::warn!(
+                trailing_bytes = len,
+                "client sent request data after the END_STREAM envelope; discarding"
+            );
+            self.warn_trailing = false;
+        }
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > MAX_DRAIN_BYTES {
+            tracing::debug!(
+                drained_bytes = self.bytes,
+                "body drain limit reached, stopping"
+            );
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Handle a bidi streaming ConnectRPC request.
@@ -2990,11 +3168,8 @@ where
 /// Bidi streaming RPCs receive multiple envelope-framed request messages
 /// and return multiple envelope-framed response messages with END_STREAM.
 ///
-/// The reader task is attached to the response body via
-/// [`StreamingResponseBody::with_reader_task`]. When the response body drops,
-/// the task is **detached** (not aborted) — it continues draining the request
-/// body until EOF or [`MAX_DRAIN_BYTES`]. Aborting early was found to race
-/// with hyper's HTTP/1.1 body-EOF detection (see `_reader_task` field docs).
+/// The handler's request stream is built by [`decode_request_body`], which
+/// also drains whatever the handler leaves unread.
 #[allow(clippy::too_many_arguments)]
 async fn handle_bidi_streaming_request<D, B>(
     dispatcher: &D,
@@ -3016,7 +3191,7 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: std::fmt::Display + Send,
 {
-    let (request_stream, reader_task) = spawn_body_reader(
+    let request_stream = decode_request_body(
         body,
         limits.max_message_size,
         metadata.streaming_encoding.clone(),
@@ -3032,7 +3207,7 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"))
+        .with_path(["/", path].concat())
         .with_decode_options(limits.decode_options());
 
     // Call the handler with timeout if configured
@@ -3053,7 +3228,6 @@ where
             Ok(result) => result,
             Err(_) => {
                 let err = ConnectError::deadline_exceeded("request timeout");
-                drop(reader_task);
                 return streaming_error_response(&err, protocol, codec_format);
             }
         }
@@ -3072,7 +3246,6 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
-            drop(reader_task);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -3084,20 +3257,13 @@ where
     );
 
     // Build streaming response
-    let mut response = Response::builder().status(StatusCode::OK).header(
-        header::CONTENT_TYPE,
+    let mut response = response_head(
         protocol.response_content_type(codec_format, true),
+        protocol.content_encoding_header(),
+        response_encoding,
+        protocol.accept_encoding_header(),
+        &compression,
     );
-
-    if let Some(encoding) = response_encoding {
-        response = response.header(protocol.content_encoding_header(), encoding);
-    }
-
-    // Advertise what encodings we accept (optional per spec, informational)
-    let accept = compression.accept_encoding_header();
-    if !accept.is_empty() {
-        response = response.header(protocol.accept_encoding_header(), accept);
-    }
 
     // Add response headers set by the handler
     for (key, value) in resp.headers.iter() {
@@ -3117,8 +3283,7 @@ where
         protocol,
         stream_compression,
         effective_policy,
-    )
-    .with_reader_task(reader_task);
+    );
 
     response.body(body).unwrap_or_else(|_| {
         let err = ConnectError::internal("failed to build bidi streaming response");
@@ -3227,14 +3392,12 @@ fn error_response(err: ConnectError) -> Response<Full<Bytes>> {
     let status = err.http_status();
     let body = err.to_json();
 
-    let mut response = Response::builder()
+    let response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type::JSON);
 
     // Add response headers from the error
-    for (key, value) in err.response_headers() {
-        response = response.header(key, value);
-    }
+    let response = echo_error_headers(response, &err);
 
     // Add trailers as trailer- prefixed headers
     let response = add_trailers(response, err.trailers());
@@ -3393,6 +3556,46 @@ pub mod axum_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Every limit must survive the builder chain and come back out of the
+    /// accessor of the same name. Setting all three in one chain also pins
+    /// that no setter clobbers a sibling.
+    #[test]
+    fn limits_builders_round_trip_through_the_accessors() {
+        let limits = Limits::default()
+            .with_max_request_body_size(16 * 1024 * 1024)
+            .with_max_message_size(8 * 1024 * 1024)
+            .with_element_memory_limit(64 * 1024 * 1024);
+
+        assert_eq!(limits.max_request_body_size(), 16 * 1024 * 1024);
+        assert_eq!(limits.max_message_size(), 8 * 1024 * 1024);
+        assert_eq!(limits.element_memory_limit(), 64 * 1024 * 1024);
+
+        // `decode_options` reads the element budget, not one of its siblings.
+        assert_eq!(
+            limits.decode_options().element_memory_limit(),
+            64 * 1024 * 1024
+        );
+    }
+
+    /// The defaults an untouched `Limits` reports must be the documented
+    /// constants, so a caller who reads one back before setting it is not
+    /// misled about what the server is enforcing.
+    #[test]
+    fn default_limits_report_the_documented_defaults() {
+        let limits = Limits::default();
+        assert_eq!(
+            limits.max_request_body_size(),
+            DEFAULT_MAX_REQUEST_BODY_SIZE
+        );
+        assert_eq!(limits.max_message_size(), DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(
+            limits.element_memory_limit(),
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT
+        );
+    }
 
     /// A payload at or above `envelope::MIN_CHAIN_SIZE` must reach the body
     /// frames by refcount, not by copy: the emitted data frame references
@@ -3404,7 +3607,7 @@ mod tests {
 
         let payload = Bytes::from(vec![0x42u8; crate::envelope::MIN_CHAIN_SIZE]);
         let original_ptr = payload.as_ptr();
-        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone().into())]).boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3442,7 +3645,7 @@ mod tests {
         use futures::StreamExt as _;
 
         let payload = Bytes::from_static(b"small");
-        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone().into())]).boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3472,7 +3675,9 @@ mod tests {
             Ok(large.clone()),
             Ok(small.clone()),
         ];
-        let source = futures::stream::iter(items).boxed();
+        let source = futures::stream::iter(items)
+            .map(|r| r.map(Into::into))
+            .boxed();
         let mut stream = std::pin::pin!(create_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3512,7 +3717,9 @@ mod tests {
             Ok::<_, ConnectError>(large.clone()),
             Err(ConnectError::internal("boom")),
         ];
-        let source = futures::stream::iter(items).boxed();
+        let source = futures::stream::iter(items)
+            .map(|r| r.map(Into::into))
+            .boxed();
         let mut stream = std::pin::pin!(create_grpc_envelope_stream(
             source,
             http::HeaderMap::new(),
@@ -3527,6 +3734,163 @@ mod tests {
         let trailers = stream.next().await.unwrap().unwrap();
         let map = trailers.into_trailers().unwrap();
         assert_eq!(map.get("grpc-status").unwrap(), "13", "internal = 13");
+        assert!(stream.next().await.is_none());
+    }
+
+    /// An item the encoder split into segments keeps its large segments as
+    /// their own frames, by refcount, while the tag/length fragments between
+    /// them ride in the batch buffer: header+lead, large A, fragment,
+    /// large B, then the next (small) envelope with the trailing fragment
+    /// ahead of it, then trailers. Reassembled, the bytes decode to the same
+    /// envelopes a contiguous encode would have produced.
+    #[tokio::test]
+    async fn streaming_segmented_item_chains_each_large_segment() {
+        use crate::response::EncodedBody;
+        use futures::StreamExt as _;
+
+        let min = crate::envelope::MIN_CHAIN_SIZE;
+        let lead = Bytes::from_static(b"tag");
+        let a = Bytes::from(vec![0xA1u8; min]);
+        let mid = Bytes::from_static(b"ln");
+        let b = Bytes::from(vec![0xB2u8; min + 1]);
+        let tail = Bytes::from_static(b"t");
+        let segmented = EncodedBody::Segmented(vec![
+            lead.clone(),
+            a.clone(),
+            mid.clone(),
+            b.clone(),
+            tail.clone(),
+        ]);
+        let first_message = segmented.clone().into_contiguous();
+        let small = Bytes::from_static(b"next");
+        let items = [
+            Ok::<_, ConnectError>(segmented),
+            Ok(EncodedBody::Contiguous(small.clone())),
+        ];
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            futures::stream::iter(items).boxed(),
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let mut frames = Vec::new();
+        let mut terminal = None;
+        while let Some(frame) = stream.next().await {
+            match frame.unwrap().into_data() {
+                Ok(data) => frames.push(data),
+                Err(frame) => terminal = Some(frame),
+            }
+        }
+
+        let hdr = crate::envelope::HEADER_SIZE;
+        let lens: Vec<usize> = frames.iter().map(Bytes::len).collect();
+        assert_eq!(
+            lens,
+            [
+                hdr + lead.len(),
+                a.len(),
+                mid.len(),
+                b.len(),
+                tail.len() + hdr + small.len()
+            ]
+        );
+        assert!(
+            std::ptr::eq(frames[1].as_ptr(), a.as_ptr()),
+            "A by refcount"
+        );
+        assert!(
+            std::ptr::eq(frames[3].as_ptr(), b.as_ptr()),
+            "B by refcount"
+        );
+        assert!(terminal.expect("trailers frame").is_trailers());
+
+        let mut wire = bytes::BytesMut::new();
+        for frame in &frames {
+            wire.extend_from_slice(frame);
+        }
+        let first = Envelope::decode(&mut wire).unwrap().unwrap();
+        let second = Envelope::decode(&mut wire).unwrap().unwrap();
+        assert_eq!(first.data, first_message);
+        assert_eq!(second.data, small);
+        assert!(wire.is_empty());
+    }
+
+    /// With an async producer the trailing fragment of a segmented item must
+    /// be flushed when the source goes `Pending`, so the peer can decode the
+    /// message before the next item exists: header+lead, large, tail, then
+    /// `Pending`.
+    #[tokio::test]
+    async fn streaming_segmented_tail_flushes_before_pending() {
+        use crate::response::EncodedBody;
+        use futures::StreamExt as _;
+
+        let min = crate::envelope::MIN_CHAIN_SIZE;
+        let lead = Bytes::from_static(b"tag");
+        let big = Bytes::from(vec![9u8; min]);
+        let tail = Bytes::from_static(b"end");
+        let item = EncodedBody::Segmented(vec![lead.clone(), big.clone(), tail.clone()]);
+        let source = futures::stream::iter([Ok::<_, ConnectError>(item)])
+            .chain(futures::stream::pending())
+            .boxed();
+        let mut stream = Box::pin(create_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let hdr = crate::envelope::HEADER_SIZE;
+        let f1 = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(f1.len(), hdr + lead.len());
+        let f2 = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert!(std::ptr::eq(f2.as_ptr(), big.as_ptr()));
+        let f3 = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(f3, tail, "tail must not wait for the next item");
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(stream.as_mut().poll_next(&mut cx).is_pending());
+    }
+
+    /// A source error right after a segmented item still emits every staged
+    /// segment, in order, before the error finalizer.
+    #[tokio::test]
+    async fn streaming_error_after_segmented_item_preserves_order() {
+        use crate::response::EncodedBody;
+        use futures::StreamExt as _;
+
+        let min = crate::envelope::MIN_CHAIN_SIZE;
+        let a = Bytes::from(vec![1u8; min]);
+        let b = Bytes::from(vec![2u8; min]);
+        let items = [
+            Ok::<_, ConnectError>(EncodedBody::Segmented(vec![a.clone(), b.clone()])),
+            Err(ConnectError::internal("boom")),
+        ];
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            futures::stream::iter(items).boxed(),
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let head = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(head.len(), crate::envelope::HEADER_SIZE);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().into_data().unwrap(),
+            a
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().into_data().unwrap(),
+            b
+        );
+        let trailers = stream
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13", "internal = 13");
         assert!(stream.next().await.is_none());
     }
 
@@ -3616,6 +3980,8 @@ mod tests {
 
         let err = handle_unary_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -3643,6 +4009,8 @@ mod tests {
 
         let resp = handle_streaming_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Protocol::Grpc,
             CodecFormat::Proto,
@@ -4082,7 +4450,8 @@ mod tests {
         // then one trailers frame.
         let items: Vec<Result<Bytes, ConnectError>> =
             (0..10).map(|_| Ok(Bytes::from_static(b"msg"))).collect();
-        let source: BoxStream<_> = Box::pin(futures::stream::iter(items));
+        let source: crate::EncodedStream =
+            Box::pin(futures::stream::iter(items).map(|r| r.map(Into::into)));
 
         let stream = BatchingEnvelopeStream::new(
             source,
@@ -4111,7 +4480,8 @@ mod tests {
         // 9KB items: first fills buf to 9K < 16K → loop, second fills to 18K ≥ 16K → flush.
         let big = Bytes::from(vec![b'x'; 9 * 1024]);
         let items: Vec<Result<Bytes, ConnectError>> = (0..4).map(|_| Ok(big.clone())).collect();
-        let source: BoxStream<_> = Box::pin(futures::stream::iter(items));
+        let source: crate::EncodedStream =
+            Box::pin(futures::stream::iter(items).map(|r| r.map(Into::into)));
 
         let stream = BatchingEnvelopeStream::new(
             source,
@@ -4149,8 +4519,8 @@ mod tests {
     fn batching_connect_finalizer_is_data_frame() {
         // Connect protocol finalizer is an END_STREAM envelope (data frame),
         // not an HTTP/2 trailers frame.
-        let source: BoxStream<_> = Box::pin(futures::stream::once(async {
-            Ok(Bytes::from_static(b"x"))
+        let source: crate::EncodedStream = Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"x").into())
         }));
         let stream = BatchingEnvelopeStream::new(
             source,
@@ -4179,7 +4549,8 @@ mod tests {
             Ok(Bytes::from_static(b"c")),
             Err(ConnectError::internal("boom")),
         ];
-        let source: BoxStream<_> = Box::pin(futures::stream::iter(items));
+        let source: crate::EncodedStream =
+            Box::pin(futures::stream::iter(items).map(|r| r.map(Into::into)));
         let stream = BatchingEnvelopeStream::new(
             source,
             http::HeaderMap::new(),
@@ -4305,6 +4676,8 @@ mod tests {
 
         handle_unary_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -4355,6 +4728,8 @@ mod tests {
 
         handle_unary_request(
             &router,
+            "svc/Method",
+            router.lookup("svc/Method"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -4425,7 +4800,6 @@ mod tests {
     async fn interceptor_runs_on_connect_get_request() {
         use crate::interceptor::{Interceptor, Next, UnaryRequest, UnaryResponse};
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         let intercepted = Arc::new(AtomicBool::new(false));
         let handler_ran = Arc::new(Mutex::new(false));
@@ -4469,6 +4843,8 @@ mod tests {
 
         handle_unary_request(
             &router,
+            "svc/Get",
+            router.lookup("svc/Get"),
             req,
             Limits::default(),
             Arc::new(CompressionRegistry::new()),
@@ -4978,14 +5354,70 @@ mod tests {
     }
 
     // ========================================================================
-    // spawn_body_reader tests
+    // decode_request_body tests
     // ========================================================================
+
+    /// Wait until the test body has been dropped: the request stream, and any
+    /// drain it handed the body to, are finished with it. The body holds a
+    /// clone of `token`.
+    async fn body_released<T>(token: &Arc<T>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(token) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request body released");
+        assert_no_drain_panicked();
+    }
 
     /// Test body that yields a fixed sequence of data frames and records how
     /// many bytes the reader actually pulls from it.
     struct CountingBody {
         frames: std::collections::VecDeque<Bytes>,
         pulled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingBody {
+        fn new(
+            frames: impl IntoIterator<Item = Bytes>,
+            pulled: &Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            count_panics();
+            Self {
+                frames: frames.into_iter().collect(),
+                pulled: Arc::clone(pulled),
+            }
+        }
+    }
+
+    thread_local! {
+        /// Panics on this thread, counted by the hook [`count_panics`]
+        /// installs.
+        static PANICS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Count panics per thread from now on, then run the previous hook. A
+    /// `#[tokio::test]` runtime polls spawned tasks on the test's own
+    /// thread, so this sees a drain task that panics, which Tokio catches.
+    fn count_panics() {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = PANICS.try_with(|panics| panics.set(panics.get() + 1));
+                previous(info);
+            }));
+        });
+    }
+
+    /// Fail the test if a drain task on this thread has panicked.
+    fn assert_no_drain_panicked() {
+        assert_eq!(
+            PANICS.with(std::cell::Cell::get),
+            0,
+            "a drain task panicked"
+        );
     }
 
     impl Body for CountingBody {
@@ -5010,8 +5442,9 @@ mod tests {
 
     /// Regression test: a client that sends a valid END_STREAM envelope and
     /// then keeps sending request body data must not cause unbounded
-    /// buffering. The reader must treat END_STREAM as terminal and switch to
-    /// bounded drain mode, stopping once `MAX_DRAIN_BYTES` is exceeded.
+    /// buffering. The request stream must treat END_STREAM as terminal and
+    /// hand the rest of the body to the bounded drain, which stops once
+    /// `MAX_DRAIN_BYTES` is exceeded.
     #[tokio::test]
     async fn test_body_reader_bounds_data_after_end_stream() {
         const CHUNK_SIZE: usize = 64 * 1024;
@@ -5026,22 +5459,14 @@ mod tests {
             frames.push_back(Bytes::from(vec![0xAA_u8; CHUNK_SIZE]));
         }
 
-        let body = CountingBody {
-            frames,
-            pulled: Arc::clone(&pulled),
-        };
+        let body = CountingBody::new(frames, &pulled);
 
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
             Arc::new(CompressionRegistry::new()),
         );
-
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
 
         // The handler-facing stream sees a clean end of stream: no messages,
         // no error. Trailing junk after END_STREAM must not surface to the
@@ -5050,16 +5475,614 @@ mod tests {
             request_stream.next().await.is_none(),
             "request stream must end cleanly after END_STREAM"
         );
+        body_released(&pulled).await;
 
-        // The reader must stop pulling from the body shortly after the drain
-        // limit instead of buffering the trailing data without bound.
+        // The rest of the body is drained (for HTTP/1.1 keep-alive), but the
+        // drain stops shortly after its limit instead of reading the trailing
+        // data without bound.
         let pulled = pulled.load(std::sync::atomic::Ordering::Relaxed);
         let max_expected = MAX_DRAIN_BYTES + CHUNK_SIZE + crate::envelope::HEADER_SIZE + 2;
         assert!(
-            pulled <= max_expected,
-            "reader pulled {pulled} bytes after END_STREAM (expected at most \
-             {max_expected}); trailing data is being buffered without bound"
+            pulled > MAX_DRAIN_BYTES && pulled <= max_expected,
+            "reader pulled {pulled} bytes after END_STREAM (expected more than \
+             {MAX_DRAIN_BYTES} and at most {max_expected})"
         );
+    }
+
+    /// Trailing data in the END_STREAM envelope's own frame counts towards
+    /// the drain limit: when it alone exceeds the limit, the body is dropped
+    /// on the spot and nothing more is read.
+    #[tokio::test]
+    async fn test_body_reader_oversized_trailing_frame_stops_the_drain() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first = Envelope::end_stream(Bytes::from_static(b"{}"))
+            .encode()
+            .to_vec();
+        first.resize(first.len() + MAX_DRAIN_BYTES + 1, 0xAA);
+        let first_len = first.len();
+        let body = CountingBody::new(
+            [Bytes::from(first), Bytes::from_static(b"never read")],
+            &pulled,
+        );
+
+        let mut request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        assert!(request_stream.next().await.is_none());
+        assert_eq!(Arc::strong_count(&pulled), 1, "body dropped at once");
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::Relaxed), first_len);
+    }
+
+    /// Test body that yields its frames, then stays pending forever, and
+    /// records when it is dropped: a client that stalls part-way through a
+    /// request.
+    struct StalledBody {
+        frames: std::collections::VecDeque<Bytes>,
+        _dropped: DropFlag,
+    }
+
+    impl Body for StalledBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.get_mut().frames.pop_front() {
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Body fed by the test through a channel.
+    struct FedBody {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        _dropped: DropFlag,
+    }
+
+    impl Body for FedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.get_mut()
+                .rx
+                .poll_recv(cx)
+                .map(|data| data.map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    /// A request stream on a test body, seen from the handler's side.
+    struct Reader {
+        request_stream: Option<BoxStream<Result<Bytes, ConnectError>>>,
+        body_dropped: Arc<AtomicBool>,
+        /// Held by the decoder while the stream is decoding.
+        registry: Arc<CompressionRegistry>,
+    }
+
+    impl Reader {
+        /// A reader on a body that yields `frames` and then stalls.
+        fn stalled(frames: impl IntoIterator<Item = Bytes>) -> Self {
+            let body_dropped = Arc::new(AtomicBool::new(false));
+            Self::on(
+                StalledBody {
+                    frames: frames.into_iter().collect(),
+                    _dropped: DropFlag(Arc::clone(&body_dropped)),
+                },
+                body_dropped,
+            )
+        }
+
+        fn on<B>(body: B, body_dropped: Arc<AtomicBool>) -> Self
+        where
+            B: Body<Data = Bytes, Error = Infallible> + Send + 'static,
+        {
+            count_panics();
+            let registry = Arc::new(CompressionRegistry::new());
+            let request_stream =
+                decode_request_body(body, DEFAULT_MAX_MESSAGE_SIZE, None, Arc::clone(&registry));
+            Self {
+                request_stream: Some(request_stream),
+                body_dropped,
+                registry,
+            }
+        }
+
+        /// The next item the handler would see.
+        async fn next(&mut self) -> Option<Result<Bytes, ConnectError>> {
+            self.request_stream
+                .as_mut()
+                .expect("stream not dropped")
+                .next()
+                .await
+        }
+
+        /// Poll the stream once, as a handler waiting for a message does, and
+        /// assert that nothing is ready yet.
+        fn assert_pending(&mut self) {
+            assert!(
+                self.next().now_or_never().is_none(),
+                "the handler's stream must be waiting for the client"
+            );
+        }
+
+        /// Assert that the handler's stream has ended now, not when a timer
+        /// fires: with time paused, awaiting the stream would auto-advance the
+        /// clock and hide the difference.
+        async fn assert_stream_ended(&mut self) {
+            Self::settle().await;
+            assert!(
+                matches!(self.next().now_or_never(), Some(None)),
+                "the handler's stream must have ended"
+            );
+        }
+
+        /// The handler is done with the request stream.
+        fn handler_drops_stream(&mut self) {
+            self.request_stream = None;
+        }
+
+        fn body_dropped(&self) -> bool {
+            self.body_dropped.load(Ordering::Relaxed)
+        }
+
+        /// Let a drain task run until it is waiting on the body.
+        async fn settle() {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Assert that the stalled body is drained for [`DRAIN_TIMEOUT`] and
+        /// then dropped. The decoder, and with it any partial message, is
+        /// gone from the start of the drain. Time is paused, so a drain that
+        /// never lets go fails at an `assert` instead of hanging.
+        async fn assert_drains_then_releases(self) {
+            Self::settle().await;
+            assert_eq!(
+                Arc::strong_count(&self.registry),
+                1,
+                "the decoder must be dropped when the drain starts"
+            );
+            tokio::time::advance(DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+            Self::settle().await;
+            assert!(!self.body_dropped(), "the body is held while draining");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            Self::settle().await;
+            assert!(self.body_dropped(), "the body must be dropped");
+            assert_no_drain_panicked();
+        }
+    }
+
+    /// A client declares a message, sends all but its last byte, and
+    /// stalls. Once the handler drops the request stream the partial message
+    /// is freed without waiting for the rest of it.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_partial_envelope_released_when_handler_drops() {
+        let mut wire = Envelope::data(Bytes::from(vec![7_u8; 4096]))
+            .encode()
+            .to_vec();
+        wire.pop();
+        let mut reader = Reader::stalled([Bytes::from(wire)]);
+        reader.assert_pending();
+        assert!(
+            !reader.body_dropped(),
+            "held while the handler holds the stream"
+        );
+        assert_eq!(
+            Arc::strong_count(&reader.registry),
+            2,
+            "the decoder is alive while the handler holds the stream"
+        );
+
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// The handler is gone before the client has sent anything.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_no_data_released_when_handler_drops() {
+        let mut reader = Reader::stalled([]);
+        reader.assert_pending();
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// The handler has read a whole message and then goes away while the
+    /// client stalls.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_complete_message_then_stall_released_when_handler_drops() {
+        let frame = Envelope::data(Bytes::from_static(b"hello")).encode();
+        let mut reader = Reader::stalled([frame]);
+        let first = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&first[..], b"hello");
+        reader.handler_drops_stream();
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A handler that keeps its request stream open and idle is not cut off:
+    /// waiting for the client is the handler's business (and its deadline's).
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_waits_while_handler_holds_stream() {
+        let mut reader = Reader::stalled([]);
+        reader.assert_pending();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        Reader::settle().await;
+        reader.assert_pending();
+        assert!(!reader.body_dropped());
+    }
+
+    /// A handler waiting on its request stream is woken by each frame that
+    /// arrives later, including one that completes a message, and skips
+    /// empty frames.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_wakes_for_frames_arriving_later() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = Reader::on(
+            FedBody {
+                rx,
+                _dropped: DropFlag(Arc::clone(&dropped)),
+            },
+            dropped,
+        );
+        let handler = tokio::spawn(async move { reader.next().await });
+        Reader::settle().await;
+        let wire = Envelope::data(Bytes::from_static(b"late")).encode();
+        feed.send(wire.slice(..3)).unwrap();
+        Reader::settle().await;
+        feed.send(Bytes::new()).unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        feed.send(wire.slice(3..)).unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(1), handler)
+            .await
+            .expect("the handler was not woken")
+            .expect("handler task must not panic")
+            .expect("a message")
+            .expect("decodes");
+        assert_eq!(&msg[..], b"late");
+    }
+
+    /// After a decode error the decoder is finished whether or not the
+    /// handler has dropped the stream: the body is drained, bounded in time.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_decode_error_then_stall_released() {
+        // A header declaring more than the message limit.
+        let mut header = vec![0_u8];
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut reader = Reader::stalled([Bytes::from(header)]);
+        let err = reader
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("oversize message is an error");
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// Likewise after the END_STREAM envelope: the client has said it is
+    /// done, and anything it sends afterwards is discarded.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_end_stream_then_stall_released() {
+        let frame = Envelope::end_stream(Bytes::from_static(b"{}")).encode();
+        let mut reader = Reader::stalled([frame]);
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A message that arrives in the same frame as END_STREAM is still
+    /// delivered, ahead of the end of the stream.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_message_before_end_stream_is_delivered() {
+        let mut wire = Envelope::data(Bytes::from_static(b"hello"))
+            .encode()
+            .to_vec();
+        wire.extend_from_slice(&Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let mut reader = Reader::stalled([Bytes::from(wire)]);
+        let first = reader.next().await.expect("a message").expect("decodes");
+        assert_eq!(&first[..], b"hello");
+        reader.assert_stream_ended().await;
+        reader.assert_drains_then_releases().await;
+    }
+
+    /// A client that trickles data during the drain cannot extend it: the
+    /// deadline is absolute, not an idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_body_reader_drain_deadline_is_not_extended_by_trickled_data() {
+        let (feed, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut reader = Reader::on(
+            FedBody {
+                rx,
+                _dropped: DropFlag(Arc::clone(&dropped)),
+            },
+            dropped,
+        );
+        reader.handler_drops_stream();
+        Reader::settle().await;
+
+        for _ in 0..4 {
+            feed.send(Bytes::from_static(&[0xAA; 8])).unwrap();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            Reader::settle().await;
+        }
+        assert!(!reader.body_dropped(), "still draining before the deadline");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        Reader::settle().await;
+        assert!(reader.body_dropped(), "trickled data extended the drain");
+        assert_no_drain_panicked();
+    }
+
+    /// A body that yields `wire` in frames of `chunk` bytes, then ends.
+    fn chunked_body(wire: &[u8], chunk: usize) -> CountingBody {
+        CountingBody::new(
+            wire.chunks(chunk).map(Bytes::copy_from_slice),
+            &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+
+    /// A large message that arrives over many transport frames reaches the
+    /// handler as the sole owner of its allocation: the request stream keeps
+    /// no buffer that shares it, and nothing is left buffered once it is out.
+    #[tokio::test]
+    async fn test_body_reader_large_message_owns_its_allocation() {
+        let payload = Bytes::from(vec![0x42_u8; 1024 * 1024]);
+        let wire = Envelope::data(payload.clone()).encode();
+        let mut request_stream = decode_request_body(
+            chunked_body(&wire, 16 * 1024),
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+
+        let msg = request_stream
+            .next()
+            .await
+            .expect("message")
+            .expect("decodes");
+        assert_eq!(msg, payload, "message must arrive intact");
+        assert!(msg.is_unique(), "reader shares the message's allocation");
+        assert!(
+            request_stream.next().await.is_none(),
+            "nothing left buffered"
+        );
+    }
+
+    /// A compressed envelope split across frames is reassembled and
+    /// decompressed.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn test_body_reader_compressed_message_across_frames() {
+        let registry = Arc::new(CompressionRegistry::default());
+        let payload = Bytes::from(vec![b'z'; 64 * 1024]);
+        let compressed = registry
+            .compress("gzip", &payload)
+            .expect("gzip compresses");
+        let wire = Envelope::compressed(compressed).encode();
+
+        let mut request_stream = decode_request_body(
+            chunked_body(&wire, 7),
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Some("gzip".to_owned()),
+            registry,
+        );
+        let msg = request_stream
+            .next()
+            .await
+            .expect("message")
+            .expect("decodes");
+        assert_eq!(msg, payload);
+        assert!(request_stream.next().await.is_none());
+    }
+
+    /// gRPC request streams have no END_STREAM envelope: the body simply
+    /// ends. Messages are delivered however the frames slice them (two in one
+    /// frame, one split across frames), the end of the body ends the stream,
+    /// and nothing is left to drain, so the body is released there and then.
+    #[tokio::test]
+    async fn test_body_reader_frames_need_not_align_with_envelopes() {
+        let mut wire = Vec::new();
+        for payload in [&b"one"[..], b"two", b"three"] {
+            wire.extend_from_slice(&Envelope::data(Bytes::copy_from_slice(payload)).encode());
+        }
+        // "one" + "two" + the header and first byte of "three" | the rest.
+        let split = wire.len() - 4;
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = CountingBody::new(
+            [
+                Bytes::copy_from_slice(&wire[..split]),
+                Bytes::copy_from_slice(&wire[split..]),
+            ],
+            &pulled,
+        );
+
+        let mut request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        let mut got = Vec::new();
+        while let Some(item) = request_stream.next().await {
+            got.push(item.expect("message decodes"));
+        }
+        assert_eq!(got, [&b"one"[..], b"two", b"three"]);
+        assert_eq!(
+            Arc::strong_count(&pulled),
+            1,
+            "body released at its end, no drain involved"
+        );
+        assert_eq!(
+            pulled.load(std::sync::atomic::Ordering::Relaxed),
+            wire.len()
+        );
+    }
+
+    /// Test body that replays a fixed sequence of frames (data or trailers)
+    /// and can claim `is_end_stream()` from the start; records bytes pulled.
+    struct ScriptedBody {
+        frames: std::collections::VecDeque<Frame<Bytes>>,
+        claims_end_stream: bool,
+        pulled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Body for ScriptedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            let frame = this.frames.pop_front();
+            if let Some(data) = frame.as_ref().and_then(Frame::data_ref) {
+                this.pulled
+                    .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            Poll::Ready(frame.map(Ok))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.claims_end_stream
+        }
+    }
+
+    /// A trailers frame between the messages and the end of the body carries
+    /// nothing for the decoder and is skipped.
+    #[tokio::test]
+    async fn test_body_reader_skips_trailers_frames() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("abc"));
+        let body = ScriptedBody {
+            frames: [
+                Frame::data(Envelope::data(Bytes::from_static(b"hello")).encode()),
+                Frame::trailers(trailers),
+            ]
+            .into(),
+            claims_end_stream: false,
+            pulled: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let mut request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        assert_eq!(&request_stream.next().await.unwrap().unwrap()[..], b"hello");
+        assert!(request_stream.next().await.is_none());
+    }
+
+    /// A body that already reports its end when the handler drops the
+    /// request stream needs no drain: it is released on the spot.
+    #[tokio::test]
+    async fn test_body_reader_drop_with_body_at_end_of_stream_spawns_nothing() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = ScriptedBody {
+            frames: [Frame::data(Bytes::from_static(b"never read"))].into(),
+            claims_end_stream: true,
+            pulled: Arc::clone(&pulled),
+        };
+        let request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        drop(request_stream);
+        assert_eq!(Arc::strong_count(&pulled), 1, "released synchronously");
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A request stream dropped on a thread outside any runtime is still
+    /// drained, on the runtime it was created on.
+    #[tokio::test]
+    async fn test_body_reader_dropped_off_runtime_drains_on_its_own() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = CountingBody::new(
+            [Envelope::data(Bytes::from_static(b"unread")).encode()],
+            &pulled,
+        );
+        let request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        std::thread::spawn(move || drop(request_stream))
+            .join()
+            .expect("dropping the stream must not panic");
+        body_released(&pulled).await;
+        assert_eq!(
+            pulled.load(std::sync::atomic::Ordering::Relaxed),
+            Envelope::data(Bytes::from_static(b"unread")).encode().len(),
+            "the body was drained"
+        );
+    }
+
+    /// A request stream created and dropped outside any Tokio runtime
+    /// releases the body instead of panicking for want of a runtime to drain
+    /// it on.
+    #[test]
+    fn test_body_reader_dropped_outside_a_runtime_does_not_panic() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = CountingBody::new(
+            [Envelope::data(Bytes::from_static(b"unread")).encode()],
+            &pulled,
+        );
+        let request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        drop(request_stream);
+        assert_eq!(Arc::strong_count(&pulled), 1);
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A body that ends part-way through an envelope surfaces
+    /// `invalid_argument` to the handler rather than a clean end of stream.
+    #[tokio::test]
+    async fn test_body_reader_incomplete_envelope_at_eof() {
+        let wire = Envelope::data(Bytes::from_static(b"hello world")).encode();
+        let mut frames = std::collections::VecDeque::new();
+        frames.push_back(wire.slice(..3));
+        frames.push_back(wire.slice(3..9));
+        let body = CountingBody::new(frames, &Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+
+        let mut request_stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        let err = request_stream
+            .next()
+            .await
+            .expect("an item must be delivered")
+            .expect_err("a truncated envelope is an error");
+        assert_eq!(err.code, crate::error::ErrorCode::InvalidArgument);
+        assert_eq!(err.message.as_deref(), Some("incomplete request envelope"));
+        assert!(request_stream.next().await.is_none());
     }
 
     /// An END_STREAM envelope with no preceding messages (the typical
@@ -5072,12 +6095,9 @@ mod tests {
         let mut frames = std::collections::VecDeque::new();
         frames.push_back(end_stream_frame);
 
-        let body = CountingBody {
-            frames,
-            pulled: Arc::clone(&pulled),
-        };
+        let body = CountingBody::new(frames, &pulled);
 
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
@@ -5088,10 +6108,7 @@ mod tests {
             request_stream.next().await.is_none(),
             "request stream must end cleanly with no messages"
         );
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
+        body_released(&pulled).await;
         assert_eq!(
             pulled.load(std::sync::atomic::Ordering::Relaxed),
             frame_len,
@@ -5114,12 +6131,9 @@ mod tests {
         let mut frames = std::collections::VecDeque::new();
         frames.push_back(frame);
 
-        let body = CountingBody {
-            frames,
-            pulled: Arc::clone(&pulled),
-        };
+        let body = CountingBody::new(frames, &pulled);
 
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
@@ -5130,10 +6144,7 @@ mod tests {
             request_stream.next().await.is_none(),
             "trailing junk after END_STREAM must not surface to the handler"
         );
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
+        body_released(&pulled).await;
         assert_eq!(
             pulled.load(std::sync::atomic::Ordering::Relaxed),
             frame_len,
@@ -5153,12 +6164,9 @@ mod tests {
         frames.push_back(data_frame);
         frames.push_back(end_stream_frame);
 
-        let body = CountingBody {
-            frames,
-            pulled: Arc::clone(&pulled),
-        };
+        let body = CountingBody::new(frames, &pulled);
 
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
@@ -5176,10 +6184,7 @@ mod tests {
             "request stream must end after END_STREAM"
         );
 
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
+        body_released(&pulled).await;
         assert_eq!(
             pulled.load(std::sync::atomic::Ordering::Relaxed),
             total_len,
@@ -5187,11 +6192,11 @@ mod tests {
         );
     }
 
-    /// When the handler drops the request stream, the reader stops decoding
-    /// and drains the remaining body bounded by `MAX_DRAIN_BYTES` instead of
-    /// buffering or forwarding it.
+    /// When the handler drops the request stream unread, the remaining body
+    /// is drained, bounded by `MAX_DRAIN_BYTES`, rather than abandoned,
+    /// buffered or decoded.
     #[tokio::test]
-    async fn test_body_reader_bounds_data_after_receiver_dropped() {
+    async fn test_body_reader_bounds_data_after_stream_dropped() {
         const CHUNK_SIZE: usize = 64 * 1024;
         const JUNK_TOTAL: usize = 4 * 1024 * 1024;
 
@@ -5204,12 +6209,9 @@ mod tests {
             frames.push_back(Bytes::from(vec![0xAA_u8; CHUNK_SIZE]));
         }
 
-        let body = CountingBody {
-            frames,
-            pulled: Arc::clone(&pulled),
-        };
+        let body = CountingBody::new(frames, &pulled);
 
-        let (request_stream, reader_task) = spawn_body_reader(
+        let request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
@@ -5218,17 +6220,14 @@ mod tests {
         // The handler gives up on the request stream immediately.
         drop(request_stream);
 
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
+        body_released(&pulled).await;
 
         let pulled = pulled.load(std::sync::atomic::Ordering::Relaxed);
         let max_expected = MAX_DRAIN_BYTES + 2 * CHUNK_SIZE;
         assert!(
-            pulled <= max_expected,
-            "reader pulled {pulled} bytes after the receiver was dropped \
-             (expected at most {max_expected})"
+            pulled > MAX_DRAIN_BYTES && pulled <= max_expected,
+            "reader pulled {pulled} bytes after the stream was dropped \
+             (expected more than {MAX_DRAIN_BYTES} and at most {max_expected})"
         );
     }
 
@@ -5253,12 +6252,9 @@ mod tests {
             frames.push_back(Bytes::from(vec![0xAA_u8; CHUNK_SIZE]));
         }
 
-        let body = CountingBody {
-            frames,
-            pulled: Arc::clone(&pulled),
-        };
+        let body = CountingBody::new(frames, &pulled);
 
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             MAX_MESSAGE_SIZE,
             None,
@@ -5275,25 +6271,34 @@ mod tests {
             "no further items after the decode error"
         );
 
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
+        body_released(&pulled).await;
 
         let pulled = pulled.load(std::sync::atomic::Ordering::Relaxed);
         let max_expected = MAX_DRAIN_BYTES + 2 * CHUNK_SIZE;
         assert!(
-            pulled <= max_expected,
+            pulled > MAX_DRAIN_BYTES && pulled <= max_expected,
             "reader pulled {pulled} bytes after the decode error \
-             (expected at most {max_expected})"
+             (expected more than {MAX_DRAIN_BYTES} and at most {max_expected})"
         );
     }
 
-    /// Test body that yields a fixed sequence of data frames and then fails
-    /// with a single transport-level body error.
+    /// Test body that yields a fixed sequence of data frames, then fails with
+    /// a single transport-level body error, then stays pending.
     struct ErrorAfterFramesBody {
         frames: std::collections::VecDeque<Bytes>,
         errored: bool,
+        _dropped: DropFlag,
+    }
+
+    impl ErrorAfterFramesBody {
+        fn new(frame: Bytes, dropped: &Arc<AtomicBool>) -> Self {
+            count_panics();
+            Self {
+                frames: [frame].into(),
+                errored: false,
+                _dropped: DropFlag(Arc::clone(dropped)),
+            }
+        }
     }
 
     impl Body for ErrorAfterFramesBody {
@@ -5318,7 +6323,7 @@ mod tests {
                 ))));
             }
 
-            Poll::Ready(None)
+            Poll::Pending
         }
     }
 
@@ -5328,15 +6333,13 @@ mod tests {
     /// is indistinguishable from a complete client stream.
     #[tokio::test]
     async fn test_body_reader_surfaces_body_error_while_decoding() {
-        let mut frames = std::collections::VecDeque::new();
-        frames.push_back(Envelope::data(Bytes::from_static(b"hello")).encode());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = ErrorAfterFramesBody::new(
+            Envelope::data(Bytes::from_static(b"hello")).encode(),
+            &dropped,
+        );
 
-        let body = ErrorAfterFramesBody {
-            frames,
-            errored: false,
-        };
-
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
@@ -5365,33 +6368,30 @@ mod tests {
             "unexpected error message: {:?}",
             err.message
         );
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "a failed body is released at once, not drained"
+        );
 
         assert!(
             request_stream.next().await.is_none(),
             "no further items after the body error"
         );
-
-        reader_task
-            .expect("tests run inside a tokio runtime")
-            .await
-            .expect("reader task must not panic");
     }
 
-    /// Once the reader has finished decoding (here: a clean END_STREAM has put
-    /// it in drain mode), a subsequent transport-level body error is
-    /// diagnostic-only — the handler already observed the terminal end of the
-    /// stream and must not then receive a spurious error.
-    #[tokio::test]
+    /// Once the stream has finished decoding (here: a clean END_STREAM), a
+    /// transport-level body error during the drain is diagnostic-only — the
+    /// handler already observed the terminal end of the stream and must not
+    /// then receive a spurious error — and ends the drain.
+    #[tokio::test(start_paused = true)]
     async fn test_body_reader_body_error_after_end_stream_is_suppressed() {
-        let mut frames = std::collections::VecDeque::new();
-        frames.push_back(Envelope::end_stream(Bytes::from_static(b"{}")).encode());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = ErrorAfterFramesBody::new(
+            Envelope::end_stream(Bytes::from_static(b"{}")).encode(),
+            &dropped,
+        );
 
-        let body = ErrorAfterFramesBody {
-            frames,
-            errored: false,
-        };
-
-        let (mut request_stream, reader_task) = spawn_body_reader(
+        let mut request_stream = decode_request_body(
             body,
             DEFAULT_MAX_MESSAGE_SIZE,
             None,
@@ -5399,15 +6399,1161 @@ mod tests {
         );
 
         // END_STREAM ended the stream cleanly; the body error that follows is
-        // suppressed, so the handler sees a clean end with no error item.
+        // met by the drain, so the handler sees a clean end with no error item.
         assert!(
             request_stream.next().await.is_none(),
             "a body error after END_STREAM must not surface to the handler"
         );
+        // The body stays pending after its error: only a drain that stopped
+        // at the error has released it without the clock moving.
+        Reader::settle().await;
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "the drain ends at the error"
+        );
+        assert_no_drain_panicked();
+    }
 
-        reader_task
-            .expect("tests run inside a tokio runtime")
+    /// An error propagated out of a client call carries the upstream
+    /// response's headers, and a gateway handler returns it as its own
+    /// error. Echoing that block verbatim would put a second
+    /// `content-type` on the wire and describe this response's body with
+    /// the upstream's framing, so the server's own headers win and the
+    /// unforwardable ones are dropped — while the server metadata the
+    /// caller wanted forwarded still gets through.
+    ///
+    /// `content-length` is the one that actually breaks a client: hyper's
+    /// HTTP/1 encoder refuses to serialize a response whose declared
+    /// length contradicts the body, closing the connection with nothing
+    /// written, so the caller sees a transport failure rather than the
+    /// handler's error code.
+    fn upstream_error() -> ConnectError {
+        let mut upstream = http::HeaderMap::new();
+        upstream.insert(
+            header::CONTENT_TYPE,
+            "application/grpc+proto".parse().unwrap(),
+        );
+        upstream.insert(header::CONTENT_LENGTH, "4096".parse().unwrap());
+        upstream.insert(header::CONNECTION, "close".parse().unwrap());
+        upstream.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        upstream.insert(
+            header::DATE,
+            "Thu, 01 Jan 1970 00:00:00 GMT".parse().unwrap(),
+        );
+        upstream.insert(
+            crate::protocol::hdr::GRPC_ENCODING.clone(),
+            "gzip".parse().unwrap(),
+        );
+        // An upstream status proto whose code contradicts the one we send.
+        upstream.insert(
+            crate::protocol::hdr::GRPC_STATUS_DETAILS_BIN.clone(),
+            "CAcSBW5vcGU".parse().unwrap(),
+        );
+        upstream.insert("x-upstream-region", "eu-west-1".parse().unwrap());
+        upstream.append("x-upstream-tag", "a".parse().unwrap());
+        upstream.append("x-upstream-tag", "b".parse().unwrap());
+
+        let mut err = ConnectError::unavailable("upstream is down");
+        err.set_response_headers(upstream);
+        err
+    }
+
+    fn assert_safe_echo(headers: &http::HeaderMap, expected_content_type: &str) {
+        assert_eq!(
+            headers.get_all(header::CONTENT_TYPE).iter().count(),
+            1,
+            "exactly one content-type must reach the wire: {headers:?}"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            expected_content_type
+        );
+        for dropped in [
+            header::CONTENT_LENGTH,
+            header::CONNECTION,
+            header::TRANSFER_ENCODING,
+            header::DATE,
+            crate::protocol::hdr::GRPC_ENCODING.clone(),
+            crate::protocol::hdr::GRPC_STATUS_DETAILS_BIN.clone(),
+        ] {
+            assert!(
+                !headers.contains_key(&dropped),
+                "{dropped} describes the upstream response and must not be forwarded"
+            );
+        }
+
+        // The point of attaching headers to an error is that this survives.
+        assert_eq!(headers.get("x-upstream-region").unwrap(), "eu-west-1");
+        let tags: Vec<_> = headers
+            .get_all("x-upstream-tag")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(tags, ["a", "b"], "multi-valued metadata keeps every value");
+    }
+
+    #[test]
+    fn propagated_upstream_headers_do_not_corrupt_the_connect_unary_response() {
+        let response = error_response(upstream_error());
+        assert_safe_echo(response.headers(), content_type::JSON);
+    }
+
+    #[test]
+    fn propagated_upstream_headers_do_not_corrupt_the_connect_streaming_response() {
+        let response =
+            streaming_error_response(&upstream_error(), Protocol::Connect, CodecFormat::Proto);
+        assert_safe_echo(
+            response.headers(),
+            Protocol::Connect.response_content_type(CodecFormat::Proto, true),
+        );
+    }
+
+    #[test]
+    fn propagated_upstream_headers_do_not_corrupt_the_grpc_streaming_response() {
+        let response =
+            streaming_error_response(&upstream_error(), Protocol::Grpc, CodecFormat::Proto);
+        assert_safe_echo(
+            response.headers(),
+            Protocol::Grpc.response_content_type(CodecFormat::Proto, true),
+        );
+        // The trailers-only status headers are the server's own and stay.
+        assert_eq!(response.headers().get(&GRPC_STATUS).unwrap(), "14");
+    }
+
+    /// Per-route limits: a route carrying its own `Limits` is held to them on
+    /// every dispatch path, other routes keep the service-wide limits, and a
+    /// route may be looser than the service as well as tighter.
+    mod route_limits {
+        use super::*;
+        use buffa_types::google::protobuf::StringValue;
+
+        const TIGHT: usize = 64;
+        /// gRPC status text for `resource_exhausted`.
+        fn exhausted() -> String {
+            crate::ErrorCode::ResourceExhausted.grpc_code().to_string()
+        }
+
+        fn echo() -> impl crate::Handler<StringValue, StringValue> {
+            crate::handler_fn(|_ctx: RequestContext, req: StringValue| async move {
+                crate::Response::ok(req)
+            })
+        }
+
+        fn echo_stream() -> impl crate::handler::StreamingHandler<StringValue, StringValue> {
+            crate::handler::streaming_handler_fn(
+                |_ctx: RequestContext, req: StringValue| async move {
+                    crate::Response::stream_ok(futures::stream::iter([Ok(req)]))
+                },
+            )
+        }
+
+        /// `svc/Tight` and `svc/TightStream` are limited to `TIGHT` bytes;
+        /// `svc/Default` uses whatever the service is configured with.
+        fn router() -> Arc<Router> {
+            let tight = Limits::default()
+                .with_max_message_size(TIGHT)
+                .with_max_request_body_size(TIGHT);
+            Arc::new(
+                Router::new()
+                    .route("svc", "Tight", echo())
+                    .route("svc", "Default", echo())
+                    .route_server_stream("svc", "TightStream", echo_stream())
+                    .with_route_limits("/svc/Tight", tight)
+                    .with_route_limits("svc/TightStream", tight),
+            )
+        }
+
+        fn message(len: usize) -> Bytes {
+            crate::codec::encode_proto(&StringValue {
+                value: "x".repeat(len),
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        fn enveloped(msg: Bytes) -> Bytes {
+            Envelope::data(msg).encode()
+        }
+
+        fn post(path: &str, content_type: &str, body: Bytes) -> Request<Full<Bytes>> {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Full::new(body))
+                .unwrap()
+        }
+
+        async fn call<B>(
+            router: &Arc<Router>,
+            service_limits: Limits,
+            req: Request<B>,
+        ) -> Result<Response<ConnectRpcBody>, ConnectError>
+        where
+            B: Body<Data = Bytes> + Send + 'static,
+            B::Error: std::error::Error + Send + Sync + 'static,
+        {
+            handle_request(
+                Arc::clone(router),
+                req,
+                service_limits,
+                Arc::new(CompressionRegistry::new()),
+                &CompressionPolicy::default(),
+                &DeadlinePolicy::new(),
+                &[],
+            )
             .await
-            .expect("reader task must not panic");
+        }
+
+        /// `grpc-status` from the response headers (a trailers-only error) —
+        /// `None` for a response that carries messages.
+        fn grpc_status_header(resp: &Response<ConnectRpcBody>) -> Option<String> {
+            resp.headers()
+                .get("grpc-status")
+                .map(|v| v.to_str().unwrap().to_owned())
+        }
+
+        /// `grpc-status` from the body trailers of a response that started
+        /// streaming.
+        async fn grpc_status_trailer(resp: Response<ConnectRpcBody>) -> Option<String> {
+            let body = resp.into_body().collect().await.unwrap();
+            body.trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .map(|v| v.to_str().unwrap().to_owned())
+        }
+
+        #[tokio::test]
+        async fn connect_unary_route_limit_rejects_oversized_and_spares_other_routes() {
+            let router = router();
+            let big = message(2 * TIGHT);
+            let default = Limits::default();
+
+            let err = call(
+                &router,
+                default,
+                post("/svc/Tight", "application/proto", big.clone()),
+            )
+            .await
+            .err()
+            .expect("route limit must reject the oversized body");
+            assert_eq!(err.code, crate::ErrorCode::ResourceExhausted);
+
+            let ok = call(
+                &router,
+                default,
+                post("/svc/Default", "application/proto", big),
+            )
+            .await
+            .expect("service-wide limits admit it on another route");
+            assert_eq!(ok.status(), StatusCode::OK);
+
+            let ok = call(
+                &router,
+                default,
+                post("/svc/Tight", "application/proto", message(8)),
+            )
+            .await
+            .expect("a request within the route limit is served");
+            assert_eq!(ok.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn grpc_unary_fast_path_honours_route_limit() {
+            let router = router();
+            let big = enveloped(message(2 * TIGHT));
+            let default = Limits::default();
+
+            let resp = call(
+                &router,
+                default,
+                post("/svc/Tight", "application/grpc", big.clone()),
+            )
+            .await
+            .expect("gRPC errors are trailers-only responses");
+            assert_eq!(grpc_status_header(&resp), Some(exhausted()));
+
+            let resp = call(
+                &router,
+                default,
+                post("/svc/Default", "application/grpc", big),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grpc_status_header(&resp), None);
+            assert_eq!(grpc_status_trailer(resp).await.as_deref(), Some("0"));
+        }
+
+        #[tokio::test]
+        async fn streaming_path_honours_route_limit() {
+            let router = router();
+            let default = Limits::default();
+
+            let big = enveloped(message(2 * TIGHT));
+            let resp = call(
+                &router,
+                default,
+                post("/svc/TightStream", "application/grpc", big),
+            )
+            .await
+            .expect("gRPC errors are trailers-only responses");
+            assert_eq!(grpc_status_header(&resp), Some(exhausted()));
+
+            let small = enveloped(message(8));
+            let resp = call(
+                &router,
+                default,
+                post("/svc/TightStream", "application/grpc", small),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grpc_status_header(&resp), None);
+            assert_eq!(grpc_status_trailer(resp).await.as_deref(), Some("0"));
+        }
+
+        /// The route's limits replace the service-wide ones outright, so a
+        /// route can admit what the rest of the service refuses.
+        #[tokio::test]
+        async fn route_limit_can_loosen_service_limit() {
+            let service_tight = Limits::default()
+                .with_max_message_size(TIGHT)
+                .with_max_request_body_size(TIGHT);
+            let router = Arc::new(
+                Router::new()
+                    .route("svc", "Upload", echo())
+                    .route("svc", "Default", echo())
+                    .with_route_limits("/svc/Upload", Limits::default()),
+            );
+            let big = message(2 * TIGHT);
+
+            let ok = call(
+                &router,
+                service_tight,
+                post("/svc/Upload", "application/proto", big.clone()),
+            )
+            .await
+            .expect("the route's own (default) limits admit it");
+            assert_eq!(ok.status(), StatusCode::OK);
+
+            let err = call(
+                &router,
+                service_tight,
+                post("/svc/Default", "application/proto", big),
+            )
+            .await
+            .err()
+            .expect("the service-wide limit still governs other routes");
+            assert_eq!(err.code, crate::ErrorCode::ResourceExhausted);
+        }
+
+        /// Bytes the server read from a 64 × 1 KiB body before answering `req`.
+        async fn bytes_polled(router: &Arc<Router>, req: http::request::Builder) -> usize {
+            let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let body = CountingBody::new(
+                std::iter::repeat_n(Bytes::from(vec![0u8; 1024]), 64),
+                &pulled,
+            );
+            let _ = call(router, Limits::default(), req.body(body).unwrap()).await;
+            pulled.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Requests refused before dispatch — wrong verb, unknown content
+        /// type, unsupported encoding — still drain the body for keep-alive,
+        /// and on a route with its own limits that drain stops at the route's
+        /// limit (after the first 1 KiB frame here) rather than the
+        /// service-wide one (all 64 KiB).
+        #[tokio::test]
+        async fn pre_dispatch_error_drains_honour_route_limit() {
+            let router = router();
+            let put = || Request::builder().method(Method::PUT);
+            let post = || Request::builder().method(Method::POST);
+
+            // 405: verb not allowed.
+            assert_eq!(bytes_polled(&router, put().uri("/svc/Tight")).await, 1024);
+            assert_eq!(
+                bytes_polled(&router, put().uri("/svc/Default")).await,
+                64 * 1024
+            );
+            // 415: unknown content type.
+            let unknown_ct =
+                |b: http::request::Builder| b.header(header::CONTENT_TYPE, "application/foo");
+            assert_eq!(
+                bytes_polled(&router, unknown_ct(post().uri("/svc/Tight"))).await,
+                1024
+            );
+            assert_eq!(
+                bytes_polled(&router, unknown_ct(post().uri("/svc/Default"))).await,
+                64 * 1024
+            );
+            // Unsupported request compression on a streaming route.
+            let bogus_encoding = |b: http::request::Builder| {
+                b.header(header::CONTENT_TYPE, "application/grpc")
+                    .header("grpc-encoding", "bogus")
+            };
+            assert_eq!(
+                bytes_polled(&router, bogus_encoding(post().uri("/svc/TightStream"))).await,
+                1024
+            );
+            assert_eq!(
+                bytes_polled(&router, bogus_encoding(post().uri("/svc/Default"))).await,
+                64 * 1024
+            );
+        }
+
+        #[tokio::test]
+        async fn connect_get_honours_route_limit() {
+            use base64::Engine as _;
+            let tight = Limits::default().with_max_message_size(TIGHT);
+            let router = Arc::new(
+                Router::new()
+                    .route_idempotent("svc", "TightGet", echo())
+                    .route_idempotent("svc", "DefaultGet", echo())
+                    .with_route_limits("svc/TightGet", tight),
+            );
+            let msg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message(2 * TIGHT));
+            let get = |path: &str| {
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "{path}?encoding=proto&base64=1&connect=v1&message={msg}"
+                    ))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap()
+            };
+            let err = call(&router, Limits::default(), get("/svc/TightGet"))
+                .await
+                .err()
+                .expect("over the route limit");
+            assert_eq!(err.code, crate::ErrorCode::ResourceExhausted);
+            let ok = call(&router, Limits::default(), get("/svc/DefaultGet"))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn client_streaming_path_honours_route_limit() {
+            let tight = Limits::default().with_max_message_size(TIGHT);
+            let concat = crate::handler::client_streaming_handler_fn(
+                |_ctx: RequestContext, mut reqs: crate::ServiceStream<StringValue>| async move {
+                    use futures::StreamExt as _;
+                    let mut out = String::new();
+                    while let Some(r) = reqs.next().await {
+                        out.push_str(&r?.value);
+                    }
+                    crate::Response::ok(StringValue {
+                        value: out,
+                        ..Default::default()
+                    })
+                },
+            );
+            let router = Arc::new(
+                Router::new()
+                    .route_client_stream("svc", "Concat", concat)
+                    .with_route_limits("svc/Concat", tight),
+            );
+            let mut two = enveloped(message(8)).to_vec();
+            two.extend_from_slice(&enveloped(message(2 * TIGHT)));
+            let resp = call(
+                &router,
+                Limits::default(),
+                post("/svc/Concat", "application/grpc", Bytes::from(two)),
+            )
+            .await
+            .unwrap();
+            // The first message is within the limit; the second is not, and
+            // the error arrives in the trailers of an already-started stream.
+            assert_eq!(grpc_status_trailer(resp).await, Some(exhausted()));
+        }
+
+        /// The third `Limits` field, the decode budget, follows the route too:
+        /// a message that is tiny on the wire but allocates 64 elements is
+        /// refused on a route whose budget is one byte and served elsewhere.
+        #[tokio::test]
+        async fn route_limit_carries_the_element_budget() {
+            use buffa_types::google::protobuf::{ListValue, Value};
+            let count = || {
+                crate::handler_fn(|_ctx: RequestContext, req: ListValue| async move {
+                    crate::Response::ok(StringValue {
+                        value: req.values.len().to_string(),
+                        ..Default::default()
+                    })
+                })
+            };
+            let router = Arc::new(
+                Router::new()
+                    .route("svc", "TightCount", count())
+                    .route("svc", "Count", count())
+                    .with_route_limits(
+                        "svc/TightCount",
+                        Limits::default().with_element_memory_limit(1),
+                    ),
+            );
+            let list = Bytes::from(buffa::Message::encode_to_vec(&ListValue {
+                values: (0..64).map(|_| Value::default()).collect(),
+                ..Default::default()
+            }));
+            let err = call(
+                &router,
+                Limits::default(),
+                post("/svc/TightCount", "application/proto", list.clone()),
+            )
+            .await
+            .err()
+            .expect("over the route's element budget");
+            assert_eq!(err.code, crate::ErrorCode::InvalidArgument);
+            let ok = call(
+                &router,
+                Limits::default(),
+                post("/svc/Count", "application/proto", list),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+        }
+
+        /// The lookup runs before the body read, but a miss must still surface
+        /// as `unimplemented` after the drain, not as a limits error.
+        #[tokio::test]
+        async fn unknown_route_still_reports_not_found() {
+            let router = router();
+            let err = call(
+                &router,
+                Limits::default(),
+                post("/svc/Missing", "application/proto", message(8)),
+            )
+            .await
+            .err()
+            .expect("miss");
+            assert_eq!(err.code, crate::ErrorCode::Unimplemented);
+        }
+    }
+
+    /// The request's header map is moved into the handler's `RequestContext`
+    /// on every dispatch path. Each path takes the request apart at a
+    /// different point, so each is driven separately; client- and
+    /// bidi-streaming receive the parsed metadata from
+    /// `handle_streaming_request` rather than the request itself.
+    mod request_headers_reach_handler {
+        use super::*;
+        use buffa_types::google::protobuf::StringValue;
+        use std::sync::Mutex;
+
+        const PROBE: &str = "x-probe";
+
+        type Seen = Arc<Mutex<Vec<Option<String>>>>;
+
+        fn record(seen: &Seen, ctx: &RequestContext) {
+            seen.lock().unwrap().push(
+                ctx.header(PROBE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+            );
+        }
+
+        fn router(seen: &Seen) -> Arc<Router> {
+            let unary = {
+                let seen = Arc::clone(seen);
+                crate::handler_fn(move |ctx: RequestContext, req: StringValue| {
+                    record(&seen, &ctx);
+                    async move { crate::Response::ok(req) }
+                })
+            };
+            let unary_get = {
+                let seen = Arc::clone(seen);
+                crate::handler_fn(move |ctx: RequestContext, req: StringValue| {
+                    record(&seen, &ctx);
+                    async move { crate::Response::ok(req) }
+                })
+            };
+            let server_stream = {
+                let seen = Arc::clone(seen);
+                crate::handler::streaming_handler_fn(
+                    move |ctx: RequestContext, req: StringValue| {
+                        record(&seen, &ctx);
+                        async move { crate::Response::stream_ok(futures::stream::iter([Ok(req)])) }
+                    },
+                )
+            };
+            let client_stream = {
+                let seen = Arc::clone(seen);
+                crate::handler::client_streaming_handler_fn(
+                    move |ctx: RequestContext, _reqs: crate::ServiceStream<StringValue>| {
+                        record(&seen, &ctx);
+                        async move { crate::Response::ok(StringValue::default()) }
+                    },
+                )
+            };
+            let bidi = {
+                let seen = Arc::clone(seen);
+                crate::handler::bidi_streaming_handler_fn(
+                    move |ctx: RequestContext, reqs: crate::ServiceStream<StringValue>| {
+                        record(&seen, &ctx);
+                        async move { crate::Response::stream_ok(reqs) }
+                    },
+                )
+            };
+            Arc::new(
+                Router::new()
+                    .route("svc", "Unary", unary)
+                    .route_idempotent("svc", "Get", unary_get)
+                    .route_server_stream("svc", "ServerStream", server_stream)
+                    .route_client_stream("svc", "ClientStream", client_stream)
+                    .route_bidi_stream("svc", "Bidi", bidi),
+            )
+        }
+
+        fn message() -> Bytes {
+            crate::codec::encode_proto(&StringValue {
+                value: "v".into(),
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        fn post(path: &str, content_type: &str, body: Bytes, probe: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(PROBE, probe)
+                .body(Full::new(body))
+                .unwrap()
+        }
+
+        async fn call(router: &Arc<Router>, req: Request<Full<Bytes>>) {
+            let resp = handle_request(
+                Arc::clone(router),
+                req,
+                Limits::default(),
+                Arc::new(CompressionRegistry::new()),
+                &CompressionPolicy::default(),
+                &DeadlinePolicy::new(),
+                &[],
+            )
+            .await
+            .expect("dispatch succeeds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Drive the body so streaming handlers run to completion.
+            let _ = resp.into_body().collect().await;
+        }
+
+        #[tokio::test]
+        async fn on_every_dispatch_path() {
+            use base64::Engine as _;
+            let seen: Seen = Arc::default();
+            let router = router(&seen);
+            let enveloped = Envelope::data(message()).encode();
+
+            call(
+                &router,
+                post(
+                    "/svc/Unary",
+                    "application/proto",
+                    message(),
+                    "connect-unary",
+                ),
+            )
+            .await;
+            let get = Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/svc/Get?encoding=proto&base64=1&connect=v1&message={}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message())
+                ))
+                .header(PROBE, "connect-get")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            call(&router, get).await;
+            call(
+                &router,
+                post(
+                    "/svc/Unary",
+                    "application/grpc",
+                    enveloped.clone(),
+                    "grpc-unary",
+                ),
+            )
+            .await;
+            call(
+                &router,
+                post(
+                    "/svc/ServerStream",
+                    "application/grpc",
+                    enveloped.clone(),
+                    "server-stream",
+                ),
+            )
+            .await;
+            call(
+                &router,
+                post(
+                    "/svc/ClientStream",
+                    "application/grpc",
+                    enveloped.clone(),
+                    "client-stream",
+                ),
+            )
+            .await;
+            call(
+                &router,
+                post("/svc/Bidi", "application/grpc", enveloped, "bidi"),
+            )
+            .await;
+
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    "connect-unary",
+                    "connect-get",
+                    "grpc-unary",
+                    "server-stream",
+                    "client-stream",
+                    "bidi"
+                ]
+                .map(|s| Some(s.to_owned())),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod intercept_head_tests {
+    use super::*;
+    use crate::interceptor::Interceptor;
+    use crate::spec::{Spec, StreamType};
+    use crate::{ServiceStream, client_streaming_handler_fn, handler_fn};
+    use buffa_types::Empty;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    const UNARY: Spec = Spec::server("/svc/Unary", StreamType::Unary);
+
+    /// A request body that counts how often it is polled.
+    struct CountedBody(Arc<AtomicUsize>);
+
+    impl Body for CountedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(None)
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        Accept,
+        Reject,
+    }
+
+    /// Records its name in `log`, then accepts or rejects in `intercept_head`.
+    struct Head {
+        name: &'static str,
+        verdict: Verdict,
+        log: Log,
+    }
+
+    #[async_trait::async_trait]
+    impl Interceptor for Head {
+        async fn intercept_head(&self, _head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+            self.log.lock().unwrap().push(self.name);
+            match self.verdict {
+                Verdict::Accept => Ok(()),
+                Verdict::Reject => Err(ConnectError::unauthenticated("no credential")),
+            }
+        }
+    }
+
+    fn head(name: &'static str, verdict: Verdict, log: &Log) -> Arc<dyn Interceptor> {
+        Arc::new(Head {
+            name,
+            verdict,
+            log: Arc::clone(log),
+        })
+    }
+
+    /// One handler of each kind; each records that it ran.
+    fn router(ran: &Arc<AtomicBool>) -> Router {
+        let unary = Arc::clone(ran);
+        let get = Arc::clone(ran);
+        let client = Arc::clone(ran);
+        Router::new()
+            .route(
+                "svc",
+                "Unary",
+                handler_fn(move |_ctx: RequestContext, _req: Empty| {
+                    unary.store(true, Ordering::SeqCst);
+                    async { crate::Response::ok(Empty::default()) }
+                }),
+            )
+            .with_spec(UNARY)
+            .route_idempotent(
+                "svc",
+                "Get",
+                handler_fn(move |_ctx: RequestContext, _req: Empty| {
+                    get.store(true, Ordering::SeqCst);
+                    async { crate::Response::ok(Empty::default()) }
+                }),
+            )
+            .route_client_stream(
+                "svc",
+                "Client",
+                client_streaming_handler_fn(
+                    move |_ctx: RequestContext, requests: ServiceStream<Empty>| {
+                        client.store(true, Ordering::SeqCst);
+                        async move {
+                            drop(requests);
+                            crate::Response::ok(Empty::default())
+                        }
+                    },
+                ),
+            )
+    }
+
+    async fn dispatch(
+        router: Router,
+        interceptors: &[Arc<dyn Interceptor>],
+        req: Request<CountedBody>,
+    ) -> Result<Response<ConnectRpcBody>, ConnectError> {
+        handle_request(
+            Arc::new(router),
+            req,
+            Limits::default(),
+            Arc::new(CompressionRegistry::new()),
+            &CompressionPolicy::default(),
+            &DeadlinePolicy::new(),
+            interceptors,
+        )
+        .await
+    }
+
+    fn post(path: &str, content_type: &str, polls: &Arc<AtomicUsize>) -> Request<CountedBody> {
+        Request::post(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(CountedBody(Arc::clone(polls)))
+            .unwrap()
+    }
+
+    /// How a rejection reaches the client in each protocol.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Connect unary: an HTTP error status.
+        HttpStatus,
+        /// gRPC: `grpc-status: 16` in the trailers.
+        GrpcTrailer,
+        /// gRPC-Web: a trailers frame in the body carrying `grpc-status: 16`.
+        GrpcWebFrame,
+        /// Connect streaming: an end-of-stream envelope carrying the code.
+        ConnectEndStream,
+    }
+
+    async fn assert_rejected(result: Result<Response<ConnectRpcBody>, ConnectError>, reply: Reply) {
+        match reply {
+            Reply::HttpStatus => {
+                let Err(err) = result else {
+                    panic!("a Connect unary rejection is an error");
+                };
+                assert_eq!(err.http_status(), StatusCode::UNAUTHORIZED);
+            }
+            Reply::GrpcTrailer => {
+                let response = result.expect("a gRPC rejection is a response");
+                let collected = response.into_body().collect().await.unwrap();
+                let trailers = collected.trailers().expect("gRPC status trailers");
+                assert_eq!(trailers.get("grpc-status").unwrap(), "16");
+            }
+            Reply::GrpcWebFrame => {
+                let response = result.expect("a gRPC-Web rejection is a response");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("grpc-status: 16"),
+                    "the trailers frame must carry the code: {body:?}"
+                );
+            }
+            Reply::ConnectEndStream => {
+                let response = result.expect("a Connect streaming rejection is a response");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("unauthenticated"),
+                    "the end-of-stream envelope must carry the code: {body:?}"
+                );
+            }
+        }
+    }
+
+    /// A rejection in `intercept_head` must leave the body unread and the
+    /// handler unrun, in every dispatch shape, and reach the client in that
+    /// shape's own error format. In the streaming shapes a request stream
+    /// dropped after it was created would drain the body, so the polls are
+    /// counted after the runtime has had time to run a spawned drain. The
+    /// gRPC-Web text-mode shape is one the service rejects with its own drain
+    /// unless the hook runs first.
+    #[tokio::test]
+    async fn head_rejection_reads_no_body_and_runs_no_handler() {
+        const SHAPES: [(&str, &str, &str, Reply); 6] = [
+            (
+                "connect unary",
+                "/svc/Unary",
+                "application/proto",
+                Reply::HttpStatus,
+            ),
+            (
+                "grpc unary",
+                "/svc/Unary",
+                "application/grpc+proto",
+                Reply::GrpcTrailer,
+            ),
+            (
+                "connect client stream",
+                "/svc/Client",
+                "application/connect+proto",
+                Reply::ConnectEndStream,
+            ),
+            (
+                "grpc client stream",
+                "/svc/Client",
+                "application/grpc+proto",
+                Reply::GrpcTrailer,
+            ),
+            (
+                "grpc-web client stream",
+                "/svc/Client",
+                "application/grpc-web+proto",
+                Reply::GrpcWebFrame,
+            ),
+            (
+                "grpc-web text mode",
+                "/svc/Client",
+                "application/grpc-web-text+proto",
+                Reply::GrpcWebFrame,
+            ),
+        ];
+
+        for (name, path, content_type, reply) in SHAPES {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let ran = Arc::new(AtomicBool::new(false));
+            let log = Log::default();
+            let chain = [head("gate", Verdict::Reject, &log)];
+
+            let result = dispatch(router(&ran), &chain, post(path, content_type, &polls)).await;
+            for _ in 0..YIELDS {
+                tokio::task::yield_now().await;
+            }
+
+            assert_rejected(result, reply).await;
+            assert_eq!(polls.load(Ordering::SeqCst), 0, "{name}: body was read");
+            assert!(!ran.load(Ordering::SeqCst), "{name}: handler ran");
+            assert_eq!(*log.lock().unwrap(), ["gate"], "{name}");
+        }
+
+        // Connect GET has no content type, so it gets its own request.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [head("gate", Verdict::Reject, &log)];
+        let req = Request::get("/svc/Get?message=&encoding=proto&base64=1&connect=v1")
+            .body(CountedBody(Arc::clone(&polls)))
+            .unwrap();
+        let result = dispatch(router(&ran), &chain, req).await;
+        assert_rejected(result, Reply::HttpStatus).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "connect get: body was read"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "connect get: handler ran");
+    }
+
+    /// Enough turns for a spawned drain to poll the body.
+    const YIELDS: usize = 5;
+
+    /// Every interceptor's head check runs, outermost first, until one
+    /// rejects; interceptors after the rejecting one are not consulted.
+    #[tokio::test]
+    async fn head_checks_run_in_registration_order_and_stop_at_the_first_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [
+            head("first", Verdict::Accept, &log),
+            head("second", Verdict::Reject, &log),
+            head("third", Verdict::Accept, &log),
+        ];
+
+        let result = dispatch(
+            router(&ran),
+            &chain,
+            post("/svc/Unary", "application/proto", &polls),
+        )
+        .await;
+
+        assert_rejected(result, Reply::HttpStatus).await;
+        assert_eq!(*log.lock().unwrap(), ["first", "second"]);
+    }
+
+    /// What the head shows for one request.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        path: String,
+        spec: Option<Spec>,
+        protocol: Protocol,
+        authorization: Option<String>,
+        peer: Option<Peer>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Peer(u32);
+
+    struct Inspect(Arc<Mutex<Option<Seen>>>);
+
+    #[async_trait::async_trait]
+    impl Interceptor for Inspect {
+        async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+            *self.0.lock().unwrap() = Some(Seen {
+                path: head.path().to_owned(),
+                spec: head.spec(),
+                protocol: head.protocol(),
+                authorization: head
+                    .header("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                peer: head.extensions().get::<Peer>().copied(),
+            });
+            Ok(())
+        }
+    }
+
+    /// Dispatch `req` through an accepting `Inspect` and return what it saw.
+    async fn inspect(
+        req: Request<CountedBody>,
+    ) -> (Option<Seen>, Result<StatusCode, ConnectError>) {
+        let seen = Arc::new(Mutex::new(None));
+        let chain: [Arc<dyn Interceptor>; 1] = [Arc::new(Inspect(Arc::clone(&seen)))];
+        let ran = Arc::new(AtomicBool::new(false));
+        let status = dispatch(router(&ran), &chain, req)
+            .await
+            .map(|response| response.status());
+        (seen.lock().unwrap().take(), status)
+    }
+
+    /// The head shows the path, the resolved `Spec`, the headers and the
+    /// transport's extensions, and accepting it lets the call run.
+    #[tokio::test]
+    async fn head_exposes_the_request_and_an_accepted_call_proceeds() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut req = post("/svc/Unary", "application/proto", &polls);
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer token".parse().unwrap());
+        req.extensions_mut().insert(Peer(7));
+
+        let (seen, status) = inspect(req).await;
+
+        assert_eq!(
+            status.expect("an accepted call is dispatched"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            seen,
+            Some(Seen {
+                path: "/svc/Unary".to_owned(),
+                spec: Some(UNARY),
+                protocol: Protocol::Connect,
+                authorization: Some("Bearer token".to_owned()),
+                peer: Some(Peer(7)),
+            })
+        );
+    }
+
+    /// The protocol the head reports follows the request's content type.
+    #[tokio::test]
+    async fn head_reports_the_protocol_of_the_request() {
+        for (path, content_type, expected) in [
+            ("/svc/Unary", "application/proto", Protocol::Connect),
+            (
+                "/svc/Client",
+                "application/connect+proto",
+                Protocol::Connect,
+            ),
+            ("/svc/Unary", "application/grpc+proto", Protocol::Grpc),
+            (
+                "/svc/Client",
+                "application/grpc-web+proto",
+                Protocol::GrpcWeb,
+            ),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let (seen, _) = inspect(post(path, content_type, &polls)).await;
+            let seen = seen.unwrap_or_else(|| panic!("{content_type}: the hook did not run"));
+            assert_eq!(seen.protocol, expected, "{content_type}");
+        }
+    }
+
+    /// A path that matches no method still reaches the head, with no `Spec`,
+    /// so a rejecting hook answers before the not-found error does.
+    #[tokio::test]
+    async fn head_runs_for_an_unknown_path_before_the_not_found_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (seen, status) = inspect(post("/svc/Missing", "application/proto", &polls)).await;
+        let seen = seen.expect("the hook must run for an unknown path");
+        assert_eq!((seen.path.as_str(), seen.spec), ("/svc/Missing", None));
+        assert_eq!(status.unwrap_err().http_status(), StatusCode::NOT_FOUND);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let log = Log::default();
+        let chain = [head("gate", Verdict::Reject, &log)];
+        let result = dispatch(
+            router(&ran),
+            &chain,
+            post("/svc/Missing", "application/proto", &polls),
+        )
+        .await;
+        assert_rejected(result, Reply::HttpStatus).await;
+    }
+
+    /// A value a head check inserts reaches the handler through the request
+    /// context, so authentication can hand the caller's identity on.
+    #[tokio::test]
+    async fn head_extensions_reach_the_handler() {
+        #[derive(Clone)]
+        struct Caller(&'static str);
+
+        struct Authenticate;
+
+        #[async_trait::async_trait]
+        impl Interceptor for Authenticate {
+            async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+                head.extensions_mut().insert(Caller("alice"));
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let router = Router::new().route(
+            "svc",
+            "Unary",
+            handler_fn(move |ctx: RequestContext, _req: Empty| {
+                *handler_seen.lock().unwrap() = ctx.extensions().get::<Caller>().map(|c| c.0);
+                async { crate::Response::ok(Empty::default()) }
+            }),
+        );
+        let chain: [Arc<dyn Interceptor>; 1] = [Arc::new(Authenticate)];
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        dispatch(
+            router,
+            &chain,
+            post("/svc/Unary", "application/proto", &polls),
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(*seen.lock().unwrap(), Some("alice"));
     }
 }

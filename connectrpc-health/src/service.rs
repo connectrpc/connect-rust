@@ -8,7 +8,7 @@ use connectrpc::{
 };
 use futures::StreamExt;
 
-use crate::connect::grpc::health::v1::{Health, HealthExt};
+use crate::connect::grpc::health::v1::{HEALTH_CHECK_SPEC, HEALTH_WATCH_SPEC, Health, HealthExt};
 use crate::proto::grpc::health::v1::{
     HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
 };
@@ -31,7 +31,10 @@ use crate::{Checker, StaticChecker};
 ///     "acme.user.v1.UserService",
 /// ]));
 /// let service = Arc::new(HealthService::from_arc(Arc::clone(&checker)));
+/// // Hold the health routes to a few KiB per request; `install_static`
+/// // does this itself, generic registration cannot.
 /// let router = service.register(Router::new());
+/// let router = connectrpc_health::apply_request_limits(router, connectrpc_health::request_limits());
 /// ```
 ///
 /// `HealthService::new(checker)` is the move-in shorthand; use
@@ -91,7 +94,11 @@ impl<C: Checker> HealthService<C> {
 /// reporting [`Status::Serving`](crate::Status::Serving)), wraps it in
 /// a [`HealthService`], registers that service on `router`, and hands
 /// back both the updated router and a shared `Arc<StaticChecker>` for
-/// status mutation.
+/// status mutation. The two health routes are set to
+/// [`request_limits`] (16 KiB per request) via [`apply_request_limits`],
+/// which replaces the service-wide limits on those routes even when they
+/// are tighter; to tune them, call `apply_request_limits(router, yours)`
+/// on the returned router — the later call wins.
 ///
 /// Pass the generated `*_SERVICE_NAME` constants from your service
 /// stubs to avoid drifting from the wire name a probe will ask about.
@@ -121,8 +128,58 @@ where
 {
     let checker = Arc::new(StaticChecker::with_services(services));
     let service = Arc::new(HealthService::from_arc(Arc::clone(&checker)));
-    let router = service.register(router);
+    let router = apply_request_limits(service.register(router), request_limits());
     (router, checker)
+}
+
+/// The largest request message, in bytes on the wire and after
+/// decompression, the health routes accept under [`request_limits`]: 16 KiB.
+///
+/// A `HealthCheckRequest` carries one fully-qualified service name, so a
+/// legitimate request is a few hundred bytes; 16 KiB leaves two orders of
+/// magnitude of headroom while sizing the routes to their actual request
+/// profile rather than the general-purpose service-wide default.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
+
+/// The per-route [`Limits`](connectrpc::Limits) this crate sets on its
+/// `Check` and `Watch` routes: message size capped at [`MAX_REQUEST_BYTES`]
+/// (the request body at that plus the 5-byte envelope framed protocols add),
+/// and the element-memory decode budget at four times that instead of the
+/// 32 MiB `connectrpc` default. A `HealthCheckRequest` has no repeated or
+/// map fields, so a decode that charges the budget at all is one this
+/// service was never going to answer; the bound keeps a future revision of
+/// the protocol from changing that quietly.
+#[must_use]
+pub fn request_limits() -> connectrpc::Limits {
+    connectrpc::Limits::default()
+        .with_max_request_body_size(MAX_REQUEST_BYTES + connectrpc::envelope::HEADER_SIZE)
+        .with_max_message_size(MAX_REQUEST_BYTES)
+        .with_element_memory_limit(4 * MAX_REQUEST_BYTES)
+}
+
+/// Set the `Check` and `Watch` routes on `router` to `limits`, replacing
+/// the service-wide limits for them (whether looser or tighter).
+///
+/// [`install_static`] already applies [`request_limits`]. Call this
+/// yourself, usually with [`request_limits`], after registering a
+/// [`HealthService`] built around a custom [`Checker`] — via
+/// [`HealthExt::register`](crate::HealthExt) or
+/// [`Router::add_service`](connectrpc::Router::add_service) — since those
+/// generic registration paths cannot; or call it after either path with
+/// your own [`Limits`](connectrpc::Limits) to tune the health routes
+/// specifically. The later call wins. Build an override from
+/// [`request_limits`] rather than `Limits::default()`: the replacement is
+/// whole, so anything the profile sets and the override does not is reset
+/// to the `connectrpc` default.
+///
+/// # Panics
+///
+/// Panics if the health routes are not registered on `router`.
+#[must_use]
+pub fn apply_request_limits(router: Router, limits: connectrpc::Limits) -> Router {
+    router
+        .with_route_limits(HEALTH_CHECK_SPEC.procedure, limits)
+        .with_route_limits(HEALTH_WATCH_SPEC.procedure, limits)
 }
 
 impl<C> Clone for HealthService<C> {
@@ -148,7 +205,6 @@ impl<C: Checker> Health for HealthService<C> {
         let status = self.checker.check(request.service).await?;
         Response::ok(HealthCheckResponse {
             status: ServingStatus::from(status).into(),
-            ..Default::default()
         })
     }
 
@@ -161,7 +217,6 @@ impl<C: Checker> Health for HealthService<C> {
         Response::stream_ok(stream.map(|status| {
             Ok::<_, ConnectError>(HealthCheckResponse {
                 status: ServingStatus::from(status).into(),
-                ..Default::default()
             })
         }))
     }
@@ -202,6 +257,34 @@ mod tests {
         (client, addr)
     }
 
+    /// The wire types are generated with `unknown_fields=false`: an
+    /// unrecognized field is accepted and skipped on both decode paths, and
+    /// is absent when the message is re-encoded. Guards against a
+    /// regeneration silently dropping the option.
+    #[test]
+    fn unknown_fields_are_skipped_not_retained() {
+        use buffa::Message;
+        use buffa::view::MessageView;
+
+        use crate::proto::grpc::health::v1::HealthCheckRequestView;
+
+        let known = HealthCheckRequest {
+            service: "acme.A".into(),
+        }
+        .encode_to_vec();
+        let mut with_unknown = known.clone();
+        // Field 15, varint 0 — not defined by `HealthCheckRequest`.
+        with_unknown.extend_from_slice(&[0x78, 0x00]);
+
+        let owned = HealthCheckRequest::decode_from_slice(&with_unknown).unwrap();
+        assert_eq!(owned.service, "acme.A");
+        assert_eq!(owned.encode_to_vec(), known);
+
+        let view = HealthCheckRequestView::decode_view(&with_unknown).unwrap();
+        assert_eq!(view.service, "acme.A");
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), known);
+    }
+
     #[tokio::test]
     async fn check_serving_service() {
         let checker = Arc::new(StaticChecker::with_services(["acme.A"]));
@@ -210,7 +293,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -234,7 +316,6 @@ mod tests {
         let err = client
             .check(HealthCheckRequest {
                 service: "acme.NoSuch".into(),
-                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -251,7 +332,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -288,7 +368,6 @@ mod tests {
         let mut stream = client
             .watch(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -346,7 +425,6 @@ mod tests {
         let mut stream = client
             .watch(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -380,7 +458,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -404,7 +481,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -415,11 +491,99 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(resp.view().status, ServingStatus::NOT_SERVING);
+
+        // `install_static` holds both routes to MAX_REQUEST_BYTES: an
+        // oversized request is refused before it reaches the checker. Over
+        // HTTP/2, so the refused request's stream is reset on its own rather
+        // than closing an HTTP/1.1 connection the next call might reuse.
+        let client = HealthClient::new(
+            HttpClient::plaintext_http2_only(),
+            ClientConfig::new(format!("http://{addr}").parse().unwrap()),
+        );
+        let oversized = HealthCheckRequest {
+            service: "x".repeat(2 * crate::MAX_REQUEST_BYTES),
+        };
+        let err = client.check(oversized.clone()).await.unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+        let mut stream = client.watch(oversized).await.unwrap();
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// An integrator's own `apply_request_limits` after `install_static`
+    /// replaces the bundled profile: tightened to 1 KiB, a 2 KiB request the
+    /// default 16 KiB would serve is refused.
+    #[tokio::test]
+    async fn integrator_limits_replace_the_bundled_profile() {
+        use crate::{apply_request_limits, install_static};
+        let (router, _health) = install_static(Router::new(), ["acme.A"]);
+        let router = apply_request_limits(
+            router,
+            connectrpc::Limits::default().with_max_message_size(1024),
+        );
+        let app = router.into_axum_router();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HealthClient::new(
+            HttpClient::plaintext_http2_only(),
+            ClientConfig::new(format!("http://{addr}").parse().unwrap()),
+        );
+        let err = client
+            .check(HealthCheckRequest {
+                service: "x".repeat(2048),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// The largest name the bundled profile admits decodes under its decode
+    /// budget and misses with a `not_found` whose message is a small
+    /// fraction of the request, over both the header-borne (gRPC) and
+    /// body-borne (Connect) error paths.
+    #[tokio::test]
+    async fn largest_admitted_name_misses_with_a_bounded_error() {
+        use crate::install_static;
+        let (router, _health) = install_static(Router::new(), ["acme.A"]);
+        let app = router.into_axum_router();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // 8 bytes of slack covers the field tag and length varint, so the
+        // encoded message sits just under MAX_REQUEST_BYTES.
+        let request = HealthCheckRequest {
+            service: "x".repeat(crate::MAX_REQUEST_BYTES - 8),
+        };
+        let config = || ClientConfig::new(format!("http://{addr}").parse().unwrap());
+        for (transport, config) in [
+            (
+                HttpClient::plaintext_http2_only(),
+                config().with_protocol(connectrpc::Protocol::Grpc),
+            ),
+            (HttpClient::plaintext(), config()),
+        ] {
+            let client = HealthClient::new(transport, config);
+            let err = client.check(request.clone()).await.unwrap_err();
+            assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err}");
+            let message = err.message.unwrap();
+            assert!(message.len() < 512, "{}", message.len());
+            assert!(
+                message.ends_with(&format!(
+                    "[name truncated, {} bytes]",
+                    request.service.len()
+                )),
+                "{message}"
+            );
+        }
     }
 
     #[tokio::test]

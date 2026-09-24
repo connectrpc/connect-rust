@@ -170,37 +170,25 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME: &str = "anthropic.connectrpc.wkt.v1.WellKnownTypesService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `CreateEvent` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `CreateEvent` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const WELL_KNOWN_TYPES_SERVICE_CREATE_EVENT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/CreateEvent",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `CalculateDuration` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `CalculateDuration` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/CalculateDuration",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `ProcessMetadata` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `ProcessMetadata` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/ProcessMetadata",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Heartbeat` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Heartbeat` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/anthropic.connectrpc.wkt.v1.WellKnownTypesService/Heartbeat",
         ::connectrpc::StreamType::Unary,
@@ -733,10 +721,14 @@ for WellKnownTypesServiceServer<T> {
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -796,7 +788,9 @@ pub struct WellKnownTypesServiceClient<T> {
 impl<T> WellKnownTypesServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -848,8 +842,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
-                "CreateEvent",
+                WELL_KNOWN_TYPES_SERVICE_CREATE_EVENT_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -893,8 +887,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
-                "CalculateDuration",
+                WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -938,8 +932,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
-                "ProcessMetadata",
+                WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -979,8 +973,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                WELL_KNOWN_TYPES_SERVICE_SERVICE_NAME,
-                "Heartbeat",
+                WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

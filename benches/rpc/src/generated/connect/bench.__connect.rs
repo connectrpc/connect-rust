@@ -164,55 +164,37 @@ for ::buffa::view::OwnedView<
 }
 /// Full service name for this service.
 pub const BENCH_SERVICE_SERVICE_NAME: &str = "bench.v1.BenchService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Unary` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Unary` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BENCH_SERVICE_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BenchService/Unary",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `ServerStream` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `ServerStream` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BENCH_SERVICE_SERVER_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BenchService/ServerStream",
         ::connectrpc::StreamType::ServerStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `ClientStream` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `ClientStream` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BENCH_SERVICE_CLIENT_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BenchService/ClientStream",
         ::connectrpc::StreamType::ClientStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `BidiStream` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `BidiStream` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BENCH_SERVICE_BIDI_STREAM_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BenchService/BidiStream",
         ::connectrpc::StreamType::BidiStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `LogUnary` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `LogUnary` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BENCH_SERVICE_LOG_UNARY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BenchService/LogUnary",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `LogUnaryOwned` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `LogUnaryOwned` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const BENCH_SERVICE_LOG_UNARY_OWNED_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.BenchService/LogUnaryOwned",
         ::connectrpc::StreamType::Unary,
@@ -838,10 +820,14 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -901,7 +887,9 @@ pub struct BenchServiceClient<T> {
 impl<T> BenchServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -946,8 +934,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                BENCH_SERVICE_SERVICE_NAME,
-                "Unary",
+                BENCH_SERVICE_UNARY_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -985,8 +972,8 @@ where
         ::connectrpc::client::call_server_stream(
                 &self.transport,
                 &self.config,
-                BENCH_SERVICE_SERVICE_NAME,
-                "ServerStream",
+                BENCH_SERVICE_SERVER_STREAM_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1056,8 +1043,8 @@ where
         ::connectrpc::client::call_client_stream(
                 &self.transport,
                 &self.config,
-                BENCH_SERVICE_SERVICE_NAME,
-                "ClientStream",
+                BENCH_SERVICE_CLIENT_STREAM_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 requests,
                 options,
             )
@@ -1091,8 +1078,8 @@ where
         ::connectrpc::client::call_bidi_stream(
                 &self.transport,
                 &self.config,
-                BENCH_SERVICE_SERVICE_NAME,
-                "BidiStream",
+                BENCH_SERVICE_BIDI_STREAM_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 options,
             )
             .await
@@ -1131,8 +1118,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                BENCH_SERVICE_SERVICE_NAME,
-                "LogUnary",
+                BENCH_SERVICE_LOG_UNARY_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1172,8 +1159,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                BENCH_SERVICE_SERVICE_NAME,
-                "LogUnaryOwned",
+                BENCH_SERVICE_LOG_UNARY_OWNED_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1182,10 +1169,7 @@ where
 }
 /// Full service name for this service.
 pub const ECHO_SERVICE_SERVICE_NAME: &str = "bench.v1.EchoService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Echo` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Echo` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.EchoService/Echo",
         ::connectrpc::StreamType::Unary,
@@ -1469,10 +1453,14 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -1532,7 +1520,9 @@ pub struct EchoServiceClient<T> {
 impl<T> EchoServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -1577,8 +1567,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                ECHO_SERVICE_SERVICE_NAME,
-                "Echo",
+                ECHO_SERVICE_ECHO_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
@@ -1587,10 +1576,7 @@ where
 }
 /// Full service name for this service.
 pub const LOG_INGEST_SERVICE_SERVICE_NAME: &str = "bench.v1.LogIngestService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Ingest` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Ingest` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/bench.v1.LogIngestService/Ingest",
         ::connectrpc::StreamType::Unary,
@@ -1874,10 +1860,14 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
 }
 /// Client for this service.
 ///
-/// Generic over `T: ClientTransport`. For **gRPC** (HTTP/2), use
-/// `Http2Connection` — it has honest `poll_ready` and composes with
-/// `tower::balance` for multi-connection load balancing. For **Connect
-/// over HTTP/1.1** (or unknown protocol), use `HttpClient`.
+/// Generic over `T: ClientTransport` whose response body error type
+/// converts into `Box<dyn std::error::Error + Send + Sync>` (both built-in
+/// transports qualify; a function generic over this client must repeat that
+/// bound as `<T::ResponseBody as connectrpc::http_body::Body>::Error:
+/// Into<Box<dyn std::error::Error + Send + Sync>>`). For
+/// **gRPC** (HTTP/2), use `Http2Connection` — it has honest `poll_ready`
+/// and composes with `tower::balance` for multi-connection load balancing.
+/// For **Connect over HTTP/1.1** (or unknown protocol), use `HttpClient`.
 ///
 /// # Example (gRPC / HTTP/2)
 ///
@@ -1937,7 +1927,9 @@ pub struct LogIngestServiceClient<T> {
 impl<T> LogIngestServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
+        Box<dyn ::std::error::Error + Send + Sync>,
+    >,
 {
     /// Create a new client with the given transport and configuration.
     pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -1982,8 +1974,8 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                LOG_INGEST_SERVICE_SERVICE_NAME,
-                "Ingest",
+                LOG_INGEST_SERVICE_INGEST_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

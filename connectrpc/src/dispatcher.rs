@@ -24,7 +24,7 @@ use crate::error::ConnectError;
 use crate::handler::BoxFuture;
 use crate::handler::BoxStream;
 use crate::payload::Payload;
-use crate::response::{EncodedResponse, RequestContext};
+use crate::response::{EncodedResponse, EncodedStream, RequestContext};
 use crate::router::MethodKind;
 use crate::spec::Spec;
 
@@ -50,9 +50,22 @@ pub struct MethodDescriptor {
     /// Static method metadata, when known.
     ///
     /// Code-generated dispatchers always supply a [`Spec`]; the dynamic
-    /// [`Router`](crate::Router) returns `None` because its method paths
-    /// are owned `String`s and `Spec::procedure` requires `&'static str`.
+    /// [`Router`](crate::Router) supplies one when
+    /// [`Router::with_spec`](crate::Router::with_spec) was chained for the
+    /// route, which generated `register()` always does.
     pub spec: Option<Spec>,
+    /// Per-route [`Limits`](crate::Limits), when the route declares its own.
+    ///
+    /// `Some` replaces the service-wide limits configured with
+    /// [`ConnectRpcService::with_limits`](crate::ConnectRpcService::with_limits)
+    /// for requests to this method — body size, message size and decode
+    /// budget alike — so a route can be tighter (a health check that never
+    /// legitimately exceeds a few KiB) or looser (an upload RPC) than the
+    /// rest of the service. `None` uses the service-wide limits. Set on a
+    /// [`Router`](crate::Router) route with
+    /// [`Router::with_route_limits`](crate::Router::with_route_limits);
+    /// generated `FooServiceServer<T>` dispatchers always report `None`.
+    pub limits: Option<crate::Limits>,
 }
 
 impl MethodDescriptor {
@@ -81,13 +94,14 @@ impl MethodDescriptor {
     }
 
     /// Construct a descriptor for the given [`MethodKind`] with default
-    /// `idempotent` (`false`) and no [`Spec`].
+    /// `idempotent` (`false`), no [`Spec`] and no per-route limits.
     #[inline]
     pub const fn from_kind(kind: MethodKind) -> Self {
         Self {
             kind,
             idempotent: false,
             spec: None,
+            limits: None,
         }
     }
 
@@ -111,6 +125,15 @@ impl MethodDescriptor {
         self.spec = Some(spec);
         self
     }
+
+    /// Attach per-route [`Limits`](crate::Limits) that replace the
+    /// service-wide limits for this method. Returns `self` for chaining.
+    #[inline]
+    #[must_use]
+    pub fn with_limits(mut self, limits: crate::Limits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
 }
 
 /// Result type for unary and client-streaming handler calls.
@@ -118,11 +141,10 @@ pub type UnaryResult = BoxFuture<'static, Result<EncodedResponse, ConnectError>>
 
 /// Result type for server-streaming and bidi-streaming handler calls.
 ///
-/// The body is a stream of pre-encoded message bytes.
-pub type StreamingResult = BoxFuture<
-    'static,
-    Result<crate::response::Response<BoxStream<Result<Bytes, ConnectError>>>, ConnectError>,
->;
+/// The body is an [`EncodedStream`]: one already-encoded
+/// [`EncodedBody`](crate::EncodedBody) per response message.
+pub type StreamingResult =
+    BoxFuture<'static, Result<crate::response::Response<EncodedStream>, ConnectError>>;
 
 /// A stream of raw request message bytes (client-streaming / bidi input).
 pub type RequestStream = BoxStream<Result<Bytes, ConnectError>>;
@@ -357,22 +379,24 @@ pub mod codegen {
     pub use super::unimplemented_streaming;
     pub use super::unimplemented_unary;
 
-    /// Map a stream of typed responses through [`Encodable::encode`].
+    /// Map a stream of typed responses through
+    /// [`Encodable::encode_segments`].
     ///
     /// Used by generated `call_server_streaming` and `call_bidi_streaming`
     /// arms to convert the handler's `Stream<Item = Result<B, _>>` into
-    /// the `Stream<Item = Result<Bytes, _>>` that the dispatcher protocol
-    /// requires. `B` is any [`Encodable<Res>`](crate::Encodable) — typically `Res` itself,
-    /// but may be [`PreEncoded`](crate::PreEncoded) or
-    /// [`MaybeBorrowed`](crate::MaybeBorrowed) for handlers that encode
-    /// borrowing views per item.
+    /// the [`EncodedStream`](crate::EncodedStream) that the dispatcher
+    /// protocol requires. `B` is any [`Encodable<Res>`](crate::Encodable),
+    /// typically `Res` itself, but may be [`PreEncoded`](crate::PreEncoded)
+    /// or [`MaybeBorrowed`](crate::MaybeBorrowed) for handlers that encode
+    /// borrowing views per item. An item that can hand a large payload over
+    /// by reference count arrives segmented and, on an uncompressed
+    /// response, is framed without copying that payload. Every other item
+    /// takes the contiguous default. See [`EncodedStream`](crate::EncodedStream)
+    /// for when compression flattens it instead.
     ///
     /// [`Encodable`]: crate::Encodable
-    /// [`Encodable::encode`]: crate::Encodable::encode
-    pub fn encode_response_stream<Res, B, S>(
-        stream: S,
-        format: CodecFormat,
-    ) -> BoxStream<Result<Bytes, ConnectError>>
+    /// [`Encodable::encode_segments`]: crate::Encodable::encode_segments
+    pub fn encode_response_stream<Res, B, S>(stream: S, format: CodecFormat) -> crate::EncodedStream
     where
         Res: Message + Send + 'static,
         B: crate::Encodable<Res> + Send + 'static,
@@ -386,7 +410,7 @@ pub mod codegen {
                     format,
                 ),
                 async |(mut s, fmt)| match s.next().await {
-                    Some(Ok(res)) => Some((Encodable::<Res>::encode(&res, fmt), (s, fmt))),
+                    Some(Ok(res)) => Some((Encodable::<Res>::encode_segments(&res, fmt), (s, fmt))),
                     Some(Err(e)) => Some((Err(e), (s, fmt))),
                     None => None,
                 },
@@ -482,7 +506,14 @@ mod tests {
             assert_eq!(d.kind, kind);
             assert!(!d.idempotent);
             assert_eq!(d.spec, None);
+            assert_eq!(d.limits, None);
         }
+
+        // `with_limits` attaches route limits and preserves the rest.
+        let route = crate::Limits::default().with_max_message_size(7);
+        let d = MethodDescriptor::unary(true).with_limits(route);
+        assert_eq!(d.limits, Some(route));
+        assert!(d.idempotent);
         assert_eq!(
             MethodDescriptor::from_kind(MethodKind::Unary).with_idempotent(true),
             MethodDescriptor::unary(true)

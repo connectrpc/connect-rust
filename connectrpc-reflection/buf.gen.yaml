@@ -14,7 +14,13 @@ inputs:
 plugins:
   - local: ../../buffa/target/release/protoc-gen-buffa
     out: src/generated/buffa
-    opt: [views=true, json=true]
+    # `unknown_fields=false`: the reflection service never reads unknown
+    # fields, so the generated types skip them on decode instead of recording
+    # them and re-encoding them into the `original_request` echo — smaller
+    # structs (no `__buffa_unknown_fields`) and no per-field bookkeeping on
+    # the request path. The echo therefore omits unknown fields, where
+    # grpc-go's re-emits them.
+    opt: [views=true, json=true, unknown_fields=false]
   - local: ../../buffa/target/release/protoc-gen-buffa-packaging
     out: src/generated/buffa
     strategy: all

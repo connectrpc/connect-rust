@@ -58,7 +58,48 @@
 //!
 //! For custom logic (probing a database, propagating dependency state),
 //! implement [`Checker`] directly and wrap it in [`HealthService::new`]
-//! / [`HealthService::from_arc`].
+//! / [`HealthService::from_arc`]; see the next section for the one extra
+//! call that path needs.
+//!
+//! # Request limits
+//!
+//! A `HealthCheckRequest` is one service name, so the health routes do not
+//! need the multi-megabyte request ceiling a `connectrpc` service allows by
+//! default. This crate sizes `Check` and `Watch` to [`MAX_REQUEST_BYTES`]
+//! (16 KiB) per request through per-route
+//! [`Limits`](connectrpc::Limits) — see [`request_limits`] for the exact
+//! profile — and a larger request is refused with `resource_exhausted`
+//! before it reaches the [`Checker`]. The profile *replaces* the
+//! service-wide limits on these two routes, whether those are looser or
+//! tighter. Within that ceiling, [`StaticChecker`]'s `not_found` error for
+//! an unregistered service echoes at most 128 bytes of the name, so the
+//! error message is bounded by a constant rather than by the size of the
+//! request. A custom [`Checker`] is responsible for bounding its own error
+//! text.
+//!
+//! * [`install_static`] applies [`request_limits`] for you.
+//! * Registering a [`HealthService`] any other way — the generated
+//!   [`HealthExt::register`](HealthExt) or
+//!   [`Router::add_service`](connectrpc::Router::add_service) — does not, so
+//!   follow it with [`apply_request_limits`]`(router, `[`request_limits`]`())`.
+//! * To tune the health routes specifically, call [`apply_request_limits`]
+//!   with your own `Limits` after either path; the later call wins.
+//!
+//! ```no_run
+//! use connectrpc::Router;
+//! use connectrpc_health::{apply_request_limits, install_static, request_limits};
+//!
+//! let (router, health) = install_static(Router::new(), ["acme.user.v1.UserService"]);
+//! // Optional: hold the health routes to 1 KiB instead of the bundled 16 KiB.
+//! // Start from `request_limits()` so the rest of the profile carries over.
+//! let router = apply_request_limits(
+//!     router,
+//!     request_limits()
+//!         .with_max_request_body_size(1024)
+//!         .with_max_message_size(1024),
+//! );
+//! # drop((router, health));
+//! ```
 //!
 //! [`grpc.health.v1.Health`]: https://github.com/grpc/grpc-proto/blob/master/grpc/health/v1/health.proto
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -74,7 +115,9 @@ mod connect;
 mod proto;
 
 pub use checker::{Checker, StatusStream};
-pub use service::{HealthService, install_static};
+pub use service::{
+    HealthService, MAX_REQUEST_BYTES, apply_request_limits, install_static, request_limits,
+};
 pub use static_checker::{StaticChecker, UnknownServiceError};
 pub use status::Status;
 
@@ -97,6 +140,13 @@ pub use connect::grpc::health::v1::HEALTH_SERVICE_NAME;
 /// Re-exports of the generated `grpc.health.v1` wire types — request and
 /// response messages, `ServingStatus`, the `*_SPEC` constants. Downstream
 /// crates can build probe loops without regenerating the proto.
+///
+/// These messages do **not** retain unknown fields: anything on the wire
+/// that this crate's copy of `health.proto` does not define is skipped on
+/// decode and absent on re-encode, so they are not a lossless relay for a
+/// newer revision of the protocol. The health service itself never reads
+/// or re-emits unknown fields, so its generated types omit the bookkeeping
+/// for them.
 pub mod wire {
     pub use crate::connect::grpc::health::v1::{HEALTH_CHECK_SPEC, HEALTH_WATCH_SPEC};
     pub use crate::proto::grpc::health::v1::health_check_response::ServingStatus;
