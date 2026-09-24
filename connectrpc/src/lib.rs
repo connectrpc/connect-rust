@@ -39,6 +39,9 @@
 //!     .fallback_service(connect.into_axum_service());
 //!
 //! axum::serve(listener, app).await?;
+//! // or, with the `server` feature, on connectrpc's connection driver
+//! // (TLS, PeerAddr/PeerCerts, max connection age, graceful GOAWAY, ...):
+//! connectrpc::axum::serve(listener, app).await?;
 //! ```
 //!
 //! ## With Raw Hyper
@@ -57,6 +60,13 @@
 //!
 //! Server::new(router).serve(addr).await?;
 //! ```
+//!
+//! To own the accept step — admit connections by client identity, cap them
+//! per tenant, listen on another transport, place them on different runtimes
+//! — write the loop yourself and hand each stream to
+//! [`Server::serve_connection`] (or [`server::serve_connection`] for any tower
+//! HTTP service); it keeps every timeout, retirement and drain guarantee of
+//! `Server::serve`. See the guide's "Custom accept loops".
 //!
 //! # Modules
 //!
@@ -159,7 +169,7 @@
 //! | `server` | ✗ | Standalone hyper-based server |
 //! | `server-tls` | ✗ | TLS for the built-in server |
 //! | `tls` | ✗ | Convenience: `server-tls` + `client-tls` |
-//! | `axum` | ✗ | Axum framework integration |
+//! | `axum` | ✗ | Axum integration (`Router::into_axum_service`); the `connectrpc::axum` module also needs `server`, and `serve_tls` needs `server-tls` |
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -167,29 +177,29 @@
 
 /// Spawn a detached background future on the ambient executor.
 ///
-/// On native targets this dispatches via [`tokio::spawn`] and returns the join
-/// handle. On `wasm32` there is no tokio runtime, so the future is dispatched
-/// via [`wasm_bindgen_futures::spawn_local`] and `None` is returned (no
-/// joinable handle available).
+/// On native targets this dispatches onto the current Tokio runtime, or drops
+/// the future when called outside one. On `wasm32` there is no tokio runtime,
+/// so the future is dispatched via [`wasm_bindgen_futures::spawn_local`].
 ///
-/// The `Send` bound is required on native (`tokio::spawn`) but relaxed on
+/// The `Send` bound is required on native (Tokio's `spawn`) but relaxed on
 /// wasm32 (`spawn_local` is single-threaded).
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn spawn_detached<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
+pub(crate) fn spawn_detached<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    Some(tokio::spawn(future))
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        drop(handle.spawn(future));
+    }
 }
 
 /// wasm32 variant — see non-wasm docs above.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn spawn_detached<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
+pub(crate) fn spawn_detached<F>(future: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
     wasm_bindgen_futures::spawn_local(future);
-    None
 }
 
 // Core modules (always available)
@@ -222,13 +232,14 @@ pub mod client;
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub mod server;
 
-// Optional: TLS-aware `axum::serve` counterpart with peer-identity passthrough.
+// Optional: `axum::serve` counterparts on the built-in server's accept loop
+// and connection driver.
 //
 // Note: this module shadows the extern-prelude `axum` crate within the crate
 // root scope only. Don't add `use axum::...` here in `lib.rs`; use
 // `::axum::...` if a root-level reference to the external crate is ever needed.
-#[cfg(all(feature = "axum", feature = "server-tls"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server-tls"))))]
+#[cfg(all(feature = "axum", feature = "server"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server"))))]
 pub mod axum;
 
 // ============================================================================
@@ -305,6 +316,12 @@ pub use error::SharedSource;
 /// `http-body` dependency to use generated code.
 pub use http_body;
 
+/// Re-export of the `http` crate, whose types, such as
+/// [`HeaderMap`](http::HeaderMap) and [`Extensions`](http::Extensions),
+/// appear throughout the public API — so consumers can name them without
+/// their own `http` dependency.
+pub use http;
+
 // Protocol detection
 pub use protocol::Protocol;
 pub use protocol::RequestProtocol;
@@ -328,6 +345,7 @@ pub use interceptor::Interceptor;
 pub use interceptor::Next;
 pub use interceptor::NextStream;
 pub use interceptor::PayloadStream;
+pub use interceptor::RequestHead;
 pub use interceptor::streaming_interceptor;
 pub use interceptor::unary_interceptor;
 
@@ -389,6 +407,18 @@ pub use server::BoundServer;
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub use server::Server;
 
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::CloseReason;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::ConnectionClosed;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::ConnectionConfig;
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub use server::ConnectionInfo;
 #[cfg(feature = "server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub use server::PeerAddr;

@@ -1,97 +1,116 @@
-//! TLS-aware `axum::serve` counterpart that exposes peer identity to handlers.
+//! `axum::serve` counterparts that run an `axum::Router` on connectrpc's
+//! connection driver.
 //!
 //! [`Router::into_axum_service`](crate::Router::into_axum_service) and
-//! [`Router::into_axum_router`](crate::Router::into_axum_router) cover the
-//! plaintext path: mount your ConnectRPC routes on an `axum::Router` and
-//! hand the result to `axum::serve`. This module fills the TLS gap.
-//!
-//! `axum::serve` accepts a plain [`TcpListener`] and has no hook for
-//! terminating TLS. The standalone [`Server`](crate::Server), by contrast,
-//! owns the rustls accept loop and so can capture [`PeerAddr`]/[`PeerCerts`]
-//! once per connection and inject them into every request's extensions for
-//! handlers to read via `ctx.peer_addr()` / `ctx.peer_certs()`. Without
-//! help, an axum + mTLS deployment has to reimplement that accept loop and
-//! per-connection plumbing by hand for handlers to get the same view.
-//!
-//! [`serve_tls`] is that help: it serves an `axum::Router`, terminates TLS,
-//! captures peer identity, and stamps it into request extensions. Handler
-//! code that reads `ctx.peer_certs()` is then portable between the
-//! standalone `Server` and an axum app — the hosting choice no longer
-//! leaks into your authorization logic.
+//! [`Router::into_axum_router`](crate::Router::into_axum_router) mount
+//! ConnectRPC routes on an `axum::Router`; `axum::serve` can host the result.
+//! [`serve`] and `serve_tls` host it on the same accept loop and
+//! [connection driver](crate::server::serve_connection) as the standalone
+//! [`Server`](crate::Server) instead, so an axum app gets everything that
+//! server has and `axum::serve` does not: TLS termination with
+//! [`PeerAddr`] / `PeerCerts` on every request, every [`ConnectionConfig`]
+//! setting (header-read timeout, HTTP/2 keepalive and flow control, max
+//! connection age / idle / requests), graceful GOAWAY on shutdown, and panic
+//! isolation. Handler code that reads `ctx.peer_addr()` / `ctx.peer_certs()`
+//! is then portable between the standalone `Server` and an axum app.
 //!
 //! ```rust,ignore
-//! // Plaintext: axum's built-in serve.
-//! axum::serve(listener, app).await?;
+//! // Plaintext, with connectrpc's connection lifecycle.
+//! connectrpc::axum::serve(listener, app)
+//!     .with_connection_config(ConnectionConfig::new().with_max_connection_age(Duration::from_secs(600)))
+//!     .await?;
 //!
-//! // TLS with PeerAddr/PeerCerts passthrough.
+//! // TLS, with PeerAddr / PeerCerts on every request.
 //! connectrpc::axum::serve_tls(listener, app, tls_config).await?;
 //! ```
 //!
 //! # Differences from `axum::serve`
 //!
-//! `serve_tls` is the TLS counterpart to `axum::serve(listener, router)` for
-//! the common `axum::Router` case. It is intentionally less generic:
-//!
-//! - **Service type.** `serve_tls` accepts a concrete `axum::Router`, not
-//!   the make-service forms `axum::serve` is generic over. There is no
+//! - **Service type.** [`serve`] takes a concrete `axum::Router`, not the
+//!   make-service forms `axum::serve` is generic over. There is no
 //!   `into_make_service_with_connect_info::<SocketAddr>()` equivalent because
-//!   `serve_tls` already injects [`PeerAddr`] (the same socket address) into
-//!   request extensions; read that instead of `ConnectInfo<SocketAddr>`.
-//!   A `Router<S>` with state must have `.with_state(...)` applied first.
+//!   [`PeerAddr`] (the same socket address) is already in the request
+//!   extensions; read that instead of `ConnectInfo<SocketAddr>`. A
+//!   `Router<S>` with state must have `.with_state(...)` applied first.
 //! - **`PeerCerts` is conditional.** It is only inserted when the
-//!   [`rustls::ServerConfig`] requests client authentication *and* the peer
-//!   presents a chain rustls verifies. With `with_no_client_auth()` (or a
-//!   permissive verifier and a client that sends no cert), only [`PeerAddr`]
-//!   is present. Handlers must treat `ctx.peer_certs()` as optional.
+//!   `rustls::ServerConfig` requests client authentication *and* the peer
+//!   presents a chain rustls verifies. Handlers must treat `ctx.peer_certs()`
+//!   as optional.
 //! - **ALPN.** The TLS terminator speaks the protocol ALPN selects. To allow
 //!   HTTP/2 (required for gRPC; preferred for Connect streaming), set
 //!   `server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()]`
 //!   before passing it in. Without ALPN, hyper falls back to HTTP/1.1.
-//! - **No automatic panic catching.** Unlike the standalone
-//!   [`Server`](crate::Server), `serve_tls` does not wrap your `axum::Router`
-//!   in `tower_http::catch_panic::CatchPanicLayer` (`axum::serve` doesn't
-//!   either). If you want a panicking handler to surface as a Connect error
-//!   rather than a dropped connection, add the layer yourself.
+//! - **Panics are caught.** A handler that panics before returning its
+//!   response yields a `500` whose body is a Connect-JSON `internal` error
+//!   (for non-RPC routes too) and the connection survives; `axum::serve`
+//!   drops the connection (HTTP/1.1) or resets the stream (HTTP/2). A panic
+//!   while a response body is produced is logged and resets that stream with
+//!   `INTERNAL_ERROR` (HTTP/2; `axum::serve` resets with `CANCEL`) or closes
+//!   the connection (HTTP/1.1). A `CatchPanicLayer` of your own still takes
+//!   precedence for the routes it wraps.
+//! - **Idle reaping ends HTTP/2 WebSockets.** With
+//!   [`ConnectionConfig::with_max_connection_idle`](crate::server::ConnectionConfig::with_max_connection_idle)
+//!   set, a connection that carries only extended-CONNECT streams counts as
+//!   idle and is closed; see that method.
+//! - **Connections are owned by the future.** Dropping (or timing out) the
+//!   [`Serve`] future aborts the connections it accepted rather than leaving
+//!   them running detached.
 //!
-//! Available only with both the `axum` and `server-tls` features enabled.
+//! Available with the `axum` and `server` features; `serve_tls` additionally
+//! needs `server-tls`.
+//!
+//! [`PeerAddr`]: crate::PeerAddr
+//! [`ConnectionConfig`]: crate::server::ConnectionConfig
 
-use std::future::{Future, IntoFuture};
+use std::future::Future;
+use std::future::IntoFuture;
 use std::pin::Pin;
+#[cfg(feature = "server-tls")]
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
-use tower::ServiceExt;
 
-use crate::server::{
-    DEFAULT_HEADER_READ_TIMEOUT, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerAddr, PeerCerts,
-    is_transient_accept_error,
-};
+use crate::server::AcceptConfig;
+use crate::server::ConnectionConfig;
+use crate::server::ConnectionExtensionsFn;
+use crate::server::ConnectionInfo;
+use crate::server::serve_with_listener;
+
+/// Serve an `axum::Router` over plaintext TCP on connectrpc's connection
+/// driver: [`PeerAddr`](crate::PeerAddr) on every request, every
+/// [`ConnectionConfig`] setting, graceful shutdown, panic isolation.
+///
+/// See the [module docs](self) for what this adds over `axum::serve`. After
+/// running out of file descriptors (`EMFILE` / `ENFILE`, or `WSAEMFILE` on
+/// Windows) the loop pauses accepts for up to a second, or until the
+/// shutdown signal fires.
+///
+/// # Errors
+///
+/// The future resolves to `Err` only for an accept error that is neither
+/// transient nor file-descriptor exhaustion, as for
+/// [`BoundServer::serve`](crate::BoundServer::serve). Per-connection
+/// failures are logged and never end the loop.
+pub fn serve(listener: TcpListener, router: axum::Router) -> Serve {
+    Serve {
+        listener,
+        router,
+        accept: AcceptConfig::default(),
+        connection: ConnectionConfig::default(),
+        connection_extensions: None,
+        shutdown: None,
+    }
+}
 
 /// Serve an `axum::Router` over TLS, exposing peer identity to handlers.
 ///
-/// The TLS counterpart to `axum::serve(listener, router)` for when handlers
-/// need [`PeerAddr`] and [`PeerCerts`] in request extensions — the same
-/// convention the standalone [`Server::with_tls`](crate::Server::with_tls)
-/// uses. The accept loop terminates TLS with `tokio-rustls`, captures the
-/// remote address and any verified client certificate chain, then injects
-/// both into every request before handing off to the axum service.
-/// [`PeerCerts`] is only present when `tls_config` requests client
-/// authentication and the peer presented a chain rustls verified.
-///
-/// Like the standalone server, the TLS handshake is bounded by a
-/// [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] to prevent slowloris-style connection
-/// exhaustion; tune it with [`ServeTls::with_tls_handshake_timeout`].
-///
-/// The returned [`ServeTls`] resolves once the listener stops accepting and
-/// in-flight connections drain (after [`ServeTls::with_graceful_shutdown`]'s
-/// signal fires) or when a non-transient accept error occurs.
-///
-/// See the [module docs](self) for the differences from `axum::serve`,
-/// including ALPN setup and panic-handling expectations.
+/// As [`serve`], plus TLS termination with `tls_config`: every request
+/// carries [`PeerAddr`](crate::PeerAddr) and, when `tls_config` requests
+/// client authentication and the peer presents a chain rustls verifies,
+/// [`PeerCerts`](crate::server::PeerCerts). The handshake is bounded by
+/// [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`](crate::server::DEFAULT_TLS_HANDSHAKE_TIMEOUT);
+/// tune it with [`Serve::with_tls_handshake_timeout`].
 ///
 /// ```rust,no_run
 /// # use std::sync::Arc;
@@ -112,75 +131,93 @@ use crate::server::{
 ///
 /// # Errors
 ///
-/// The future resolves to `Err` only for non-transient I/O errors from the
-/// underlying `accept(2)` (for example, file-descriptor exhaustion that
-/// persists past `EMFILE`/`ENFILE` retries, or a closed listener). Per-peer
-/// failures — TLS handshake errors, handshake timeouts, and HTTP-layer errors
-/// on a single connection — are logged at `debug`/`warn`/`trace` and never
-/// abort the accept loop.
+/// As [`serve`]: only an accept error that is neither transient nor
+/// file-descriptor exhaustion. TLS handshake failures and timeouts are
+/// logged at `debug` / `warn` and never end the loop.
+#[cfg(feature = "server-tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
 pub fn serve_tls(
     listener: TcpListener,
     router: axum::Router,
     tls_config: Arc<rustls::ServerConfig>,
-) -> ServeTls {
-    ServeTls {
-        listener,
-        router,
-        acceptor: tokio_rustls::TlsAcceptor::from(tls_config),
-        tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
-        header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
-        shutdown: None,
-    }
+) -> Serve {
+    let mut serve = serve(listener, router);
+    serve.accept.tls = Some(tls_config);
+    serve
 }
 
-/// Configurable future returned by [`serve_tls`].
+/// Configurable future returned by [`serve`] and `serve_tls`.
 ///
-/// Mirrors the shape of `axum::serve::Serve`: tweak it with builder
-/// methods, then `.await` it (or pass it anywhere an `IntoFuture` is
-/// accepted).
-#[must_use = "ServeTls does nothing unless `.await`ed"]
-pub struct ServeTls {
+/// Mirrors the shape of `axum::serve::Serve`: tweak it with builder methods,
+/// then `.await` it (or pass it anywhere an `IntoFuture` is accepted). It
+/// resolves once the shutdown signal has fired and every connection has
+/// drained, or on a fatal accept error.
+#[must_use = "Serve does nothing unless `.await`ed"]
+pub struct Serve {
     listener: TcpListener,
     router: axum::Router,
-    acceptor: tokio_rustls::TlsAcceptor,
-    tls_handshake_timeout: Duration,
-    header_read_timeout: Option<Duration>,
+    accept: AcceptConfig,
+    connection: ConnectionConfig,
+    connection_extensions: Option<ConnectionExtensionsFn>,
     shutdown: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
-impl ServeTls {
+/// The previous name of [`Serve`], from when only [`serve_tls`] existed.
+#[cfg(feature = "server-tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
+#[deprecated(since = "0.10.0", note = "renamed to `Serve`; `serve_tls` returns it")]
+pub type ServeTls = Serve;
+
+impl Serve {
     /// Override the TLS handshake timeout (default
-    /// [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`]). Set generously; clients on
-    /// high-latency links need a few round trips to complete the handshake.
-    #[must_use = "ServeTls does nothing unless `.await`ed"]
+    /// [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`](crate::server::DEFAULT_TLS_HANDSHAKE_TIMEOUT)).
+    /// Set generously; clients on high-latency links need a few round trips
+    /// to complete the handshake. No effect on plaintext [`serve`].
+    #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
+    #[must_use = "Serve does nothing unless `.await`ed"]
     pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
-        self.tls_handshake_timeout = timeout;
+        self.accept.tls_handshake_timeout = Some(timeout);
         self
     }
 
-    /// Override the HTTP/1.1 header read timeout (default
-    /// [`DEFAULT_HEADER_READ_TIMEOUT`], 30 seconds).
-    ///
-    /// Bounds how long the server waits to read a complete set of request
-    /// headers, measured from when hyper begins reading a new request; on a
-    /// keep-alive connection this also bounds the idle wait between requests.
-    /// A peer that connects (or finishes a request) and then stalls without
-    /// sending the next request's headers is disconnected, which mitigates
-    /// slowloris-style connection-exhaustion attacks. Pass `None` to disable.
-    ///
-    /// Applies to HTTP/1.1 only; it does not bound idle or stalled HTTP/2
-    /// connections — use `Server::with_max_connection_age` to retire those by
-    /// age.
-    #[must_use = "ServeTls does nothing unless `.await`ed"]
+    /// Override the header read timeout (default
+    /// [`DEFAULT_HEADER_READ_TIMEOUT`](crate::server::DEFAULT_HEADER_READ_TIMEOUT);
+    /// `None` or zero disables). Shorthand for
+    /// [`ConnectionConfig::with_header_read_timeout`].
+    #[must_use = "Serve does nothing unless `.await`ed"]
     pub fn with_header_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
-        self.header_read_timeout = timeout.into();
+        self.connection = self.connection.with_header_read_timeout(timeout);
+        self
+    }
+
+    /// Replace the per-connection settings wholesale — the same
+    /// [`ConnectionConfig`] value the standalone `Server` accepts, so an axum
+    /// app gets max connection age / idle / requests, HTTP/2 keepalive and
+    /// flow-control tuning with no second implementation to drift from.
+    #[must_use = "Serve does nothing unless `.await`ed"]
+    pub fn with_connection_config(mut self, config: ConnectionConfig) -> Self {
+        self.connection = config;
+        self
+    }
+
+    /// Add request extensions computed once per accepted connection from its
+    /// [`ConnectionInfo`], before its first request; same semantics as
+    /// [`BoundServer::with_connection_extensions`](crate::BoundServer::with_connection_extensions).
+    /// Calling this again replaces the function.
+    #[must_use = "Serve does nothing unless `.await`ed"]
+    pub fn with_connection_extensions<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&ConnectionInfo, &mut http::Extensions) + Send + Sync + 'static,
+    {
+        self.connection_extensions = Some(ConnectionExtensionsFn::new(f));
         self
     }
 
     /// Stop accepting new connections when `signal` resolves and drain
-    /// in-flight connections before the future returned by [`serve_tls`]
-    /// resolves. Mirrors `axum::serve::Serve::with_graceful_shutdown`.
-    #[must_use = "ServeTls does nothing unless `.await`ed"]
+    /// in-flight connections before the future resolves. Mirrors
+    /// `axum::serve::Serve::with_graceful_shutdown`.
+    #[must_use = "Serve does nothing unless `.await`ed"]
     pub fn with_graceful_shutdown<F>(mut self, signal: F) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
@@ -190,142 +227,46 @@ impl ServeTls {
     }
 }
 
-impl std::fmt::Debug for ServeTls {
+impl std::fmt::Debug for Serve {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServeTls")
-            .field("listener", &self.listener)
-            .field("tls_handshake_timeout", &self.tls_handshake_timeout)
-            .field("header_read_timeout", &self.header_read_timeout)
+        let mut s = f.debug_struct("Serve");
+        s.field("listener", &self.listener);
+        #[cfg(feature = "server-tls")]
+        s.field("tls", &self.accept.tls.is_some()).field(
+            "tls_handshake_timeout",
+            &self.accept.tls_handshake_timeout(),
+        );
+        s.field("connection", &self.connection)
+            .field(
+                "connection_extensions",
+                &self.connection_extensions.is_some(),
+            )
             .field("shutdown", &self.shutdown.is_some())
             .finish_non_exhaustive()
     }
 }
 
-impl IntoFuture for ServeTls {
+impl IntoFuture for Serve {
     type Output = std::io::Result<()>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(self.run())
-    }
-}
-
-impl ServeTls {
-    async fn run(self) -> std::io::Result<()> {
-        let ServeTls {
+        let Serve {
             listener,
             router,
-            acceptor,
-            tls_handshake_timeout,
-            header_read_timeout,
+            accept,
+            connection,
+            connection_extensions,
             shutdown,
         } = self;
-
-        // `select!` needs a polled-in-place future for both arms; default to
-        // a never-resolving signal when no graceful shutdown is configured.
-        let mut shutdown = shutdown.unwrap_or_else(|| Box::pin(std::future::pending()));
-        let graceful = GracefulShutdown::new();
-
-        loop {
-            let (stream, remote_addr) = tokio::select! {
-                biased; // honor shutdown before another accept
-
-                _ = &mut shutdown => {
-                    tracing::info!("Shutdown signal received; draining connections");
-                    break;
-                }
-                accepted = listener.accept() => match accepted {
-                    Ok(conn) => conn,
-                    Err(err) if is_transient_accept_error(&err) => {
-                        tracing::warn!("Transient accept error (continuing): {err}");
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                },
-            };
-
-            // Same TCP_NODELAY rationale as the standalone Server: avoid
-            // Nagle/delayed-ACK interaction on small HTTP/2 control frames.
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::warn!("failed to set TCP_NODELAY: {e}");
-            }
-
-            let acceptor = acceptor.clone();
-            let router = router.clone();
-            let watcher = graceful.watcher();
-
-            tokio::spawn(async move {
-                let tls_stream = match tokio::time::timeout(
-                    tls_handshake_timeout,
-                    acceptor.accept(stream),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(err)) => {
-                        tracing::debug!(remote_addr = %remote_addr, error = ?err, "TLS handshake failed");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            remote_addr = %remote_addr,
-                            "TLS handshake timed out after {tls_handshake_timeout:?}",
-                        );
-                        return;
-                    }
-                };
-
-                // Capture peer info now — once hyper owns the stream we can't
-                // borrow it again. `into_owned()` detaches the cert bytes from
-                // the session lifetime so the Arc can outlive the TlsStream.
-                let (_, conn) = tls_stream.get_ref();
-                let peer_addr = PeerAddr(remote_addr);
-                let peer_certs = conn
-                    .peer_certificates()
-                    .map(|chain| PeerCerts(chain.iter().map(|c| c.clone().into_owned()).collect()));
-
-                // Per-request: stamp peer info into extensions and forward to
-                // the axum service. `Router::clone()` is an Arc bump.
-                let svc = hyper::service::service_fn(
-                    move |mut req: hyper::Request<hyper::body::Incoming>| {
-                        req.extensions_mut().insert(peer_addr.clone());
-                        if let Some(c) = &peer_certs {
-                            req.extensions_mut().insert(c.clone());
-                        }
-                        router.clone().oneshot(req.map(axum::body::Body::new))
-                    },
-                );
-
-                // `serve_connection_with_upgrades` (vs `serve_connection` on the
-                // standalone `Server`) so axum routes that need HTTP `Upgrade:`
-                // (WebSockets) work out of the box. ConnectRPC routes don't
-                // upgrade, so this is a no-op for them. Keep this divergence —
-                // it matches what `axum::serve` does internally.
-                let mut builder = AutoBuilder::new(TokioExecutor::new());
-                // A timer is required for hyper's header read timeout (and any
-                // other time-based connection behaviour) to take effect;
-                // without it the configured `header_read_timeout` is silently
-                // ignored.
-                builder
-                    .http1()
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(header_read_timeout);
-                builder.http2().timer(TokioTimer::new());
-                let conn = builder
-                    .serve_connection_with_upgrades(TokioIo::new(tls_stream), svc)
-                    .into_owned();
-                if let Err(err) = watcher.watch(conn).await {
-                    tracing::trace!(remote_addr = %remote_addr, error = %err, "Connection ended with error");
-                }
-            });
-        }
-
-        // Stop accepting before signalling the drain so no new connection
-        // sneaks in between the watcher snapshot and the listener close.
-        drop(listener);
-        graceful.shutdown().await;
-        tracing::info!("All connections drained; shutdown complete");
-        Ok(())
+        Box::pin(serve_with_listener(
+            listener,
+            router,
+            accept,
+            connection,
+            connection_extensions,
+            shutdown,
+        ))
     }
 }
 
@@ -334,11 +275,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use std::sync::Arc;
+
     use crate::{Response as ConnectResponse, Router as ConnectRouter, handler_fn};
+    #[cfg(feature = "server-tls")]
     use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair, SanType};
+    #[cfg(feature = "server-tls")]
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[cfg(feature = "server-tls")]
     type Pki = (
         Arc<rustls::ServerConfig>,
         Arc<rustls::ClientConfig>,
@@ -347,6 +293,7 @@ mod tests {
 
     /// Minimal in-memory mTLS PKI: one CA, one server leaf, one client leaf.
     /// Returns `(server_config, client_config, client_leaf_der)`.
+    #[cfg(feature = "server-tls")]
     fn pki() -> Pki {
         // Idempotent; err == already installed (tests share process state).
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -395,6 +342,222 @@ mod tests {
         Connection: close\r\n\
         \r\n";
 
+    /// Plaintext `serve` stamps `PeerAddr` too — something `axum::serve`
+    /// needs `into_make_service_with_connect_info` for.
+    #[tokio::test]
+    async fn serve_plaintext_injects_peer_addr() {
+        let captured: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let connect = ConnectRouter::new().route(
+            "svc",
+            "Echo",
+            handler_fn(
+                move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let cap = Arc::clone(&handler_captured);
+                    async move {
+                        *cap.lock().unwrap() = ctx.peer_addr();
+                        ConnectResponse::ok(buffa_types::Empty::default())
+                    }
+                },
+            ),
+        );
+        let app = axum::Router::new().fallback_service(connect.into_axum_service());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .into_future(),
+        );
+
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tcp.local_addr().unwrap();
+        tcp.write_all(ECHO_REQ).await.unwrap();
+        let mut resp = Vec::new();
+        tcp.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 2"));
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.lock().unwrap().take(), Some(client));
+    }
+
+    /// `ConnectionConfig` settings apply to axum apps: max connection age
+    /// retires an h2 connection.
+    #[tokio::test(start_paused = true)]
+    async fn serve_honours_connection_config_max_age() {
+        let app = axum::Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            serve(listener, app)
+                .with_connection_config(
+                    ConnectionConfig::new()
+                        .with_max_connection_age(Duration::from_secs(10))
+                        .with_max_connection_age_grace(Duration::from_secs(1)),
+                )
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .into_future(),
+        );
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        let h2_task = tokio::spawn(h2_conn);
+        let req = http::Request::get(format!("http://{addr}/ok"))
+            .body(())
+            .unwrap();
+        let (resp, _) = send_request.send_request(req, true).unwrap();
+        assert_eq!(resp.await.unwrap().status(), http::StatusCode::OK);
+
+        tokio::time::advance(Duration::from_secs(12)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(h2_task.is_finished(), "aged connection was not retired");
+        if let Err(err) = h2_task.await.unwrap() {
+            assert!(err.is_go_away(), "{err:?}");
+        }
+
+        drop(send_request);
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A panicking axum handler costs its request, not the connection.
+    #[tokio::test]
+    async fn panicking_handler_yields_500_and_connection_survives() {
+        let app = axum::Router::new()
+            .route(
+                "/panic",
+                axum::routing::get(|| async {
+                    if true {
+                        panic!("handler bug");
+                    }
+                    ""
+                }),
+            )
+            .route("/ok", axum::routing::get(|| async { "ok" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .into_future(),
+        );
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(h2_conn);
+        let get = |path: &str| {
+            http::Request::get(format!("http://{addr}{path}"))
+                .body(())
+                .unwrap()
+        };
+        let (resp, _) = send_request.send_request(get("/panic"), true).unwrap();
+        let resp = resp
+            .await
+            .expect("panic must not kill the stream's connection");
+        assert_eq!(resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let (resp, _) = send_request.send_request(get("/ok"), true).unwrap();
+        assert_eq!(
+            resp.await.unwrap().status(),
+            http::StatusCode::OK,
+            "same connection keeps serving after a panic"
+        );
+
+        drop(send_request);
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The free `serve_connection` hosts an `axum::Router` a custom loop
+    /// accepted for, with `PeerAddr` from the `ConnectionInfo` it was handed
+    /// and a close reason.
+    #[tokio::test]
+    async fn serve_connection_hosts_an_axum_router() {
+        use crate::server::{CloseReason, ConnectionInfo, serve_connection};
+
+        let captured: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let connect = ConnectRouter::new().route(
+            "svc",
+            "Echo",
+            handler_fn(
+                move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let cap = Arc::clone(&handler_captured);
+                    async move {
+                        *cap.lock().unwrap() = ctx.peer_addr();
+                        ConnectResponse::ok(buffa_types::Empty::default())
+                    }
+                },
+            ),
+        );
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "up" }))
+            .fallback_service(connect.into_axum_service());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let info = ConnectionInfo::new().with_peer_addr(peer);
+            serve_connection(
+                stream,
+                info,
+                app,
+                ConnectionConfig::new(),
+                std::future::pending(),
+            )
+            .await
+        });
+
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tcp.local_addr().unwrap();
+        tcp.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let n = tcp.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+        assert!(buf[..n].ends_with(b"up"));
+        tcp.write_all(ECHO_REQ).await.unwrap();
+        let mut resp = Vec::new();
+        tcp.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 2"));
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.reason(), CloseReason::Closed);
+        assert_eq!(captured.lock().unwrap().take(), Some(client));
+    }
+
+    #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn serve_tls_injects_peer_identity() {
         let (server_cfg, client_cfg, expected_client_der) = pki();
@@ -456,8 +619,91 @@ mod tests {
         assert_eq!(certs[0].as_ref(), expected_client_der.as_ref());
     }
 
+    /// The `with_connection_extensions` function runs once per connection
+    /// through `serve_tls`, sees the verified client chain, and what it
+    /// inserts reaches the handler next to (not instead of) `PeerAddr` /
+    /// `PeerCerts`.
+    #[cfg(feature = "server-tls")]
+    #[tokio::test]
+    async fn serve_tls_connection_extensions_reach_handler() {
+        let (server_cfg, client_cfg, expected_client_der) = pki();
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct LeafLen(usize);
+
+        type Captured = Arc<Mutex<Option<(Option<LeafLen>, std::net::SocketAddr, Option<usize>)>>>;
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let connect = ConnectRouter::new().route(
+            "svc",
+            "Echo",
+            handler_fn(
+                move |ctx: crate::RequestContext, _req: buffa_types::Empty| {
+                    let cap = Arc::clone(&handler_captured);
+                    async move {
+                        *cap.lock().unwrap() = Some((
+                            ctx.extensions().get::<LeafLen>().cloned(),
+                            ctx.peer_addr().expect("serve_tls inserts PeerAddr"),
+                            ctx.peer_certs().map(|c| c[0].as_ref().len()),
+                        ));
+                        ConnectResponse::ok(buffa_types::Empty::default())
+                    }
+                },
+            ),
+        );
+        let app = axum::Router::new().fallback_service(connect.into_axum_service());
+
+        let calls_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&calls_seen);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            serve_tls(listener, app, server_cfg)
+                .with_connection_extensions(move |conn, ext| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let leaf_len = conn
+                        .peer_certs()
+                        .and_then(<[_]>::first)
+                        .map(|l| l.as_ref().len());
+                    if let Some(len) = leaf_len {
+                        ext.insert(LeafLen(len));
+                    }
+                    // The transport's `PeerAddr` must win over this one.
+                    ext.insert(crate::PeerAddr("10.0.0.1:1".parse().unwrap()));
+                })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .into_future(),
+        );
+
+        let resp = echo_over_tls(addr, client_cfg).await;
+        assert!(
+            resp.starts_with(b"HTTP/1.1 2"),
+            "expected 2xx, got: {}",
+            String::from_utf8_lossy(&resp[..resp.len().min(120)])
+        );
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve should shut down within timeout")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(calls_seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (leaf_len, peer_addr, handler_len) =
+            captured.lock().unwrap().take().expect("handler ran");
+        let expected = expected_client_der.as_ref().len();
+        assert_eq!(leaf_len, Some(LeafLen(expected)));
+        assert_eq!(handler_len, Some(expected));
+        assert_eq!(peer_addr.ip(), addr.ip());
+    }
+
     /// Open a TLS+HTTP/1.1 connection, send `ECHO_REQ`, and return the raw
     /// HTTP response bytes.
+    #[cfg(feature = "server-tls")]
     async fn echo_over_tls(
         addr: std::net::SocketAddr,
         client_cfg: Arc<rustls::ClientConfig>,
@@ -472,6 +718,7 @@ mod tests {
         resp
     }
 
+    #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn handshake_timeout_drops_stalled_connection() {
         let (server_cfg, _, _) = pki();
@@ -505,6 +752,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn header_read_timeout_closes_stalled_connection() {
         let (server_cfg, client_cfg, _) = pki();
@@ -554,6 +802,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn handshake_error_does_not_kill_accept_loop() {
         let (server_cfg, client_cfg, _) = pki();
@@ -613,6 +862,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server-tls")]
     #[tokio::test]
     async fn graceful_shutdown_drains_in_flight_request() {
         let (server_cfg, client_cfg, _) = pki();

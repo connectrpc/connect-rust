@@ -1,10 +1,12 @@
 //! RPC-level interceptors.
 //!
 //! Interceptors are the typed equivalent of `tower` middleware: they wrap
-//! a single RPC *after* the request head is parsed and the body read and
-//! decompressed, and *before* the message is decoded or the handler runs.
-//! Two surfaces:
+//! a single RPC, with its resolved [`Spec`](crate::Spec), instead of a raw
+//! HTTP request. Three surfaces:
 //!
+//! - **Head** ([`Interceptor::intercept_head`]): sees a [`RequestHead`] (the
+//!   [`Spec`](crate::Spec), headers, and extensions) before any body byte is
+//!   read, and can reject the request from those alone.
 //! - **Unary** ([`Interceptor::intercept_unary`]): sees a [`UnaryRequest`]
 //!   (the [`Spec`](crate::Spec), headers, deadline, extensions, and a
 //!   lazily-decoded [`Payload`]) and a [`Next`] continuation, and returns
@@ -14,6 +16,11 @@
 //!   continuation, and returns a [`StreamResponse`] carrying the outbound
 //!   [`PayloadStream`]. One method covers server-streaming,
 //!   client-streaming, and bidi by treating "one" as "stream of one".
+//!
+//! The head check runs before the body is read. The unary and streaming
+//! surfaces run after the request body has been read and decompressed and
+//! before the message is decoded or the handler runs; [`Interceptor`]'s
+//! "When it runs" has the detail.
 //!
 //! Streaming interceptors are **`Stream`-shaped, not connection-shaped.**
 //! `connect-go` exposes a `StreamingHandlerConn` with `Receive()`/`Send()`
@@ -37,9 +44,8 @@
 //!
 //! Register interceptors with
 //! [`ConnectRpcService::with_interceptor`](crate::ConnectRpcService::with_interceptor).
-//! When no interceptors are registered the dispatch path is byte-for-byte
-//! identical to a build without this module — there is no per-request
-//! cost for opting out.
+//! When no interceptors are registered the dispatch path allocates nothing
+//! for this module and only checks that the chain is empty.
 
 use std::sync::Arc;
 
@@ -53,6 +59,7 @@ use crate::error::ConnectError;
 use crate::handler::BoxStream;
 use crate::payload::Payload;
 use crate::response::{EncodedResponse, EncodedStream, RequestContext, Response};
+use http::{HeaderMap, HeaderValue};
 
 /// Re-export of [`async_trait::async_trait`] so interceptor authors don't
 /// need a direct `async-trait` dependency.
@@ -66,12 +73,15 @@ use crate::response::{EncodedResponse, EncodedStream, RequestContext, Response};
 /// no runtime `async-trait` requirement.
 pub use async_trait::async_trait;
 
-/// A unary RPC interceptor.
+/// An RPC interceptor.
 ///
-/// Implement [`intercept_unary`](Interceptor::intercept_unary) and/or
+/// Implement [`intercept_head`](Interceptor::intercept_head) to accept or
+/// reject a request before its body is read, and
+/// [`intercept_unary`](Interceptor::intercept_unary) and/or
 /// [`intercept_streaming`](Interceptor::intercept_streaming) to wrap a
-/// call. Each has a passthrough default — calling `next.run(..)` — so an
-/// interceptor that only cares about one shape implements only that one.
+/// call. Each has a default — `intercept_head` accepts every request and the
+/// others call `next.run(..)` — so an interceptor implements only the hooks
+/// it needs.
 ///
 /// Use [`unary_interceptor`] for a closure-shaped interceptor without a
 /// dedicated type.
@@ -82,17 +92,20 @@ pub use async_trait::async_trait;
 ///
 /// # When it runs
 ///
-/// After the request head is parsed and — for unary and server-streaming
+/// [`intercept_head`](Interceptor::intercept_head) runs after the route
+/// lookup and before any of the body is read. The other two methods run
+/// after the request head is parsed and — for unary and server-streaming
 /// calls — after the body has been read and decompressed under the
 /// service's [`Limits`](crate::Limits), but before the message is decoded:
 /// the [`Payload`] an interceptor receives decodes only when something reads
 /// it. Returning `Err` from an interceptor therefore never pays for a decode,
 /// the step whose memory cost can exceed the wire size by orders of
 /// magnitude. It does pay for the bounded body read, which Tower middleware
-/// wrapping the service does not, so a pure credential check (authentication)
-/// belongs in middleware and an interceptor is the place for checks that need
-/// the resolved [`Spec`](crate::Spec) or the parsed headers (authorization,
-/// tracing, validation). The user guide gives the exact bounds:
+/// wrapping the service and `intercept_head` do not, so a check that can
+/// decide from the head alone (authentication, or authorization from the
+/// resolved [`Spec`](crate::Spec) and the headers) belongs in one of those,
+/// and `intercept_unary` and `intercept_streaming` are the place for checks
+/// that need the message (tracing, validation). The user guide gives the exact bounds:
 /// <https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md#authentication-and-the-cost-of-an-unauthenticated-request>.
 ///
 /// # Example
@@ -130,6 +143,78 @@ pub use async_trait::async_trait;
 /// ```
 #[async_trait::async_trait]
 pub trait Interceptor: Send + Sync + 'static {
+    /// Accept or reject a request from its head alone, before any of its
+    /// body is read. The default accepts every request.
+    ///
+    /// Called once per request, on the server only, for every registered
+    /// interceptor in registration order (outermost first), before any of
+    /// the body is read, for unary and streaming calls alike.
+    /// It runs for a path that matches no method too, with
+    /// [`spec()`](RequestHead::spec) `None`, ahead of the not-found error.
+    /// Returning `Err` stops the chain: no later interceptor's
+    /// `intercept_head`, no body read, no `intercept_unary` or
+    /// `intercept_streaming`, and no handler. The client receives the error
+    /// in the protocol's own format.
+    ///
+    /// A rejected request's body is never read, as with Tower middleware
+    /// that returns a response without calling the service: an HTTP/2
+    /// stream is reset and an HTTP/1.x connection is usually closed. A
+    /// client that is still uploading can therefore see a transport error
+    /// instead of the error you returned. An outer interceptor's
+    /// `intercept_unary` or `intercept_streaming` never sees the rejection,
+    /// so count or trace rejections inside the head check or in a Tower
+    /// layer. Use this for checks that need only the request
+    /// path, the resolved [`Spec`](crate::Spec), the headers, or the
+    /// [`extensions`](RequestHead::extensions) the transport attached
+    /// (authentication, or authorization by method and caller identity).
+    /// Checks that need the message belong in `intercept_unary` or
+    /// `intercept_streaming`.
+    ///
+    /// Every interceptor's head check runs before any interceptor's
+    /// `intercept_unary` or `intercept_streaming`, so a head check sees the
+    /// headers as they reached the service, not as an outer interceptor
+    /// rewrote them with
+    /// [`headers_mut`](crate::RequestContext::headers_mut). Decide one
+    /// policy in one hook rather than splitting it across the two.
+    ///
+    /// The head can carry a value forward: insert it with
+    /// [`RequestHead::extensions_mut`], and the later interceptors and the
+    /// handler read it from [`RequestContext::extensions`]. An
+    /// authentication check can therefore attach the caller's identity here
+    /// once instead of verifying the credential again.
+    ///
+    /// The hook runs before the request deadline applies, so a hook that
+    /// waits on a slow dependency holds the request open with no time limit
+    /// unless it wraps the wait in `tokio::time::timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Return the error the client should see, such as
+    /// [`ConnectError::unauthenticated`] or [`ConnectError::permission_denied`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// struct Caller(String);
+    ///
+    /// #[connectrpc::async_trait]
+    /// impl Interceptor for Authenticate {
+    ///     async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+    ///         let token = head.header("authorization").and_then(|v| v.to_str().ok());
+    ///         let caller = match token.and_then(|t| self.verifier.verify(t)) {
+    ///             Some(caller) => caller,
+    ///             None => return Err(ConnectError::unauthenticated("missing or invalid token")),
+    ///         };
+    ///         head.extensions_mut().insert(Caller(caller));
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    async fn intercept_head(&self, head: &mut RequestHead<'_>) -> Result<(), ConnectError> {
+        let _ = head;
+        Ok(())
+    }
+
     /// Wrap a unary RPC. The default is a passthrough.
     ///
     /// Call [`next.run(req)`](Next::run) to continue. Returning without
@@ -201,6 +286,136 @@ pub trait Interceptor: Send + Sync + 'static {
         next: NextStream<'_>,
     ) -> Result<StreamResponse, ConnectError> {
         next.run(req, inbound).await
+    }
+}
+
+/// What is known about a request before its body is read: what
+/// [`Interceptor::intercept_head`] receives.
+///
+/// Borrowed from the request, so building it copies nothing. The headers
+/// are the request's headers as they reach the service, after any Tower
+/// layers, and include the protocol's own (`content-type`,
+/// `connect-timeout-ms`, `grpc-timeout`). Only the extensions can be
+/// changed.
+#[derive(Debug)]
+pub struct RequestHead<'a> {
+    path: &'a str,
+    spec: Option<crate::spec::Spec>,
+    headers: &'a HeaderMap,
+    protocol: crate::Protocol,
+    extensions: &'a mut http::Extensions,
+}
+
+impl<'a> RequestHead<'a> {
+    /// Create a head for the request `path` (with its leading slash), its
+    /// `headers`, and the `extensions` the transport attached. The protocol
+    /// is [`Protocol::Connect`](crate::Protocol::Connect) and there is no
+    /// [`Spec`](crate::Spec) until [`with_protocol`](Self::with_protocol) or
+    /// [`with_spec`](Self::with_spec) says otherwise.
+    ///
+    /// The server builds this itself; the constructor exists so a head
+    /// interceptor can be unit tested without a service.
+    #[must_use]
+    pub const fn new(
+        path: &'a str,
+        headers: &'a HeaderMap,
+        extensions: &'a mut http::Extensions,
+    ) -> Self {
+        Self {
+            path,
+            spec: None,
+            headers,
+            protocol: crate::Protocol::Connect,
+            extensions,
+        }
+    }
+
+    /// Set the static method metadata.
+    #[must_use]
+    pub fn with_spec(mut self, spec: Option<crate::spec::Spec>) -> Self {
+        self.spec = spec;
+        self
+    }
+
+    /// Set the wire protocol.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: crate::Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// The procedure path the client requested, with a leading slash
+    /// (`"/package.Service/Method"`), as [`RequestContext::path`] reports it.
+    /// Gate access on this rather than on [`spec`](Self::spec).
+    #[must_use]
+    pub const fn path(&self) -> &'a str {
+        self.path
+    }
+
+    /// Static metadata for the resolved method, or `None` when the path
+    /// matches no method that carries a [`Spec`](crate::Spec) (an unknown
+    /// path, or a dynamically registered route). A check that reads this
+    /// must treat `None` as a request to deny, or it lets those through.
+    #[must_use]
+    pub const fn spec(&self) -> Option<crate::spec::Spec> {
+        self.spec
+    }
+
+    /// The request headers.
+    #[must_use]
+    pub const fn headers(&self) -> &'a HeaderMap {
+        self.headers
+    }
+
+    /// One request header, for example `head.header("authorization")`.
+    #[must_use]
+    pub fn header(&self, key: impl http::header::AsHeaderName) -> Option<&'a HeaderValue> {
+        self.headers.get(key)
+    }
+
+    /// The wire protocol the request uses.
+    #[must_use]
+    pub const fn protocol(&self) -> crate::Protocol {
+        self.protocol
+    }
+
+    /// Extensions the transport attached to the request. With
+    /// `peer_addr` and, with the `server-tls` feature, `peer_certs`, this is
+    /// where a check finds who is connected.
+    #[must_use]
+    pub const fn extensions(&self) -> &http::Extensions {
+        self.extensions
+    }
+
+    /// Mutable access to the extensions. What a head check inserts here is
+    /// visible to later interceptors and to the handler through
+    /// [`RequestContext::extensions`].
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        self.extensions
+    }
+
+    /// The remote socket address, if the transport recorded one. Prefer this
+    /// to `extensions().get::<PeerAddr>().unwrap()`, which panics behind a
+    /// transport that did not insert it. See
+    /// [`RequestContext::peer_addr`].
+    #[cfg(feature = "server")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+    #[must_use]
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.extensions
+            .get::<crate::server::PeerAddr>()
+            .map(|p| p.0)
+    }
+
+    /// The TLS client certificate chain the peer presented (leaf first), if
+    /// any. See [`RequestContext::peer_certs`].
+    #[cfg(feature = "server-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server-tls")))]
+    #[must_use]
+    pub fn peer_certs(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        self.extensions
+            .get::<crate::server::PeerCerts>()
+            .map(|p| &p.0[..])
     }
 }
 

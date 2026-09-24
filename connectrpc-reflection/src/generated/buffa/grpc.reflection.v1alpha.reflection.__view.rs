@@ -9,15 +9,16 @@ pub struct ServerReflectionRequestView<'a> {
     pub message_request: ::core::option::Option<
         super::super::__buffa::view::oneof::server_reflection_request::MessageRequest<'a>,
     >,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ServerReflectionRequestView<'a> {
     type Owned = super::super::ServerReflectionRequest;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -31,7 +32,7 @@ impl<'a> ::buffa::MessageView<'a> for ServerReflectionRequestView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -123,8 +124,6 @@ impl<'a> ::buffa::MessageView<'a> for ServerReflectionRequestView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -196,7 +195,6 @@ impl<'a> ::buffa::MessageView<'a> for ServerReflectionRequestView<'a> {
                 }
                 ::core::option::Option::None => ::core::option::Option::None,
             },
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -244,7 +242,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerReflectionRequestView<'a> {
                 }
             }
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -292,7 +289,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerReflectionRequestView<'a> {
                 }
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -497,15 +493,16 @@ pub struct ExtensionRequestView<'a> {
     pub containing_type: &'a str,
     /// Field 2: `extension_number`
     pub extension_number: i32,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ExtensionRequestView<'a> {
     type Owned = super::super::ExtensionRequest;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -519,7 +516,7 @@ impl<'a> ::buffa::MessageView<'a> for ExtensionRequestView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -543,8 +540,6 @@ impl<'a> ::buffa::MessageView<'a> for ExtensionRequestView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -565,7 +560,6 @@ impl<'a> ::buffa::MessageView<'a> for ExtensionRequestView<'a> {
         ::core::result::Result::Ok(super::super::ExtensionRequest {
             containing_type: self.containing_type.to_string(),
             extension_number: self.extension_number,
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -586,7 +580,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ExtensionRequestView<'a> {
                 += 1u64
                     + ::buffa::types::int32_encoded_len(self.extension_number) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -603,7 +596,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ExtensionRequestView<'a> {
         if self.extension_number != 0i32 {
             ::buffa::types::put_int32_field(2u32, self.extension_number, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -784,15 +776,16 @@ pub struct ServerReflectionResponseView<'a> {
             'a,
         >,
     >,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ServerReflectionResponseView<'a> {
     type Owned = super::super::ServerReflectionResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -806,7 +799,7 @@ impl<'a> ::buffa::MessageView<'a> for ServerReflectionResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -968,8 +961,6 @@ impl<'a> ::buffa::MessageView<'a> for ServerReflectionResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -1049,7 +1040,6 @@ impl<'a> ::buffa::MessageView<'a> for ServerReflectionResponseView<'a> {
                 }
                 ::core::option::Option::None => ::core::option::Option::None,
             },
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -1115,7 +1105,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerReflectionResponseView<'a> {
                 }
             }
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -1181,7 +1170,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ServerReflectionResponseView<'a> {
                 }
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -1397,15 +1385,16 @@ pub struct FileDescriptorResponseView<'a> {
     ///
     /// Field 1: `file_descriptor_proto`
     pub file_descriptor_proto: ::buffa::RepeatedView<'a, &'a [u8]>,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for FileDescriptorResponseView<'a> {
     type Owned = super::super::FileDescriptorResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -1419,7 +1408,7 @@ impl<'a> ::buffa::MessageView<'a> for FileDescriptorResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -1440,8 +1429,6 @@ impl<'a> ::buffa::MessageView<'a> for FileDescriptorResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -1471,7 +1458,6 @@ impl<'a> ::buffa::MessageView<'a> for FileDescriptorResponseView<'a> {
                 .iter()
                 .map(|b| (b).to_vec())
                 .collect(),
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -1485,7 +1471,6 @@ impl<'a> ::buffa::ViewEncode<'a> for FileDescriptorResponseView<'a> {
         for v in &self.file_descriptor_proto {
             size += 1u64 + ::buffa::types::bytes_encoded_len(v) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -1499,7 +1484,6 @@ impl<'a> ::buffa::ViewEncode<'a> for FileDescriptorResponseView<'a> {
         for v in &self.file_descriptor_proto {
             ::buffa::types::put_shared_bytes_field(1u32, v, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -1673,15 +1657,16 @@ pub struct ExtensionNumberResponseView<'a> {
     pub base_type_name: &'a str,
     /// Field 2: `extension_number`
     pub extension_number: ::buffa::RepeatedView<'a, i32>,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ExtensionNumberResponseView<'a> {
     type Owned = super::super::ExtensionNumberResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -1695,7 +1680,7 @@ impl<'a> ::buffa::MessageView<'a> for ExtensionNumberResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -1731,8 +1716,6 @@ impl<'a> ::buffa::MessageView<'a> for ExtensionNumberResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -1759,7 +1742,6 @@ impl<'a> ::buffa::MessageView<'a> for ExtensionNumberResponseView<'a> {
         ::core::result::Result::Ok(super::super::ExtensionNumberResponse {
             base_type_name: self.base_type_name.to_string(),
             extension_number: self.extension_number.to_vec(),
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -1783,7 +1765,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ExtensionNumberResponseView<'a> {
                 .sum::<u64>();
             size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -1808,7 +1789,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ExtensionNumberResponseView<'a> {
                 ::buffa::types::encode_int32(v, buf);
             }
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -1989,15 +1969,16 @@ pub struct ListServiceResponseView<'a> {
         'a,
         super::super::__buffa::view::ServiceResponseView<'a>,
     >,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ListServiceResponseView<'a> {
     type Owned = super::super::ListServiceResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -2011,7 +1992,7 @@ impl<'a> ::buffa::MessageView<'a> for ListServiceResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -2041,8 +2022,6 @@ impl<'a> ::buffa::MessageView<'a> for ListServiceResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -2072,7 +2051,6 @@ impl<'a> ::buffa::MessageView<'a> for ListServiceResponseView<'a> {
                 .iter()
                 .map(|v| v.to_owned_from_source(__buffa_src))
                 .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -2091,7 +2069,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ListServiceResponseView<'a> {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -2110,7 +2087,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ListServiceResponseView<'a> {
             );
             v.write_to(__cache, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -2282,15 +2258,16 @@ pub struct ServiceResponseView<'a> {
     ///
     /// Field 1: `name`
     pub name: &'a str,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ServiceResponseView<'a> {
     type Owned = super::super::ServiceResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -2304,7 +2281,7 @@ impl<'a> ::buffa::MessageView<'a> for ServiceResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -2321,8 +2298,6 @@ impl<'a> ::buffa::MessageView<'a> for ServiceResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -2342,7 +2317,6 @@ impl<'a> ::buffa::MessageView<'a> for ServiceResponseView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::ServiceResponse {
             name: self.name.to_string(),
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -2356,7 +2330,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ServiceResponseView<'a> {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -2370,7 +2343,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ServiceResponseView<'a> {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.
@@ -2535,15 +2507,16 @@ pub struct ErrorResponseView<'a> {
     pub error_code: i32,
     /// Field 2: `error_message`
     pub error_message: &'a str,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ErrorResponseView<'a> {
     type Owned = super::super::ErrorResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
             buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
         )
     }
     fn decode_view_with_ctx(
@@ -2557,7 +2530,7 @@ impl<'a> ::buffa::MessageView<'a> for ErrorResponseView<'a> {
         &mut self,
         tag: ::buffa::encoding::Tag,
         cur: &'a [u8],
-        before_tag: &'a [u8],
+        _before_tag: &'a [u8],
         ctx: ::buffa::DecodeContext<'_>,
     ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
         let _ = ctx;
@@ -2581,8 +2554,6 @@ impl<'a> ::buffa::MessageView<'a> for ErrorResponseView<'a> {
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
             }
         }
         ::core::result::Result::Ok(cur)
@@ -2603,7 +2574,6 @@ impl<'a> ::buffa::MessageView<'a> for ErrorResponseView<'a> {
         ::core::result::Result::Ok(super::super::ErrorResponse {
             error_code: self.error_code,
             error_message: self.error_message.to_string(),
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
@@ -2621,7 +2591,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ErrorResponseView<'a> {
             size
                 += 1u64 + ::buffa::types::string_encoded_len(&self.error_message) as u64;
         }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
@@ -2638,7 +2607,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ErrorResponseView<'a> {
         if !self.error_message.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.error_message, buf);
         }
-        self.__buffa_unknown_fields.write_to(buf);
     }
 }
 /// Serializes this view as protobuf JSON.

@@ -67,6 +67,15 @@ fn malformed_compressed_payload(message: impl Into<String>) -> ConnectError {
     ConnectError::invalid_argument(message)
 }
 
+/// Whether `s` is an RFC 9110 `token`: one or more `tchar`s. Encoding names
+/// have to be tokens to appear in `content-encoding` / `accept-encoding`
+/// headers, and a token is always a valid `HeaderValue`.
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// Trait for compression algorithm implementations.
 ///
 /// Implement this trait to provide custom compression support. The only
@@ -82,8 +91,10 @@ fn malformed_compressed_payload(message: impl Into<String>) -> ConnectError {
 pub trait CompressionProvider: Send + Sync + 'static {
     /// The encoding name for this algorithm.
     ///
-    /// This should match the value used in Content-Encoding headers
-    /// (e.g., "gzip", "zstd", "br").
+    /// This is the value used in Content-Encoding headers (e.g., "gzip",
+    /// "zstd", "br") and must be an HTTP token: non-empty ASCII without
+    /// whitespace, quotes or separators. [`CompressionRegistry::register`]
+    /// panics on a name that is not one.
     fn name(&self) -> &'static str;
 
     /// Compress the given data.
@@ -146,10 +157,10 @@ pub trait CompressionProvider: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct CompressionRegistry {
     providers: Arc<HashMap<&'static str, Arc<dyn CompressionProvider>>>,
-    /// Cached, sorted, comma-joined list of supported encodings for
-    /// Accept-Encoding headers. Recomputed when providers are registered
-    /// (rather than on every request).
-    accept_encoding: Arc<str>,
+    /// Sorted, comma-joined list of supported encodings as an
+    /// `accept-encoding` header value, rebuilt when providers are registered
+    /// rather than on every request; `None` while no providers are registered.
+    accept_encoding: Option<http::HeaderValue>,
 }
 
 impl std::fmt::Debug for CompressionRegistry {
@@ -168,20 +179,46 @@ impl CompressionRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(HashMap::new()),
-            accept_encoding: Arc::from(""),
+            accept_encoding: None,
         }
     }
 
-    /// Recompute the cached accept-encoding string from the current provider set.
+    /// Recompute the cached accept-encoding value from the current provider set.
     fn rebuild_accept_encoding(&mut self) {
         let mut encodings: Vec<_> = self.providers.keys().copied().collect();
         encodings.sort_unstable();
-        self.accept_encoding = Arc::from(encodings.join(", "));
+        self.accept_encoding = if encodings.is_empty() {
+            None
+        } else {
+            // `register` only admits token names, so the joined list is always
+            // a valid header value.
+            http::HeaderValue::from_str(&encodings.join(", ")).ok()
+        };
+    }
+
+    /// The supported encodings as a ready-made `accept-encoding` /
+    /// `grpc-accept-encoding` header value (sorted, comma-separated), or
+    /// `None` when no providers are registered. Built once when providers
+    /// are registered, so attaching it to a request costs no allocation.
+    #[must_use]
+    pub fn accept_encoding_value(&self) -> Option<&http::HeaderValue> {
+        self.accept_encoding.as_ref()
     }
 
     /// Register a compression provider.
     ///
-    /// Returns self for method chaining.
+    /// Returns self for method chaining. Registering a provider whose
+    /// `name()` matches an existing entry replaces it, so
+    /// `CompressionRegistry::default().register(MyGzip)` overrides the
+    /// built-in gzip.
+    ///
+    /// # Panics
+    ///
+    /// If [`provider.name()`](CompressionProvider::name) is empty or contains
+    /// any byte outside the RFC 9110 `tchar` set (ASCII alphanumerics and
+    /// ``!#$%&'*+-.^_`|~``). Such a name could never be negotiated or carried
+    /// in an encoding header, so it is rejected when the registry is built
+    /// rather than on each request.
     ///
     /// # Example
     ///
@@ -197,8 +234,16 @@ impl CompressionRegistry {
     /// ```
     #[must_use]
     pub fn register<P: CompressionProvider>(mut self, provider: P) -> Self {
+        let name = provider.name();
+        assert!(
+            is_http_token(name),
+            "CompressionProvider::name() returned {name:?} for {}: an encoding name must be a \
+             non-empty HTTP token (ASCII alphanumerics and !#$%&'*+-.^_`|~), because it is sent \
+             in content-encoding and accept-encoding headers",
+            std::any::type_name::<P>()
+        );
         let providers = Arc::make_mut(&mut self.providers);
-        providers.insert(provider.name(), Arc::new(provider));
+        providers.insert(name, Arc::new(provider));
         self.rebuild_accept_encoding();
         self
     }
@@ -223,10 +268,15 @@ impl CompressionRegistry {
 
     /// Get a comma-separated string of supported encodings.
     ///
-    /// Useful for Accept-Encoding headers. The string is computed once when
-    /// providers are registered and cached, so this is a cheap lookup.
+    /// The string form of [`accept_encoding_value`](Self::accept_encoding_value):
+    /// computed once when providers are registered, so this is a cheap
+    /// lookup; empty when no providers are registered. To set a header, use
+    /// `accept_encoding_value`, which needs no re-parse.
     pub fn accept_encoding_header(&self) -> &str {
-        &self.accept_encoding
+        self.accept_encoding
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
     }
 
     /// Negotiate a response encoding based on the client's accept-encoding header.
@@ -457,6 +507,29 @@ impl Default for CompressionRegistry {
 // Built-in Providers
 // ============================================================================
 
+/// Bytes the gzip container adds around the deflate stream: a 10-byte header
+/// and an 8-byte CRC32 + ISIZE trailer.
+#[cfg(feature = "gzip")]
+const GZIP_FRAMING_LEN: usize = 18;
+
+/// Hand a finished compressed buffer over as the response frame's `Bytes`,
+/// giving back the slack first when the buffer is mostly slack.
+///
+/// The buffer was sized to the codec's worst-case bound, a little over the
+/// input length, but compressible payloads finish far below that, and
+/// `Bytes::from` keeps the whole allocation alive for as long as the frame
+/// is queued. Shrinking when more than half the buffer is unused bounds
+/// what a queued frame pins to about twice its compressed size; the copy it
+/// costs is at most the compressed length, which is the small case by
+/// construction.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+fn compressed_output(mut output: Vec<u8>) -> Bytes {
+    if output.capacity() > 2 * output.len() {
+        output.shrink_to_fit();
+    }
+    Bytes::from(output)
+}
+
 /// Gzip compression provider with internal state pooling.
 ///
 /// Pools `flate2::Compress` and `flate2::Decompress` objects to avoid the
@@ -585,7 +658,19 @@ impl GzipProvider {
         compressor: &mut flate2::Compress,
         data: &[u8],
     ) -> Result<Bytes, ConnectError> {
-        let mut output = Vec::with_capacity(data.len() + 32);
+        // Size the buffer once from deflate's worst case, as zstd's
+        // `compress_bound` does. This is zlib-rs's own conservative bound
+        // (`zlib_rs::deflate::bound`, the non-default-window branch), about
+        // `len * 1.14`; it is at or above every branch that function can
+        // take for flate2's configuration here (raw deflate, 15-bit window)
+        // at every level 0-9, so one call with the whole input and `Finish`
+        // always fits. The fast level this provider defaults to really does
+        // grow incompressible input by a few percent, so the tighter figure
+        // classic zlib quotes for its default parameters would not do. The
+        // buffer becomes the returned `Bytes`, so it is also what a queued
+        // response frame pins until it is written (see `compressed_output`).
+        let deflate_bound = data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
+        let mut output = Vec::with_capacity(GZIP_FRAMING_LEN + deflate_bound);
 
         // Gzip header (RFC 1952): fixed 10 bytes, no optional fields
         output.extend_from_slice(&[
@@ -597,11 +682,17 @@ impl GzipProvider {
             0xff, // OS = unknown
         ]);
 
-        // Deflate-compress the data
+        // Deflate-compress the data. The bound above leaves room for the
+        // whole stream, so the reserve below only fires if it was wrong;
+        // `reserve_exact` so that even then the buffer grows by what is
+        // needed rather than doubling back to the over-allocation this
+        // sizing exists to avoid.
         let start_in = compressor.total_in();
         loop {
             let consumed = (compressor.total_in() - start_in) as usize;
-            output.reserve(output.capacity().max(4096));
+            if output.len() == output.capacity() {
+                output.reserve_exact(4096);
+            }
             let status = compressor
                 .compress_vec(
                     &data[consumed..],
@@ -620,7 +711,7 @@ impl GzipProvider {
         output.extend_from_slice(&crc.sum().to_le_bytes());
         output.extend_from_slice(&(data.len() as u32).to_le_bytes());
 
-        Ok(Bytes::from(output))
+        Ok(compressed_output(output))
     }
 
     fn decompress_inner(
@@ -948,7 +1039,7 @@ impl CompressionProvider for ZstdProvider {
         let mut compressor = self.take_compressor()?;
         let result = compressor
             .compress(data)
-            .map(Bytes::from)
+            .map(compressed_output)
             .map_err(|e| ConnectError::internal(format!("zstd compression failed: {e}")));
         self.return_compressor(compressor);
         result
@@ -1337,6 +1428,73 @@ mod tests {
         );
     }
 
+    /// A compressible 1 MiB payload compresses to a few KiB; the frame that
+    /// carries it must not keep an input-sized working buffer alive behind
+    /// it.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_compress_does_not_retain_the_working_buffer() {
+        let provider = GzipProvider::default();
+        let data = vec![0u8; 1024 * 1024];
+        let compressed = provider.compress(&data).unwrap();
+        let len = compressed.len();
+        assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
+        let capacity = backing_capacity(compressed);
+        assert!(
+            capacity <= 2 * len,
+            "compressed frame of {len} bytes retained a {capacity}-byte buffer"
+        );
+    }
+
+    /// Incompressible input is the worst case for the output bound: the
+    /// frame must still come out at about the input size, not a multiple.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn test_gzip_compress_incompressible_input_is_sized_once() {
+        // A simple LCG: byte-level noise deflate cannot shrink.
+        let mut state = 0x9e37_79b9_u32;
+        let data: Vec<u8> = (0..1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        // The initial sizing, exactly: any capacity above it means the
+        // buffer grew, which is the regression this test exists to catch.
+        // Every level is covered because the bound is claimed for all of
+        // them and only a realloc would betray a level it does not hold for.
+        let sized_once =
+            GZIP_FRAMING_LEN + data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
+        for level in [0, 1, 6, 9] {
+            let provider = GzipProvider::with_level(level);
+            let compressed = provider.compress(&data).unwrap();
+            let len = compressed.len();
+            assert!(len >= data.len(), "noise should not compress: {len} bytes");
+            let capacity = backing_capacity(compressed);
+            assert!(
+                capacity <= sized_once,
+                "level {level}: incompressible frame of {len} bytes retained a \
+                 {capacity}-byte buffer, sized for {sized_once}"
+            );
+        }
+    }
+
+    /// Same as the gzip retention test, for the zstd provider.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_zstd_compress_does_not_retain_the_working_buffer() {
+        let provider = ZstdProvider::default();
+        let data = vec![0u8; 1024 * 1024];
+        let compressed = provider.compress(&data).unwrap();
+        let len = compressed.len();
+        assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
+        let capacity = backing_capacity(compressed);
+        assert!(
+            capacity <= 2 * len,
+            "compressed frame of {len} bytes retained a {capacity}-byte buffer"
+        );
+    }
+
     /// Same as the gzip allocation test, for the trait's default
     /// `decompress_with_limit` implementation (used by custom providers).
     #[test]
@@ -1652,6 +1810,69 @@ mod tests {
             let registry = CompressionRegistry::new().register(GzipProvider::default());
             assert_eq!(registry.accept_encoding_header(), "gzip");
         }
+    }
+
+    #[test]
+    fn accept_encoding_value_is_none_for_an_empty_registry() {
+        assert!(CompressionRegistry::new().accept_encoding_value().is_none());
+    }
+
+    /// A provider whose only interesting property is its name.
+    struct Named(&'static str);
+
+    impl CompressionProvider for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> {
+            Ok(Bytes::copy_from_slice(data))
+        }
+        fn decompressor<'a>(
+            &self,
+            data: &'a [u8],
+        ) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
+            Ok(Box::new(data))
+        }
+    }
+
+    #[test]
+    fn register_accepts_token_names_and_advertises_them_sorted() {
+        let registry = CompressionRegistry::new()
+            .register(Named("x-snappy"))
+            .register(Named("br"));
+        assert_eq!(registry.accept_encoding_header(), "br, x-snappy");
+        assert_eq!(registry.accept_encoding_value().unwrap(), "br, x-snappy");
+    }
+
+    #[test]
+    fn http_token_rule_matches_rfc9110_tchar() {
+        for good in ["gzip", "br", "x-snappy", "zstd", "A1!#$%&'*+-.^_`|~"] {
+            assert!(is_http_token(good), "{good:?} is a token");
+        }
+        for bad in [
+            "", "my algo", "gzip\n", "gzíp", "a,b", "\"q\"", "a/b", "gzip;q=1",
+        ] {
+            assert!(!is_http_token(bad), "{bad:?} is not a token");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a non-empty HTTP token")]
+    fn register_rejects_a_name_that_is_not_an_http_token() {
+        let _ = CompressionRegistry::new().register(Named("my algo"));
+    }
+
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    #[test]
+    fn accept_encoding_value_tracks_the_header_string() {
+        let registry = CompressionRegistry::new()
+            .register(GzipProvider::default())
+            .register(ZstdProvider::default());
+        assert_eq!(
+            registry.accept_encoding_value().unwrap(),
+            registry.accept_encoding_header()
+        );
+        assert_eq!(registry.accept_encoding_value().unwrap(), "gzip, zstd");
     }
 
     #[cfg(all(feature = "gzip", feature = "zstd"))]

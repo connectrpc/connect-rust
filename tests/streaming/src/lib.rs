@@ -33,7 +33,7 @@ mod tests {
         mut bidi: connectrpc::client::BidiStream<B, EchoRequest, EchoResponseView<'static>>,
     ) where
         B: connectrpc::http_body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
-        B::Error: std::fmt::Display,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         fn assert_send<T: Send>(_: T) {}
         // The async-block wrappers are load-bearing: asserting the bare
@@ -1143,11 +1143,200 @@ mod tests {
         );
     }
 
+    /// An echo server on its own runtime and thread, so that stopping it
+    /// tears down its accepted connections too (aborting an `axum::serve`
+    /// task on the test runtime would leave them open).
+    struct KillableServer {
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl KillableServer {
+        fn start(listener: std::net::TcpListener) -> Self {
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            listener.set_nonblocking(true).unwrap();
+            let thread = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let listener = {
+                    let _entered = rt.enter();
+                    TcpListener::from_std(listener).unwrap()
+                };
+                rt.spawn(async move {
+                    let service = ConnectRpcService::new(EchoServiceServer::new(TestEchoService));
+                    let app = axum::Router::new().fallback_service(service);
+                    axum::serve(listener, app).await.unwrap();
+                });
+                rt.block_on(async move {
+                    let _ = tokio::task::spawn_blocking(move || stopped.recv()).await;
+                });
+                // Dropping the runtime drops the accept loop and every
+                // connection task, closing their sockets.
+                rt.shutdown_background();
+            });
+            Self {
+                stop: Some(stop),
+                thread: Some(thread),
+            }
+        }
+
+        fn shutdown(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for KillableServer {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// A `SharedHttp2Connection` survives its server going away: requests
+    /// fail while it is down, and once it is back the same handle (and every
+    /// clone of it) reconnects on a subsequent request.
+    #[tokio::test]
+    async fn shared_http2_connection_reconnects_after_server_restart() {
+        use connectrpc::Protocol;
+        use connectrpc::client::Http2Connection;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = KillableServer::start(listener);
+
+        let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+        let conn = Http2Connection::connect_plaintext(uri.clone())
+            .await
+            .unwrap()
+            .shared(16);
+        let config = ClientConfig::new(uri).with_protocol(Protocol::Grpc);
+        let client = EchoServiceClient::new(conn.clone(), config.clone());
+        async fn echo(
+            client: &EchoServiceClient<connectrpc::client::SharedHttp2Connection>,
+            n: i32,
+        ) -> Result<i32, connectrpc::ConnectError> {
+            let resp = client
+                .echo(EchoRequest {
+                    sequence: n,
+                    data: format!("restart-{n}"),
+                    ..Default::default()
+                })
+                .await?;
+            Ok(resp.view().sequence)
+        }
+
+        assert_eq!(echo(&client, 1).await.unwrap(), 1);
+
+        drop(server);
+        let err = echo(&client, 2)
+            .await
+            .expect_err("no server: the request must fail");
+        assert_eq!(err.code, connectrpc::ErrorCode::Unavailable, "{err:?}");
+
+        // Back on the same port (std sets SO_REUSEADDR, and nothing else in
+        // the test binds in between). The next request re-establishes the
+        // connection; allow a few attempts in case the listener is not yet
+        // accepting when the first one is made.
+        let _server = KillableServer::start(std::net::TcpListener::bind(addr).unwrap());
+        let mut reconnected = false;
+        for attempt in 3..8 {
+            if let Ok(sequence) = echo(&client, attempt).await {
+                assert_eq!(sequence, attempt);
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(reconnected, "shared handle never reconnected");
+
+        // A clone made before the outage uses the new connection too.
+        let other = EchoServiceClient::new(conn, config);
+        assert_eq!(echo(&other, 9).await.unwrap(), 9);
+    }
+
+    /// A server that recycles connections (`with_max_connection_age`) sends
+    /// a graceful GOAWAY: no new streams on this connection, open streams may
+    /// finish. When one arrives while a stream is still open, the very next
+    /// request on the shared handle must go out on a fresh connection rather
+    /// than fail unsent against the retired one (issue #285), and the open
+    /// stream must be unharmed.
+    #[tokio::test]
+    async fn shared_http2_connection_survives_graceful_goaway_with_open_stream() {
+        use connectrpc::Protocol;
+        use connectrpc::client::Http2Connection;
+
+        const MAX_AGE: Duration = Duration::from_millis(300);
+        let bound = connectrpc::server::Server::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_max_connection_age(MAX_AGE)
+            .with_max_connection_age_grace(Duration::from_secs(30));
+        let addr = bound.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let service = ConnectRpcService::new(EchoServiceServer::new(TestEchoService));
+            bound.serve_with_service(service).await.unwrap();
+        });
+
+        let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+        let conn = Http2Connection::connect_plaintext(uri.clone())
+            .await
+            .unwrap()
+            .shared(16);
+        let client =
+            EchoServiceClient::new(conn, ClientConfig::new(uri).with_protocol(Protocol::Grpc));
+        let ping = |n: i32| {
+            let client = client.clone();
+            async move {
+                client
+                    .echo(EchoRequest {
+                        sequence: n,
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|r| r.view().sequence)
+            }
+        };
+
+        // A server stream that outlives the connection's max age: many
+        // messages, MSG_DELAY apart, of which only the first is read now.
+        let mut held = client
+            .server_stream(EchoRequest {
+                sequence: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(held.message().await.unwrap().unwrap().view().sequence, 0);
+        assert_eq!(ping(1).await.unwrap(), 1);
+
+        // Past max_connection_age (which carries +-10% jitter): the GOAWAY
+        // has arrived and the held stream keeps the old connection open.
+        tokio::time::sleep(MAX_AGE * 2).await;
+        for n in 2..5 {
+            assert_eq!(
+                ping(n).await.map_err(|e| format!("{e:?}")),
+                Ok(n),
+                "request #{n} after GOAWAY"
+            );
+        }
+        assert_eq!(
+            held.message().await.unwrap().unwrap().view().sequence,
+            1,
+            "the open stream continues on the retired connection"
+        );
+    }
+
     /// End-to-end test of `Http2Connection` / `SharedHttp2Connection`.
     ///
     /// Uses the raw h2 transport (no legacy pool) against the monomorphic
-    /// server. Verifies connect + reconnect-wrapper + buffer + ClientTransport
-    /// wiring works for a real unary RPC.
+    /// server. Verifies connect + reconnect-wrapper + ClientTransport wiring
+    /// works for a real unary RPC.
     #[tokio::test]
     async fn http2_connection_transport() {
         use connectrpc::Protocol;
@@ -1190,7 +1379,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.view().data, "h2-lazy");
 
-        // Concurrent requests on the shared handle — exercises the Buffer.
+        // Concurrent requests on the shared handle — multiplexed as h2 streams.
         let mut handles = Vec::new();
         for i in 0..16 {
             let c = shared.clone();
@@ -2061,5 +2250,116 @@ mod tests {
         }
         assert!(server.lookup("test.echo.v1.EchoService/Nope").is_none());
         assert!(router.lookup("test.echo.v1.EchoService/Nope").is_none());
+    }
+
+    // ====================================================================
+    // HTTP/1.1 connection reuse after an unread streaming request body
+    // ====================================================================
+
+    /// Write one HTTP/1.1 request on `stream` and read one complete response
+    /// (status line through the end of a content-length or chunked body).
+    /// Returns the status line and the raw body bytes (chunk framing
+    /// included). Fails the test if the peer closes the connection first or
+    /// stops sending for 5 s.
+    async fn http1_round_trip(
+        stream: &mut tokio::net::TcpStream,
+        path: &str,
+        body: &[u8],
+    ) -> (String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nhost: test\r\ncontent-type: application/connect+proto\r\n\
+             connect-protocol-version: 1\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+
+        let read_timeout = std::time::Duration::from_secs(5);
+        let mut buf = Vec::new();
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = tokio::time::timeout(read_timeout, stream.read_buf(&mut buf))
+                .await
+                .expect("server did not respond")
+                .unwrap();
+            assert!(n > 0, "server closed the connection before responding");
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let status = headers.lines().next().unwrap().to_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map(|v| v.trim().parse::<usize>().unwrap());
+        let complete = |body: &[u8]| match content_length {
+            Some(len) => body.len() >= len,
+            None => body.ends_with(b"0\r\n\r\n"),
+        };
+        while !complete(&buf[header_end..]) {
+            let n = tokio::time::timeout(read_timeout, stream.read_buf(&mut buf))
+                .await
+                .expect("server stalled mid-response")
+                .unwrap();
+            assert!(n > 0, "server closed the connection mid-response");
+        }
+        (status, buf[header_end..].to_vec())
+    }
+
+    /// Connect envelope (flags, big-endian length, payload).
+    fn envelope(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![flags];
+        out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `EchoRequest { data }` on the wire: field 2, length-delimited.
+    fn echo_request(data: &str) -> Vec<u8> {
+        let mut out = vec![0x12, u8::try_from(data.len()).unwrap()];
+        out.extend_from_slice(data.as_bytes());
+        out
+    }
+
+    /// A client-streaming or bidi handler that is done with its request
+    /// stream before the client has finished sending (here: the first
+    /// envelope fails to decode, with 256 KiB still to come) must leave the
+    /// HTTP/1.1 connection reusable: the rest of the body is drained in the
+    /// background, so the next request on the same connection is served.
+    /// Over a raw socket so that "same connection" is literal.
+    #[tokio::test]
+    async fn http1_connection_survives_unread_streaming_request_body() {
+        let (addr, _server) = start_server().await;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Flag 0x01 = compressed, with no content-encoding negotiated: the
+        // server rejects the first envelope and never decodes the junk after
+        // it, which is small enough (256 KiB) for the drain to read in full.
+        let mut poisoned = envelope(0x01, b"abc");
+        poisoned.extend(std::iter::repeat_n(0xAA, 256 * 1024));
+        let valid = envelope(0x00, &echo_request("again"));
+
+        for path in [
+            "/test.echo.v1.EchoService/ClientStream",
+            "/test.echo.v1.EchoService/BidiStream",
+        ] {
+            let (status, body) = http1_round_trip(&mut conn, path, &poisoned).await;
+            assert!(status.starts_with("http/1.1 200"), "{path}: {status}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("\"code\":\"internal\""),
+                "{path}: the decode failure is reported in END_STREAM: {}",
+                String::from_utf8_lossy(&body)
+            );
+
+            // Same socket, next request: served, not reset.
+            let (status, body) = http1_round_trip(&mut conn, path, &valid).await;
+            assert!(status.starts_with("http/1.1 200"), "{path}: {status}");
+            assert!(
+                body.windows(5).any(|w| w == b"again"),
+                "{path}: the follow-up request on the reused connection is answered"
+            );
+        }
     }
 }

@@ -328,7 +328,7 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 | `server`     | No      | Standalone hyper-based server                    |
 | `server-tls` | No      | TLS for the built-in server (`Server::with_tls`) |
 | `tls`        | No      | Convenience: enables both `server-tls` + `client-tls` |
-| `axum`       | No      | Axum framework integration                       |
+| `axum`       | No      | Axum integration (`Router::into_axum_service`); the `connectrpc::axum` module also needs `server`, and `serve_tls` needs `server-tls` |
 
 ### wasm32
 
@@ -703,7 +703,7 @@ use bytes::Bytes;
 struct MyCompression;
 
 impl CompressionProvider for MyCompression {
-    fn name(&self) -> &'static str { "my-algo" }
+    fn name(&self) -> &'static str { "my-algo" } // an HTTP token; `register` panics otherwise
     fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> { /* ... */ }
     fn decompressor<'a>(&self, data: &'a [u8]) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
         // Return a reader that yields decompressed bytes. The framework

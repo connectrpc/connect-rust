@@ -144,12 +144,17 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 /// The per-route [`Limits`](connectrpc::Limits) this crate sets on its
 /// `Check` and `Watch` routes: message size capped at [`MAX_REQUEST_BYTES`]
 /// (the request body at that plus the 5-byte envelope framed protocols add),
-/// decode budget left at the `connectrpc` default.
+/// and the element-memory decode budget at four times that instead of the
+/// 32 MiB `connectrpc` default. A `HealthCheckRequest` has no repeated or
+/// map fields, so a decode that charges the budget at all is one this
+/// service was never going to answer; the bound keeps a future revision of
+/// the protocol from changing that quietly.
 #[must_use]
 pub fn request_limits() -> connectrpc::Limits {
     connectrpc::Limits::default()
         .with_max_request_body_size(MAX_REQUEST_BYTES + connectrpc::envelope::HEADER_SIZE)
         .with_max_message_size(MAX_REQUEST_BYTES)
+        .with_element_memory_limit(4 * MAX_REQUEST_BYTES)
 }
 
 /// Set the `Check` and `Watch` routes on `router` to `limits`, replacing
@@ -162,7 +167,10 @@ pub fn request_limits() -> connectrpc::Limits {
 /// [`Router::add_service`](connectrpc::Router::add_service) — since those
 /// generic registration paths cannot; or call it after either path with
 /// your own [`Limits`](connectrpc::Limits) to tune the health routes
-/// specifically. The later call wins.
+/// specifically. The later call wins. Build an override from
+/// [`request_limits`] rather than `Limits::default()`: the replacement is
+/// whole, so anything the profile sets and the override does not is reset
+/// to the `connectrpc` default.
 ///
 /// # Panics
 ///
@@ -197,7 +205,6 @@ impl<C: Checker> Health for HealthService<C> {
         let status = self.checker.check(request.service).await?;
         Response::ok(HealthCheckResponse {
             status: ServingStatus::from(status).into(),
-            ..Default::default()
         })
     }
 
@@ -210,7 +217,6 @@ impl<C: Checker> Health for HealthService<C> {
         Response::stream_ok(stream.map(|status| {
             Ok::<_, ConnectError>(HealthCheckResponse {
                 status: ServingStatus::from(status).into(),
-                ..Default::default()
             })
         }))
     }
@@ -251,6 +257,34 @@ mod tests {
         (client, addr)
     }
 
+    /// The wire types are generated with `unknown_fields=false`: an
+    /// unrecognized field is accepted and skipped on both decode paths, and
+    /// is absent when the message is re-encoded. Guards against a
+    /// regeneration silently dropping the option.
+    #[test]
+    fn unknown_fields_are_skipped_not_retained() {
+        use buffa::Message;
+        use buffa::view::MessageView;
+
+        use crate::proto::grpc::health::v1::HealthCheckRequestView;
+
+        let known = HealthCheckRequest {
+            service: "acme.A".into(),
+        }
+        .encode_to_vec();
+        let mut with_unknown = known.clone();
+        // Field 15, varint 0 — not defined by `HealthCheckRequest`.
+        with_unknown.extend_from_slice(&[0x78, 0x00]);
+
+        let owned = HealthCheckRequest::decode_from_slice(&with_unknown).unwrap();
+        assert_eq!(owned.service, "acme.A");
+        assert_eq!(owned.encode_to_vec(), known);
+
+        let view = HealthCheckRequestView::decode_view(&with_unknown).unwrap();
+        assert_eq!(view.service, "acme.A");
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), known);
+    }
+
     #[tokio::test]
     async fn check_serving_service() {
         let checker = Arc::new(StaticChecker::with_services(["acme.A"]));
@@ -259,7 +293,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -283,7 +316,6 @@ mod tests {
         let err = client
             .check(HealthCheckRequest {
                 service: "acme.NoSuch".into(),
-                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -300,7 +332,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -337,7 +368,6 @@ mod tests {
         let mut stream = client
             .watch(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -395,7 +425,6 @@ mod tests {
         let mut stream = client
             .watch(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -429,7 +458,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -453,7 +481,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -464,7 +491,6 @@ mod tests {
         let resp = client
             .check(HealthCheckRequest {
                 service: "acme.A".into(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -480,7 +506,6 @@ mod tests {
         );
         let oversized = HealthCheckRequest {
             service: "x".repeat(2 * crate::MAX_REQUEST_BYTES),
-            ..Default::default()
         };
         let err = client.check(oversized.clone()).await.unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
@@ -513,11 +538,52 @@ mod tests {
         let err = client
             .check(HealthCheckRequest {
                 service: "x".repeat(2048),
-                ..Default::default()
             })
             .await
             .unwrap_err();
         assert_eq!(err.code, connectrpc::ErrorCode::ResourceExhausted);
+    }
+
+    /// The largest name the bundled profile admits decodes under its decode
+    /// budget and misses with a `not_found` whose message is a small
+    /// fraction of the request, over both the header-borne (gRPC) and
+    /// body-borne (Connect) error paths.
+    #[tokio::test]
+    async fn largest_admitted_name_misses_with_a_bounded_error() {
+        use crate::install_static;
+        let (router, _health) = install_static(Router::new(), ["acme.A"]);
+        let app = router.into_axum_router();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // 8 bytes of slack covers the field tag and length varint, so the
+        // encoded message sits just under MAX_REQUEST_BYTES.
+        let request = HealthCheckRequest {
+            service: "x".repeat(crate::MAX_REQUEST_BYTES - 8),
+        };
+        let config = || ClientConfig::new(format!("http://{addr}").parse().unwrap());
+        for (transport, config) in [
+            (
+                HttpClient::plaintext_http2_only(),
+                config().with_protocol(connectrpc::Protocol::Grpc),
+            ),
+            (HttpClient::plaintext(), config()),
+        ] {
+            let client = HealthClient::new(transport, config);
+            let err = client.check(request.clone()).await.unwrap_err();
+            assert_eq!(err.code, connectrpc::ErrorCode::NotFound, "{err}");
+            let message = err.message.unwrap();
+            assert!(message.len() < 512, "{}", message.len());
+            assert!(
+                message.ends_with(&format!(
+                    "[name truncated, {} bytes]",
+                    request.service.len()
+                )),
+                "{message}"
+            );
+        }
     }
 
     #[tokio::test]

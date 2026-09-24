@@ -1,7 +1,3 @@
-# crates_universe needs Cargo.lock at build time. The root .gitignore
-# excludes all Cargo.lock files; un-ignore this one.
-!Cargo.lock
-
 tools/protoc-gen-buffa
 tools/protoc-gen-buffa-packaging
 tools/protoc-gen-connect-rust

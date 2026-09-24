@@ -1,7 +1,7 @@
 /target
-Cargo.lock
-# Out-of-workspace bench crate has its own target dir.
+# Out-of-workspace bench crate has its own target dir and lockfile.
 /benches/rpc-grpc-rust/target
+/benches/rpc-grpc-rust/Cargo.lock
 /conformance/bin/
 
 # User-local Claude Code settings (project-level agents/commands ARE committed)
