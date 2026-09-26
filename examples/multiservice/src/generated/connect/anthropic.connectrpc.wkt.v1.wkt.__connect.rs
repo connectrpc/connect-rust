@@ -386,7 +386,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.create_event(ctx, sreq)
+                            WellKnownTypesService::create_event(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::wkt::v1::CreateEventResponse,
@@ -415,7 +415,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.calculate_duration(ctx, sreq)
+                            WellKnownTypesService::calculate_duration(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationResponse,
@@ -444,7 +444,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.process_metadata(ctx, sreq)
+                            WellKnownTypesService::process_metadata(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
@@ -473,7 +473,7 @@ impl<S: WellKnownTypesService> WellKnownTypesServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 ::buffa_types::google::protobuf::Empty,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.heartbeat(ctx, sreq)
+                            WellKnownTypesService::heartbeat(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     ::buffa_types::google::protobuf::Timestamp,
@@ -596,7 +596,7 @@ for WellKnownTypesServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
                     >::from_parts(&req, &body);
-                    svc.create_event(ctx, req)
+                    WellKnownTypesService::create_event(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::wkt::v1::CreateEventResponse,
@@ -618,7 +618,7 @@ for WellKnownTypesServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
                     >::from_parts(&req, &body);
-                    svc.calculate_duration(ctx, req)
+                    WellKnownTypesService::calculate_duration(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationResponse,
@@ -640,7 +640,7 @@ for WellKnownTypesServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
                     >::from_parts(&req, &body);
-                    svc.process_metadata(ctx, req)
+                    WellKnownTypesService::process_metadata(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
@@ -662,7 +662,7 @@ for WellKnownTypesServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         ::buffa_types::google::protobuf::Empty,
                     >::from_parts(&req, &body);
-                    svc.heartbeat(ctx, req)
+                    WellKnownTypesService::heartbeat(&*svc, ctx, req)
                         .await?
                         .encode::<::buffa_types::google::protobuf::Timestamp>(format)
                 })

@@ -686,7 +686,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::connectrpc::conformance::v1::UnaryRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.unary(ctx, sreq)
+                            ConformanceService::unary(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::connectrpc::conformance::v1::UnaryResponse,
@@ -718,7 +718,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.server_stream(ctx, sreq).await
+                            ConformanceService::server_stream(&*svc, ctx, sreq).await
                         }
                     }
                 }),
@@ -735,7 +735,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                             let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
                             >(req);
-                            svc.client_stream(ctx, req)
+                            ConformanceService::client_stream(&*svc, ctx, req)
                                 .await?
                                 .encode::<
                                     crate::proto::connectrpc::conformance::v1::ClientStreamResponse,
@@ -760,7 +760,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                             let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
                             >(req);
-                            svc.bidi_stream(ctx, req).await
+                            ConformanceService::bidi_stream(&*svc, ctx, req).await
                         }
                     }
                 }),
@@ -785,7 +785,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::connectrpc::conformance::v1::UnimplementedRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.unimplemented(ctx, sreq)
+                            ConformanceService::unimplemented(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::connectrpc::conformance::v1::UnimplementedResponse,
@@ -814,7 +814,7 @@ impl<S: ConformanceService> ConformanceServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::connectrpc::conformance::v1::IdempotentUnaryRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.idempotent_unary(ctx, sreq)
+                            ConformanceService::idempotent_unary(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::connectrpc::conformance::v1::IdempotentUnaryResponse,
@@ -947,7 +947,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::UnaryRequest,
                     >::from_parts(&req, &body);
-                    svc.unary(ctx, req)
+                    ConformanceService::unary(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::connectrpc::conformance::v1::UnaryResponse,
@@ -969,7 +969,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::UnimplementedRequest,
                     >::from_parts(&req, &body);
-                    svc.unimplemented(ctx, req)
+                    ConformanceService::unimplemented(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::connectrpc::conformance::v1::UnimplementedResponse,
@@ -991,7 +991,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::IdempotentUnaryRequest,
                     >::from_parts(&req, &body);
-                    svc.idempotent_unary(ctx, req)
+                    ConformanceService::idempotent_unary(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::connectrpc::conformance::v1::IdempotentUnaryResponse,
@@ -1029,7 +1029,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
                     >::from_parts(&req, &body);
-                    let resp = svc.server_stream(ctx, req).await?;
+                    let resp = ConformanceService::server_stream(&*svc, ctx, req).await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
@@ -1062,7 +1062,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
                     >(requests, format, ctx.decode_options().clone());
-                    svc.client_stream(ctx, req_stream)
+                    ConformanceService::client_stream(&*svc, ctx, req_stream)
                         .await?
                         .encode::<
                             crate::proto::connectrpc::conformance::v1::ClientStreamResponse,
@@ -1091,7 +1091,8 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
                     >(requests, format, ctx.decode_options().clone());
-                    let resp = svc.bidi_stream(ctx, req_stream).await?;
+                    let resp = ConformanceService::bidi_stream(&*svc, ctx, req_stream)
+                        .await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<

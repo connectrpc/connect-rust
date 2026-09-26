@@ -217,7 +217,7 @@ impl<S: Health> HealthExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::grpc::health::v1::HealthCheckRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.check(ctx, sreq)
+                            Health::check(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::grpc::health::v1::HealthCheckResponse,
@@ -249,7 +249,7 @@ impl<S: Health> HealthExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::grpc::health::v1::HealthCheckRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.watch(ctx, sreq).await
+                            Health::watch(&*svc, ctx, sreq).await
                         }
                     }
                 }),
@@ -351,7 +351,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,
                     >::from_parts(&req, &body);
-                    svc.check(ctx, req)
+                    Health::check(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::grpc::health::v1::HealthCheckResponse,
@@ -388,7 +388,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,
                     >::from_parts(&req, &body);
-                    let resp = svc.watch(ctx, req).await?;
+                    let resp = Health::watch(&*svc, ctx, req).await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<

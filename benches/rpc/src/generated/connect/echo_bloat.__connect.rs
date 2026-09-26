@@ -172,7 +172,7 @@ impl<S: BloatEchoService> BloatEchoServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::BloatEcho,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.echo(ctx, sreq)
+                            BloatEchoService::echo(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<crate::proto::bench::v1::BloatEcho>(format)
                         }
@@ -268,7 +268,7 @@ impl<T: BloatEchoService> ::connectrpc::Dispatcher for BloatEchoServiceServer<T>
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BloatEcho,
                     >::from_parts(&req, &body);
-                    svc.echo(ctx, req)
+                    BloatEchoService::echo(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::bench::v1::BloatEcho>(format)
                 })

@@ -321,7 +321,7 @@ impl<S: ElizaService> ElizaServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::connectrpc::eliza::v1::SayRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.say(ctx, sreq)
+                            ElizaService::say(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::connectrpc::eliza::v1::SayResponse,
@@ -346,7 +346,7 @@ impl<S: ElizaService> ElizaServiceExt for S {
                             let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::proto::connectrpc::eliza::v1::ConverseRequest,
                             >(req);
-                            svc.converse(ctx, req).await
+                            ElizaService::converse(&*svc, ctx, req).await
                         }
                     }
                 }),
@@ -374,7 +374,7 @@ impl<S: ElizaService> ElizaServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::connectrpc::eliza::v1::IntroduceRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.introduce(ctx, sreq).await
+                            ElizaService::introduce(&*svc, ctx, sreq).await
                         }
                     }
                 }),
@@ -482,7 +482,7 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::eliza::v1::SayRequest,
                     >::from_parts(&req, &body);
-                    svc.say(ctx, req)
+                    ElizaService::say(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::connectrpc::eliza::v1::SayResponse,
@@ -519,7 +519,7 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::connectrpc::eliza::v1::IntroduceRequest,
                     >::from_parts(&req, &body);
-                    let resp = svc.introduce(ctx, req).await?;
+                    let resp = ElizaService::introduce(&*svc, ctx, req).await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
@@ -566,7 +566,7 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::eliza::v1::ConverseRequest,
                     >(requests, format, ctx.decode_options().clone());
-                    let resp = svc.converse(ctx, req_stream).await?;
+                    let resp = ElizaService::converse(&*svc, ctx, req_stream).await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<

@@ -1,0 +1,18 @@
+kind: Fixed
+body: |-
+    **RPCs named after Rust methods, such as `Register`, `Clone` and `Into`,
+    now compile** ([#309]). The generated server code called each handler with
+    method-call syntax on the `Arc` that holds the service, so an RPC whose
+    Rust name is also a method of that `Arc` resolved to the wrong method and
+    failed to compile, with the error pointing at generated code. That
+    covered the generated `register` and the methods of prelude traits that
+    `Arc` implements, such as `clone`, `into`, `as_ref` and `drop`. Generated
+    code now calls handlers through the service trait. In your own code,
+    method-call syntax can still resolve to the other method: for example,
+    call an RPC named `Into` as `FooClient::into(&client, request)`. An RPC
+    named `New`, `Config` or `ConfigMut` still fails with E0592, because the
+    generated client has a method of that name; the only workaround is to
+    rename the RPC.
+
+    [#309]: https://github.com/connectrpc/connect-rust/issues/309
+time: 2026-09-26T19:00:20.000000000+00:00

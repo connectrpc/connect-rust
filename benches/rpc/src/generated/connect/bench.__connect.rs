@@ -420,7 +420,7 @@ impl<S: BenchService> BenchServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::BenchRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.unary(ctx, sreq)
+                            BenchService::unary(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<crate::proto::bench::v1::BenchResponse>(format)
                         }
@@ -450,7 +450,7 @@ impl<S: BenchService> BenchServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::BenchRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.server_stream(ctx, sreq).await
+                            BenchService::server_stream(&*svc, ctx, sreq).await
                         }
                     }
                 }),
@@ -467,7 +467,7 @@ impl<S: BenchService> BenchServiceExt for S {
                             let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::proto::bench::v1::BenchRequest,
                             >(req);
-                            svc.client_stream(ctx, req)
+                            BenchService::client_stream(&*svc, ctx, req)
                                 .await?
                                 .encode::<crate::proto::bench::v1::BenchResponse>(format)
                         }
@@ -490,7 +490,7 @@ impl<S: BenchService> BenchServiceExt for S {
                             let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::proto::bench::v1::BenchRequest,
                             >(req);
-                            svc.bidi_stream(ctx, req).await
+                            BenchService::bidi_stream(&*svc, ctx, req).await
                         }
                     }
                 }),
@@ -515,7 +515,7 @@ impl<S: BenchService> BenchServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::LogRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.log_unary(ctx, sreq)
+                            BenchService::log_unary(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<crate::proto::bench::v1::LogResponse>(format)
                         }
@@ -542,7 +542,7 @@ impl<S: BenchService> BenchServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::LogRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.log_unary_owned(ctx, sreq)
+                            BenchService::log_unary_owned(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<crate::proto::bench::v1::LogResponse>(format)
                         }
@@ -670,7 +670,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BenchRequest,
                     >::from_parts(&req, &body);
-                    svc.unary(ctx, req)
+                    BenchService::unary(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::bench::v1::BenchResponse>(format)
                 })
@@ -690,7 +690,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
                     >::from_parts(&req, &body);
-                    svc.log_unary(ctx, req)
+                    BenchService::log_unary(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::bench::v1::LogResponse>(format)
                 })
@@ -710,7 +710,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
                     >::from_parts(&req, &body);
-                    svc.log_unary_owned(ctx, req)
+                    BenchService::log_unary_owned(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::bench::v1::LogResponse>(format)
                 })
@@ -745,7 +745,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BenchRequest,
                     >::from_parts(&req, &body);
-                    let resp = svc.server_stream(ctx, req).await?;
+                    let resp = BenchService::server_stream(&*svc, ctx, req).await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
@@ -777,7 +777,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
                     >(requests, format, ctx.decode_options().clone());
-                    svc.client_stream(ctx, req_stream)
+                    BenchService::client_stream(&*svc, ctx, req_stream)
                         .await?
                         .encode::<crate::proto::bench::v1::BenchResponse>(format)
                 })
@@ -803,7 +803,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
                     >(requests, format, ctx.decode_options().clone());
-                    let resp = svc.bidi_stream(ctx, req_stream).await?;
+                    let resp = BenchService::bidi_stream(&*svc, ctx, req_stream).await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
@@ -1299,7 +1299,7 @@ impl<S: EchoService> EchoServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::EchoRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.echo(ctx, sreq)
+                            EchoService::echo(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<crate::proto::bench::v1::EchoResponse>(format)
                         }
@@ -1397,7 +1397,7 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::EchoRequest,
                     >::from_parts(&req, &body);
-                    svc.echo(ctx, req)
+                    EchoService::echo(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::bench::v1::EchoResponse>(format)
                 })
@@ -1704,7 +1704,7 @@ impl<S: LogIngestService> LogIngestServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::v1::LogRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.ingest(ctx, sreq)
+                            LogIngestService::ingest(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::bench::v1::LogIngestResponse,
@@ -1804,7 +1804,7 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
                     >::from_parts(&req, &body);
-                    svc.ingest(ctx, req)
+                    LogIngestService::ingest(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::bench::v1::LogIngestResponse>(format)
                 })

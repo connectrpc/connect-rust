@@ -173,7 +173,7 @@ impl<S: FortuneService> FortuneServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::fortune::v1::GetFortunesRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.get_fortunes(ctx, sreq)
+                            FortuneService::get_fortunes(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::fortune::v1::GetFortunesResponse,
@@ -273,7 +273,7 @@ impl<T: FortuneService> ::connectrpc::Dispatcher for FortuneServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::fortune::v1::GetFortunesRequest,
                     >::from_parts(&req, &body);
-                    svc.get_fortunes(ctx, req)
+                    FortuneService::get_fortunes(&*svc, ctx, req)
                         .await?
                         .encode::<crate::proto::fortune::v1::GetFortunesResponse>(format)
                 })
