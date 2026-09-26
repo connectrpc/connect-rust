@@ -482,10 +482,11 @@ gRPC implementation built on the same hyper/h2 stack, in two configurations:
 `protobuf` v4 runtime on the upb kernel. The `tonic` arm builds tonic from
 crates.io and the `tonic-protobuf` arm from grpc-rust revision `7053afcd`, so
 the two also differ by the handful of unreleased tonic commits at that
-revision. connectrpc-rs uses [buffa](https://github.com/anthropics/buffa). Measured
-2026-09 on a bare-metal AWS c7i.metal-24xl (Intel Xeon Platinum 8488C, turbo
-disabled), client and servers on the same host over loopback. Higher is
-better unless noted.
+revision. connectrpc-rs uses [buffa](https://github.com/anthropics/buffa).
+Unless a subsection says otherwise, the numbers were measured 2026-09 on a
+bare-metal AWS c7i.metal-24xl (Intel Xeon Platinum 8488C, turbo disabled),
+with client and servers on the same host over loopback. Higher is better
+unless noted.
 
 grpc-rust's own `grpc` crate is a client channel with no server, so it does
 not appear in the server tables; the [Client stacks](#client-stacks) table
@@ -493,15 +494,15 @@ compares it against the connectrpc-rs and tonic clients. The `tonic-protobuf` ar
 protoc plugin from C++ source, so it needs cmake and a C++17 compiler; see
 [`benches/rpc-grpc-rust/README.md`](benches/rpc-grpc-rust/README.md).
 
-The short version: on small unary calls, echo throughput and server streaming
-the two tonic configurations are within 3% of connectrpc-rs, and connectrpc-rs is 9–14%
-slower than either tonic configuration on a 10-message client stream, which is
-a framework cost (the server hands each streamed request message across tasks
-on its way to the handler). The proto library accounts for the rest: a
-50-record log-batch request completes 40% faster with buffa's zero-copy views
-than with prost and 17% faster than with upb at concurrency 1, which under
-load becomes 5–13% more throughput than prost (13% at c=256) and level with
-upb (−3% to +3%); and the upb arm is 13% slower on the 1 MB gzip'd payload.
+The short version: on small unary calls, echo throughput, and 10-message
+client and server streams, the two tonic configurations are within 3% of
+connectrpc-rs. The differences on log batches and large payloads come from the
+proto library. At concurrency 1, a 50-record log-batch request takes 39% longer
+with prost than with buffa's zero-copy views, and 16% longer with upb. Under
+load, tonic serves 6–13% fewer log-batch requests per second than
+connectrpc-rs (13% fewer at c=256), and tonic-protobuf is within 4% (−4% to
++3%), although its c=256 cell measured 23% lower on a second pass. The upb arm
+also takes 11% longer on the 1 MB gzip'd payload.
 
 ### Single-request latency
 
@@ -515,18 +516,20 @@ connectrpc-rs client, so the columns compare servers. Lower is better.
 
 | Benchmark | connectrpc-rs | tonic | tonic-protobuf |
 |---|---:|---:|---:|
-| unary_small (1 int32 + nested msg) | 79.6 | 79.7 | 78.4 (−2%) |
-| unary_logs_50 (50 log records, ~22 KB) | 211.8 | 297.5 (+40%) | 247.3 (+17%) |
-| unary_large (~1 MB payload, gzip request) | 2,925 | 2,847 (−3%) | 3,305 (+13%) |
-| client_stream (10 messages) | 186.4 | 170.4 (−9%) | 160.6 (−14%) |
-| server_stream (10 messages) | 107.5 | 106.1 (−1%) | 110.5 (+3%) |
+| unary_small (1 int32 + nested msg) | 79.7 | 78.8 (−1%) | 78.4 (−2%) |
+| unary_logs_50 (50 log records, ~22 KB) | 218.5 | 303.1 (+39%) | 253.5 (+16%) |
+| unary_large (~1 MB payload, gzip request) | 4,486 | 4,521 (+1%) | 4,964 (+11%) |
+| client_stream (10 messages) | 166.3 | 168.2 (+1%) | 162.2 (−2%) |
+| server_stream (10 messages) | 108.0 | 107.0 (−1%) | 110.2 (+2%) |
 
 The same bench also runs [connect-go](https://github.com/connectrpc/connect-go)
-over gRPC: 249 μs unary_small, 527 μs unary_logs_50, 406 μs client_stream,
-1,083 μs server_stream. Over the Connect protocol, unary_small is 80.6 μs on
-connectrpc-rs and 142 μs on connect-go.
+over gRPC: 253 μs unary_small, 529 μs unary_logs_50, 406 μs client_stream,
+1,080 μs server_stream. Over the Connect protocol, unary_small is 80.5 μs on
+connectrpc-rs and 147 μs on connect-go.
 
-Run with `task bench:cross`.
+Run with `task bench:cross`. It builds the connect-go server with `go build`,
+so it needs a Go toolchain unless `RPC_BENCH_BIN_DIR` points at prebuilt
+server binaries (see [`benches/rpc/README.md`](benches/rpc/README.md)).
 
 </details>
 
@@ -535,7 +538,8 @@ Run with `task bench:cross`.
 64-byte string echo, 8 h2 connections (to avoid single-connection mutex
 contention — see [h2 #531](https://github.com/hyperium/h2/issues/531)).
 Measures framework dispatch + envelope framing + proto encode/decode with
-minimal handler work; all three stacks land within 2% of each other.
+minimal handler work; the three stacks are within 1% of each other up to
+c=64, and connectrpc-rs leads by 3% at c=256.
 
 ![Echo throughput](benches/charts/echo.svg)
 
@@ -543,13 +547,14 @@ minimal handler work; all three stacks land within 2% of each other.
 
 | Concurrency | connectrpc-rs | tonic | tonic-protobuf |
 |---|---:|---:|---:|
-| c=16 | 189,624 | 193,164 (+2%) | 191,938 (+1%) |
-| c=64 | 299,826 | 301,387 (+1%) | 299,864 |
-| c=256 | 270,927 | 266,473 (−2%) | 267,400 (−1%) |
+| c=16 | 194,853 | 196,512 (+1%) | 195,235 |
+| c=64 | 298,919 | 301,501 (+1%) | 298,403 |
+| c=256 | 271,985 | 264,772 (−3%) | 262,920 (−3%) |
 
-A second pass in the same session reproduced every cell within 1%.
+A second pass in the same session reproduced every cell within 1.1%.
 
-Run with `task bench:echo -- --multi-conn=8`.
+Run with `task bench:echo -- --multi-conn=8`; the table shows the
+`(8-conn)` rows of its output.
 
 </details>
 
@@ -570,17 +575,17 @@ round-robin over the connections, each cell the median-throughput run of three
 
 | Connections | Requests in flight | connectrpc-rs `HttpClient` | connectrpc-rs `SharedHttp2Connection` | tonic | grpc-rust |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 17,343 | 17,176 (−1%) | 17,273 | 15,133 (−13%) |
-| 1 | 16 | 36,372 | 36,287 | 35,277 (−3%) | 37,139 (+2%) |
-| 1 | 64 | 41,145 | 40,546 (−1%) | 35,934 (−13%) | 36,898 (−10%) |
-| 8 | 16 | 191,527 | 189,871 (−1%) | 191,933 | 181,187 (−5%) |
-| 8 | 64 | 300,751 | 297,133 (−1%) | 298,744 (−1%) | 292,344 (−3%) |
+| 1 | 1 | 17,497 | 17,394 (−1%) | 17,281 (−1%) | 15,093 (−14%) |
+| 1 | 16 | 37,111 | 36,923 (−1%) | 36,044 (−3%) | 36,780 (−1%) |
+| 1 | 64 | 42,004 | 41,360 (−2%) | 36,414 (−13%) | 36,780 (−12%) |
+| 8 | 16 | 195,213 | 197,060 (+1%) | 194,472 | 184,641 (−5%) |
+| 8 | 64 | 307,749 | 304,224 (−1%) | 302,701 (−2%) | 294,227 (−4%) |
 
-At one request at a time the three hyper-based clients take 57–58 μs per call
-(p50) and grpc-rust's channel 65 μs. With 64 requests in flight on a single
-connection the two connectrpc-rs transports keep scaling to 41k req/s where
-tonic and grpc-rust level off at 36–37k; with the same 64 requests spread over
-8 connections all four are within 3%.
+At one request at a time, tonic and both connectrpc-rs clients take 56–58 μs
+per call (p50), and grpc-rust's channel takes 66 μs. With 64 requests in flight on a single
+connection, the two connectrpc-rs transports keep scaling to 41–42k req/s,
+while tonic and grpc-rust level off at 36–37k. With the same 64 requests spread
+over 8 connections, all four are within 5%.
 
 Run with `task bench:clients -- --repeat=3`.
 
@@ -602,22 +607,24 @@ to prost.
 
 | Concurrency | connectrpc-rs | tonic | tonic-protobuf |
 |---|---:|---:|---:|
-| c=16 | 30,660 | 27,488 (−10%) | 30,246 (−1%) |
-| c=64 | 75,166 | 71,887 (−4%) | 77,588 (+3%) |
-| c=256 | 134,741 | 119,628 (−11%) | 131,365 (−3%) |
+| c=16 | 31,237 | 27,891 (−11%) | 30,561 (−2%) |
+| c=64 | 76,678 | 71,910 (−6%) | 78,722 (+3%) |
+| c=256 | 138,599 | 120,011 (−13%) | 133,558 (−4%) |
 
-At c=256, connectrpc-rs decodes **6.7M records/sec**, tonic-protobuf 6.6M and
+At c=256, connectrpc-rs decodes **6.9M records/sec**, tonic-protobuf 6.7M and
 tonic 6.0M. A second pass in the same session reproduced every cell within
-1%.
+1.4% except tonic-protobuf at c=256, which measured 102,828 req/s (23% lower);
+the table shows the first pass.
 
 **Raw mode (`strict_utf8_mapping`):** For trusted-source log ingestion where
 UTF-8 validation is unnecessary, buffa can emit `&[u8]` instead of `&str` for
 string fields (editions `utf8_validation = NONE` + the `strict_utf8_mapping`
-codegen option). The 2026-03 CPU profile below shows this eliminates the
-11–12% of server CPU spent in `str::from_utf8`. End-to-end throughput gain in this benchmark
-is small (136.5k vs 134.7k req/s at c=256) because client encode
-becomes the bottleneck when both run on one machine — in production with
-separate client/server, the server sees the CPU saving as capacity.
+codegen option). The 2026-03 CPU profile below attributes 11.2% of server CPU
+to UTF-8 validation, which raw mode skips. The end-to-end gain in this
+benchmark is within run-to-run noise (139.6k vs 138.6k req/s at c=256),
+because client encode becomes the bottleneck when both run on one machine. In
+production, with the client on another host, the server sees the CPU saving as
+capacity.
 
 Run with `task bench:log`.
 
@@ -650,7 +657,7 @@ response. Every server uses an 8-connection valkey pool; client uses
 | gRPC | 69,706 | 157,481 | 199,574 | — |
 | gRPC-Web | 69,067 | 153,727 | 191,811 | — |
 
-Connect's ~20% unary throughput advantage over gRPC at c=256 comes from
+Connect's 23% unary throughput advantage over gRPC at c=256 comes from
 simpler framing: no envelope header, no trailing HEADERS frame. At 200k+
 req/s, gRPC's trailer frame is ~200k extra h2 HEADERS encodes per second.
 The gap grows with throughput (5% @ c=16 → 23% @ c=256).
@@ -684,7 +691,7 @@ string data directly from the request buffer (zero allocs per string field);
 materialize `String` + `HashMap<String,String>` for every record before the
 handler runs. upb sits between the two: it copies string bytes into a
 per-message arena but makes no per-field heap allocation, which is consistent
-with it landing within a few percent of buffa in the tables above.
+with it landing within a few percent of buffa in the throughput tables above.
 
 The framework layer itself — codegen-emitted `FooServiceServer<T>` with
 compile-time `match` dispatch, a two-frame `GrpcUnaryBody` for the common unary
