@@ -1,5 +1,8 @@
 [workspace]
 members = ["connectrpc", "connectrpc-codegen", "connectrpc-build", "connectrpc-health", "connectrpc-reflection", "conformance", "examples/eliza", "examples/middleware", "examples/mtls-identity", "examples/multiservice", "examples/streaming-tour", "examples/wasm-client", "tests/streaming", "benches/rpc", "benches/rpc-tonic"]
+# benches/rpc-grpc-rust needs the grpc-rust codegen toolchain (protoc 35.1 +
+# a cmake-built C++ plugin); it is built on demand by the bench drivers, not CI.
+exclude = ["benches/rpc-grpc-rust"]
 resolver = "2"
 
 [workspace.package]

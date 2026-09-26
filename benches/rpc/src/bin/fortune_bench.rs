@@ -1,19 +1,20 @@
-//! Fortunes benchmark: connectrpc-rs vs tonic vs connect-go.
+//! Fortunes benchmark: connectrpc-rs vs tonic (prost and upb-protobuf codecs)
+//! vs connect-go.
 //!
 //! Adapted from the TechEmpower Web Framework Benchmarks. Measures a realistic
 //! workload: network round-trip to a valkey backing store, string processing,
 //! sorting, and response encoding via a single unary RPC. A valkey container
 //! is spawned as a sibling process and shared across all server runs.
 
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, Http2Connection, HttpClient, SharedHttp2Connection};
+use rpc_bench::ServerProcess;
 use rpc_bench::connect::fortune::v1::*;
 use rpc_bench::fortune;
 use rpc_bench::proto::fortune::v1::*;
@@ -30,48 +31,6 @@ const DEFAULT_MEASUREMENT: Duration = Duration::from_secs(10);
 const QUICK_WARMUP: Duration = Duration::from_secs(1);
 const QUICK_MEASUREMENT: Duration = Duration::from_secs(3);
 const MAX_LATENCY_SAMPLES: usize = 500_000;
-
-// ── Server process management ────────────────────────────────────────
-
-struct ServerProcess {
-    child: Child,
-    addr: SocketAddr,
-}
-
-impl ServerProcess {
-    fn start(cmd: &str, args: &[&str]) -> Self {
-        let mut child = Command::new(cmd)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to start {cmd}: {e}"));
-
-        let stdout = child.stdout.take().expect("no stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .expect("failed to read server address");
-        if bytes_read == 0 {
-            panic!("server {cmd} exited before printing its address");
-        }
-        let addr: SocketAddr = line.trim().parse().unwrap_or_else(|e| {
-            panic!("failed to parse server address from {cmd} ({line:?}): {e}")
-        });
-
-        std::thread::sleep(Duration::from_millis(50));
-
-        Self { child, addr }
-    }
-}
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 // ── Valkey container ────────────────────────────────────────────────
 
@@ -152,6 +111,9 @@ impl Drop for ValkeyContainer {
 // ── Build helpers ────────────────────────────────────────────────────
 
 fn build_connectrpc_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("fortune_server") {
+        return path;
+    }
     eprintln!("  Building connectrpc-rs fortune server...");
     let output = Command::new("cargo")
         .args([
@@ -173,6 +135,9 @@ fn build_connectrpc_server() -> String {
 }
 
 fn build_tonic_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("fortune-server-tonic") {
+        return path;
+    }
     eprintln!("  Building tonic fortune server...");
     let output = Command::new("cargo")
         .args([
@@ -196,7 +161,14 @@ fn build_tonic_server() -> String {
     format!("{manifest_dir}/../../target/release/fortune-server-tonic")
 }
 
+fn build_tonic_protobuf_server() -> String {
+    rpc_bench::build_grpc_rust_bin("fortune-server-tonic-protobuf")
+}
+
 fn build_connect_go_server() -> String {
+    if let Some(path) = rpc_bench::prebuilt_bin("fortune-connect-go") {
+        return path;
+    }
     eprintln!("  Building connect-go fortune server...");
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let go_dir = format!("{manifest_dir}/../rpc-go");
@@ -301,7 +273,13 @@ async fn bench_server(
 
     // Warmup phase.
     tokio::time::sleep(warmup).await;
-    count.store(0, Ordering::Relaxed);
+    // A server that rejects every call (e.g. an unimplemented method after a
+    // stub regen) would otherwise report 0 req/s instead of failing.
+    let warmed = count.swap(0, Ordering::Relaxed);
+    assert!(
+        warmed > 0,
+        "{impl_name}: no request succeeded during warmup"
+    );
     latencies.lock().await.clear();
     let measure_start = Instant::now();
 
@@ -409,7 +387,13 @@ async fn bench_server_multiconn(
     }
 
     tokio::time::sleep(warmup).await;
-    count.store(0, Ordering::Relaxed);
+    // A server that rejects every call (e.g. an unimplemented method after a
+    // stub regen) would otherwise report 0 req/s instead of failing.
+    let warmed = count.swap(0, Ordering::Relaxed);
+    assert!(
+        warmed > 0,
+        "{impl_name}: no request succeeded during warmup"
+    );
     latencies.lock().await.clear();
     let measure_start = Instant::now();
 
@@ -497,6 +481,7 @@ async fn main() {
     eprintln!("\nBuilding servers...");
     let connectrpc_bin = build_connectrpc_server();
     let tonic_bin = build_tonic_server();
+    let tonic_protobuf_bin = build_tonic_protobuf_server();
     let connect_go_bin = build_connect_go_server();
 
     // Each server + the set of protocols to hit it with. The connectrpc-rs
@@ -513,12 +498,14 @@ async fn main() {
         vec![
             ("connectrpc-rs", &connectrpc_bin, all_three),
             ("tonic", &tonic_bin, grpc_only),
+            ("tonic-protobuf", &tonic_protobuf_bin, grpc_only),
             ("connect-go", &connect_go_bin, connect_and_grpc),
         ]
     } else {
         vec![
             ("connectrpc-rs", &connectrpc_bin, grpc_only),
             ("tonic", &tonic_bin, grpc_only),
+            ("tonic-protobuf", &tonic_protobuf_bin, grpc_only),
             ("connect-go", &connect_go_bin, grpc_only),
         ]
     };

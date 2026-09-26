@@ -1,7 +1,5 @@
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::{Command, Stdio};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -10,51 +8,6 @@ use connectrpc::client::{ClientConfig, HttpClient};
 use rpc_bench::*;
 
 const STREAM_MSG_COUNT: i32 = 10;
-
-// ── Server process management ─────────────────────────────────────────
-
-struct ServerProcess {
-    child: Child,
-    addr: SocketAddr,
-}
-
-impl ServerProcess {
-    /// Start a server process and read the address from its first stdout line.
-    fn start(cmd: &str, args: &[&str]) -> Self {
-        let mut child = Command::new(cmd)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to start {cmd}: {e}"));
-
-        let stdout = child.stdout.take().expect("no stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .expect("failed to read server address");
-        let addr: SocketAddr = line.trim().parse().unwrap_or_else(|e| {
-            panic!("failed to parse server address from {cmd} ({line:?}): {e}")
-        });
-
-        // Give the server a moment to be fully ready for connections.
-        std::thread::sleep(Duration::from_millis(50));
-
-        Self { child, addr }
-    }
-
-    fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-}
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -73,6 +26,9 @@ fn make_connect_client(addr: SocketAddr) -> BenchServiceClient<HttpClient> {
 // ── Server paths ──────────────────────────────────────────────────────
 
 fn connectrpc_server_path() -> String {
+    if let Some(path) = prebuilt_bin("bench_server") {
+        return path;
+    }
     // Build the server binary if needed and return its path.
     let output = Command::new("cargo")
         .args([
@@ -95,6 +51,9 @@ fn connectrpc_server_path() -> String {
 }
 
 fn tonic_server_path() -> String {
+    if let Some(path) = prebuilt_bin("rpc-bench-tonic") {
+        return path;
+    }
     let output = Command::new("cargo")
         .args([
             "build",
@@ -112,7 +71,14 @@ fn tonic_server_path() -> String {
     format!("{manifest_dir}/../../target/release/rpc-bench-tonic")
 }
 
+fn tonic_protobuf_server_path() -> String {
+    build_grpc_rust_bin("bench-server-tonic-protobuf")
+}
+
 fn connect_go_server_path() -> String {
+    if let Some(path) = prebuilt_bin("bench-connect-go") {
+        return path;
+    }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let go_dir = format!("{manifest_dir}/../rpc-go");
     let bin_path = format!("{go_dir}/bench-connect-go");
@@ -128,29 +94,55 @@ fn connect_go_server_path() -> String {
     bin_path
 }
 
+// ── Server sets ───────────────────────────────────────────────────────
+
+/// One freshly started server per implementation that speaks gRPC, labelled
+/// for the criterion report. `tonic` is tonic + prost; `tonic-protobuf` is
+/// tonic + grpc-rust's codec on Google's upb-kernel `protobuf` runtime.
+fn grpc_servers() -> Vec<(&'static str, ServerProcess)> {
+    vec![
+        (
+            "connectrpc-rs",
+            ServerProcess::start(&connectrpc_server_path(), &[]),
+        ),
+        ("tonic", ServerProcess::start(&tonic_server_path(), &[])),
+        (
+            "tonic-protobuf",
+            ServerProcess::start(&tonic_protobuf_server_path(), &[]),
+        ),
+        (
+            "connect-go",
+            ServerProcess::start(&connect_go_server_path(), &[]),
+        ),
+    ]
+}
+
+/// One freshly started server per implementation that speaks the Connect
+/// protocol. tonic serves gRPC only.
+fn connect_servers() -> Vec<(&'static str, ServerProcess)> {
+    vec![
+        (
+            "connectrpc-rs",
+            ServerProcess::start(&connectrpc_server_path(), &[]),
+        ),
+        (
+            "connect-go",
+            ServerProcess::start(&connect_go_server_path(), &[]),
+        ),
+    ]
+}
+
 // ── Benchmarks ────────────────────────────────────────────────────────
 
-/// Labels for each server implementation.
-const IMPLS: [&str; 3] = ["connectrpc-rs", "tonic", "connect-go"];
-
 fn bench_unary_small_grpc(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let tonic_bin = tonic_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    let servers = [
-        ServerProcess::start(&connectrpc_bin, &[]),
-        ServerProcess::start(&tonic_bin, &[]),
-        ServerProcess::start(&connect_go_bin, &[]),
-    ];
-
+    let servers = grpc_servers();
     let req = small_request();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("cross/unary_small_grpc");
 
-    for (impl_name, server) in IMPLS.iter().zip(servers.iter()) {
-        let client = make_grpc_client(server.addr());
+    for (impl_name, server) in &servers {
+        let client = make_grpc_client(server.addr);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {
             b.to_async(&rt)
                 .iter(|| async { client.unary(req.clone()).await.expect("unary RPC failed") });
@@ -158,26 +150,17 @@ fn bench_unary_small_grpc(c: &mut Criterion) {
     }
 
     group.finish();
-    drop(servers);
 }
 
 fn bench_unary_small_connect(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    // tonic doesn't support Connect protocol, only gRPC
-    let servers = [
-        ("connectrpc-rs", ServerProcess::start(&connectrpc_bin, &[])),
-        ("connect-go", ServerProcess::start(&connect_go_bin, &[])),
-    ];
-
+    let servers = connect_servers();
     let req = small_request();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("cross/unary_small_connect");
 
     for (impl_name, server) in &servers {
-        let client = make_connect_client(server.addr());
+        let client = make_connect_client(server.addr);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {
             b.to_async(&rt)
                 .iter(|| async { client.unary(req.clone()).await.expect("unary RPC failed") });
@@ -188,16 +171,7 @@ fn bench_unary_small_connect(c: &mut Criterion) {
 }
 
 fn bench_unary_large_grpc(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let tonic_bin = tonic_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    let servers = [
-        ServerProcess::start(&connectrpc_bin, &[]),
-        ServerProcess::start(&tonic_bin, &[]),
-        ServerProcess::start(&connect_go_bin, &[]),
-    ];
-
+    let servers = grpc_servers();
     let req = large_request();
     let payload_size = {
         use buffa::Message;
@@ -208,8 +182,8 @@ fn bench_unary_large_grpc(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross/unary_large_grpc");
     group.throughput(Throughput::Bytes(payload_size));
 
-    for (impl_name, server) in IMPLS.iter().zip(servers.iter()) {
-        let config = ClientConfig::new(format!("http://{}", server.addr()).parse().unwrap())
+    for (impl_name, server) in &servers {
+        let config = ClientConfig::new(format!("http://{}", server.addr).parse().unwrap())
             .with_protocol(Protocol::Grpc)
             .compress_requests("gzip");
         let client = BenchServiceClient::new(HttpClient::plaintext_http2_only(), config);
@@ -220,20 +194,10 @@ fn bench_unary_large_grpc(c: &mut Criterion) {
     }
 
     group.finish();
-    drop(servers);
 }
 
 fn bench_server_stream_grpc(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let tonic_bin = tonic_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    let servers = [
-        ServerProcess::start(&connectrpc_bin, &[]),
-        ServerProcess::start(&tonic_bin, &[]),
-        ServerProcess::start(&connect_go_bin, &[]),
-    ];
-
+    let servers = grpc_servers();
     let base_req = BenchRequest {
         response_count: STREAM_MSG_COUNT,
         payload: small_payload().into(),
@@ -244,8 +208,8 @@ fn bench_server_stream_grpc(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross/server_stream_grpc");
     group.throughput(Throughput::Elements(STREAM_MSG_COUNT as u64));
 
-    for (impl_name, server) in IMPLS.iter().zip(servers.iter()) {
-        let client = make_grpc_client(server.addr());
+    for (impl_name, server) in &servers {
+        let client = make_grpc_client(server.addr);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {
             b.to_async(&rt).iter(|| async {
                 let mut stream = client
@@ -267,28 +231,18 @@ fn bench_server_stream_grpc(c: &mut Criterion) {
     }
 
     group.finish();
-    drop(servers);
 }
 
 fn bench_client_stream_grpc(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let tonic_bin = tonic_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    let servers = [
-        ServerProcess::start(&connectrpc_bin, &[]),
-        ServerProcess::start(&tonic_bin, &[]),
-        ServerProcess::start(&connect_go_bin, &[]),
-    ];
-
+    let servers = grpc_servers();
     let messages: Vec<BenchRequest> = (0..STREAM_MSG_COUNT).map(|_| small_request()).collect();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("cross/client_stream_grpc");
     group.throughput(Throughput::Elements(STREAM_MSG_COUNT as u64));
 
-    for (impl_name, server) in IMPLS.iter().zip(servers.iter()) {
-        let client = make_grpc_client(server.addr());
+    for (impl_name, server) in &servers {
+        let client = make_grpc_client(server.addr);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {
             b.to_async(&rt).iter(|| async {
                 client
@@ -300,20 +254,10 @@ fn bench_client_stream_grpc(c: &mut Criterion) {
     }
 
     group.finish();
-    drop(servers);
 }
 
 fn bench_unary_logs_grpc(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let tonic_bin = tonic_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    let servers = [
-        ServerProcess::start(&connectrpc_bin, &[]),
-        ServerProcess::start(&tonic_bin, &[]),
-        ServerProcess::start(&connect_go_bin, &[]),
-    ];
-
+    let servers = grpc_servers();
     let req = log_request(50);
     let payload_size = {
         use buffa::Message;
@@ -324,8 +268,8 @@ fn bench_unary_logs_grpc(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross/unary_logs_50_grpc");
     group.throughput(Throughput::Bytes(payload_size));
 
-    for (impl_name, server) in IMPLS.iter().zip(servers.iter()) {
-        let client = make_grpc_client(server.addr());
+    for (impl_name, server) in &servers {
+        let client = make_grpc_client(server.addr);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {
             b.to_async(&rt)
                 .iter(|| async { client.log_unary(req.clone()).await.expect("log RPC failed") });
@@ -333,18 +277,10 @@ fn bench_unary_logs_grpc(c: &mut Criterion) {
     }
 
     group.finish();
-    drop(servers);
 }
 
 fn bench_unary_logs_connect(c: &mut Criterion) {
-    let connectrpc_bin = connectrpc_server_path();
-    let connect_go_bin = connect_go_server_path();
-
-    let servers = [
-        ("connectrpc-rs", ServerProcess::start(&connectrpc_bin, &[])),
-        ("connect-go", ServerProcess::start(&connect_go_bin, &[])),
-    ];
-
+    let servers = connect_servers();
     let req = log_request(50);
     let payload_size = {
         use buffa::Message;
@@ -356,7 +292,7 @@ fn bench_unary_logs_connect(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(payload_size));
 
     for (impl_name, server) in &servers {
-        let client = make_connect_client(server.addr());
+        let client = make_connect_client(server.addr);
         group.bench_function(BenchmarkId::from_parameter(impl_name), |b| {
             b.to_async(&rt)
                 .iter(|| async { client.log_unary(req.clone()).await.expect("log RPC failed") });

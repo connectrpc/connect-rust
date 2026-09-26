@@ -475,28 +475,67 @@ for `include_bytes!`) or by an existing `buffa_descriptor::DescriptorPool`.
 
 ## Performance
 
-Comparison against [tonic](https://docs.rs/tonic/) 0.14 (the standard Rust gRPC
-implementation, built on the same hyper/h2 stack). Measured on Intel Xeon
-Platinum 8488C with [buffa](https://github.com/anthropics/buffa) as the proto
-library. Higher is better unless noted.
+Comparison against [tonic](https://docs.rs/tonic/) 0.14.6, the standard Rust
+gRPC implementation built on the same hyper/h2 stack, in two configurations:
+`tonic` is tonic with prost, and `tonic-protobuf` is tonic with
+[grpc-rust](https://github.com/grpc/grpc-rust)'s codec over Google's
+`protobuf` v4 runtime on the upb kernel. The `tonic` arm builds tonic from
+crates.io and the `tonic-protobuf` arm from grpc-rust revision `7053afcd`, so
+the two also differ by the handful of unreleased tonic commits at that
+revision. connectrpc-rs uses [buffa](https://github.com/anthropics/buffa).
+Unless a subsection says otherwise, the numbers were measured 2026-09 on a
+bare-metal AWS c7i.metal-24xl (Intel Xeon Platinum 8488C, turbo disabled),
+with client and servers on the same host over loopback. Higher is better
+unless noted.
+
+grpc-rust's own `grpc` crate is a client channel with no server, so it does
+not appear in the server tables; the [Client stacks](#client-stacks) table
+compares it against the connectrpc-rs and tonic clients. The `tonic-protobuf` arm's first build compiles `protoc` and a
+protoc plugin from C++ source, so it needs cmake and a C++17 compiler; see
+[`benches/rpc-grpc-rust/README.md`](benches/rpc-grpc-rust/README.md).
+
+The short version: on small unary calls, echo throughput, and 10-message
+client and server streams, the two tonic configurations are within 3% of
+connectrpc-rs. The differences on log batches and large payloads come from the
+proto library. At concurrency 1, a 50-record log-batch request takes 39% longer
+with prost than with buffa's zero-copy views, and 16% longer with upb. Under
+load, tonic serves 6–13% fewer log-batch requests per second than
+connectrpc-rs (13% fewer at c=256), and tonic-protobuf is within 4% (−4% to
++3%), although its c=256 cell measured 23% lower on a second pass. The upb arm
+also takes 11% longer on the 1 MB gzip'd payload.
 
 ### Single-request latency
 
 Criterion benchmarks at concurrency=1 (no h2 contention), measuring per-request
-framework + proto work in isolation. Lower is better.
+framework + proto work in isolation. Every arm is driven by the same
+connectrpc-rs client, so the columns compare servers. Lower is better.
 
 ![Single-request latency](benches/charts/latency.svg)
 
 <details><summary>Raw data (μs, lower is better)</summary>
 
-| Benchmark | connectrpc-rs | tonic | ratio |
+| Benchmark | connectrpc-rs | tonic | tonic-protobuf |
 |---|---:|---:|---:|
-| unary_small (1 int32 + nested msg) | 87.6 | 170.8 | **1.95×** |
-| unary_logs_50 (50 log records, ~15 KB) | 195.0 | 338.5 | **1.74×** |
-| client_stream (10 messages) | 166.1 | 223.8 | **1.35×** |
-| server_stream (10 messages) | 109.8 | 110.1 | 1.00× |
+| unary_small (1 int32 + nested msg) | 79.7 | 78.8 (−1%) | 78.4 (−2%) |
+| unary_logs_50 (50 log records, ~22 KB) | 218.5 | 303.1 (+39%) | 253.5 (+16%) |
+| unary_large (~1 MB payload, gzip request) | 4,486 | 4,521 (+1%) | 4,964 (+11%) |
+| client_stream (10 messages) | 166.3 | 168.2 (+1%) | 162.2 (−2%) |
+| server_stream (10 messages) | 108.0 | 107.0 (−1%) | 110.2 (+2%) |
 
-Run with `task bench:cross:quick`.
+The same bench also runs [connect-go](https://github.com/connectrpc/connect-go)
+over gRPC: 253 μs unary_small, 529 μs unary_logs_50, 406 μs client_stream,
+1,080 μs server_stream. Over the Connect protocol, unary_small is 80.5 μs on
+connectrpc-rs and 147 μs on connect-go.
+
+Compare the unary_large columns within a run, not across runs: the row
+depends on what the bench process ran before it. Identical binaries on the
+same instance type and kernel measured the connectrpc-rs arm at 4,486 μs in
+the full suite and at 3,298 μs with the run filtered to unary_large, while
+the tonic arm moved by under 1%.
+
+Run with `task bench:cross`. It builds the connect-go server with `go build`,
+so it needs a Go toolchain unless `RPC_BENCH_BIN_DIR` points at prebuilt
+server binaries (see [`benches/rpc/README.md`](benches/rpc/README.md)).
 
 </details>
 
@@ -505,19 +544,56 @@ Run with `task bench:cross:quick`.
 64-byte string echo, 8 h2 connections (to avoid single-connection mutex
 contention — see [h2 #531](https://github.com/hyperium/h2/issues/531)).
 Measures framework dispatch + envelope framing + proto encode/decode with
-minimal handler work.
+minimal handler work; the three stacks are within 1% of each other up to
+c=64, and connectrpc-rs leads by 3% at c=256.
 
 ![Echo throughput](benches/charts/echo.svg)
 
 <details><summary>Raw data (req/s)</summary>
 
-| Concurrency | connectrpc-rs | tonic |
-|---|---:|---:|
-| c=16 | 170,292 | 168,811 (−1%) |
-| c=64 | 238,498 | 234,304 (−2%) |
-| c=256 | 252,000 | 247,167 (−2%) |
+| Concurrency | connectrpc-rs | tonic | tonic-protobuf |
+|---|---:|---:|---:|
+| c=16 | 194,853 | 196,512 (+1%) | 195,235 |
+| c=64 | 298,919 | 301,501 (+1%) | 298,403 |
+| c=256 | 271,985 | 264,772 (−3%) | 262,920 (−3%) |
 
-Run with `task bench:echo -- --multi-conn=8`.
+A second pass in the same session reproduced every cell within 1.1%.
+
+Run with `task bench:echo -- --multi-conn=8`; the table shows the
+`(8-conn)` rows of its output.
+
+</details>
+
+### Client stacks
+
+The other tables in this section hold the client fixed (connectrpc-rs) and vary
+the server; this one holds the server fixed (the connectrpc-rs echo server) and
+varies the client: the generated connectrpc-rs client over `HttpClient`
+(hyper-util's pooled client, one per connection) and over
+`SharedHttp2Connection` (one raw h2 connection each, no pool), tonic's
+generated client (tonic-prost, built from the same grpc-rust revision), and
+grpc-rust's `grpc` channel with its `protobuf` codec. All four speak gRPC over
+h2 to the same server; closed loop, 64-byte echo, requests in flight spread
+round-robin over the connections, each cell the median-throughput run of three
+10-second runs.
+
+<details><summary>Raw data (req/s)</summary>
+
+| Connections | Requests in flight | connectrpc-rs `HttpClient` | connectrpc-rs `SharedHttp2Connection` | tonic | grpc-rust |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 17,497 | 17,394 (−1%) | 17,281 (−1%) | 15,093 (−14%) |
+| 1 | 16 | 37,111 | 36,923 (−1%) | 36,044 (−3%) | 36,780 (−1%) |
+| 1 | 64 | 42,004 | 41,360 (−2%) | 36,414 (−13%) | 36,780 (−12%) |
+| 8 | 16 | 195,213 | 197,060 (+1%) | 194,472 | 184,641 (−5%) |
+| 8 | 64 | 307,749 | 304,224 (−1%) | 302,701 (−2%) | 294,227 (−4%) |
+
+At one request at a time, tonic and both connectrpc-rs clients take 56–58 μs
+per call (p50), and grpc-rust's channel takes 66 μs. With 64 requests in flight on a single
+connection, the two connectrpc-rs transports keep scaling to 41–42k req/s,
+while tonic and grpc-rust level off at 36–37k. With the same 64 requests spread
+over 8 connections, all four are within 5%.
+
+Run with `task bench:clients -- --repeat=3`.
 
 </details>
 
@@ -525,29 +601,36 @@ Run with `task bench:echo -- --multi-conn=8`.
 
 50 structured log records per request (~22 KB batch): varints, string fields,
 nested message, map entries. Handler iterates every field to force full decode.
-This is where the proto library matters — buffa's zero-copy views avoid the
-per-string allocations that prost's owned types require.
+This is where the proto library matters: buffa's views borrow string data from
+the request buffer, prost allocates a `String` per field and a `HashMap` per
+map, and upb parses eagerly into a per-message arena, copying string bytes but
+avoiding per-field heap allocations — which puts it much closer to buffa than
+to prost.
 
 ![Log ingest throughput](benches/charts/log-ingest.svg)
 
 <details><summary>Raw data (req/s)</summary>
 
-| Concurrency | connectrpc-rs | tonic |
-|---|---:|---:|
-| c=16 | 32,257 | 28,110 (−13%) |
-| c=64 | 73,313 | 68,690 (−6%) |
-| c=256 | 112,027 | 84,171 (−25%) |
+| Concurrency | connectrpc-rs | tonic | tonic-protobuf |
+|---|---:|---:|---:|
+| c=16 | 31,237 | 27,891 (−11%) | 30,561 (−2%) |
+| c=64 | 76,678 | 71,910 (−6%) | 78,722 (+3%) |
+| c=256 | 138,599 | 120,011 (−13%) | 133,558 (−4%) |
 
-At c=256, connectrpc-rs decodes **5.6M records/sec** vs tonic's **4.2M**.
+At c=256, connectrpc-rs decodes **6.9M records/sec**, tonic-protobuf 6.7M and
+tonic 6.0M. A second pass in the same session reproduced every cell within
+1.4% except tonic-protobuf at c=256, which measured 102,828 req/s (23% lower);
+the table shows the first pass.
 
 **Raw mode (`strict_utf8_mapping`):** For trusted-source log ingestion where
 UTF-8 validation is unnecessary, buffa can emit `&[u8]` instead of `&str` for
 string fields (editions `utf8_validation = NONE` + the `strict_utf8_mapping`
-codegen option). CPU profile shows this eliminates 11.8% of server CPU
-(`str::from_utf8` drops to zero). End-to-end throughput gain in this benchmark
-is smaller (~1%) because client encode becomes the bottleneck when both run on
-one machine — in production with separate client/server, the server sees ~15%
-more capacity.
+codegen option). The 2026-03 CPU profile below attributes 11.2% of server CPU
+to UTF-8 validation, which raw mode skips. The end-to-end gain in this
+benchmark is within run-to-run noise (139.6k vs 138.6k req/s at c=256),
+because client encode becomes the bottleneck when both run on one machine. In
+production, with the client on another host, the server sees the CPU saving as
+capacity.
 
 Run with `task bench:log`.
 
@@ -559,7 +642,7 @@ Handler performs a network round-trip to a [valkey](https://valkey.io/)
 container (`HGETALL` of 12 fortune messages, ~800 bytes), adds an ephemeral
 record, sorts, and encodes a 13-message response. This is the shape of a
 typical read-mostly service: RPC framing + async I/O wait + moderate-size
-response. All three servers use an 8-connection valkey pool; client uses
+response. Every server uses an 8-connection valkey pool; client uses
 8 h2 connections so protocol framing is the only variable.
 
 <details><summary>Raw data (req/s, c=256)</summary>
@@ -580,19 +663,22 @@ response. All three servers use an 8-connection valkey pool; client uses
 | gRPC | 69,706 | 157,481 | 199,574 | — |
 | gRPC-Web | 69,067 | 153,727 | 191,811 | — |
 
-Connect's ~20% unary throughput advantage over gRPC at c=256 comes from
+Connect's 23% unary throughput advantage over gRPC at c=256 comes from
 simpler framing: no envelope header, no trailing HEADERS frame. At 200k+
 req/s, gRPC's trailer frame is ~200k extra h2 HEADERS encodes per second.
 The gap grows with throughput (5% @ c=16 → 23% @ c=256).
 
 Run with `task bench:fortunes:protocols:h2`. Requires `docker` for the
-valkey sibling container (image pulled automatically on first run).
+valkey sibling container (image pulled automatically on first run). These
+fortunes figures are from the 2026-03 run and predate the `tonic-protobuf`
+arm.
 
 </details>
 
-### Where the advantage comes from
+### Where the log-ingest difference comes from
 
-CPU profile breakdown (log-ingest, c=64, 30s, `task profile:log`):
+CPU profile breakdown (log-ingest, c=64, 30s, `task profile:log`, 2026-03
+run against tonic + prost):
 
 | Cost center | connectrpc-rs | tonic |
 |---|---:|---:|
@@ -604,16 +690,20 @@ CPU profile breakdown (log-ingest, c=64, 30s, `task profile:log`):
 | **Total proto** | **27.1%** | **~24%** (+allocator) |
 | Allocator (malloc/free/realloc) | **3.6%** | **9.6%** |
 
-connectrpc-rs spends a *larger fraction* of CPU in proto decode — because it
-spends so much less everywhere else. buffa's view types borrow string data
-directly from the request buffer (zero allocs per string field); `MapView` is
-a flat `Vec<(K,V)>` scan with no hashing. tonic/prost must fully materialize
-`String` + `HashMap<String,String>` for every record before the handler runs.
+The difference is allocation: 3.6% of CPU in the allocator against 9.6%, and
+nothing in `HashMap` operations against 8.5%. buffa's view types borrow
+string data directly from the request buffer (zero allocs per string field);
+`MapView` is a flat `Vec<(K,V)>` scan with no hashing. tonic/prost must fully
+materialize `String` + `HashMap<String,String>` for every record before the
+handler runs. upb sits between the two: it copies string bytes into a
+per-message arena but makes no per-field heap allocation, which is consistent
+with it landing within a few percent of buffa in the throughput tables above.
 
-The framework itself contributes: codegen-emitted `FooServiceServer<T>` with
-compile-time `match` dispatch (no `Arc<dyn Handler>` vtable), a two-frame
-`GrpcUnaryBody` for the common unary case, and stream-message batching into
-fewer h2 DATA frames.
+The framework layer itself — codegen-emitted `FooServiceServer<T>` with
+compile-time `match` dispatch, a two-frame `GrpcUnaryBody` for the common unary
+case, and stream-message batching into fewer h2 DATA frames — measures level
+with tonic's on the echo and small-unary benches above, so the decode path is
+where the difference is made.
 
 ## Custom Compression
 
