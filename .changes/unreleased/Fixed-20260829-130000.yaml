@@ -6,9 +6,9 @@ body: |-
     capacity intact, so a queued compressible frame held about its
     uncompressed size in memory until HTTP/2 wrote it. Incompressible input
     at gzip's default fast level also outgrew the gzip buffer, which then
-    doubled. Both encoders now give back the unused capacity when the
-    compressed frame is under half of it, and the gzip buffer is sized from
-    deflate's worst-case bound, so it no longer grows. A queued compressible
-    frame now pins at most about twice its compressed size; an
+    doubled. Both encoders now copy the compressed frame into a buffer of
+    its own when it is under half of the working buffer, and the gzip buffer
+    is sized from deflate's worst-case bound, so it no longer grows. A
+    queued compressible frame now pins only its compressed size; an
     incompressible one, about its input size.
 time: 2026-08-29T13:00:00.000000000+00:00

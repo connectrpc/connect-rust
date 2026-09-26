@@ -513,21 +513,30 @@ impl Default for CompressionRegistry {
 const GZIP_FRAMING_LEN: usize = 18;
 
 /// Hand a finished compressed buffer over as the response frame's `Bytes`,
-/// giving back the slack first when the buffer is mostly slack.
+/// copying the output out first when the buffer is mostly slack.
 ///
 /// The buffer was sized to the codec's worst-case bound, a little over the
 /// input length, but compressible payloads finish far below that, and
 /// `Bytes::from` keeps the whole allocation alive for as long as the frame
-/// is queued. Shrinking when more than half the buffer is unused bounds
-/// what a queued frame pins to about twice its compressed size; the copy it
-/// costs is at most the compressed length, which is the small case by
-/// construction.
+/// is queued. Copying when more than half the buffer is unused bounds what
+/// a queued frame pins to its compressed size; the copy is the compressed
+/// length, under half the buffer by the condition above.
+///
+/// The copy frees the working buffer; do not replace it with
+/// `shrink_to_fit`. A buffer of a large input is above glibc's mmap
+/// threshold, and shrinking it with `realloc` leaves too small a chunk to
+/// raise that threshold, so every later compression of a large input would
+/// map, fault in and unmap a fresh buffer (flate2's Rust backends zero-fill
+/// the spare output capacity on each call). Freeing the full-size buffer
+/// raises the threshold, up to glibc's 32 MiB cap, and lets later calls
+/// reuse heap memory.
 #[cfg(any(feature = "gzip", feature = "zstd"))]
-fn compressed_output(mut output: Vec<u8>) -> Bytes {
+fn compressed_output(output: Vec<u8>) -> Bytes {
     if output.capacity() > 2 * output.len() {
-        output.shrink_to_fit();
+        Bytes::copy_from_slice(&output)
+    } else {
+        Bytes::from(output)
     }
-    Bytes::from(output)
 }
 
 /// Gzip compression provider with internal state pooling.
@@ -666,9 +675,8 @@ impl GzipProvider {
         // at every level 0-9, so one call with the whole input and `Finish`
         // always fits. The fast level this provider defaults to really does
         // grow incompressible input by a few percent, so the tighter figure
-        // classic zlib quotes for its default parameters would not do. The
-        // buffer becomes the returned `Bytes`, so it is also what a queued
-        // response frame pins until it is written (see `compressed_output`).
+        // classic zlib quotes for its default parameters would not do.
+        // `compressed_output` decides what the returned frame retains.
         let deflate_bound = data.len() + data.len().div_ceil(8) + data.len().div_ceil(64) + 5;
         let mut output = Vec::with_capacity(GZIP_FRAMING_LEN + deflate_bound);
 
@@ -1364,11 +1372,11 @@ mod tests {
     ///
     /// `Bytes::try_into_mut` reuses the original allocation when the handle
     /// is unique, so the resulting `BytesMut::capacity()` exposes how much
-    /// memory the decompressed message actually retains.
+    /// memory the message actually retains.
     fn backing_capacity(bytes: Bytes) -> usize {
         bytes
             .try_into_mut()
-            .expect("freshly decompressed Bytes has no other references")
+            .expect("freshly produced Bytes has no other references")
             .capacity()
     }
 
@@ -1429,8 +1437,8 @@ mod tests {
     }
 
     /// A compressible 1 MiB payload compresses to a few KiB; the frame that
-    /// carries it must not keep an input-sized working buffer alive behind
-    /// it.
+    /// carries it must be backed by a buffer of its own size, not the
+    /// input-sized working buffer.
     #[cfg(feature = "gzip")]
     #[test]
     fn test_gzip_compress_does_not_retain_the_working_buffer() {
@@ -1440,8 +1448,8 @@ mod tests {
         let len = compressed.len();
         assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
         let capacity = backing_capacity(compressed);
-        assert!(
-            capacity <= 2 * len,
+        assert_eq!(
+            capacity, len,
             "compressed frame of {len} bytes retained a {capacity}-byte buffer"
         );
     }
@@ -1489,8 +1497,8 @@ mod tests {
         let len = compressed.len();
         assert!(len < 64 * 1024, "1 MiB of zeros compressed to {len} bytes");
         let capacity = backing_capacity(compressed);
-        assert!(
-            capacity <= 2 * len,
+        assert_eq!(
+            capacity, len,
             "compressed frame of {len} bytes retained a {capacity}-byte buffer"
         );
     }
