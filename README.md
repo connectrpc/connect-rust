@@ -531,9 +531,7 @@ Compare the unary_large columns within a run, not across runs: the row
 depends on what the bench process ran before it. Identical binaries on the
 same instance type and kernel measured the connectrpc-rs arm at 4,486 μs in
 the full suite and at 3,298 μs with the run filtered to unary_large, while
-the tonic arm moved by under 1%. Run back to back on one host, the client
-from the previous table's 2026-09-08 run was as slow as the current client
-or slower, so the rise from that table's 2.9 ms is not a client regression.
+the tonic arm moved by under 1%.
 
 Run with `task bench:cross`. It builds the connect-go server with `go build`,
 so it needs a Go toolchain unless `RPC_BENCH_BIN_DIR` points at prebuilt
