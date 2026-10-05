@@ -50,20 +50,17 @@ impl BenchService for BenchServiceImpl {
         let req = req.to_owned_message();
         let count = req.response_count;
         let payload = req.payload;
-        let stream = futures::stream::unfold(0, move |i| {
-            let payload = payload.clone();
-            async move {
-                if i >= count {
-                    return None;
-                }
-                Some((
-                    Ok(BenchResponse {
-                        payload,
-                        ..Default::default()
-                    }),
-                    i + 1,
-                ))
+        let stream = futures::stream::unfold((payload, 0), move |(payload, i)| async move {
+            if i >= count {
+                return None;
             }
+            // Each item owns its payload, as a handler that builds a response
+            // per message would; the copy is part of the measured work.
+            let item = BenchResponse {
+                payload: payload.clone(),
+                ..Default::default()
+            };
+            Some((Ok(item), (payload, i + 1)))
         });
         Response::stream_ok(stream)
     }
