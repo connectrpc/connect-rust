@@ -186,7 +186,7 @@ impl<S: GreetService> GreetServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::anthropic::connectrpc::greet::v1::GreetRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.greet(ctx, sreq)
+                            GreetService::greet(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::greet::v1::GreetResponse,
@@ -287,7 +287,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::greet::v1::GreetRequest,
                     >::from_parts(&req, &body);
-                    svc.greet(ctx, req)
+                    GreetService::greet(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::greet::v1::GreetResponse,

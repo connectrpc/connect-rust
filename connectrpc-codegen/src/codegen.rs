@@ -1465,6 +1465,20 @@ fn check_module_collisions(
     Ok(())
 }
 
+/// The call to a service's handler: `Trait::method(&*svc, ctx, request)`.
+///
+/// `svc` is an `Arc<S>`, and method-call syntax on it finds the `Arc`'s own
+/// methods before those of `S`. An RPC named like one of them, such as the
+/// extension trait's `register` or a prelude trait's `clone`, would resolve
+/// to that method (issue [#309]). The `&*` makes `Self` the service and not
+/// the `Arc`.
+///
+/// [#309]: https://github.com/connectrpc/connect-rust/issues/309
+fn handler_call(trait_name: &Ident, method: &Ident, request: &str) -> TokenStream {
+    let request = format_ident!("{request}");
+    quote! { #trait_name::#method(&*svc, ctx, #request) }
+}
+
 /// Generate code for a single service.
 fn generate_service(
     file: &FileDescriptorProto,
@@ -1560,6 +1574,8 @@ fn generate_service(
         .map(|m| {
             let method_name = m.name.as_deref().unwrap_or("");
             let method_snake = make_field_ident(&method_name.to_snake_case());
+            let call_sreq = handler_call(&trait_name, &method_snake, "sreq");
+            let call_req = handler_call(&trait_name, &method_snake, "req");
             // Attach the per-method `Spec` const so the dynamic `Router`
             // surfaces `RequestContext::spec()` exactly like the
             // monomorphic `FooServiceServer<T>` dispatcher does.
@@ -1581,7 +1597,7 @@ fn generate_service(
                 let input_owned = resolver.rust_type(input_fqn, package).unwrap();
                 let call_handler = quote! {
                     let sreq = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(req.reborrow(), req.bytes());
-                    svc.#method_snake(ctx, sreq).await
+                    #call_sreq.await
                 };
                 quote! {
                     .route_view_server_stream::<_, _, #output_type>(
@@ -1616,7 +1632,7 @@ fn generate_service(
                                 let svc = ::std::sync::Arc::clone(&svc);
                                 async move {
                                     #into_items
-                                    svc.#method_snake(ctx, req).await?.encode::<#output_type>(format)
+                                    #call_req.await?.encode::<#output_type>(format)
                                 }
                             }
                         }),
@@ -1639,7 +1655,7 @@ fn generate_service(
                                 let svc = ::std::sync::Arc::clone(&svc);
                                 async move {
                                     #into_items
-                                    svc.#method_snake(ctx, req).await
+                                    #call_req.await
                                 }
                             }
                         }),
@@ -1669,7 +1685,7 @@ fn generate_service(
                 let input_owned = resolver.rust_type(input_fqn, package).unwrap();
                 let call_handler = quote! {
                     let sreq = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(req.reborrow(), req.bytes());
-                    svc.#method_snake(ctx, sreq).await?.encode::<#output_type>(format)
+                    #call_sreq.await?.encode::<#output_type>(format)
                 };
 
                 quote! {
@@ -2024,6 +2040,8 @@ fn generate_service_server(
     for m in &service.method {
         let method_name = m.name.as_deref().unwrap_or("");
         let method_snake = make_field_ident(&method_name.to_snake_case());
+        let call_req = handler_call(trait_name, &method_snake, "req");
+        let call_req_stream = handler_call(trait_name, &method_snake, "req_stream");
         let input_view = resolver.rust_view_type(m.input_type.as_deref().unwrap_or(""), package)?;
         let output_type = resolver.rust_type(m.output_type.as_deref().unwrap_or(""), package)?;
         let cs = m.client_streaming.unwrap_or(false);
@@ -2044,7 +2062,7 @@ fn generate_service_server(
                     let svc = ::std::sync::Arc::clone(&self.inner);
                     Box::pin(async move {
                         let req_stream = #stream_decode;
-                        let resp = svc.#method_snake(ctx, req_stream).await?;
+                        let resp = #call_req_stream.await?;
                         Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
                 }
@@ -2056,7 +2074,7 @@ fn generate_service_server(
                     let svc = ::std::sync::Arc::clone(&self.inner);
                     Box::pin(async move {
                         let req_stream = #stream_decode;
-                        svc.#method_snake(ctx, req_stream).await?.encode::<#output_type>(format)
+                        #call_req_stream.await?.encode::<#output_type>(format)
                     })
                 }
             });
@@ -2066,7 +2084,7 @@ fn generate_service_server(
             let input_owned = resolver.rust_type(input_fqn, package)?;
             let call_handler = quote! {
                 let req = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(&req, &body);
-                let resp = svc.#method_snake(ctx, req).await?;
+                let resp = #call_req.await?;
             };
             call_ss_arms.push(quote! {
                 #method_name => {
@@ -2087,7 +2105,7 @@ fn generate_service_server(
             let input_owned = resolver.rust_type(input_fqn, package)?;
             let call_handler = quote! {
                 let req = ::connectrpc::ServiceRequest::<#input_owned>::from_parts(&req, &body);
-                svc.#method_snake(ctx, req).await?.encode::<#output_type>(format)
+                #call_req.await?.encode::<#output_type>(format)
             };
             call_unary_arms.push(quote! {
                 #method_name => {
@@ -3874,6 +3892,38 @@ mod tests {
         let file = minimal_file_with_methods("example.v1", &["GetFoo", "GetBar"]);
         let code = gen_service(std::slice::from_ref(&file), 0, &[], false).unwrap();
         syn::parse_str::<syn::File>(&code).expect("generated code parses");
+    }
+
+    /// An RPC may share its name with a method that an `Arc` already has:
+    /// the extension trait's `register` (issue #309), or a prelude trait's
+    /// `clone`, `into` or `drop`. Method-call syntax on the `Arc` would
+    /// resolve to that method, so every handler call names the service trait.
+    #[test]
+    fn handler_calls_name_the_service_trait() {
+        let mut file =
+            minimal_file_with_methods("example.v1", &["Register", "Clone", "Into", "Drop"]);
+        let methods = &mut file.service[0].method;
+        methods[1].server_streaming = Some(true);
+        methods[2].client_streaming = Some(true);
+        methods[3].client_streaming = Some(true);
+        methods[3].server_streaming = Some(true);
+
+        let code = gen_service(std::slice::from_ref(&file), 0, &[], false).unwrap();
+        let code = prettyplease::unparse(&syn::parse_str(&code).expect("generated code parses"));
+
+        for method in ["register", "clone", "into", "drop"] {
+            let call = format!("PingService::{method}(&*svc, ctx, ");
+            // Once in the `Router` registration and once in the dispatcher.
+            assert_eq!(code.matches(&call).count(), 2, "{method}: {code}");
+            assert!(
+                !code.contains(&format!("svc.{method}(")),
+                "{method}: {code}"
+            );
+            assert!(
+                !code.contains(&format!(".{method}(ctx")),
+                "{method}: {code}"
+            );
+        }
     }
 
     /// Build a proto file holding several services, each with the given

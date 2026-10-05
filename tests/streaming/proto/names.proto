@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package test.names.v1;
+
+// A service whose RPC names are also methods of the `Arc` that holds the
+// service implementation: the generated `register`, and `clone`, `into` and
+// `drop` from traits in the prelude. It has one RPC of each of the four types.
+service NamesService {
+  rpc Register(NameRequest) returns (NameResponse);
+  rpc Clone(NameRequest) returns (stream NameResponse);
+  rpc Into(stream NameRequest) returns (NameResponse);
+  rpc Drop(stream NameRequest) returns (stream NameResponse);
+}
+
+message NameRequest {
+  string name = 1;
+}
+
+message NameResponse {
+  string name = 1;
+}

@@ -173,7 +173,7 @@ impl<S: LogIngestService> LogIngestServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::bench::noutf8::v1::LogRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.ingest(ctx, sreq)
+                            LogIngestService::ingest(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::bench::noutf8::v1::LogIngestResponse,
@@ -273,7 +273,7 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::noutf8::v1::LogRequest,
                     >::from_parts(&req, &body);
-                    svc.ingest(ctx, req)
+                    LogIngestService::ingest(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::bench::noutf8::v1::LogIngestResponse,

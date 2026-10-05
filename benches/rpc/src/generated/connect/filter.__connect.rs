@@ -171,7 +171,7 @@ impl<S: FilterService> FilterServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::anthropic::connectrpc::filter::v1::Record,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.redact(ctx, sreq)
+                            FilterService::redact(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::filter::v1::Record,
@@ -272,7 +272,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::filter::v1::Record,
                     >::from_parts(&req, &body);
-                    svc.redact(ctx, req)
+                    FilterService::redact(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::filter::v1::Record,

@@ -411,6 +411,31 @@ from another's (`XGet.Foo` and `X.GetFoo` both name the
 `X_GET_FOO_SPEC` constant), are rejected at generation time with a
 message naming both sides. Rename one of them in the proto.
 
+An RPC's Rust method name can also be the name of another method on
+the value you call it on: the generated `register` on an `Arc`, or a
+prelude trait method such as `clone`, `into`, or `drop`. The generated
+code compiles, but method-call syntax in your code can resolve to the
+other method. For example, with
+`rpc Into(stream NameRequest) returns (NameResponse)`,
+`client.into(requests)` resolves to `Into::into`, which takes no
+request, and does not compile. Name the trait or the client type in
+the call instead:
+
+```rust
+// A handler on a service implementation.
+NamesService::into(&svc, ctx, requests).await?;
+// A handler on an `Arc` that holds one: `&*` passes the service, not the `Arc`.
+NamesService::into(&*svc, ctx, requests).await?;
+// A client method.
+NamesServiceClient::into(&client, requests).await?;
+// Cloning a client whose service has an RPC named `Clone`.
+let copy = Clone::clone(&client);
+```
+
+An RPC named `New`, `Config`, or `ConfigMut` does not compile wherever
+the generated client is compiled, because the client already has
+methods with those names. Rename the RPC.
+
 ### Handler signatures
 
 Unary handlers take a read-only `RequestContext` plus a borrowed
@@ -1965,6 +1990,9 @@ see [Health checking](#health-checking) and
 
 Enable the `client` feature for HTTP client support with connection
 pooling.
+
+An RPC named like a method that the client already has needs a
+qualified call; see [Implementing servers](#implementing-servers).
 
 ### HttpClient
 

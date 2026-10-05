@@ -177,7 +177,7 @@ impl<S: MathService> MathServiceExt for S {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::proto::anthropic::connectrpc::math::v1::AddRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.add(ctx, sreq)
+                            MathService::add(&*svc, ctx, sreq)
                                 .await?
                                 .encode::<
                                     crate::proto::anthropic::connectrpc::math::v1::AddResponse,
@@ -278,7 +278,7 @@ impl<T: MathService> ::connectrpc::Dispatcher for MathServiceServer<T> {
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::anthropic::connectrpc::math::v1::AddRequest,
                     >::from_parts(&req, &body);
-                    svc.add(ctx, req)
+                    MathService::add(&*svc, ctx, req)
                         .await?
                         .encode::<
                             crate::proto::anthropic::connectrpc::math::v1::AddResponse,

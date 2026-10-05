@@ -178,7 +178,8 @@ impl<S: ServerReflection> ServerReflectionExt for S {
                             let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::proto::grpc::reflection::v1::ServerReflectionRequest,
                             >(req);
-                            svc.server_reflection_info(ctx, req).await
+                            ServerReflection::server_reflection_info(&*svc, ctx, req)
+                                .await
                         }
                     }
                 }),
@@ -314,7 +315,12 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::grpc::reflection::v1::ServerReflectionRequest,
                     >(requests, format, ctx.decode_options().clone());
-                    let resp = svc.server_reflection_info(ctx, req_stream).await?;
+                    let resp = ServerReflection::server_reflection_info(
+                            &*svc,
+                            ctx,
+                            req_stream,
+                        )
+                        .await?;
                     Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
