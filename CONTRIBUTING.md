@@ -108,6 +108,19 @@ Key rules:
   (`::connectrpc::...`, `::buffa::...`) — no `use` statements at module
   scope. This lets multiple generated files be `include!`d into the same
   Rust module without E0252 collisions.
+- Fully-qualified paths include **the prelude**: write
+  `::std::result::Result`, `::std::marker::Send`,
+  `::std::option::Option::Some`. In `connectrpc-build` output the stubs
+  share a module with the package's messages and enums, and in every layout
+  each `pub mod` has `use super::*;`. So `message Result` or `service Send`,
+  in the package or a parent package, shadows the prelude there. The
+  `stubs_resolve_only_their_own_names` test fails when a template writes a
+  type, trait or module that the stubs do not declare without a `::` root.
+  It skips attributes (`#[derive(Clone)]`) and primitives (`str`).
+- Every **generic type parameter** that a template declares goes in
+  `GENERIC_PARAMS`, so that a message, service or sub-package of the same
+  name is reached through `self::` (`message T` is written `self::T`). The
+  same test fails on a parameter that is not listed.
 
 ## Conformance Tests
 

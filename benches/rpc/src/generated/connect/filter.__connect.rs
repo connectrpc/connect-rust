@@ -96,7 +96,7 @@ pub const FILTER_SERVICE_REDACT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::s
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait FilterService: Send + Sync + 'static {
+pub trait FilterService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Handle the Redact RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -117,9 +117,9 @@ pub trait FilterService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::anthropic::connectrpc::filter::v1::Record,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -220,7 +220,7 @@ impl<T: FilterService> FilterServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for FilterServiceServer<T> {
+impl<T> ::std::clone::Clone for FilterServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -232,16 +232,16 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("anthropic.connectrpc.filter.v1.FilterService/")?;
         match method {
             "Redact" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(FILTER_SERVICE_REDACT_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -251,7 +251,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.filter.v1.FilterService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -259,7 +259,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
         match method {
             "Redact" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::anthropic::connectrpc::filter::v1::Record,
                     >(request.encoded()?, format)?;
@@ -289,7 +289,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.filter.v1.FilterService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -305,7 +305,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.filter.v1.FilterService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -321,7 +321,7 @@ impl<T: FilterService> ::connectrpc::Dispatcher for FilterServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.filter.v1.FilterService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -400,8 +400,10 @@ pub struct FilterServiceClient<T> {
 impl<T> FilterServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -420,7 +422,7 @@ where
     pub async fn redact(
         &self,
         request: crate::proto::anthropic::connectrpc::filter::v1::Record,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::filter::v1::__buffa::view::RecordView<
@@ -438,7 +440,7 @@ where
         &self,
         request: crate::proto::anthropic::connectrpc::filter::v1::Record,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::filter::v1::__buffa::view::RecordView<

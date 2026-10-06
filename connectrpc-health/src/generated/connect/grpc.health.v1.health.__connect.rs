@@ -104,7 +104,7 @@ pub const HEALTH_WATCH_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait Health: Send + Sync + 'static {
+pub trait Health: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Check returns the serving status of the requested service. If the
     /// service name is empty, the response covers the whole server.
     ///
@@ -126,9 +126,9 @@ pub trait Health: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::grpc::health::v1::HealthCheckResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Watch performs a watch for the serving status of the requested service.
     /// The server will immediately send back a message indicating the current
     /// serving status. It will then subsequently send a new message whenever
@@ -162,10 +162,10 @@ pub trait Health: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::grpc::health::v1::HealthCheckResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -294,7 +294,7 @@ impl<T: Health> HealthServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for HealthServer<T> {
+impl<T> ::std::clone::Clone for HealthServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -306,22 +306,22 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("grpc.health.v1.Health/")?;
         match method {
             "Check" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(HEALTH_CHECK_SPEC),
                 )
             }
             "Watch" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
                         .with_spec(HEALTH_WATCH_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -331,14 +331,15 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("grpc.health.v1.Health/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.health.v1.Health/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Check" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,
                     >(request.encoded()?, format)?;
@@ -368,14 +369,15 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("grpc.health.v1.Health/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.health.v1.Health/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Watch" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,
                     >(request, format)?;
@@ -389,7 +391,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                         crate::proto::grpc::health::v1::HealthCheckRequest,
                     >::from_parts(&req, &body);
                     let resp = svc.watch(ctx, req).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::grpc::health::v1::HealthCheckResponse,
@@ -409,7 +411,8 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("grpc.health.v1.Health/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.health.v1.Health/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -424,7 +427,8 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("grpc.health.v1.Health/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.health.v1.Health/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -504,8 +508,10 @@ pub struct HealthClient<T> {
 impl<T> HealthClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -524,7 +530,7 @@ where
     pub async fn check(
         &self,
         request: crate::proto::grpc::health::v1::HealthCheckRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::grpc::health::v1::__buffa::view::HealthCheckResponseView<
@@ -542,7 +548,7 @@ where
         &self,
         request: crate::proto::grpc::health::v1::HealthCheckRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::grpc::health::v1::__buffa::view::HealthCheckResponseView<
@@ -565,7 +571,7 @@ where
     pub async fn watch(
         &self,
         request: crate::proto::grpc::health::v1::HealthCheckRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::grpc::health::v1::__buffa::view::HealthCheckResponseView<
@@ -582,7 +588,7 @@ where
         &self,
         request: crate::proto::grpc::health::v1::HealthCheckRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::grpc::health::v1::__buffa::view::HealthCheckResponseView<

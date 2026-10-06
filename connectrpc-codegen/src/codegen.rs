@@ -777,7 +777,7 @@ fn doc_attrs(text: &str) -> TokenStream {
 /// service method input/output types resolve to the same paths buffa-codegen
 /// emits for message fields — including cross-package (`super::foo::Bar`),
 /// WKT extern paths (`::buffa_types::google::protobuf::Empty`), and nested
-/// types (`outer::Inner`). Zero drift with buffa's own generation.
+/// types (`outer::Inner`). The one difference is [`module_qualified`].
 struct TypeResolver<'a> {
     ctx: buffa_codegen::context::CodeGenContext<'a>,
     /// When true, every resolved path must be absolute (`::foo` or
@@ -806,7 +806,8 @@ impl<'a> TypeResolver<'a> {
     }
 
     /// Resolve a proto FQN (e.g. `.google.protobuf.Empty`) to a Rust type-path
-    /// string relative to `current_package`.
+    /// string relative to `current_package`, passed through
+    /// [`module_qualified`].
     ///
     /// Errors if the type is absent from the descriptor set, and — in
     /// `require_extern` mode — if the resolved path is not absolute.
@@ -814,7 +815,7 @@ impl<'a> TypeResolver<'a> {
         match self.ctx.rust_type_relative(proto_fqn, current_package, 0) {
             Some(path) => {
                 self.check_extern_coverage(proto_fqn, &path)?;
-                Ok(path)
+                Ok(module_qualified(path))
             }
             None => Err(self.unresolved_type_error(proto_fqn)),
         }
@@ -884,7 +885,31 @@ impl<'a> TypeResolver<'a> {
         } else {
             format!("{to_package}::{SENTINEL_MOD}::view")
         };
-        Ok(rust_path_to_tokens(&format!("{prefix}::{within}View")))
+        Ok(rust_path_to_tokens(&module_qualified(format!(
+            "{prefix}::{within}View"
+        ))))
+    }
+}
+
+/// Every generic type parameter the templates declare. The templates spell them
+/// literally; the `stubs_resolve_only_their_own_names` test fails if one is
+/// added without being listed here.
+const GENERIC_PARAMS: [&str; 2] = ["S", "T"];
+
+/// Prefix `self::` to a path whose first segment is one of
+/// [`GENERIC_PARAMS`], and return every other path unchanged.
+///
+/// Inside `impl<T>` the bare name `T` is the parameter, so `message T` (or
+/// `service T`, or a sub-package `T`) has to be reached through the module.
+/// Renaming the parameters instead would change the rustdoc of every
+/// generated client and server, and would leave the new names open to the
+/// same collision.
+fn module_qualified(path: String) -> String {
+    let first = path.split("::").next().unwrap_or_default();
+    if GENERIC_PARAMS.contains(&first) {
+        format!("self::{path}")
+    } else {
+        path
     }
 }
 
@@ -963,10 +988,15 @@ fn generate_connect_services(
 ) -> Result<TokenStream> {
     let mut tokens = TokenStream::new();
 
-    // All types in generated code use fully qualified paths (e.g.
-    // `::std::sync::Arc`, `::connectrpc::Context`) so that multiple service
-    // files can be `include!`d into the same module without E0252 duplicate
-    // import errors.
+    // Generated code reaches everything it does not declare itself through a
+    // `::`-rooted path (`::std::sync::Arc`, `::connectrpc::RequestContext`),
+    // for two reasons. Multiple service files can be `include!`d into the
+    // same module without E0252 duplicate import errors. And the prelude is
+    // not reliable there: the module declares the package's service traits
+    // (in the unified layout, its messages and enums too) and glob-imports
+    // its parent modules. So `message Result` or `service Send`, in this
+    // package or a parent package, takes the place of the prelude item, as
+    // does `use anyhow::Ok;` in the module that hosts the generated code.
 
     // The view-family impls (`buffa::HasMessageView`) are emitted by buffa's
     // own codegen alongside each message's view and owned-view wrapper, so
@@ -1492,6 +1522,8 @@ fn generate_service(
         server_name,
         service_name_const,
     } = idents;
+    // How the `impl<S>` and `impl<T>` blocks name the trait.
+    let trait_path = rust_path_to_tokens(&module_qualified(trait_name.to_string()));
 
     // Get service documentation and append async impl guidance
     let service_doc = get_service_comment(file, service).unwrap_or_default();
@@ -1709,6 +1741,7 @@ fn generate_service(
     let service_server = generate_service_server(
         &full_service_name,
         &trait_name,
+        &trait_path,
         &server_name,
         service,
         resolver,
@@ -1821,7 +1854,7 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
 
         #service_doc_tokens
         #[allow(clippy::type_complexity)]
-        pub trait #trait_name: Send + Sync + 'static {
+        pub trait #trait_name: ::std::marker::Send + ::std::marker::Sync + 'static {
             #(#trait_methods)*
         }
 
@@ -1848,7 +1881,7 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
             fn register(self: ::std::sync::Arc<Self>, router: ::connectrpc::Router) -> ::connectrpc::Router;
         }
 
-        impl<S: #trait_name> #ext_trait_name for S {
+        impl<S: #trait_path> #ext_trait_name for S {
             fn register(self: ::std::sync::Arc<Self>, router: ::connectrpc::Router) -> ::connectrpc::Router {
                 router
                     #(#route_registrations)*
@@ -1859,7 +1892,7 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
         #[doc(hidden)]
         pub struct #register_marker_name;
 
-        impl<S: #trait_name> ::connectrpc::ServiceRegister<#register_marker_name>
+        impl<S: #trait_path> ::connectrpc::ServiceRegister<#register_marker_name>
             for ::std::sync::Arc<S>
         {
             fn register_service(self, router: ::connectrpc::Router) -> ::connectrpc::Router {
@@ -1881,7 +1914,7 @@ methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
         impl<T> #client_name<T>
         where
             T: ::connectrpc::client::ClientTransport,
-            <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<Box<dyn ::std::error::Error + Send + Sync>>,
+            <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync>>,
         {
             /// Create a new client with the given transport and configuration.
             pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -1976,6 +2009,7 @@ fn generate_spec_consts(
 fn generate_service_server(
     full_service_name: &str,
     trait_name: &proc_macro2::Ident,
+    trait_path: &TokenStream,
     server_name: &proc_macro2::Ident,
     service: &ServiceDescriptorProto,
     resolver: &TypeResolver<'_>,
@@ -2008,7 +2042,7 @@ fn generate_service_server(
             } else {
                 quote! { ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(#is_idempotent) }
             };
-            quote! { #method_name => Some(#desc.with_spec(#spec_const)), }
+            quote! { #method_name => ::std::option::Option::Some(#desc.with_spec(#spec_const)), }
         })
         .collect();
 
@@ -2042,10 +2076,10 @@ fn generate_service_server(
             call_bidi_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
-                    Box::pin(async move {
+                    ::std::boxed::Box::pin(async move {
                         let req_stream = #stream_decode;
                         let resp = svc.#method_snake(ctx, req_stream).await?;
-                        Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
+                        ::std::result::Result::Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
                 }
             });
@@ -2054,7 +2088,7 @@ fn generate_service_server(
             call_cs_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
-                    Box::pin(async move {
+                    ::std::boxed::Box::pin(async move {
                         let req_stream = #stream_decode;
                         svc.#method_snake(ctx, req_stream).await?.encode::<#output_type>(format)
                     })
@@ -2071,13 +2105,13 @@ fn generate_service_server(
             call_ss_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
-                    Box::pin(async move {
+                    ::std::boxed::Box::pin(async move {
                         // The normalized body is owned by this future; the handler
                         // borrows from it until it returns the response stream.
                         let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request, format)?;
                         let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body, ctx.decode_options())?;
                         #call_handler
-                        Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
+                        ::std::result::Result::Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
                 }
             });
@@ -2092,7 +2126,7 @@ fn generate_service_server(
             call_unary_arms.push(quote! {
                 #method_name => {
                     let svc = ::std::sync::Arc::clone(&self.inner);
-                    Box::pin(async move {
+                    ::std::boxed::Box::pin(async move {
                         // Generated handlers are view-based, so the owned-message
                         // cache an interceptor may have populated cannot be reused.
                         // `encoded()` returns the (post-replacement) wire bytes —
@@ -2129,7 +2163,7 @@ fn generate_service_server(
             inner: ::std::sync::Arc<T>,
         }
 
-        impl<T: #trait_name> #server_name<T> {
+        impl<T: #trait_path> #server_name<T> {
             /// Wrap a service implementation in a monomorphic dispatcher.
             pub fn new(service: T) -> Self {
                 Self { inner: ::std::sync::Arc::new(service) }
@@ -2141,19 +2175,19 @@ fn generate_service_server(
             }
         }
 
-        impl<T> Clone for #server_name<T> {
+        impl<T> ::std::clone::Clone for #server_name<T> {
             fn clone(&self) -> Self {
                 Self { inner: ::std::sync::Arc::clone(&self.inner) }
             }
         }
 
-        impl<T: #trait_name> ::connectrpc::Dispatcher for #server_name<T> {
+        impl<T: #trait_path> ::connectrpc::Dispatcher for #server_name<T> {
             #[inline]
-            fn lookup(&self, path: &str) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+            fn lookup(&self, path: &str) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
                 let method = path.strip_prefix(#path_prefix)?;
                 match method {
                     #(#lookup_arms)*
-                    _ => None,
+                    _ => ::std::option::Option::None,
                 }
             }
 
@@ -2164,7 +2198,7 @@ fn generate_service_server(
                 request: ::connectrpc::Payload,
                 format: ::connectrpc::CodecFormat,
             ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-                let Some(method) = path.strip_prefix(#path_prefix) else {
+                let ::std::option::Option::Some(method) = path.strip_prefix(#path_prefix) else {
                     return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
                 };
                 // Suppress unused warnings when this service has no unary methods.
@@ -2182,7 +2216,7 @@ fn generate_service_server(
                 request: ::buffa::bytes::Bytes,
                 format: ::connectrpc::CodecFormat,
             ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-                let Some(method) = path.strip_prefix(#path_prefix) else {
+                let ::std::option::Option::Some(method) = path.strip_prefix(#path_prefix) else {
                     return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
                 };
                 let _ = (&ctx, &request, &format);
@@ -2199,7 +2233,7 @@ fn generate_service_server(
                 requests: ::connectrpc::dispatcher::codegen::RequestStream,
                 format: ::connectrpc::CodecFormat,
             ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-                let Some(method) = path.strip_prefix(#path_prefix) else {
+                let ::std::option::Option::Some(method) = path.strip_prefix(#path_prefix) else {
                     return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
                 };
                 let _ = (&ctx, &requests, &format);
@@ -2216,7 +2250,7 @@ fn generate_service_server(
                 requests: ::connectrpc::dispatcher::codegen::RequestStream,
                 format: ::connectrpc::CodecFormat,
             ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-                let Some(method) = path.strip_prefix(#path_prefix) else {
+                let ::std::option::Option::Some(method) = path.strip_prefix(#path_prefix) else {
                     return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
                 };
                 let _ = (&ctx, &requests, &format);
@@ -2290,7 +2324,7 @@ fn generate_trait_method(
                 &self,
                 ctx: ::connectrpc::RequestContext,
                 request: #request_param,
-            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + Send + use<Self>>>> + Send;
+            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + ::std::marker::Send + use<Self>>>> + ::std::marker::Send;
         })
     } else if client_streaming && !server_streaming {
         // Client streaming method. Inbound items are `StreamMessage<Req>` —
@@ -2308,7 +2342,7 @@ fn generate_trait_method(
                 &'a self,
                 ctx: ::connectrpc::RequestContext,
                 requests: ::connectrpc::InboundStream<#stream_owned>,
-            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + Send + use<'a, Self>>> + Send;
+            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + ::std::marker::Send + use<'a, Self>>> + ::std::marker::Send;
         })
     } else if client_streaming && server_streaming {
         // Bidi streaming method. Same `impl Encodable<...>` item type and
@@ -2323,7 +2357,7 @@ fn generate_trait_method(
                 &self,
                 ctx: ::connectrpc::RequestContext,
                 requests: ::connectrpc::InboundStream<#stream_owned>,
-            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + Send + use<Self>>>> + Send;
+            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + ::std::marker::Send + use<Self>>>> + ::std::marker::Send;
         })
     } else {
         // Unary method. The request is *borrowed*: the generated dispatcher
@@ -2355,7 +2389,7 @@ fn generate_trait_method(
                 &'a self,
                 ctx: ::connectrpc::RequestContext,
                 request: #request_param,
-            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + Send + use<'a, Self>>> + Send;
+            ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + ::std::marker::Send + use<'a, Self>>> + ::std::marker::Send;
         })
     }
 }
@@ -2426,7 +2460,7 @@ fn generate_client_method(
             #[doc = " than, say, wrapping it in a `timeout`."]
         };
         ret_ty = quote! {
-            Result<
+            ::std::result::Result<
                 ::connectrpc::client::UnaryResponse<::buffa::view::OwnedView<#output_view_type<'static>>>,
                 ::connectrpc::ConnectError,
             >
@@ -2445,7 +2479,7 @@ fn generate_client_method(
     } else if client_streaming && server_streaming {
         // Bidi
         ret_ty = quote! {
-            Result<
+            ::std::result::Result<
                 ::connectrpc::client::BidiStream<
                     T::ResponseBody, #input_type, #output_view_type<'static>
                 >,
@@ -2464,7 +2498,7 @@ fn generate_client_method(
     } else if server_streaming {
         // Server-stream
         ret_ty = quote! {
-            Result<
+            ::std::result::Result<
                 ::connectrpc::client::ServerStream<T::ResponseBody, #output_view_type<'static>>,
                 ::connectrpc::ConnectError,
             >
@@ -2482,7 +2516,7 @@ fn generate_client_method(
     } else {
         // Unary
         ret_ty = quote! {
-            Result<
+            ::std::result::Result<
                 ::connectrpc::client::UnaryResponse<::buffa::view::OwnedView<#output_view_type<'static>>>,
                 ::connectrpc::ConnectError,
             >
@@ -3048,7 +3082,7 @@ mod tests {
 
         // Trait method declares `ServiceStream<impl Encodable<Resp> + ...>`.
         assert_eq!(
-            code.matches(":: connectrpc :: ServiceStream < impl :: connectrpc :: Encodable < Resp > + Send + use < Self >>")
+            code.matches(":: connectrpc :: ServiceStream < impl :: connectrpc :: Encodable < Resp > + :: std :: marker :: Send + use < Self >>")
                 .count(),
             2,
             "server-streaming and bidi should both use the Encodable item type: {code}"
@@ -5243,6 +5277,223 @@ mod tests {
         // No top-level `use` in either file.
         assert_no_top_level_use(&formatted_a, "service A");
         assert_no_top_level_use(&formatted_b, "service B");
+    }
+
+    /// Build a proto file in package `pkg` with one service that has an RPC
+    /// of each of the four shapes, all typed `input` -> `output` (bare
+    /// message names, declared in the file).
+    fn four_shape_file(service: &str, input: &str, output: &str) -> FileDescriptorProto {
+        let method =
+            |name: &str, client_streaming: bool, server_streaming: bool| MethodDescriptorProto {
+                name: Some(name.into()),
+                input_type: Some(format!(".pkg.{input}")),
+                output_type: Some(format!(".pkg.{output}")),
+                client_streaming: Some(client_streaming),
+                server_streaming: Some(server_streaming),
+                ..Default::default()
+            };
+        FileDescriptorProto {
+            name: Some("pkg.proto".into()),
+            package: Some("pkg".into()),
+            message_type: [input, output]
+                .into_iter()
+                .map(|name| DescriptorProto {
+                    name: Some(name.into()),
+                    ..Default::default()
+                })
+                .collect(),
+            service: vec![ServiceDescriptorProto {
+                name: Some(service.into()),
+                method: vec![
+                    method("Unary", false, false),
+                    method("ServerStream", false, true),
+                    method("ClientStream", true, false),
+                    method("Bidi", true, true),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Collect the identifiers in `tokens` that are looked up in the enclosing
+    /// scope as a type, trait, module or constructor. An identifier counts
+    /// when the token before it is something other than `::` or a single `.`,
+    /// and it is capitalized or starts a path. Keywords are skipped, `self`,
+    /// `Self`, `super` and `crate` among them.
+    ///
+    /// Attributes are skipped: doc text is not code, and `derive(Clone)`
+    /// resolves `Clone` as a macro, which a proto cannot declare. A path in
+    /// an attribute (`#[tracing::instrument]`) has to be `::`-rooted by hand.
+    fn scope_resolved_idents(tokens: TokenStream, out: &mut std::collections::BTreeSet<String>) {
+        use proc_macro2::{Spacing, TokenTree};
+
+        // The punctuation run that ends just before the current token, which
+        // tells `::` (a path) from `:` (a bound or a type), and `.` (a field
+        // or method) from `..` (a range or struct update).
+        let mut prev = String::new();
+        let mut tokens = tokens.into_iter().peekable();
+        while let Some(tree) = tokens.next() {
+            match tree {
+                TokenTree::Punct(punct) => {
+                    prev.push(punct.as_char());
+                    continue;
+                }
+                TokenTree::Group(_) if prev.ends_with('#') => {}
+                TokenTree::Group(group) => scope_resolved_idents(group.stream(), out),
+                TokenTree::Ident(ident) => {
+                    let member = prev.ends_with('.') && !prev.ends_with("..");
+                    let starts_path = matches!(
+                        tokens.peek(),
+                        Some(TokenTree::Punct(p)) if p.as_char() == ':' && p.spacing() == Spacing::Joint
+                    );
+                    let name = ident.to_string();
+                    if !member
+                        && !prev.ends_with("::")
+                        && !buffa_codegen::idents::is_rust_keyword(&name)
+                        && (starts_path || name.starts_with(char::is_uppercase))
+                    {
+                        out.insert(name);
+                    }
+                }
+                TokenTree::Literal(_) => {}
+            }
+            prev.clear();
+        }
+    }
+
+    #[test]
+    fn scope_resolved_idents_finds_each_position() {
+        let mut idents = std::collections::BTreeSet::new();
+        scope_resolved_idents(
+            quote! {
+                #[derive(Skipped)]
+                fn f(a: &A) -> impl B + use<'a, C> where <D as E>::Skipped: dyn F {
+                    let G(x) = g::<H>(I { x, ..J::default() });
+                    k::Skipped::skipped(x.Skipped, ::skipped::Skipped, self::Skipped, 0..L);
+                    r#type::Skipped(Self::Skipped)
+                }
+            },
+            &mut idents,
+        );
+        let found: String = idents.into_iter().collect();
+        assert_eq!(found, "ABCDEFGHIJLgkr#type");
+    }
+
+    /// Fails when a template names anything it does not declare itself without
+    /// a `::` root; `generate_connect_services` says why. Primitives are not
+    /// covered: `str` stays bare, as it does in buffa's output.
+    #[test]
+    fn stubs_resolve_only_their_own_names() {
+        let file = four_shape_file("ZzSvc", "ZzReq", "ZzResp");
+        let config = buffa_codegen::CodeGenConfig::default();
+        let targets = ["pkg.proto".to_string()];
+        let resolver = TypeResolver::new(std::slice::from_ref(&file), &targets, &config, false);
+        let mut batch = BatchState {
+            all_message_encodable_impls: true,
+            ..BatchState::default()
+        };
+        let code = generate_connect_services(&file, &resolver, &mut batch).unwrap();
+
+        let mut idents = std::collections::BTreeSet::new();
+        scope_resolved_idents(code, &mut idents);
+        // The fixture's own names, and what is derived from them.
+        idents.retain(|name| !name.contains("Zz") && !name.starts_with("ZZ_"));
+        // `Output` is the binding in `Future<Output = …>`, which is looked up
+        // in the trait. `__buffa` is the module buffa reserves in each package.
+        for declared in ["Output", "__buffa"].iter().chain(&GENERIC_PARAMS) {
+            idents.remove(*declared);
+        }
+        assert!(
+            idents.is_empty(),
+            "{idents:?} can be shadowed in the module that includes the stubs: write a \
+             `::`-rooted path, or list a new generic parameter in GENERIC_PARAMS"
+        );
+    }
+
+    #[test]
+    fn module_qualified_matches_the_first_segment_only() {
+        for (path, expected) in [
+            ("S", "self::S"),
+            ("T", "self::T"),
+            ("T::Msg", "self::T::Msg"),
+            ("Sx", "Sx"),
+            ("s::T", "s::T"),
+            ("super::T", "super::T"),
+            ("crate::T", "crate::T"),
+            ("::T::X", "::T::X"),
+        ] {
+            assert_eq!(module_qualified(path.into()), expected);
+        }
+    }
+
+    #[test]
+    fn types_named_like_generic_params_are_module_qualified() {
+        let code = gen_file(&[four_shape_file("Svc", "S", "T")], 0, &[], false).unwrap();
+        assert!(
+            code.contains(":: connectrpc :: ServiceRequest < '_ , self :: S >"),
+            "input type not qualified: {code}"
+        );
+        assert!(
+            code.contains(":: connectrpc :: Encodable < self :: T >"),
+            "output type not qualified: {code}"
+        );
+        assert!(
+            code.contains("async fn unary (& self , request : self :: S)"),
+            "client request type not qualified: {code}"
+        );
+
+        for service in ["S", "T"] {
+            let file = four_shape_file(service, "Req", "Resp");
+            let code = gen_file(&[file], 0, &[], false).unwrap();
+            for bound in [
+                format!("impl < S : self :: {service} > {service}Ext for S"),
+                format!("impl < T : self :: {service} > {service}Server < T >"),
+            ] {
+                assert!(code.contains(&bound), "missing `{bound}`: {code}");
+            }
+        }
+
+        // A sub-package starts the path of its types and views.
+        let sub = FileDescriptorProto {
+            name: Some("sub.proto".into()),
+            package: Some("pkg.T".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Msg".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut file = four_shape_file("Svc", "Req", "Resp");
+        for method in &mut file.service[0].method {
+            method.input_type = Some(".pkg.T.Msg".into());
+        }
+        let code = gen_file(&[sub, file], 1, &[], false).unwrap();
+        assert!(
+            code.contains("ServiceRequest < '_ , self :: T :: Msg >"),
+            "sub-package type not qualified: {code}"
+        );
+        assert!(
+            code.contains("self :: T :: __buffa :: view :: MsgView"),
+            "sub-package view not qualified: {code}"
+        );
+
+        // In the split layout the messages are reached from the crate root,
+        // and the trait is still declared beside the stubs.
+        let extern_paths = [(".".to_string(), "crate::proto".to_string())];
+        let code = gen_file(&[four_shape_file("T", "S", "Resp")], 0, &extern_paths, true).unwrap();
+        assert!(
+            code.contains("impl < T : self :: T > TServer < T >"),
+            "split-layout trait not qualified: {code}"
+        );
+        assert!(
+            code.contains("ServiceRequest < '_ , crate :: proto :: pkg :: S >"),
+            "split-layout type changed: {code}"
+        );
+
+        // Every other name keeps its bare form.
+        let code = gen_file(&[four_shape_file("Svc", "Req", "Resp")], 0, &[], false).unwrap();
+        assert!(!code.contains("self ::"), "unexpected `self::`: {code}");
     }
 
     /// `generate_spec_consts` emits one `pub const … : Spec` per method,

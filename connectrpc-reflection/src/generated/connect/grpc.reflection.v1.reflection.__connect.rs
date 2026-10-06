@@ -108,7 +108,7 @@ pub const SERVER_REFLECTION_SERVER_REFLECTION_INFO_SPEC: ::connectrpc::Spec = ::
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait ServerReflection: Send + Sync + 'static {
+pub trait ServerReflection: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// The reflection service is structured as a bidirectional stream, ensuring
     /// all related requests go to a single server.
     ///
@@ -127,10 +127,10 @@ pub trait ServerReflection: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::grpc::reflection::v1::ServerReflectionResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -223,7 +223,7 @@ impl<T: ServerReflection> ServerReflectionServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for ServerReflectionServer<T> {
+impl<T> ::std::clone::Clone for ServerReflectionServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -235,16 +235,16 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("grpc.reflection.v1.ServerReflection/")?;
         match method {
             "ServerReflectionInfo" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
                         .with_spec(SERVER_REFLECTION_SERVER_REFLECTION_INFO_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -254,8 +254,8 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("grpc.reflection.v1.ServerReflection/")
-        else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.reflection.v1.ServerReflection/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &request, &format);
@@ -270,8 +270,8 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("grpc.reflection.v1.ServerReflection/")
-        else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.reflection.v1.ServerReflection/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &request, &format);
@@ -286,8 +286,8 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("grpc.reflection.v1.ServerReflection/")
-        else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.reflection.v1.ServerReflection/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -302,20 +302,20 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("grpc.reflection.v1.ServerReflection/")
-        else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("grpc.reflection.v1.ServerReflection/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &requests, &format);
         match method {
             "ServerReflectionInfo" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::grpc::reflection::v1::ServerReflectionRequest,
                     >(requests, format, ctx.decode_options().clone());
                     let resp = svc.server_reflection_info(ctx, req_stream).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::grpc::reflection::v1::ServerReflectionResponse,
@@ -400,8 +400,10 @@ pub struct ServerReflectionClient<T> {
 impl<T> ServerReflectionClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -419,7 +421,7 @@ where
     /// Call the ServerReflectionInfo RPC. Sends a request to /grpc.reflection.v1.ServerReflection/ServerReflectionInfo.
     pub async fn server_reflection_info(
         &self,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::grpc::reflection::v1::ServerReflectionRequest,
@@ -438,7 +440,7 @@ where
     pub async fn server_reflection_info_with_options(
         &self,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::grpc::reflection::v1::ServerReflectionRequest,

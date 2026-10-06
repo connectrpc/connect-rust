@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package test.shadow.types.v1;
+
+// Messages and enums named after what the generated service code refers to.
+
+// RPC types named after the generic parameters of the generated `impl` blocks.
+service GenericParamService {
+  rpc Unary(S) returns (T);
+  rpc ServerStream(T) returns (stream S);
+  rpc ClientStream(stream S) returns (T);
+  rpc Bidi(stream T) returns (stream S);
+}
+
+message S {
+  string value = 1;
+}
+
+message T {
+  string value = 1;
+}
+
+// RPC types named after prelude items.
+service PreludeService {
+  rpc Unary(Option) returns (Result);
+  rpc ServerStream(Box) returns (stream Send);
+  rpc ClientStream(stream Sync) returns (Clone);
+  rpc Bidi(stream Into) returns (stream From);
+}
+
+message Option {
+  string value = 1;
+}
+
+message Result {
+  string value = 1;
+}
+
+message Box {}
+message Send {}
+message Sync {}
+message Clone {}
+message Into {}
+message From {}
+
+// The rest of the Rust 2024 prelude's types and traits, and the names of the
+// variants of `Option` and `Result`. A message is a type and not a value, so
+// `message Some` leaves the `Some(…)` constructor alone.
+message AsMut {}
+message AsRef {}
+message AsyncFn {}
+message AsyncFnMut {}
+message AsyncFnOnce {}
+message Copy {}
+message Default {}
+message DoubleEndedIterator {}
+message Drop {}
+message Eq {}
+message Err {}
+message ExactSizeIterator {}
+message Extend {}
+message Fn {}
+message FnMut {}
+message FnOnce {}
+message FromIterator {}
+message Future {}
+message IntoFuture {}
+message IntoIterator {}
+message Iterator {}
+message None {}
+message Ok {}
+message Ord {}
+message PartialEq {}
+message PartialOrd {}
+message Sized {}
+message Some {}
+message String {}
+message ToOwned {}
+message ToString {}
+message TryFrom {}
+message TryInto {}
+message Unpin {}
+message Vec {}
+
+// Standard items outside the prelude that the service code names.
+enum Arc {
+  ARC_UNSPECIFIED = 0;
+}
+
+enum Error {
+  ERROR_UNSPECIFIED = 0;
+}

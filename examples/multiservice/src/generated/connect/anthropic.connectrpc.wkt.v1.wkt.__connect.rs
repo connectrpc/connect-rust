@@ -244,7 +244,7 @@ pub const WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC: ::connectrpc::Spec = ::connec
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait WellKnownTypesService: Send + Sync + 'static {
+pub trait WellKnownTypesService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// CreateEvent creates an event with a timestamp.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -265,9 +265,9 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::anthropic::connectrpc::wkt::v1::CreateEventResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// CalculateDuration calculates the duration between two timestamps.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -288,9 +288,9 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// ProcessMetadata processes arbitrary metadata as a Struct.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -311,9 +311,9 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Heartbeat returns the server's current time. Exercises well-known
     /// types as the direct RPC input (Empty) and output (Timestamp).
     ///
@@ -332,9 +332,9 @@ pub trait WellKnownTypesService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 ::buffa_types::google::protobuf::Timestamp,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -524,7 +524,7 @@ impl<T: WellKnownTypesService> WellKnownTypesServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for WellKnownTypesServiceServer<T> {
+impl<T> ::std::clone::Clone for WellKnownTypesServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -537,35 +537,35 @@ for WellKnownTypesServiceServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path
             .strip_prefix("anthropic.connectrpc.wkt.v1.WellKnownTypesService/")?;
         match method {
             "CreateEvent" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(WELL_KNOWN_TYPES_SERVICE_CREATE_EVENT_SPEC),
                 )
             }
             "CalculateDuration" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(WELL_KNOWN_TYPES_SERVICE_CALCULATE_DURATION_SPEC),
                 )
             }
             "ProcessMetadata" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(WELL_KNOWN_TYPES_SERVICE_PROCESS_METADATA_SPEC),
                 )
             }
             "Heartbeat" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(WELL_KNOWN_TYPES_SERVICE_HEARTBEAT_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -575,7 +575,7 @@ for WellKnownTypesServiceServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.wkt.v1.WellKnownTypesService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -583,7 +583,7 @@ for WellKnownTypesServiceServer<T> {
         match method {
             "CreateEvent" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
                     >(request.encoded()?, format)?;
@@ -605,7 +605,7 @@ for WellKnownTypesServiceServer<T> {
             }
             "CalculateDuration" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
                     >(request.encoded()?, format)?;
@@ -627,7 +627,7 @@ for WellKnownTypesServiceServer<T> {
             }
             "ProcessMetadata" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
                     >(request.encoded()?, format)?;
@@ -649,7 +649,7 @@ for WellKnownTypesServiceServer<T> {
             }
             "Heartbeat" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         ::buffa_types::google::protobuf::Empty,
                     >(request.encoded()?, format)?;
@@ -677,7 +677,7 @@ for WellKnownTypesServiceServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.wkt.v1.WellKnownTypesService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -693,7 +693,7 @@ for WellKnownTypesServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.wkt.v1.WellKnownTypesService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -709,7 +709,7 @@ for WellKnownTypesServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.wkt.v1.WellKnownTypesService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -788,8 +788,10 @@ pub struct WellKnownTypesServiceClient<T> {
 impl<T> WellKnownTypesServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -808,7 +810,7 @@ where
     pub async fn create_event(
         &self,
         request: crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CreateEventResponseView<
@@ -829,7 +831,7 @@ where
         &self,
         request: crate::proto::anthropic::connectrpc::wkt::v1::CreateEventRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CreateEventResponseView<
@@ -853,7 +855,7 @@ where
     pub async fn calculate_duration(
         &self,
         request: crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CalculateDurationResponseView<
@@ -874,7 +876,7 @@ where
         &self,
         request: crate::proto::anthropic::connectrpc::wkt::v1::CalculateDurationRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::CalculateDurationResponseView<
@@ -898,7 +900,7 @@ where
     pub async fn process_metadata(
         &self,
         request: crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::ProcessMetadataResponseView<
@@ -919,7 +921,7 @@ where
         &self,
         request: crate::proto::anthropic::connectrpc::wkt::v1::ProcessMetadataRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::wkt::v1::__buffa::view::ProcessMetadataResponseView<
@@ -943,7 +945,7 @@ where
     pub async fn heartbeat(
         &self,
         request: ::buffa_types::google::protobuf::Empty,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,
@@ -962,7 +964,7 @@ where
         &self,
         request: ::buffa_types::google::protobuf::Empty,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 ::buffa_types::google::protobuf::__buffa::view::TimestampView<'static>,

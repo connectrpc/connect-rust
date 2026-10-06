@@ -402,7 +402,7 @@ pub const CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC: ::connectrpc::Spec = ::conn
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait ConformanceService: Send + Sync + 'static {
+pub trait ConformanceService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// A unary operation. The request indicates the response headers and trailers
     /// and also indicates either a response message or an error to send back.
     ///
@@ -436,9 +436,9 @@ pub trait ConformanceService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::connectrpc::conformance::v1::UnaryResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// A server-streaming operation. The request indicates the response headers,
     /// response messages, trailers, and an optional error to send back. The
     /// response data should be sent in the order indicated, and the server should
@@ -477,10 +477,10 @@ pub trait ConformanceService: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::connectrpc::conformance::v1::ServerStreamResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// A client-streaming operation. The first request indicates the response
     /// headers and trailers and also indicates either a response message or an
     /// error to send back.
@@ -516,9 +516,9 @@ pub trait ConformanceService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::connectrpc::conformance::v1::ClientStreamResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// A bidirectional-streaming operation. The first request indicates the response
     /// headers, response messages, trailers, and an optional error to send back.
     /// The response data should be sent in the order indicated, and the server
@@ -582,10 +582,10 @@ pub trait ConformanceService: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::connectrpc::conformance::v1::BidiStreamResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// A unary endpoint that the server should not implement and should instead
     /// return an unimplemented error when invoked.
     ///
@@ -607,9 +607,9 @@ pub trait ConformanceService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::connectrpc::conformance::v1::UnimplementedResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// A unary endpoint denoted as having no side effects (i.e. idempotent).
     /// Implementations should use an HTTP GET when invoking this endpoint and
     /// leverage query parameters to send data.
@@ -632,9 +632,9 @@ pub trait ConformanceService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::connectrpc::conformance::v1::IdempotentUnaryResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -865,7 +865,7 @@ impl<T: ConformanceService> ConformanceServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for ConformanceServiceServer<T> {
+impl<T> ::std::clone::Clone for ConformanceServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -877,46 +877,46 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("connectrpc.conformance.v1.ConformanceService/")?;
         match method {
             "Unary" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(CONFORMANCE_SERVICE_UNARY_SPEC),
                 )
             }
             "ServerStream" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
                         .with_spec(CONFORMANCE_SERVICE_SERVER_STREAM_SPEC),
                 )
             }
             "ClientStream" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming()
                         .with_spec(CONFORMANCE_SERVICE_CLIENT_STREAM_SPEC),
                 )
             }
             "BidiStream" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
                         .with_spec(CONFORMANCE_SERVICE_BIDI_STREAM_SPEC),
                 )
             }
             "Unimplemented" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC),
                 )
             }
             "IdempotentUnary" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
                         .with_spec(CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -926,7 +926,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("connectrpc.conformance.v1.ConformanceService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -934,7 +934,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         match method {
             "Unary" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::connectrpc::conformance::v1::UnaryRequest,
                     >(request.encoded()?, format)?;
@@ -956,7 +956,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
             }
             "Unimplemented" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::connectrpc::conformance::v1::UnimplementedRequest,
                     >(request.encoded()?, format)?;
@@ -978,7 +978,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
             }
             "IdempotentUnary" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::connectrpc::conformance::v1::IdempotentUnaryRequest,
                     >(request.encoded()?, format)?;
@@ -1008,7 +1008,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("connectrpc.conformance.v1.ConformanceService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -1016,7 +1016,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         match method {
             "ServerStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
                     >(request, format)?;
@@ -1030,7 +1030,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
                         crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
                     >::from_parts(&req, &body);
                     let resp = svc.server_stream(ctx, req).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::connectrpc::conformance::v1::ServerStreamResponse,
@@ -1050,7 +1050,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("connectrpc.conformance.v1.ConformanceService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -1058,7 +1058,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         match method {
             "ClientStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
                     >(requests, format, ctx.decode_options().clone());
@@ -1079,7 +1079,7 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("connectrpc.conformance.v1.ConformanceService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -1087,12 +1087,12 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
         match method {
             "BidiStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
                     >(requests, format, ctx.decode_options().clone());
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::connectrpc::conformance::v1::BidiStreamResponse,
@@ -1175,8 +1175,10 @@ pub struct ConformanceServiceClient<T> {
 impl<T> ConformanceServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -1195,7 +1197,7 @@ where
     pub async fn unary(
         &self,
         request: crate::proto::connectrpc::conformance::v1::UnaryRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::UnaryResponseView<
@@ -1213,7 +1215,7 @@ where
         &self,
         request: crate::proto::connectrpc::conformance::v1::UnaryRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::UnaryResponseView<
@@ -1237,7 +1239,7 @@ where
     pub async fn server_stream(
         &self,
         request: crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::connectrpc::conformance::v1::__buffa::view::ServerStreamResponseView<
@@ -1257,7 +1259,7 @@ where
         &self,
         request: crate::proto::connectrpc::conformance::v1::ServerStreamRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::connectrpc::conformance::v1::__buffa::view::ServerStreamResponseView<
@@ -1295,7 +1297,7 @@ where
         requests: impl ::connectrpc::client::ClientRequestStream<
             crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
         >,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::ClientStreamResponseView<
@@ -1331,7 +1333,7 @@ where
             crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
         >,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::ClientStreamResponseView<
@@ -1354,7 +1356,7 @@ where
     /// Call the BidiStream RPC. Sends a request to /connectrpc.conformance.v1.ConformanceService/BidiStream.
     pub async fn bidi_stream(
         &self,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
@@ -1370,7 +1372,7 @@ where
     pub async fn bidi_stream_with_options(
         &self,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
@@ -1393,7 +1395,7 @@ where
     pub async fn unimplemented(
         &self,
         request: crate::proto::connectrpc::conformance::v1::UnimplementedRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::UnimplementedResponseView<
@@ -1414,7 +1416,7 @@ where
         &self,
         request: crate::proto::connectrpc::conformance::v1::UnimplementedRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::UnimplementedResponseView<
@@ -1438,7 +1440,7 @@ where
     pub async fn idempotent_unary(
         &self,
         request: crate::proto::connectrpc::conformance::v1::IdempotentUnaryRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::IdempotentUnaryResponseView<
@@ -1459,7 +1461,7 @@ where
         &self,
         request: crate::proto::connectrpc::conformance::v1::IdempotentUnaryRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::conformance::v1::__buffa::view::IdempotentUnaryResponseView<
