@@ -199,7 +199,7 @@ pub const ELIZA_SERVICE_INTRODUCE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec:
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait ElizaService: Send + Sync + 'static {
+pub trait ElizaService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Say is a unary RPC. Eliza responds to the prompt with a single sentence.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -220,9 +220,9 @@ pub trait ElizaService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::connectrpc::eliza::v1::SayResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Converse is a bidirectional RPC. The caller may exchange multiple
     /// back-and-forth messages with Eliza over a long-lived connection. Eliza
     /// responds to each ConverseRequest with a ConverseResponse.
@@ -242,10 +242,10 @@ pub trait ElizaService: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::connectrpc::eliza::v1::ConverseResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Introduce is a server streaming RPC. Given the caller's name, Eliza
     /// returns a stream of sentences to introduce itself.
     ///
@@ -266,10 +266,10 @@ pub trait ElizaService: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::connectrpc::eliza::v1::IntroduceResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -419,7 +419,7 @@ impl<T: ElizaService> ElizaServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for ElizaServiceServer<T> {
+impl<T> ::std::clone::Clone for ElizaServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -431,28 +431,28 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("connectrpc.eliza.v1.ElizaService/")?;
         match method {
             "Say" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
                         .with_spec(ELIZA_SERVICE_SAY_SPEC),
                 )
             }
             "Converse" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
                         .with_spec(ELIZA_SERVICE_CONVERSE_SPEC),
                 )
             }
             "Introduce" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
                         .with_spec(ELIZA_SERVICE_INTRODUCE_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -462,14 +462,15 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Say" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::connectrpc::eliza::v1::SayRequest,
                     >(request.encoded()?, format)?;
@@ -499,14 +500,15 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Introduce" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::connectrpc::eliza::v1::IntroduceRequest,
                     >(request, format)?;
@@ -520,7 +522,7 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
                         crate::proto::connectrpc::eliza::v1::IntroduceRequest,
                     >::from_parts(&req, &body);
                     let resp = svc.introduce(ctx, req).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::connectrpc::eliza::v1::IntroduceResponse,
@@ -540,7 +542,8 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -555,19 +558,20 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("connectrpc.eliza.v1.ElizaService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &requests, &format);
         match method {
             "Converse" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::connectrpc::eliza::v1::ConverseRequest,
                     >(requests, format, ctx.decode_options().clone());
                     let resp = svc.converse(ctx, req_stream).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::connectrpc::eliza::v1::ConverseResponse,
@@ -650,8 +654,10 @@ pub struct ElizaServiceClient<T> {
 impl<T> ElizaServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -670,7 +676,7 @@ where
     pub async fn say(
         &self,
         request: crate::proto::connectrpc::eliza::v1::SayRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::eliza::v1::__buffa::view::SayResponseView<
@@ -688,7 +694,7 @@ where
         &self,
         request: crate::proto::connectrpc::eliza::v1::SayRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::connectrpc::eliza::v1::__buffa::view::SayResponseView<
@@ -710,7 +716,7 @@ where
     /// Call the Converse RPC. Sends a request to /connectrpc.eliza.v1.ElizaService/Converse.
     pub async fn converse(
         &self,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::connectrpc::eliza::v1::ConverseRequest,
@@ -726,7 +732,7 @@ where
     pub async fn converse_with_options(
         &self,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::connectrpc::eliza::v1::ConverseRequest,
@@ -749,7 +755,7 @@ where
     pub async fn introduce(
         &self,
         request: crate::proto::connectrpc::eliza::v1::IntroduceRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::connectrpc::eliza::v1::__buffa::view::IntroduceResponseView<
@@ -769,7 +775,7 @@ where
         &self,
         request: crate::proto::connectrpc::eliza::v1::IntroduceRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::connectrpc::eliza::v1::__buffa::view::IntroduceResponseView<

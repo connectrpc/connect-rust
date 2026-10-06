@@ -110,7 +110,7 @@ pub const GREET_SERVICE_GREET_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::ser
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait GreetService: Send + Sync + 'static {
+pub trait GreetService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Greet returns a greeting message for the given name.
     /// This method has no side effects and supports GET requests.
     ///
@@ -132,9 +132,9 @@ pub trait GreetService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::anthropic::connectrpc::greet::v1::GreetResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -235,7 +235,7 @@ impl<T: GreetService> GreetServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for GreetServiceServer<T> {
+impl<T> ::std::clone::Clone for GreetServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -247,16 +247,16 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("anthropic.connectrpc.greet.v1.GreetService/")?;
         match method {
             "Greet" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
                         .with_spec(GREET_SERVICE_GREET_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -266,7 +266,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.greet.v1.GreetService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -274,7 +274,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
         match method {
             "Greet" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::anthropic::connectrpc::greet::v1::GreetRequest,
                     >(request.encoded()?, format)?;
@@ -304,7 +304,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.greet.v1.GreetService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -320,7 +320,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.greet.v1.GreetService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
@@ -336,7 +336,7 @@ impl<T: GreetService> ::connectrpc::Dispatcher for GreetServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path
+        let ::std::option::Option::Some(method) = path
             .strip_prefix("anthropic.connectrpc.greet.v1.GreetService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
@@ -415,8 +415,10 @@ pub struct GreetServiceClient<T> {
 impl<T> GreetServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -435,7 +437,7 @@ where
     pub async fn greet(
         &self,
         request: crate::proto::anthropic::connectrpc::greet::v1::GreetRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::greet::v1::__buffa::view::GreetResponseView<
@@ -453,7 +455,7 @@ where
         &self,
         request: crate::proto::anthropic::connectrpc::greet::v1::GreetRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::anthropic::connectrpc::greet::v1::__buffa::view::GreetResponseView<

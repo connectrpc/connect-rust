@@ -405,11 +405,27 @@ becomes an async method.
 
 Every service in a proto package is generated into one Rust module, so
 the names derived from them must be distinct after that normalization:
-two services that differ only in case or underscores (`XGet` and
+two services whose names become the same UpperCamelCase name (`XGet` and
 `X_Get`), or a service and method pair whose words split differently
 from another's (`XGet.Foo` and `X.GetFoo` both name the
 `X_GET_FOO_SPEC` constant), are rejected at generation time with a
-message naming both sides. Rename one of them in the proto.
+message naming both sides. Rename one of them in the proto. The check
+covers services only: a message or enum named like one of a service's
+generated items (`GreetServiceClient`, `GreetServiceServer`,
+`GreetServiceExt`) is accepted. In `connectrpc-build` output, where messages
+share that module, the generated code then fails to compile with E0428.
+
+The generated code compiles when a message, enum or service has the name of
+a standard library type or trait, such as `message Result` or
+`service Send`. A glob import of that package, like
+`use proto::greet::v1::*;` in the [quick start](#quick-start), shadows the
+standard name in your module, in server and client code alike. After
+`use proto::arrow::flight::protocol::*;`, `Result<T, E>` means the message,
+and the compiler reports E0107 (wrong number of generic arguments) on your
+own code. Import the module under a short name instead, with
+`use proto::arrow::flight::protocol as flight;`, and write `flight::Result`.
+With `buf generate`, the service items are in the `connect` tree, so import
+that module the same way.
 
 ### Handler signatures
 

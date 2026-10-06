@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package test.shadow.types.v1.child;
+
+// A sub-package of the package in `shadow_types.proto`. Its Rust module
+// glob-imports its parent, so every name declared there is in scope here too.
+service ChildService {
+  rpc Unary(ChildRequest) returns (ChildResponse);
+  rpc ServerStream(ChildRequest) returns (stream ChildResponse);
+  rpc ClientStream(stream ChildRequest) returns (ChildResponse);
+  rpc Bidi(stream ChildRequest) returns (stream ChildResponse);
+}
+
+message ChildRequest {}
+
+message ChildResponse {}

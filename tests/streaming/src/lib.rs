@@ -4,6 +4,9 @@ pub mod proto {
 pub use proto::test::echo::v1::*;
 
 #[cfg(test)]
+mod shadow;
+
+#[cfg(test)]
 mod tests {
 
     use std::sync::Arc;

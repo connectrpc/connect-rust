@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package test.shadow.services.v1;
+
+// Services named after what the generated service code refers to: prelude
+// items, and the generic parameters `S` and `T` of the generated `impl`
+// blocks. Each service's trait takes the service's name. `Result` has an RPC
+// of each of the four types, so that the module holds all of the generated code.
+
+service Result {
+  rpc Unary(Request) returns (Response);
+  rpc ServerStream(Request) returns (stream Response);
+  rpc ClientStream(stream Request) returns (Response);
+  rpc Bidi(stream Request) returns (stream Response);
+}
+
+service Box {
+  rpc Call(Request) returns (Response);
+}
+
+service Clone {
+  rpc Call(Request) returns (Response);
+}
+
+service Into {
+  rpc Call(Request) returns (Response);
+}
+
+service Option {
+  rpc Call(Request) returns (Response);
+}
+
+service S {
+  rpc Call(Request) returns (Response);
+}
+
+service Send {
+  rpc Call(Request) returns (Response);
+}
+
+service Sync {
+  rpc Call(Request) returns (Response);
+}
+
+service T {
+  rpc Call(Request) returns (Response);
+}
+
+message Request {}
+
+message Response {}

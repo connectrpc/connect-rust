@@ -1,0 +1,14 @@
+kind: Fixed
+body: |-
+    **Proto types and services named after Rust prelude items compile.**
+    Generated service code wrote `Result`, `Option`, `Box`, `Send`, `Sync`,
+    `Clone` and `Into` without a path. A message, enum or service with one of
+    those names in the same package or a parent package (`message Result`, as
+    in Arrow Flight) took its place, and the build failed inside
+    `*.__connect.rs` with errors such as E0107 (`struct takes 0 generic
+    arguments`) or E0404 (`expected trait, found struct`). Generated code now
+    writes the full path, such as `::std::result::Result`. It reaches a message
+    or service named `S` or `T`, the generic parameters of the generated `impl`
+    blocks, as `self::S`. Regenerate checked-in code to pick this up: every
+    `*.__connect.rs` file changes, and the generated API stays the same.
+time: 2026-10-04T21:58:00.000000000+00:00

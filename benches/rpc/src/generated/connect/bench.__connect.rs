@@ -250,7 +250,7 @@ pub const BENCH_SERVICE_LOG_UNARY_OWNED_SPEC: ::connectrpc::Spec = ::connectrpc:
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait BenchService: Send + Sync + 'static {
+pub trait BenchService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Handle the Unary RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -268,9 +268,9 @@ pub trait BenchService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::bench::v1::BenchResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Handle the ServerStream RPC.
     ///
     /// `request` is borrowed from the request body and is valid for the
@@ -287,10 +287,10 @@ pub trait BenchService: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::bench::v1::BenchResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Handle the ClientStream RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -307,9 +307,9 @@ pub trait BenchService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::bench::v1::BenchResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Handle the BidiStream RPC.
     ///
     /// Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):
@@ -325,10 +325,10 @@ pub trait BenchService: Send + Sync + 'static {
             ::connectrpc::ServiceStream<
                 impl ::connectrpc::Encodable<
                     crate::proto::bench::v1::BenchResponse,
-                > + Send + use<Self>,
+                > + ::std::marker::Send + use<Self>,
             >,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Handle the LogUnary RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -346,9 +346,9 @@ pub trait BenchService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::bench::v1::LogResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
     /// Handle the LogUnaryOwned RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -366,9 +366,9 @@ pub trait BenchService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::bench::v1::LogResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -589,7 +589,7 @@ impl<T: BenchService> BenchServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for BenchServiceServer<T> {
+impl<T> ::std::clone::Clone for BenchServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -601,46 +601,46 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("bench.v1.BenchService/")?;
         match method {
             "Unary" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(BENCH_SERVICE_UNARY_SPEC),
                 )
             }
             "ServerStream" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
                         .with_spec(BENCH_SERVICE_SERVER_STREAM_SPEC),
                 )
             }
             "ClientStream" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming()
                         .with_spec(BENCH_SERVICE_CLIENT_STREAM_SPEC),
                 )
             }
             "BidiStream" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::bidi_streaming()
                         .with_spec(BENCH_SERVICE_BIDI_STREAM_SPEC),
                 )
             }
             "LogUnary" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(BENCH_SERVICE_LOG_UNARY_SPEC),
                 )
             }
             "LogUnaryOwned" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(BENCH_SERVICE_LOG_UNARY_OWNED_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -650,14 +650,15 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("bench.v1.BenchService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.BenchService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Unary" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::bench::v1::BenchRequest,
                     >(request.encoded()?, format)?;
@@ -677,7 +678,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
             }
             "LogUnary" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::bench::v1::LogRequest,
                     >(request.encoded()?, format)?;
@@ -697,7 +698,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
             }
             "LogUnaryOwned" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::bench::v1::LogRequest,
                     >(request.encoded()?, format)?;
@@ -725,14 +726,15 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("bench.v1.BenchService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.BenchService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "ServerStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::bench::v1::BenchRequest,
                     >(request, format)?;
@@ -746,7 +748,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         crate::proto::bench::v1::BenchRequest,
                     >::from_parts(&req, &body);
                     let resp = svc.server_stream(ctx, req).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::bench::v1::BenchResponse,
@@ -766,14 +768,15 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("bench.v1.BenchService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.BenchService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &requests, &format);
         match method {
             "ClientStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
                     >(requests, format, ctx.decode_options().clone());
@@ -792,19 +795,20 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("bench.v1.BenchService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.BenchService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &requests, &format);
         match method {
             "BidiStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
                     >(requests, format, ctx.decode_options().clone());
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
-                    Ok(
+                    ::std::result::Result::Ok(
                         resp
                             .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
                                 crate::proto::bench::v1::BenchResponse,
@@ -887,8 +891,10 @@ pub struct BenchServiceClient<T> {
 impl<T> BenchServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -907,7 +913,7 @@ where
     pub async fn unary(
         &self,
         request: crate::proto::bench::v1::BenchRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::BenchResponseView<'static>,
@@ -923,7 +929,7 @@ where
         &self,
         request: crate::proto::bench::v1::BenchRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::BenchResponseView<'static>,
@@ -944,7 +950,7 @@ where
     pub async fn server_stream(
         &self,
         request: crate::proto::bench::v1::BenchRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::bench::v1::__buffa::view::BenchResponseView<'static>,
@@ -962,7 +968,7 @@ where
         &self,
         request: crate::proto::bench::v1::BenchRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::ServerStream<
             T::ResponseBody,
             crate::proto::bench::v1::__buffa::view::BenchResponseView<'static>,
@@ -998,7 +1004,7 @@ where
         requests: impl ::connectrpc::client::ClientRequestStream<
             crate::proto::bench::v1::BenchRequest,
         >,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::BenchResponseView<'static>,
@@ -1032,7 +1038,7 @@ where
             crate::proto::bench::v1::BenchRequest,
         >,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::BenchResponseView<'static>,
@@ -1053,7 +1059,7 @@ where
     /// Call the BidiStream RPC. Sends a request to /bench.v1.BenchService/BidiStream.
     pub async fn bidi_stream(
         &self,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::bench::v1::BenchRequest,
@@ -1067,7 +1073,7 @@ where
     pub async fn bidi_stream_with_options(
         &self,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::BidiStream<
             T::ResponseBody,
             crate::proto::bench::v1::BenchRequest,
@@ -1088,7 +1094,7 @@ where
     pub async fn log_unary(
         &self,
         request: crate::proto::bench::v1::LogRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::LogResponseView<'static>,
@@ -1107,7 +1113,7 @@ where
         &self,
         request: crate::proto::bench::v1::LogRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::LogResponseView<'static>,
@@ -1129,7 +1135,7 @@ where
     pub async fn log_unary_owned(
         &self,
         request: crate::proto::bench::v1::LogRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::LogResponseView<'static>,
@@ -1148,7 +1154,7 @@ where
         &self,
         request: crate::proto::bench::v1::LogRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::LogResponseView<'static>,
@@ -1227,7 +1233,7 @@ pub const ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait EchoService: Send + Sync + 'static {
+pub trait EchoService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Handle the Echo RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -1245,9 +1251,9 @@ pub trait EchoService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::bench::v1::EchoResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -1346,7 +1352,7 @@ impl<T: EchoService> EchoServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for EchoServiceServer<T> {
+impl<T> ::std::clone::Clone for EchoServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -1358,16 +1364,16 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("bench.v1.EchoService/")?;
         match method {
             "Echo" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(ECHO_SERVICE_ECHO_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -1377,14 +1383,15 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("bench.v1.EchoService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.EchoService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Echo" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::bench::v1::EchoRequest,
                     >(request.encoded()?, format)?;
@@ -1412,7 +1419,8 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("bench.v1.EchoService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.EchoService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &request, &format);
@@ -1427,7 +1435,8 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("bench.v1.EchoService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.EchoService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -1442,7 +1451,8 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("bench.v1.EchoService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.EchoService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -1520,8 +1530,10 @@ pub struct EchoServiceClient<T> {
 impl<T> EchoServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -1540,7 +1552,7 @@ where
     pub async fn echo(
         &self,
         request: crate::proto::bench::v1::EchoRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::EchoResponseView<'static>,
@@ -1556,7 +1568,7 @@ where
         &self,
         request: crate::proto::bench::v1::EchoRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::EchoResponseView<'static>,
@@ -1632,7 +1644,7 @@ pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spe
 /// [`PreEncoded`](::connectrpc::PreEncoded) — see its `# Streaming
 /// example` doc.
 #[allow(clippy::type_complexity)]
-pub trait LogIngestService: Send + Sync + 'static {
+pub trait LogIngestService: ::std::marker::Send + ::std::marker::Sync + 'static {
     /// Handle the Ingest RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -1650,9 +1662,9 @@ pub trait LogIngestService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::bench::v1::LogIngestResponse,
-            > + Send + use<'a, Self>,
+            > + ::std::marker::Send + use<'a, Self>,
         >,
-    > + Send;
+    > + ::std::marker::Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -1753,7 +1765,7 @@ impl<T: LogIngestService> LogIngestServiceServer<T> {
         Self { inner }
     }
 }
-impl<T> Clone for LogIngestServiceServer<T> {
+impl<T> ::std::clone::Clone for LogIngestServiceServer<T> {
     fn clone(&self) -> Self {
         Self {
             inner: ::std::sync::Arc::clone(&self.inner),
@@ -1765,16 +1777,16 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
     fn lookup(
         &self,
         path: &str,
-    ) -> Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
+    ) -> ::std::option::Option<::connectrpc::dispatcher::codegen::MethodDescriptor> {
         let method = path.strip_prefix("bench.v1.LogIngestService/")?;
         match method {
             "Ingest" => {
-                Some(
+                ::std::option::Option::Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(LOG_INGEST_SERVICE_INGEST_SPEC),
                 )
             }
-            _ => None,
+            _ => ::std::option::Option::None,
         }
     }
     fn call_unary(
@@ -1784,14 +1796,15 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
         request: ::connectrpc::Payload,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("bench.v1.LogIngestService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.LogIngestService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &request, &format);
         match method {
             "Ingest" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
+                ::std::boxed::Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
                         crate::proto::bench::v1::LogRequest,
                     >(request.encoded()?, format)?;
@@ -1819,7 +1832,8 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
         request: ::buffa::bytes::Bytes,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("bench.v1.LogIngestService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.LogIngestService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &request, &format);
@@ -1834,7 +1848,8 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::UnaryResult {
-        let Some(method) = path.strip_prefix("bench.v1.LogIngestService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.LogIngestService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_unary(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -1849,7 +1864,8 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
         requests: ::connectrpc::dispatcher::codegen::RequestStream,
         format: ::connectrpc::CodecFormat,
     ) -> ::connectrpc::dispatcher::codegen::StreamingResult {
-        let Some(method) = path.strip_prefix("bench.v1.LogIngestService/") else {
+        let ::std::option::Option::Some(method) = path
+            .strip_prefix("bench.v1.LogIngestService/") else {
             return ::connectrpc::dispatcher::codegen::unimplemented_streaming(path);
         };
         let _ = (&ctx, &requests, &format);
@@ -1927,8 +1943,10 @@ pub struct LogIngestServiceClient<T> {
 impl<T> LogIngestServiceClient<T>
 where
     T: ::connectrpc::client::ClientTransport,
-    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: Into<
-        Box<dyn ::std::error::Error + Send + Sync>,
+    <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::convert::Into<
+        ::std::boxed::Box<
+            dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+        >,
     >,
 {
     /// Create a new client with the given transport and configuration.
@@ -1947,7 +1965,7 @@ where
     pub async fn ingest(
         &self,
         request: crate::proto::bench::v1::LogRequest,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::LogIngestResponseView<'static>,
@@ -1963,7 +1981,7 @@ where
         &self,
         request: crate::proto::bench::v1::LogRequest,
         options: ::connectrpc::client::CallOptions,
-    ) -> Result<
+    ) -> ::std::result::Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
                 crate::proto::bench::v1::__buffa::view::LogIngestResponseView<'static>,
