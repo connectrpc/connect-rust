@@ -208,6 +208,12 @@ tasks:
       # servers can let the reflection service describe itself.
       - BUF_TOKEN="" buf build buf.build/grpc/grpc --path grpc/reflection/v1/reflection.proto --path grpc/reflection/v1alpha/reflection.proto -o descriptor/reflection.fds.bin
 
+  connectrpc-types:generate:
+    desc: Regenerate connectrpc-types Rust code from the vendored google.rpc protos
+    dir: "{{.ROOT_DIR}}/connectrpc-types"
+    cmds:
+      - buf generate
+
   example:multiservice:server:
     desc: Run the multi-service server (greet, math, well-known types)
     cmds:
@@ -495,6 +501,7 @@ tasks:
       - task: bench:generate
       - task: connectrpc-health:generate
       - task: connectrpc-reflection:generate
+      - task: connectrpc-types:generate
 
 
   # ===========================================================================

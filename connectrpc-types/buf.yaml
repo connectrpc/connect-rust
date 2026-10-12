@@ -1,0 +1,6 @@
+# Local proto module configuration for connectrpc-types.
+# The generated code is checked into src/generated/.
+# To regenerate: task connectrpc-types:generate
+version: v2
+modules:
+  - path: proto

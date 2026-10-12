@@ -28,6 +28,7 @@ connectrpc provides:
 - **`connectrpc-build`** — `build.rs` integration for generating code at build time
 - **`connectrpc-health`** — The standard `grpc.health.v1.Health` service, for `grpc_health_probe` / kubelet gRPC probes / service-mesh health checks
 - **`connectrpc-reflection`** — The standard gRPC server reflection service (`grpc.reflection.v1` + `v1alpha`), so `grpcurl`, `buf curl`, Postman, and `grpcui` can discover and call your services
+- **`connectrpc-types`** — Shared `google.rpc` message types: `Status`, `Code`, and the standard error details (`BadRequest`, `ErrorInfo`, `RetryInfo`, …) to attach to a `ConnectError`
 
 The runtime is built on [`tower::Service`](https://docs.rs/tower/latest/tower/trait.Service.html), making it framework-agnostic. It integrates with any tower-compatible HTTP framework including [Axum](https://docs.rs/axum), [Hyper](https://docs.rs/hyper), and others.
 

@@ -1,0 +1,29 @@
+[package]
+name = "connectrpc-types"
+version = "0.9.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "Shared protobuf message types for connectrpc: google.rpc Status, Code, and the standard error details"
+keywords = ["connectrpc", "grpc", "protobuf", "status", "rpc"]
+categories = ["network-programming", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Protobuf + serde (pulled in by the generated module paths)
+buffa = { workspace = true }
+buffa-types = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+connectrpc = { path = "../connectrpc" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
