@@ -81,6 +81,10 @@ tasks:
     cmds:
       - cargo check -p connectrpc --no-default-features
       - cargo test -p connectrpc --no-default-features
+      - cargo check -p connectrpc-types --no-default-features
+      - cargo test -p connectrpc-types --no-default-features
+      - cargo check -p connectrpc-types --no-default-features --features json
+      - cargo check -p connectrpc-types --no-default-features --features views
 
   # ===========================================================================
   # Changelog (changie)

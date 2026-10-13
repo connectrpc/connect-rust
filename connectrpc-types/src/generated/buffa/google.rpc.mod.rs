@@ -17,74 +17,105 @@ include!("google.rpc.status.rs");
 pub mod __buffa {
     #[allow(unused_imports)]
     use super::*;
+    #[cfg(feature = "views")]
     pub mod view {
         #[allow(unused_imports)]
         use super::*;
         include!("google.rpc.error_details.__view.rs");
         include!("google.rpc.status.__view.rs");
     }
+    #[cfg(feature = "json")]
     /// Register this package's `Any` type entries and extension entries.
+    #[allow(unused_variables)]
     pub fn register_types(reg: &mut ::buffa::type_registry::TypeRegistry) {
-        reg.register_json_any(super::__ERROR_INFO_JSON_ANY);
-        reg.register_json_any(super::__RETRY_INFO_JSON_ANY);
-        reg.register_json_any(super::__DEBUG_INFO_JSON_ANY);
-        reg.register_json_any(super::__QUOTA_FAILURE_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__ERROR_INFO_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__RETRY_INFO_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__DEBUG_INFO_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__QUOTA_FAILURE_JSON_ANY);
+        #[cfg(feature = "json")]
         reg.register_json_any(super::quota_failure::__VIOLATION_JSON_ANY);
+        #[cfg(feature = "json")]
         reg.register_json_any(super::__PRECONDITION_FAILURE_JSON_ANY);
+        #[cfg(feature = "json")]
         reg.register_json_any(super::precondition_failure::__VIOLATION_JSON_ANY);
-        reg.register_json_any(super::__BAD_REQUEST_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__BAD_REQUEST_JSON_ANY);
+        #[cfg(feature = "json")]
         reg.register_json_any(super::bad_request::__FIELD_VIOLATION_JSON_ANY);
-        reg.register_json_any(super::__REQUEST_INFO_JSON_ANY);
-        reg.register_json_any(super::__RESOURCE_INFO_JSON_ANY);
-        reg.register_json_any(super::__HELP_JSON_ANY);
-        reg.register_json_any(super::help::__LINK_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__REQUEST_INFO_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__RESOURCE_INFO_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__HELP_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::help::__LINK_JSON_ANY);
+        #[cfg(feature = "json")]
         reg.register_json_any(super::__LOCALIZED_MESSAGE_JSON_ANY);
-        reg.register_json_any(super::__STATUS_JSON_ANY);
+        #[cfg(feature = "json")] reg.register_json_any(super::__STATUS_JSON_ANY);
     }
 }
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::ErrorInfoView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::ErrorInfoOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::RetryInfoView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::RetryInfoOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::DebugInfoView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::DebugInfoOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::QuotaFailureView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::QuotaFailureOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::PreconditionFailureView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::PreconditionFailureOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::BadRequestView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::BadRequestOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::RequestInfoView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::RequestInfoOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::ResourceInfoView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::ResourceInfoOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::HelpView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::HelpOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::LocalizedMessageView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::LocalizedMessageOwnedView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::StatusView;
+#[cfg(feature = "views")]
 #[doc(inline)]
 pub use self::__buffa::view::StatusOwnedView;
+#[cfg(feature = "json")]
 #[doc(inline)]
 pub use self::__buffa::register_types;

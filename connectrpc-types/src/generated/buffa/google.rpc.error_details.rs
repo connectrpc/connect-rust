@@ -30,8 +30,8 @@
 /// }
 /// ```
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct ErrorInfo {
     /// The reason of the error. This is a constant value that identifies the
     /// proximate cause of the error. Error reasons are unique within a particular
@@ -40,10 +40,13 @@ pub struct ErrorInfo {
     /// UPPER_SNAKE_CASE.
     ///
     /// Field 1: `reason`
-    #[serde(
-        rename = "reason",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "reason",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub reason: ::buffa::alloc::string::String,
     /// The logical grouping to which the "reason" belongs. The error domain
@@ -54,10 +57,13 @@ pub struct ErrorInfo {
     /// infrastructure, the error domain is "googleapis.com".
     ///
     /// Field 2: `domain`
-    #[serde(
-        rename = "domain",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "domain",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub domain: ::buffa::alloc::string::String,
     /// Additional structured details about this error.
@@ -71,16 +77,19 @@ pub struct ErrorInfo {
     /// instances that can be created in a single (batch) request.
     ///
     /// Field 3: `metadata`
-    #[serde(
-        rename = "metadata",
-        skip_serializing_if = "::buffa::__private::HashMap::is_empty",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "metadata",
+            skip_serializing_if = "::buffa::__private::HashMap::is_empty",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub metadata: ::buffa::__private::HashMap<
         ::buffa::alloc::string::String,
         ::buffa::alloc::string::String,
     >,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -214,6 +223,7 @@ impl ::buffa::ExtensionSet for ErrorInfo {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for ErrorInfo {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -227,6 +237,7 @@ impl ::buffa::json_helpers::ProtoElemJson for ErrorInfo {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __ERROR_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.ErrorInfo",
@@ -248,22 +259,25 @@ pub const __ERROR_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
 /// number of retries have been reached or a maximum retry delay cap has been
 /// reached.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct RetryInfo {
     /// Clients should wait at least this long between retrying the same request.
     ///
     /// Field 1: `retry_delay`
-    #[serde(
-        rename = "retryDelay",
-        alias = "retry_delay",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "retryDelay",
+            alias = "retry_delay",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+        )
     )]
     pub retry_delay: ::buffa::MessageField<
         ::buffa_types::google::protobuf::Duration,
         ::buffa::Inline<::buffa_types::google::protobuf::Duration>,
     >,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -370,6 +384,7 @@ impl ::buffa::ExtensionSet for RetryInfo {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for RetryInfo {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -383,6 +398,7 @@ impl ::buffa::json_helpers::ProtoElemJson for RetryInfo {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __RETRY_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.RetryInfo",
@@ -392,29 +408,35 @@ pub const __RETRY_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
 };
 /// Describes additional debugging info.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct DebugInfo {
     /// The stack trace entries indicating where the error occurred.
     ///
     /// Field 1: `stack_entries`
-    #[serde(
-        rename = "stackEntries",
-        alias = "stack_entries",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "stackEntries",
+            alias = "stack_entries",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub stack_entries: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     /// Additional debugging information provided by the server.
     ///
     /// Field 2: `detail`
-    #[serde(
-        rename = "detail",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "detail",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub detail: ::buffa::alloc::string::String,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -528,6 +550,7 @@ impl ::buffa::ExtensionSet for DebugInfo {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for DebugInfo {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -541,6 +564,7 @@ impl ::buffa::json_helpers::ProtoElemJson for DebugInfo {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __DEBUG_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.DebugInfo",
@@ -560,19 +584,22 @@ pub const __DEBUG_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
 /// Also see RetryInfo and Help types for other details about handling a
 /// quota failure.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct QuotaFailure {
     /// Describes all quota violations.
     ///
     /// Field 1: `violations`
-    #[serde(
-        rename = "violations",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "violations",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub violations: ::buffa::alloc::vec::Vec<quota_failure::Violation>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -680,6 +707,7 @@ impl ::buffa::ExtensionSet for QuotaFailure {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for QuotaFailure {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -693,6 +721,7 @@ impl ::buffa::json_helpers::ProtoElemJson for QuotaFailure {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __QUOTA_FAILURE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.QuotaFailure",
@@ -706,18 +735,21 @@ pub mod quota_failure {
     /// A message type used to describe a single quota violation.  For example, a
     /// daily quota or a custom quota that was exceeded.
     #[derive(Clone, PartialEq, Default)]
-    #[derive(::serde::Serialize, ::serde::Deserialize)]
-    #[serde(default)]
+    #[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+    #[cfg_attr(feature = "json", serde(default))]
     pub struct Violation {
         /// The subject on which the quota check failed.
         /// For example, "clientip:\<ip address of client\>" or "project:\<Google
         /// developer project id\>".
         ///
         /// Field 1: `subject`
-        #[serde(
-            rename = "subject",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "subject",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub subject: ::buffa::alloc::string::String,
         /// A description of how the quota check failed. Clients can use this
@@ -729,10 +761,13 @@ pub mod quota_failure {
         /// exceeded".
         ///
         /// Field 2: `description`
-        #[serde(
-            rename = "description",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "description",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub description: ::buffa::alloc::string::String,
         /// The API Service from which the `QuotaFailure.Violation` orginates. In
@@ -750,11 +785,14 @@ pub mod quota_failure {
         /// "compute.googleapis.com".
         ///
         /// Field 3: `api_service`
-        #[serde(
-            rename = "apiService",
-            alias = "api_service",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "apiService",
+                alias = "api_service",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub api_service: ::buffa::alloc::string::String,
         /// The metric of the violated quota. A quota metric is a named counter to
@@ -766,11 +804,14 @@ pub mod quota_failure {
         /// "storage.googleapis.com/internet_egress_bandwidth".
         ///
         /// Field 4: `quota_metric`
-        #[serde(
-            rename = "quotaMetric",
-            alias = "quota_metric",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "quotaMetric",
+                alias = "quota_metric",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub quota_metric: ::buffa::alloc::string::String,
         /// The id of the violated quota. Also know as "limit name", this is the
@@ -779,11 +820,14 @@ pub mod quota_failure {
         /// For example, "CPUS-PER-VM-FAMILY-per-project-region".
         ///
         /// Field 5: `quota_id`
-        #[serde(
-            rename = "quotaId",
-            alias = "quota_id",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "quotaId",
+                alias = "quota_id",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub quota_id: ::buffa::alloc::string::String,
         /// The dimensions of the violated quota. Every non-global quota is enforced
@@ -804,11 +848,14 @@ pub mod quota_failure {
         /// empty.
         ///
         /// Field 6: `quota_dimensions`
-        #[serde(
-            rename = "quotaDimensions",
-            alias = "quota_dimensions",
-            skip_serializing_if = "::buffa::__private::HashMap::is_empty",
-            deserialize_with = "::buffa::json_helpers::null_as_default"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "quotaDimensions",
+                alias = "quota_dimensions",
+                skip_serializing_if = "::buffa::__private::HashMap::is_empty",
+                deserialize_with = "::buffa::json_helpers::null_as_default"
+            )
         )]
         pub quota_dimensions: ::buffa::__private::HashMap<
             ::buffa::alloc::string::String,
@@ -821,11 +868,14 @@ pub mod quota_failure {
         /// field would reflect this quantity.
         ///
         /// Field 7: `quota_value`
-        #[serde(
-            rename = "quotaValue",
-            alias = "quota_value",
-            with = "::buffa::json_helpers::int64",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "quotaValue",
+                alias = "quota_value",
+                with = "::buffa::json_helpers::int64",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+            )
         )]
         pub quota_value: i64,
         /// The new quota value being rolled out at the time of the violation. At the
@@ -838,14 +888,17 @@ pub mod quota_failure {
         /// this field.
         ///
         /// Field 8: `future_quota_value`
-        #[serde(
-            rename = "futureQuotaValue",
-            alias = "future_quota_value",
-            with = "::buffa::json_helpers::opt_int64",
-            skip_serializing_if = "::core::option::Option::is_none"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "futureQuotaValue",
+                alias = "future_quota_value",
+                with = "::buffa::json_helpers::opt_int64",
+                skip_serializing_if = "::core::option::Option::is_none"
+            )
         )]
         pub future_quota_value: ::core::option::Option<i64>,
-        #[serde(skip)]
+        #[cfg_attr(feature = "json", serde(skip))]
         #[doc(hidden)]
         pub __buffa_unknown_fields: ::buffa::UnknownFields,
     }
@@ -1072,6 +1125,7 @@ pub mod quota_failure {
             &mut self.__buffa_unknown_fields
         }
     }
+    #[cfg(feature = "json")]
     impl ::buffa::json_helpers::ProtoElemJson for Violation {
         fn serialize_proto_json<S: ::serde::Serializer>(
             v: &Self,
@@ -1085,6 +1139,7 @@ pub mod quota_failure {
             <Self as ::serde::Deserialize>::deserialize(d)
         }
     }
+    #[cfg(feature = "json")]
     #[doc(hidden)]
     pub const __VIOLATION_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
         type_url: "type.googleapis.com/google.rpc.QuotaFailure.Violation",
@@ -1092,8 +1147,10 @@ pub mod quota_failure {
         from_json: ::buffa::type_registry::any_from_json::<Violation>,
         is_wkt: false,
     };
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::quota_failure::ViolationView;
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::quota_failure::ViolationOwnedView;
 }
@@ -1103,19 +1160,22 @@ pub mod quota_failure {
 /// acknowledged, it could list the terms of service violation in the
 /// PreconditionFailure message.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct PreconditionFailure {
     /// Describes all precondition violations.
     ///
     /// Field 1: `violations`
-    #[serde(
-        rename = "violations",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "violations",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub violations: ::buffa::alloc::vec::Vec<precondition_failure::Violation>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -1225,6 +1285,7 @@ impl ::buffa::ExtensionSet for PreconditionFailure {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for PreconditionFailure {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -1238,6 +1299,7 @@ impl ::buffa::json_helpers::ProtoElemJson for PreconditionFailure {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __PRECONDITION_FAILURE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.PreconditionFailure",
@@ -1250,18 +1312,21 @@ pub mod precondition_failure {
     use super::*;
     /// A message type used to describe a single precondition failure.
     #[derive(Clone, PartialEq, Default)]
-    #[derive(::serde::Serialize, ::serde::Deserialize)]
-    #[serde(default)]
+    #[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+    #[cfg_attr(feature = "json", serde(default))]
     pub struct Violation {
         /// The type of PreconditionFailure. We recommend using a service-specific
         /// enum type to define the supported precondition violation subjects. For
         /// example, "TOS" for "Terms of Service violation".
         ///
         /// Field 1: `type`
-        #[serde(
-            rename = "type",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "type",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub r#type: ::buffa::alloc::string::String,
         /// The subject, relative to the type, that failed.
@@ -1269,10 +1334,13 @@ pub mod precondition_failure {
         /// which terms of service is being referenced.
         ///
         /// Field 2: `subject`
-        #[serde(
-            rename = "subject",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "subject",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub subject: ::buffa::alloc::string::String,
         /// A description of how the precondition failed. Developers can use this
@@ -1281,13 +1349,16 @@ pub mod precondition_failure {
         /// For example: "Terms of service not accepted".
         ///
         /// Field 3: `description`
-        #[serde(
-            rename = "description",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "description",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub description: ::buffa::alloc::string::String,
-        #[serde(skip)]
+        #[cfg_attr(feature = "json", serde(skip))]
         #[doc(hidden)]
         pub __buffa_unknown_fields: ::buffa::UnknownFields,
     }
@@ -1414,6 +1485,7 @@ pub mod precondition_failure {
             &mut self.__buffa_unknown_fields
         }
     }
+    #[cfg(feature = "json")]
     impl ::buffa::json_helpers::ProtoElemJson for Violation {
         fn serialize_proto_json<S: ::serde::Serializer>(
             v: &Self,
@@ -1427,6 +1499,7 @@ pub mod precondition_failure {
             <Self as ::serde::Deserialize>::deserialize(d)
         }
     }
+    #[cfg(feature = "json")]
     #[doc(hidden)]
     pub const __VIOLATION_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
         type_url: "type.googleapis.com/google.rpc.PreconditionFailure.Violation",
@@ -1434,28 +1507,33 @@ pub mod precondition_failure {
         from_json: ::buffa::type_registry::any_from_json::<Violation>,
         is_wkt: false,
     };
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::precondition_failure::ViolationView;
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::precondition_failure::ViolationOwnedView;
 }
 /// Describes violations in a client request. This error type focuses on the
 /// syntactic aspects of the request.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct BadRequest {
     /// Describes all violations in a client request.
     ///
     /// Field 1: `field_violations`
-    #[serde(
-        rename = "fieldViolations",
-        alias = "field_violations",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "fieldViolations",
+            alias = "field_violations",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub field_violations: ::buffa::alloc::vec::Vec<bad_request::FieldViolation>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -1565,6 +1643,7 @@ impl ::buffa::ExtensionSet for BadRequest {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for BadRequest {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -1578,6 +1657,7 @@ impl ::buffa::json_helpers::ProtoElemJson for BadRequest {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __BAD_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.BadRequest",
@@ -1590,8 +1670,8 @@ pub mod bad_request {
     use super::*;
     /// A message type used to describe a single bad request field.
     #[derive(Clone, PartialEq, Default)]
-    #[derive(::serde::Serialize, ::serde::Deserialize)]
-    #[serde(default)]
+    #[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+    #[cfg_attr(feature = "json", serde(default))]
     pub struct FieldViolation {
         /// A path that leads to a field in the request body. The value will be a
         /// sequence of dot-separated identifiers that identify a protocol buffer
@@ -1634,19 +1714,25 @@ pub mod bad_request {
         ///   value in the third `emailAddresses` message.
         ///
         /// Field 1: `field`
-        #[serde(
-            rename = "field",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "field",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub field: ::buffa::alloc::string::String,
         /// A description of why the request element is bad.
         ///
         /// Field 2: `description`
-        #[serde(
-            rename = "description",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "description",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub description: ::buffa::alloc::string::String,
         /// The reason of the field-level error. This is a constant value that
@@ -1657,26 +1743,32 @@ pub mod bad_request {
         /// which represents UPPER_SNAKE_CASE.
         ///
         /// Field 3: `reason`
-        #[serde(
-            rename = "reason",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "reason",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub reason: ::buffa::alloc::string::String,
         /// Provides a localized error message for field-level errors that is safe to
         /// return to the API consumer.
         ///
         /// Field 4: `localized_message`
-        #[serde(
-            rename = "localizedMessage",
-            alias = "localized_message",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "localizedMessage",
+                alias = "localized_message",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+            )
         )]
         pub localized_message: ::buffa::MessageField<
             super::LocalizedMessage,
             ::buffa::Inline<super::LocalizedMessage>,
         >,
-        #[serde(skip)]
+        #[cfg_attr(feature = "json", serde(skip))]
         #[doc(hidden)]
         pub __buffa_unknown_fields: ::buffa::UnknownFields,
     }
@@ -1832,6 +1924,7 @@ pub mod bad_request {
             &mut self.__buffa_unknown_fields
         }
     }
+    #[cfg(feature = "json")]
     impl ::buffa::json_helpers::ProtoElemJson for FieldViolation {
         fn serialize_proto_json<S: ::serde::Serializer>(
             v: &Self,
@@ -1845,6 +1938,7 @@ pub mod bad_request {
             <Self as ::serde::Deserialize>::deserialize(d)
         }
     }
+    #[cfg(feature = "json")]
     #[doc(hidden)]
     pub const __FIELD_VIOLATION_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
         type_url: "type.googleapis.com/google.rpc.BadRequest.FieldViolation",
@@ -1852,40 +1946,48 @@ pub mod bad_request {
         from_json: ::buffa::type_registry::any_from_json::<FieldViolation>,
         is_wkt: false,
     };
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::bad_request::FieldViolationView;
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::bad_request::FieldViolationOwnedView;
 }
 /// Contains metadata about the request that clients can attach when filing a bug
 /// or providing other forms of feedback.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct RequestInfo {
     /// An opaque string that should only be interpreted by the service generating
     /// it. For example, it can be used to identify requests in the service's logs.
     ///
     /// Field 1: `request_id`
-    #[serde(
-        rename = "requestId",
-        alias = "request_id",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "requestId",
+            alias = "request_id",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub request_id: ::buffa::alloc::string::String,
     /// Any data that was used to serve this request. For example, an encrypted
     /// stack trace that can be sent back to the service provider for debugging.
     ///
     /// Field 2: `serving_data`
-    #[serde(
-        rename = "servingData",
-        alias = "serving_data",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "servingData",
+            alias = "serving_data",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub serving_data: ::buffa::alloc::string::String,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -1995,6 +2097,7 @@ impl ::buffa::ExtensionSet for RequestInfo {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for RequestInfo {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -2008,6 +2111,7 @@ impl ::buffa::json_helpers::ProtoElemJson for RequestInfo {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __REQUEST_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.RequestInfo",
@@ -2017,19 +2121,22 @@ pub const __REQUEST_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buff
 };
 /// Describes the resource that is being accessed.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct ResourceInfo {
     /// A name for the type of resource being accessed, e.g. "sql table",
     /// "cloud storage bucket", "file", "Google calendar"; or the type URL
     /// of the resource: e.g. "type.googleapis.com/google.pubsub.v1.Topic".
     ///
     /// Field 1: `resource_type`
-    #[serde(
-        rename = "resourceType",
-        alias = "resource_type",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "resourceType",
+            alias = "resource_type",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub resource_type: ::buffa::alloc::string::String,
     /// The name of the resource being accessed.  For example, a shared calendar
@@ -2038,11 +2145,14 @@ pub struct ResourceInfo {
     /// \[google.rpc.Code.PERMISSION_DENIED\]\[google.rpc.Code.PERMISSION_DENIED\].
     ///
     /// Field 2: `resource_name`
-    #[serde(
-        rename = "resourceName",
-        alias = "resource_name",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "resourceName",
+            alias = "resource_name",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub resource_name: ::buffa::alloc::string::String,
     /// The owner of the resource (optional).
@@ -2050,10 +2160,13 @@ pub struct ResourceInfo {
     /// id\>".
     ///
     /// Field 3: `owner`
-    #[serde(
-        rename = "owner",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "owner",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub owner: ::buffa::alloc::string::String,
     /// Describes what error is encountered when accessing this resource.
@@ -2061,13 +2174,16 @@ pub struct ResourceInfo {
     /// on the developer console project.
     ///
     /// Field 4: `description`
-    #[serde(
-        rename = "description",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "description",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub description: ::buffa::alloc::string::String,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -2209,6 +2325,7 @@ impl ::buffa::ExtensionSet for ResourceInfo {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for ResourceInfo {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -2222,6 +2339,7 @@ impl ::buffa::json_helpers::ProtoElemJson for ResourceInfo {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __RESOURCE_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.ResourceInfo",
@@ -2235,19 +2353,22 @@ pub const __RESOURCE_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buf
 /// project hasn't enabled the accessed service, this can contain a URL pointing
 /// directly to the right place in the developer console to flip the bit.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct Help {
     /// URL(s) pointing to additional information on handling the current error.
     ///
     /// Field 1: `links`
-    #[serde(
-        rename = "links",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "links",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub links: ::buffa::alloc::vec::Vec<help::Link>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -2355,6 +2476,7 @@ impl ::buffa::ExtensionSet for Help {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for Help {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -2368,6 +2490,7 @@ impl ::buffa::json_helpers::ProtoElemJson for Help {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __HELP_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.Help",
@@ -2380,28 +2503,34 @@ pub mod help {
     use super::*;
     /// Describes a URL link.
     #[derive(Clone, PartialEq, Default)]
-    #[derive(::serde::Serialize, ::serde::Deserialize)]
-    #[serde(default)]
+    #[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+    #[cfg_attr(feature = "json", serde(default))]
     pub struct Link {
         /// Describes what the link offers.
         ///
         /// Field 1: `description`
-        #[serde(
-            rename = "description",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "description",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub description: ::buffa::alloc::string::String,
         /// The URL of the link.
         ///
         /// Field 2: `url`
-        #[serde(
-            rename = "url",
-            with = "::buffa::json_helpers::proto_string",
-            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        #[cfg_attr(
+            feature = "json",
+            serde(
+                rename = "url",
+                with = "::buffa::json_helpers::proto_string",
+                skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+            )
         )]
         pub url: ::buffa::alloc::string::String,
-        #[serde(skip)]
+        #[cfg_attr(feature = "json", serde(skip))]
         #[doc(hidden)]
         pub __buffa_unknown_fields: ::buffa::UnknownFields,
     }
@@ -2513,6 +2642,7 @@ pub mod help {
             &mut self.__buffa_unknown_fields
         }
     }
+    #[cfg(feature = "json")]
     impl ::buffa::json_helpers::ProtoElemJson for Link {
         fn serialize_proto_json<S: ::serde::Serializer>(
             v: &Self,
@@ -2526,6 +2656,7 @@ pub mod help {
             <Self as ::serde::Deserialize>::deserialize(d)
         }
     }
+    #[cfg(feature = "json")]
     #[doc(hidden)]
     pub const __LINK_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
         type_url: "type.googleapis.com/google.rpc.Help.Link",
@@ -2533,38 +2664,46 @@ pub mod help {
         from_json: ::buffa::type_registry::any_from_json::<Link>,
         is_wkt: false,
     };
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::help::LinkView;
+    #[cfg(feature = "views")]
     #[doc(inline)]
     pub use super::__buffa::view::help::LinkOwnedView;
 }
 /// Provides a localized error message that is safe to return to the user
 /// which can be attached to an RPC error.
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct LocalizedMessage {
     /// The locale used following the specification defined at
     /// <https://www.rfc-editor.org/rfc/bcp/bcp47.txt.>
     /// Examples are: "en-US", "fr-CH", "es-MX"
     ///
     /// Field 1: `locale`
-    #[serde(
-        rename = "locale",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "locale",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub locale: ::buffa::alloc::string::String,
     /// The localized error message in the above locale.
     ///
     /// Field 2: `message`
-    #[serde(
-        rename = "message",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "message",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub message: ::buffa::alloc::string::String,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -2674,6 +2813,7 @@ impl ::buffa::ExtensionSet for LocalizedMessage {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for LocalizedMessage {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -2687,6 +2827,7 @@ impl ::buffa::json_helpers::ProtoElemJson for LocalizedMessage {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __LOCALIZED_MESSAGE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.LocalizedMessage",

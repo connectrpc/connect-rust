@@ -154,6 +154,20 @@ compiling (`Serialize is not satisfied` — note the error names the trait, not
 the feature). Proto-only mode therefore fits a leaf binary or a fully
 proto-only graph, not one library inside a mixed workspace.
 
+The `connectrpc-types` crate has a default-on `json` feature of its own for the
+serde impls on the `google.rpc` types. A proto-only build still compiles with it
+on, because `connectrpc-types` does not depend on `connectrpc`. To drop the
+unused serde impls, turn it off the same way, and re-list `views` if generated
+code has these types as fields:
+
+```toml
+connectrpc-types = { version = "0.9", default-features = false, features = ["views"] }
+```
+
+Such code comes from `protoc-gen-buffa`, so remove its serde impls by leaving
+`json=true` out of that plugin's `opt`; `protoc-gen-connect-rust` ignores
+`no_json`.
+
 > View-body responses are already proto-only and return `Unimplemented` for the
 > JSON codec — see [Returning a view body](#returning-a-view-body) — so a
 > proto-only build changes nothing for them.

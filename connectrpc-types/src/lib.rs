@@ -21,9 +21,45 @@
 //! The `google.protobuf` types they use (`Any` in `Status.details`,
 //! `Duration` in `RetryInfo`) are `buffa-types`' own.
 //!
-//! Each message also has `*View` / `*OwnedView` types: zero-copy decoders
-//! for reading a serialized message in place. Most code wants the owned
-//! types.
+//! With the `views` feature, each message also has `*View` / `*OwnedView`
+//! types: zero-copy decoders for reading a serialized message in place. Most
+//! code wants the owned types.
+//!
+//! # Feature flags
+//!
+//! | Feature | Default | Adds | Turning it off saves |
+//! |---|---|---|---|
+//! | `json` | on | The `serde` impls with the protobuf JSON mapping, and `google::rpc::register_types` (see [JSON and `Any`](#json-and-any)) | The `serde` derives on these types, and the `json` features of `buffa` and `buffa-types` |
+//! | `views` | on | The `*View` / `*OwnedView` types, and the `HasMessageView` impls that `connectrpc` service code requires | Compile time only |
+//!
+//! Code that only [attaches](#attaching-error-details) or
+//! [reads](#reading-error-details) error details compiles with both off:
+//!
+//! ```toml
+//! # Error details only.
+//! connectrpc-types = { version = "0.9", default-features = false }
+//! ```
+//!
+//! The crate then depends only on `buffa` and `buffa-types`. `serde` stays in
+//! a build that also uses `connectrpc`, which always depends on it.
+//!
+//! A message of your own that has one of these types as a field
+//! ([Using these types from generated code](#using-these-types-from-generated-code))
+//! needs the features that match how it was generated:
+//!
+//! - `views`, unless the message is generated with `views=false`. Its view
+//!   type has the view of each field as a field type, and `connectrpc` service
+//!   code requires the view of each request and response message. Without the
+//!   feature, the compiler reports ``cannot find `view` in `__buffa` ``.
+//! - `json`, unless the message is generated without serde impls for a
+//!   [proto-only build]. Its serde impls call the ones here. Without the
+//!   feature, the compiler reports `Status: serde::Serialize` as not
+//!   satisfied, which gives the trait and not the feature.
+//!
+//! ```toml
+//! # Proto-only build with these types as fields.
+//! connectrpc-types = { version = "0.9", default-features = false, features = ["views"] }
+//! ```
 //!
 //! # Attaching error details
 //!
@@ -101,7 +137,9 @@
 //! A schema that imports `google/rpc/status.proto` (say, a batch response
 //! carrying a `Status` per item) should name this crate rather than generate
 //! the package again, so its fields hold these types. Map the package with
-//! the buffa plugin's `extern_path` option:
+//! the buffa plugin's `extern_path` option, and keep this crate's
+//! [features](#feature-flags) in line with the plugin's `views` and `json`
+//! options:
 //!
 //! ```yaml
 //! # buf.gen.yaml
@@ -127,23 +165,28 @@
 //!
 //! # JSON and `Any`
 //!
-//! Every message implements `serde`'s `Serialize` / `Deserialize` with the
-//! protobuf JSON mapping. A `Status` whose `details` should render as
-//! expanded JSON objects rather than opaque `Any` values needs these types
-//! in the process-wide buffa type registry, installed once at startup:
+//! With the `json` feature, every message implements `serde`'s `Serialize` /
+//! `Deserialize` with the protobuf JSON mapping. To render the `details` of a
+//! `Status` as expanded JSON objects rather than opaque `Any` values, register
+//! these types in the process-wide buffa type registry once, at startup:
 //!
 //! ```
+//! # #[cfg(feature = "json")] {
 //! use buffa::type_registry::{TypeRegistry, set_type_registry};
 //!
 //! let mut registry = TypeRegistry::new();
 //! buffa_types::register_wkt_types(&mut registry);
 //! connectrpc_types::google::rpc::register_types(&mut registry);
 //! set_type_registry(registry);
+//! # }
 //! ```
 //!
-//! Without it, a detail serializes as `{"@type": ..., "value": <base64>}`.
+//! Without the registry, a detail serializes as
+//! `{"@type": ..., "value": <base64>}`, and an expanded detail from a peer
+//! parses without an error into an `Any` whose `value` is empty.
 //!
 //! [googleapis]: https://github.com/googleapis/googleapis
+//! [proto-only build]: https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md#proto-only-no-json-builds
 //! [`ErrorDetail::from_message`]: https://docs.rs/connectrpc/0.9/connectrpc/struct.ErrorDetail.html#method.from_message
 //! [`ErrorDetail::value`]: https://docs.rs/connectrpc/0.9/connectrpc/struct.ErrorDetail.html#structfield.value
 

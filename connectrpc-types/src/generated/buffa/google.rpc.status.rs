@@ -9,17 +9,20 @@
 /// You can find out more about this error model and how to work with it in the
 /// [API Design Guide](https://cloud.google.com/apis/design/errors).
 #[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
+#[cfg_attr(feature = "json", derive(::serde::Serialize, ::serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct Status {
     /// The status code, which should be an enum value of
     /// [google.rpc.Code](crate::google::rpc::Code).
     ///
     /// Field 1: `code`
-    #[serde(
-        rename = "code",
-        with = "::buffa::json_helpers::int32",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i32"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "code",
+            with = "::buffa::json_helpers::int32",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i32"
+        )
     )]
     pub code: i32,
     /// A developer-facing error message, which should be in English. Any
@@ -28,23 +31,29 @@ pub struct Status {
     /// by the client.
     ///
     /// Field 2: `message`
-    #[serde(
-        rename = "message",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "message",
+            with = "::buffa::json_helpers::proto_string",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+        )
     )]
     pub message: ::buffa::alloc::string::String,
     /// A list of messages that carry the error details.  There is a common set of
     /// message types for APIs to use.
     ///
     /// Field 3: `details`
-    #[serde(
-        rename = "details",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+    #[cfg_attr(
+        feature = "json",
+        serde(
+            rename = "details",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )
     )]
     pub details: ::buffa::alloc::vec::Vec<::buffa_types::google::protobuf::Any>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "json", serde(skip))]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -184,6 +193,7 @@ impl ::buffa::ExtensionSet for Status {
         &mut self.__buffa_unknown_fields
     }
 }
+#[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for Status {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
@@ -197,6 +207,7 @@ impl ::buffa::json_helpers::ProtoElemJson for Status {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
+#[cfg(feature = "json")]
 #[doc(hidden)]
 pub const __STATUS_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
     type_url: "type.googleapis.com/google.rpc.Status",

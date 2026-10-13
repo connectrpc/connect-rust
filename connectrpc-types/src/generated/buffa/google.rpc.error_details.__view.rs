@@ -241,6 +241,7 @@ impl<'a> ::buffa::ViewEncode<'a> for ErrorInfoView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -435,6 +436,7 @@ impl ::buffa::HasMessageView for super::super::ErrorInfo {
     type View<'a> = ErrorInfoView<'a>;
     type ViewHandle = ErrorInfoOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for ErrorInfoOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -589,6 +591,7 @@ impl<'a> ::buffa::ViewEncode<'a> for RetryInfoView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -737,6 +740,7 @@ impl ::buffa::HasMessageView for super::super::RetryInfo {
     type View<'a> = RetryInfoView<'a>;
     type ViewHandle = RetryInfoOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for RetryInfoOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -867,6 +871,7 @@ impl<'a> ::buffa::ViewEncode<'a> for DebugInfoView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -1019,6 +1024,7 @@ impl ::buffa::HasMessageView for super::super::DebugInfo {
     type View<'a> = DebugInfoView<'a>;
     type ViewHandle = DebugInfoOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for DebugInfoOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -1167,6 +1173,7 @@ impl<'a> ::buffa::ViewEncode<'a> for QuotaFailureView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -1314,6 +1321,7 @@ impl ::buffa::HasMessageView for super::super::QuotaFailure {
     type View<'a> = QuotaFailureView<'a>;
     type ViewHandle = QuotaFailureOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for QuotaFailureOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -1686,6 +1694,7 @@ pub mod quota_failure {
             self.__buffa_unknown_fields.write_to(buf);
         }
     }
+    #[cfg(feature = "json")]
     /// Serializes this view as protobuf JSON.
     ///
     /// Implicit-presence fields with default values are omitted, `required`
@@ -1978,6 +1987,7 @@ pub mod quota_failure {
         type View<'a> = ViolationView<'a>;
         type ViewHandle = ViolationOwnedView;
     }
+    #[cfg(feature = "json")]
     impl ::serde::Serialize for ViolationOwnedView {
         fn serialize<__S: ::serde::Serializer>(
             &self,
@@ -2127,6 +2137,7 @@ impl<'a> ::buffa::ViewEncode<'a> for PreconditionFailureView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -2278,6 +2289,7 @@ impl ::buffa::HasMessageView for super::super::PreconditionFailure {
     type View<'a> = PreconditionFailureView<'a>;
     type ViewHandle = PreconditionFailureOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for PreconditionFailureOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -2442,6 +2454,7 @@ pub mod precondition_failure {
             self.__buffa_unknown_fields.write_to(buf);
         }
     }
+    #[cfg(feature = "json")]
     /// Serializes this view as protobuf JSON.
     ///
     /// Implicit-presence fields with default values are omitted, `required`
@@ -2614,6 +2627,7 @@ pub mod precondition_failure {
         type View<'a> = ViolationView<'a>;
         type ViewHandle = ViolationOwnedView;
     }
+    #[cfg(feature = "json")]
     impl ::serde::Serialize for ViolationOwnedView {
         fn serialize<__S: ::serde::Serializer>(
             &self,
@@ -2754,6 +2768,7 @@ impl<'a> ::buffa::ViewEncode<'a> for BadRequestView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -2901,6 +2916,7 @@ impl ::buffa::HasMessageView for super::super::BadRequest {
     type View<'a> = BadRequestView<'a>;
     type ViewHandle = BadRequestOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for BadRequestOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -3158,6 +3174,7 @@ pub mod bad_request {
             self.__buffa_unknown_fields.write_to(buf);
         }
     }
+    #[cfg(feature = "json")]
     /// Serializes this view as protobuf JSON.
     ///
     /// Implicit-presence fields with default values are omitted, `required`
@@ -3387,6 +3404,7 @@ pub mod bad_request {
         type View<'a> = FieldViolationView<'a>;
         type ViewHandle = FieldViolationOwnedView;
     }
+    #[cfg(feature = "json")]
     impl ::serde::Serialize for FieldViolationOwnedView {
         fn serialize<__S: ::serde::Serializer>(
             &self,
@@ -3517,6 +3535,7 @@ impl<'a> ::buffa::ViewEncode<'a> for RequestInfoView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -3671,6 +3690,7 @@ impl ::buffa::HasMessageView for super::super::RequestInfo {
     type View<'a> = RequestInfoView<'a>;
     type ViewHandle = RequestInfoOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for RequestInfoOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -3844,6 +3864,7 @@ impl<'a> ::buffa::ViewEncode<'a> for ResourceInfoView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -4025,6 +4046,7 @@ impl ::buffa::HasMessageView for super::super::ResourceInfo {
     type View<'a> = ResourceInfoView<'a>;
     type ViewHandle = ResourceInfoOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for ResourceInfoOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -4165,6 +4187,7 @@ impl<'a> ::buffa::ViewEncode<'a> for HelpView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -4302,6 +4325,7 @@ impl ::buffa::HasMessageView for super::super::Help {
     type View<'a> = HelpView<'a>;
     type ViewHandle = HelpOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for HelpOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
@@ -4441,6 +4465,7 @@ pub mod help {
             self.__buffa_unknown_fields.write_to(buf);
         }
     }
+    #[cfg(feature = "json")]
     /// Serializes this view as protobuf JSON.
     ///
     /// Implicit-presence fields with default values are omitted, `required`
@@ -4589,6 +4614,7 @@ pub mod help {
         type View<'a> = LinkView<'a>;
         type ViewHandle = LinkOwnedView;
     }
+    #[cfg(feature = "json")]
     impl ::serde::Serialize for LinkOwnedView {
         fn serialize<__S: ::serde::Serializer>(
             &self,
@@ -4719,6 +4745,7 @@ impl<'a> ::buffa::ViewEncode<'a> for LocalizedMessageView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -4875,6 +4902,7 @@ impl ::buffa::HasMessageView for super::super::LocalizedMessage {
     type View<'a> = LocalizedMessageView<'a>;
     type ViewHandle = LocalizedMessageOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for LocalizedMessageOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,

@@ -20,7 +20,12 @@ plugins:
     # `google.protobuf` (the `Any` in `Status.details`, the `Duration` in
     # `RetryInfo`) maps to buffa-types without an `extern_path`, so the
     # details are the same `Any` the rest of the ecosystem uses.
-    opt: [views=true, json=true]
+    #
+    # `gate_impls=true` puts the serde impls under `#[cfg(feature = "json")]`
+    # and the view types under `#[cfg(feature = "views")]`. The one option
+    # covers both kinds, each with its own feature: buffa has no option that
+    # covers only the serde impls. Cargo.toml declares the features.
+    opt: [views=true, json=true, gate_impls=true]
   - local: ../../buffa/target/release/protoc-gen-buffa-packaging
     out: src/generated/buffa
     strategy: all

@@ -178,6 +178,7 @@ impl<'a> ::buffa::ViewEncode<'a> for StatusView<'a> {
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
+#[cfg(feature = "json")]
 /// Serializes this view as protobuf JSON.
 ///
 /// Implicit-presence fields with default values are omitted, `required`
@@ -345,6 +346,7 @@ impl ::buffa::HasMessageView for super::super::Status {
     type View<'a> = StatusView<'a>;
     type ViewHandle = StatusOwnedView;
 }
+#[cfg(feature = "json")]
 impl ::serde::Serialize for StatusOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,

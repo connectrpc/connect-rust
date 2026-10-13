@@ -5,12 +5,9 @@
 //! constructing them — a locally generated `Any` or `Duration` would not
 //! type-check.
 
-use buffa::view::MessageView;
 use buffa::{Message, MessageField, MessageName};
 use buffa_types::google::protobuf::{Any, Duration};
-use connectrpc_types::google::rpc::{
-    BadRequest, Code, ErrorInfo, RetryInfo, Status, StatusView, bad_request,
-};
+use connectrpc_types::google::rpc::{BadRequest, Code, ErrorInfo, RetryInfo, Status, bad_request};
 
 fn retry_after(seconds: i64) -> RetryInfo {
     RetryInfo {
@@ -111,8 +108,12 @@ fn status_round_trips_on_the_wire_with_its_details() {
     assert_eq!(mismatched, None);
 }
 
+#[cfg(feature = "views")]
 #[test]
 fn status_decodes_as_a_borrowing_view() {
+    use buffa::view::MessageView;
+    use connectrpc_types::google::rpc::StatusView;
+
     // The `grpc-status-details-bin` trailer is a serialized `Status`; a view
     // reads it without copying the message or the detail payloads.
     let status = Status {
@@ -160,6 +161,9 @@ fn paths_match_what_extern_path_codegen_emits() {
     named::<rpc::Status>();
     named::<rpc::Code>();
     named::<rpc::bad_request::FieldViolation>();
-    named::<rpc::__buffa::view::StatusView<'static>>();
-    named::<rpc::__buffa::view::bad_request::FieldViolationView<'static>>();
+    #[cfg(feature = "views")]
+    {
+        named::<rpc::__buffa::view::StatusView<'static>>();
+        named::<rpc::__buffa::view::bad_request::FieldViolationView<'static>>();
+    }
 }

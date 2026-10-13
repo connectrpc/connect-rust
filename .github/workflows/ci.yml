@@ -305,3 +305,11 @@ jobs:
       - run: cargo test --locked -p connectrpc --no-default-features
       - run: cargo check --locked -p connectrpc --no-default-features --features server
       - run: cargo check --locked -p connectrpc --no-default-features --features axum,server
+      # `json` and `views` are separate features in the generated code; build
+      # each combination so a regeneration cannot leave one of them broken.
+      # `cargo test` turns `buffa/json` back on through the `connectrpc`
+      # dev-dependency, so the plain check is a different build.
+      - run: cargo check --locked -p connectrpc-types --no-default-features
+      - run: cargo test --locked -p connectrpc-types --no-default-features
+      - run: cargo check --locked -p connectrpc-types --no-default-features --features json
+      - run: cargo check --locked -p connectrpc-types --no-default-features --features views

@@ -217,7 +217,8 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
   `-p connectrpc --no-default-features`. Because the tests run, a test that
   needs `json`, `gzip` or `zstd` must be
   `#[cfg(feature = "...")]`-gated or it fails here while passing the
-  default-feature suite
+  default-feature suite. Also checks and tests `connectrpc-types` with no
+  features, and checks it with only `json` and with only `views`
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
 - **Latest dependencies** (weekly, separate workflow) — `cargo update` to
   the newest compatible versions, then the test suite

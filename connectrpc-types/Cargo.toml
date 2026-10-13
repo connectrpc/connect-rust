@@ -14,16 +14,32 @@ categories = ["network-programming", "encoding"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+# The "Feature flags" section of the crate docs says who needs each feature,
+# which is why both are on by default.
+[features]
+default = ["json", "views"]
+# The serde impls with the protobuf JSON mapping, and `register_types`.
+json = ["buffa/json", "buffa-types/json", "dep:serde"]
+# The `*View` / `*OwnedView` zero-copy types.
+views = []
+
 [dependencies]
-# Protobuf + serde (pulled in by the generated module paths)
-buffa = { workspace = true }
-buffa-types = { workspace = true }
-serde = { workspace = true }
+# Protobuf + serde (pulled in by the generated module paths). The buffa crates
+# do not inherit the workspace entries, which turn `json` on: a crate cannot
+# turn a feature of an inherited dependency off. Keep the versions in sync with
+# the `[workspace.dependencies]` entries, which document the floor.
+buffa = { version = "0.9.2" }
+buffa-types = { version = "0.9.2" }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
 connectrpc = { path = "../connectrpc" }
 serde_json = { workspace = true }
+
+[[test]]
+name = "json"
+required-features = ["json"]
 
 [lints]
 workspace = true

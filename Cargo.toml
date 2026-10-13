@@ -43,9 +43,10 @@ async-trait = "0.1"
 # (see CONTRIBUTING.md), and raise the floor only when generated code needs it.
 # (connectrpc-build also sources the generated `mod.rs` `#[allow(...)]` list
 # from `buffa_codegen::ALLOW_LINTS`.)
-# NOTE: the `connectrpc` crate pins `buffa` directly (not `workspace = true`)
-# so its `json` cargo feature can gate `buffa/json` for proto-only builds —
-# keep that floor aligned with this one when bumping.
+# NOTE: a crate whose own `json` cargo feature gates `buffa/json` for
+# proto-only builds (`connectrpc`, `connectrpc-types`) pins the buffa crates
+# directly (not `workspace = true`) — keep those floors aligned with these
+# when bumping.
 buffa = { version = "0.9.2", features = ["json"] }
 buffa-types = { version = "0.9.2", features = ["json"] }
 buffa-codegen = { version = "0.9.2" }
