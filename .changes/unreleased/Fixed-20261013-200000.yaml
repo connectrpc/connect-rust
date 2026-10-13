@@ -1,0 +1,20 @@
+kind: Fixed
+body: |-
+    **A message or enum that shares a Rust name with a service's generated
+    types is reported at generation time** ([#330]). In `connectrpc-build`
+    output a package's top-level messages, enums and view types share a module
+    with its service code. So `message GreetClient` next to `service Greet`, or
+    `service PingView` next to `message Ping`, failed inside the generated code
+    with E0428 or E0255 (`the name ... is defined multiple times`). Generation
+    now fails with an error that gives both proto declarations. Rename one of
+    them, generate with `buf generate`, or set buffa's `type_name_prefix`.
+    With `gate_client_feature`, `message GreetClient` compiled while the
+    `client` feature was off; it is now rejected too.
+
+    When a message, enum, view type or service already has the name of an
+    `OwnedFooView` alias (`message OwnedFooView`, the view of
+    `message OwnedFoo`, `service OwnedFooView`), the alias is left out, so those
+    schemas now compile. Write `OwnedView<FooView<'static>>` for that type.
+
+    [#330]: https://github.com/connectrpc/connect-rust/issues/330
+time: 2026-10-13T20:00:00.000000000+00:00

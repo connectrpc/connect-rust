@@ -259,7 +259,10 @@ impl Config {
     ///
     /// Calls to the convenience builders above made *before* this method
     /// are discarded; calls made *after* override individual fields in the
-    /// supplied config.
+    /// supplied config. That includes this crate's own default of
+    /// `generate_json(true)`: [`CodeGenConfig::default`] has it off, so call
+    /// [`Config::generate_json`] with `true` after this method unless the
+    /// build is proto-only.
     #[must_use]
     pub fn buffa_config(mut self, config: CodeGenConfig) -> Self {
         self.options.buffa = config;
@@ -359,15 +362,31 @@ impl Config {
     ///
     /// # Errors
     ///
+    /// Returns an error if:
+    ///
     /// - `$OUT_DIR` is unset and no `out_dir` was configured
     /// - `protoc` or `buf` is not on `PATH` (when using those sources)
     /// - the compiler exits non-zero (syntax error, missing import, ...)
-    /// - a precompiled descriptor set cannot be read or decoded
+    /// - a precompiled descriptor set cannot be read, or the descriptor set
+    ///   from any source cannot be decoded (for example, it exceeds the
+    ///   element-memory limit)
+    /// - the `BUFFA_ELEMENT_MEMORY_LIMIT` environment variable is set to
+    ///   something other than a byte count, `unlimited` or `max`
     /// - codegen fails (unsupported proto feature, or a method type absent
     ///   from the descriptor set — see [`Config::descriptor_set`])
     /// - two services in one package, or two of their methods, would
     ///   generate the same Rust identifier (`XGet` and `X_Get`; `XGet.Foo`
     ///   and `X.GetFoo`) — rename one in the proto
+    /// - a service and a top-level message or enum in its package would
+    ///   generate the same Rust identifier (`service Foo` and `message
+    ///   FooClient`; `service FooView` and `message Foo`) — rename one in the
+    ///   proto, or set `type_name_prefix` through [`Config::buffa_config`]
+    /// - a file that declares a service is listed more than once in
+    ///   [`Config::files`]
+    /// - [`Config::client_feature_name`] was given a name that is not a valid
+    ///   Cargo feature name, or an empty name (that call turns gating on, so
+    ///   an empty name is accepted only if `gate_client_feature(false)`
+    ///   follows it)
     /// - the output directory cannot be created or written to
     /// - [`Config::emit_descriptor_set`] was given a name containing path
     ///   separators, or the descriptor set cannot be written

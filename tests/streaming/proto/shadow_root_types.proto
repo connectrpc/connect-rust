@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package test.shadow.root_types.v1;
+
+// Messages whose names, or whose views' names, come close to what the
+// generated service code declares in the same Rust module. Each case here
+// compiles; the ones that cannot are generation errors.
+
+service AliasService {
+  rpc Unary(Req) returns (Resp);
+  rpc Bidi(stream Req) returns (stream Resp);
+}
+
+message Req {}
+
+message Resp {}
+
+// The name of the alias for `Req`'s owned view, which is left out.
+message OwnedReqView {}
+
+// Its view has the name of the alias for `Resp`'s owned view.
+message OwnedResp {}
+
+// The names of two of `AliasService`'s constants. A message is a type and a
+// constant is a value.
+message ALIAS_SERVICE_SERVICE_NAME {}
+
+message ALIAS_SERVICE_UNARY_SPEC {}
+
+// The name of the alias for `Ping`'s owned view.
+service OwnedPingView {
+  rpc Call(Ping) returns (Ping);
+}
+
+message Ping {}

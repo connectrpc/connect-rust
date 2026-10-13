@@ -404,16 +404,70 @@ becomes `trait GreetService`; `greet_service` would too), and each RPC
 becomes an async method.
 
 Every service in a proto package is generated into one Rust module, so
-the names derived from them must be distinct after that normalization:
-two services whose names become the same UpperCamelCase name (`XGet` and
-`X_Get`), or a service and method pair whose words split differently
-from another's (`XGet.Foo` and `X.GetFoo` both name the
-`X_GET_FOO_SPEC` constant), are rejected at generation time with a
-message naming both sides. Rename one of them in the proto. The check
-covers services only: a message or enum named like one of a service's
-generated items (`GreetServiceClient`, `GreetServiceServer`,
-`GreetServiceExt`) is accepted. In `connectrpc-build` output, where messages
-share that module, the generated code then fails to compile with E0428.
+their generated names must differ. Generation fails with an error such as
+``service pkg.Foo in pkg.proto and service pkg.FooClient in pkg.proto both
+generate Rust identifier `FooClient`; rename one in the proto``, in these
+cases:
+
+- Two services become the same UpperCamelCase name: `XGet` and `X_Get`.
+- A service has the name of a type generated for another service: `Foo` and
+  `FooClient`.
+- Two service and method pairs split the same words differently: `XGet.Foo`
+  and `X.GetFoo` both generate the `X_GET_FOO_SPEC` constant.
+
+Rename one of them in the proto.
+
+In `connectrpc-build` output, that module also contains the package's
+top-level messages and enums. It contains each message's view types too:
+`GreetRequestView` and `GreetRequestOwnedView` for `message GreetRequest`,
+and `GreetRequestLazyView` with buffa's `lazy_views` option. Generation fails
+in the same way in these cases:
+
+- A top-level message or enum has the same name as a type generated for a
+  service. For `service GreetService`, those are the `GreetService` trait,
+  `GreetServiceExt`, `GreetServiceClient`, `GreetServiceServer` and
+  `GreetServiceRegisterMarker`.
+- A service has the same name as a view type: `service GreetRequestView` next
+  to `message GreetRequest`.
+
+If you can't rename either one, you can keep the proto as it is.
+[`buf generate`](#buf-generate-checked-in-code-production-grade) puts messages
+and services in separate modules, so a message, enum or view type cannot
+collide with a service. In `connectrpc-build`, buffa's `type_name_prefix`
+option adds a prefix to the Rust name of every message, enum and view type
+(`PbGreetRequest`), and leaves the wire format and JSON unchanged:
+
+```rust
+// build.rs
+fn main() {
+    let mut buffa = connectrpc_build::CodeGenConfig::default();
+    buffa.type_name_prefix = "Pb".into();
+    connectrpc_build::Config::new()
+        .buffa_config(buffa)
+        // `buffa_config` replaces the whole config, and buffa's own default
+        // leaves out the serde derives that the `json` feature needs.
+        .generate_json(true)
+        .files(&["proto/greet.proto"])
+        .includes(&["proto/"])
+        .include_file("_connectrpc.rs")
+        .compile()
+        .unwrap();
+}
+```
+
+The check does not cover the names below. When one of them is the same as a
+name generated for a service, generation succeeds, and the generated code
+fails to compile with E0255 or E0428 (`the name ... is defined multiple
+times`):
+
+- In both layouts, a sub-package with an UpperCamelCase name:
+  `package pkg.FooClient` next to `service Foo` in `package pkg`.
+- In `connectrpc-build` output, a file-level extension whose constant has the
+  name of a service's constant:
+  `extend ... { string greet_service_name = 1000; }` next to `service Greet`.
+- In `connectrpc-build` output, a name that buffa's experimental
+  `idiomatic_imports` option imports into the module: `service String` or
+  `service MessageField`.
 
 The generated code compiles when a message, enum or service has the name of
 a standard library type or trait, such as `message Result` or
@@ -571,10 +625,8 @@ outlive the call, so it is re-decoded - a Bytes refcount bump plus a
 decode walk, with no per-field copy). Codegen emits
 `OwnedFooView` aliases and `impl Encodable<Foo> for OwnedFooView` per
 RPC type (or, with `encodable_impls=all_messages`, the impls for every
-message in the generated crate - the aliases stay RPC-scoped). (When two RPC types in the same package would alias to the
-same `OwnedFooView` name — e.g. a local `MyMessage` plus an imported
-`api.v1.foo.bar.MyMessage` — the alias is suppressed for both; spell
-the inlined `OwnedView<…View<'static>>` form for those types.) `connectrpc::MaybeBorrowed` covers the conditional case:
+message in the generated crate - the aliases stay RPC-scoped).
+`connectrpc::MaybeBorrowed` covers the conditional case:
 
 ```rust
 use connectrpc::{MaybeBorrowed, RequestContext, Response, ServiceRequest, ServiceResult};
@@ -597,6 +649,20 @@ async fn redact(
     Response::ok(MaybeBorrowed::Owned(owned))
 }
 ```
+
+The `OwnedFooView` alias is left out in these cases, where something else in
+the service's package has that name. Write `OwnedView<FooView<'static>>` for
+that type instead:
+
+- Two RPC types would get the same alias, such as a local `MyMessage` and an
+  imported `api.v1.foo.bar.MyMessage`. Neither gets the alias.
+- A service is named `OwnedFooView`.
+- In `connectrpc-build` output, a top-level message, an enum or a view type has
+  the name: `message OwnedFooView`, or `message OwnedFoo`, whose view type is
+  `OwnedFooView`.
+
+When a service, message, enum or view type has the name, `OwnedFooView` means
+that item and not the alias.
 
 A view body's large `bytes` and `string` fields reach the transport by
 reference count rather than being copied into one buffer, on unary and

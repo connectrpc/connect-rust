@@ -3,6 +3,7 @@ fn main() {
         .files(&[
             "proto/echo.proto",
             "proto/shadow_child.proto",
+            "proto/shadow_root_types.proto",
             "proto/shadow_services.proto",
             "proto/shadow_types.proto",
         ])

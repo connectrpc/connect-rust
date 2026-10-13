@@ -1,11 +1,13 @@
 //! Proto types and services named after what generated service code refers
 //! to: prelude items such as `Result` and `Send`, and the generic parameters
-//! `S` and `T`.
+//! `S` and `T`. `shadow_root_types.proto` has names close to the ones that
+//! code declares.
 //!
 //! That the generated code for the `shadow_*.proto` files compiles is the main
-//! assertion; for `services::Result` and `ChildService` it is the only one.
-//! The other service traits are implemented, and the calls with `S` and `T`
-//! run each type of RPC through the Router and the dispatcher.
+//! assertion; for `services::Result`, `ChildService` and all of
+//! `shadow_root_types.proto` it is the only one. The other service traits are
+//! implemented, and the calls with `S` and `T` run each type of RPC through
+//! the Router and the dispatcher.
 
 use std::sync::Arc;
 

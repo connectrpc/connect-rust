@@ -189,10 +189,11 @@ fn emit_service_files(
     //   the same package collide with E0428);
     // - colliding-alias detection (issue #75) needs full-batch visibility
     //   because the stitcher mounts sibling files into one module;
-    // - module-scope service and method identifiers (issue #279), for the
-    //   same reason.
+    // - module-scope service and method identifiers (issue #279), and the
+    //   types buffa puts in that module (issue #330), for the same reason.
     let mut batch = BatchState {
         colliding_aliases: collect_alias_collisions(proto_file, file_to_generate),
+        root_types: buffa_root_types(proto_file, file_to_generate, resolver),
         gate_client_feature: options.gate_client_feature,
         client_feature_name: client_feature_name.to_string(),
         all_message_encodable_impls: options.encodable_impls == EncodableImpls::AllMessages,
@@ -268,13 +269,24 @@ fn emit_service_files(
 ///
 /// # Errors
 ///
-/// Returns an error if buffa-codegen fails (e.g. unsupported proto
-/// feature), if a method input/output type is absent from `proto_file`
-/// (an import missing from the descriptor set), if two services of one
-/// package — or two of their methods — would generate the same Rust
-/// identifier (`XGet` and `X_Get`; `XGet.Foo` and `X.GetFoo`), or if the
-/// generated service binding Rust does not parse under `syn` (indicates a
-/// bug in this crate).
+/// Returns an error if:
+///
+/// - buffa-codegen fails (e.g. unsupported proto feature)
+/// - a method input/output type is absent from `proto_file` (an import
+///   missing from the descriptor set)
+/// - two services in one package, or two of their methods, would generate
+///   the same Rust identifier (`XGet` and `X_Get`; `XGet.Foo` and
+///   `X.GetFoo`)
+/// - a service and a top-level message or enum in its package would generate
+///   the same Rust identifier (`service Foo` and `message FooClient`;
+///   `service FooView` and `message Foo`)
+/// - a file that declares a service is listed more than once in
+///   `file_to_generate`
+/// - [`Options::client_feature_name`](field@Options::client_feature_name) is
+///   not a valid Cargo feature name, or is empty while
+///   [`Options::gate_client_feature`] is on
+/// - the generated service binding Rust does not parse under `syn`
+///   (indicates a bug in this crate)
 pub fn generate_files(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -412,10 +424,18 @@ fn inline_companions_into_package_mods(
 ///
 /// # Errors
 ///
-/// Errors if any method input/output type is not covered by an extern_path
-/// mapping, or is absent from `proto_file` (missing import), or if two
-/// services of one package — or two of their methods — would generate the
-/// same Rust identifier (`XGet` and `X_Get`; `XGet.Foo` and `X.GetFoo`).
+/// Returns an error if:
+///
+/// - a method input/output type is not covered by an extern_path mapping, or
+///   is absent from `proto_file` (missing import)
+/// - two services in one package, or two of their methods, would generate
+///   the same Rust identifier (`XGet` and `X_Get`; `XGet.Foo` and
+///   `X.GetFoo`)
+/// - a file that declares a service is listed more than once in
+///   `file_to_generate`
+/// - [`Options::client_feature_name`](field@Options::client_feature_name) is
+///   not a valid Cargo feature name, or is empty while
+///   [`Options::gate_client_feature`] is on
 pub fn generate_services(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -784,7 +804,8 @@ struct TypeResolver<'a> {
     /// `crate::foo`). Paths that would resolve to `super::`-relative or
     /// bare-ident forms produce an error instead. Used by
     /// [`generate_services`] to enforce that service stubs reference
-    /// message types via `extern_path` only.
+    /// message types via `extern_path` only. So it also tells the split
+    /// layout (true) from the unified one.
     require_extern: bool,
 }
 
@@ -927,6 +948,11 @@ fn bare_type_name(proto_fqn: &str) -> &str {
 // ConnectRPC service code generation
 // ---------------------------------------------------------------------------
 
+/// Per package, Rust identifier → the proto declaration that produces it
+/// (`message pkg.Msg in x.proto`).
+type IdentsByPackage =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
 /// Per-batch dedup state passed through the per-file emission loop.
 #[derive(Default)]
 struct BatchState {
@@ -948,15 +974,22 @@ struct BatchState {
     /// including same-package and well-known types like
     /// `.google.protobuf.Empty`) are unaffected.
     ///
-    /// [#75]: https://github.com/anthropics/connect-rust/issues/75
+    /// Also holds the name of each service's types, which an alias cannot
+    /// have either (`service OwnedFooView`).
+    ///
+    /// [#75]: https://github.com/connectrpc/connect-rust/issues/75
     colliding_aliases: std::collections::BTreeSet<(String, String)>,
     /// Per package, identifier → proto producer (`service pkg.Svc in
     /// x.proto` or `method pkg.Svc.Method in x.proto`) for every
     /// module-scope item a service stub has emitted so far. Filled and
     /// consulted by [`check_module_collisions`]; keyed per package because
-    /// every service of a package lands in one Rust module. Message types
-    /// and `Owned*View` aliases share that module but are not tracked here.
-    module_idents: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// every service of a package lands in one Rust module. The types buffa
+    /// puts in that module are in [`root_types`](Self::root_types).
+    module_idents: IdentsByPackage,
+    /// From [`buffa_root_types`]. A service item of one of these names is an
+    /// error ([`check_module_collisions`]), and an `Owned*View` alias of one
+    /// of these names is left out ([`alias_collides`]).
+    root_types: IdentsByPackage,
     /// Mirrors [`Options::gate_client_feature`]. When `true`, prefix
     /// each emitted `FooClient<T>` struct + `impl` with
     /// `#[cfg(feature = "...")]`. Threaded here so it propagates
@@ -1023,16 +1056,23 @@ fn owned_view_alias_ident(fqn: &str) -> Ident {
 
 /// True iff emitting `Owned<Msg>View` for `proto_fqn` in `current_package`
 /// would collide with another distinct FQN's alias in the same module
-/// (issue [#75]). Cross-package types whose short name is unique in this
-/// package's alias set keep their alias; only the colliding set is
+/// (issue [#75]), with a service's type (`service OwnedFooView`), or with a
+/// type buffa puts there (issue [#330]): `message OwnedFooView`, or the view
+/// of `message OwnedFoo`. Cross-package types whose short name is unique in
+/// this package's alias set keep their alias; only the colliding set is
 /// suppressed in favour of the inlined `OwnedView<…<'static>>` form.
 ///
-/// [#75]: https://github.com/anthropics/connect-rust/issues/75
+/// [#75]: https://github.com/connectrpc/connect-rust/issues/75
+/// [#330]: https://github.com/connectrpc/connect-rust/issues/330
 fn alias_collides(batch: &BatchState, current_package: &str, proto_fqn: &str) -> bool {
     let alias = owned_view_alias_ident(proto_fqn).to_string();
     batch
-        .colliding_aliases
-        .contains(&(current_package.to_string(), alias))
+        .root_types
+        .get(current_package)
+        .is_some_and(|types| types.contains_key(&alias))
+        || batch
+            .colliding_aliases
+            .contains(&(current_package.to_string(), alias))
 }
 
 /// Statement converting the Router-path `ServiceStream<OwnedView<…>>` into
@@ -1093,17 +1133,104 @@ fn stream_owned_message_type(
     Ok(quote! { #input_owned })
 }
 
+/// The types buffa puts at the root of each package's module, which in the
+/// unified layout is the module the service stubs are included into: each
+/// top-level message and enum, and a `pub use` of each message's `*View`,
+/// `*OwnedView` and (with `lazy_views`) `*LazyView`. Empty in the split
+/// layout, where that module is in another tree.
+///
+/// buffa drops a `pub use` whose name a message or enum has, or that two
+/// messages claim (`Foo`'s lazy view and `FooLazy`'s view), so those names
+/// are left to the message or enum, or left free.
+///
+/// Not listed, so a service of that name still fails in rustc:
+///
+/// - a sub-package's module, which keeps the case of the package segment
+///   (`pkg.FooClient`); it is in that module in both layouts
+/// - the `use` items of buffa's experimental `idiomatic_imports` (`String`,
+///   `MessageField`, an imported message's name)
+/// - the file-level extension constants, which are values and so can only
+///   share a name with a service's constants (`greet_service_name` and
+///   `GREET_SERVICE_NAME`); buffa does not export how it names them
+///
+/// Listed although buffa does not generate them: the types of a package in
+/// `exclude_packages`. The stubs of a service in such a package refer to
+/// messages that do not exist, so they do not compile either way.
+fn buffa_root_types(
+    proto_file: &[FileDescriptorProto],
+    file_to_generate: &[String],
+    resolver: &TypeResolver<'_>,
+) -> IdentsByPackage {
+    use std::collections::BTreeMap;
+
+    let mut root_types = IdentsByPackage::new();
+    if resolver.require_extern {
+        return root_types;
+    }
+    let config = resolver.ctx.config;
+    let view_suffixes: &[&str] = if config.lazy_views {
+        &["View", "OwnedView", "LazyView"]
+    } else {
+        &["View", "OwnedView"]
+    };
+    // (package, name) → the message it is a view of; `None` once a second
+    // message claims the name.
+    let mut views: BTreeMap<(&str, String), Option<String>> = BTreeMap::new();
+
+    let files = proto_file.iter().filter(|f| {
+        f.name
+            .as_ref()
+            .is_some_and(|n| file_to_generate.contains(n))
+    });
+    for file in files {
+        let package = file.package.as_deref().unwrap_or("");
+        let file_name = file.name.as_deref().unwrap_or("");
+        let declared = root_types.entry(package.to_string()).or_default();
+        let messages = file
+            .message_type
+            .iter()
+            .map(|m| ("message", m.name.as_deref(), view_suffixes));
+        let enums = file
+            .enum_type
+            .iter()
+            .map(|e| ("enum", e.name.as_deref(), &[][..]));
+        for (kind, name, suffixes) in messages.chain(enums) {
+            let name = name.unwrap_or("");
+            let rust_name = format!("{}{name}", config.type_name_prefix);
+            let producer = if package.is_empty() {
+                format!("{kind} {name} in {file_name}")
+            } else {
+                format!("{kind} {package}.{name} in {file_name}")
+            };
+            for suffix in suffixes {
+                views
+                    .entry((package, format!("{rust_name}{suffix}")))
+                    .and_modify(|claimed| *claimed = None)
+                    .or_insert_with(|| Some(producer.clone()));
+            }
+            declared.insert(rust_name, producer);
+        }
+    }
+    for ((package, name), producer) in views {
+        if let (Some(producer), Some(declared)) = (producer, root_types.get_mut(package)) {
+            declared.entry(name).or_insert(producer);
+        }
+    }
+    root_types
+}
+
 /// Walk every service's method input/output FQNs across `file_to_generate`
 /// and identify `(package, alias_ident)` pairs where two or more distinct
 /// FQNs would produce the same `Owned<Msg>View` alias in the same target
-/// Rust module. Caller stores the result in [`BatchState::colliding_aliases`].
+/// Rust module, or where a service's type has the name. Caller stores the
+/// result in [`BatchState::colliding_aliases`].
 ///
 /// This pre-pass is what makes the alias emission collision-aware: a
 /// per-file walk can't see same-short-name FQNs from sibling files in the
 /// same package, but the stitcher mounts both into one module so the
 /// collision is real (issue [#75]).
 ///
-/// [#75]: https://github.com/anthropics/connect-rust/issues/75
+/// [#75]: https://github.com/connectrpc/connect-rust/issues/75
 fn collect_alias_collisions(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
@@ -1124,6 +1251,8 @@ fn collect_alias_collisions(
         };
         let package = file.package.clone().unwrap_or_default();
         for service in &file.service {
+            let idents = ServiceIdents::new(service.name.as_deref().unwrap_or(""));
+            colliding.extend(idents.types().map(|i| (package.clone(), i.to_string())));
             for m in &service.method {
                 for fqn in [m.input_type.as_deref(), m.output_type.as_deref()]
                     .into_iter()
@@ -1152,17 +1281,13 @@ fn collect_alias_collisions(
 /// file. The alias names the owned-view form of a message in handler code
 /// (e.g. an `OwnedOutView` response body or a decoded client response).
 ///
-/// Aliases whose name would collide with another distinct type's alias
-/// in the same target package (per [`BatchState::colliding_aliases`]) are
-/// suppressed — users spell the inlined `OwnedView<…<'static>>` form for
-/// those types instead. This is the issue [#75] fix; the non-colliding
-/// common case (including well-known types like `.google.protobuf.Empty`)
-/// keeps its alias.
+/// An alias for which [`alias_collides`] holds is suppressed — users write
+/// the inlined `OwnedView<…<'static>>` form for that type instead. The
+/// non-colliding common case (including well-known types like
+/// `.google.protobuf.Empty`) keeps its alias.
 ///
 /// Deduped on `(package, fqn)` across the batch so two files in the same
 /// package don't both emit the alias (E0428).
-///
-/// [#75]: https://github.com/anthropics/connect-rust/issues/75
 fn generate_owned_view_aliases(
     file: &FileDescriptorProto,
     resolver: &TypeResolver<'_>,
@@ -1415,20 +1540,26 @@ impl ServiceIdents {
     /// Every module-scope identifier, trait first so a whole-service clash
     /// (`XGet` / `X_Get`) is reported against the name the user recognizes.
     fn iter(&self) -> impl Iterator<Item = &Ident> {
+        self.types().chain([&self.service_name_const])
+    }
+
+    /// The identifiers that name a type or trait, which a message or enum of
+    /// the same name collides with. The constant is a value, so it does not.
+    fn types(&self) -> impl Iterator<Item = &Ident> {
         [
             &self.trait_name,
             &self.ext_trait_name,
             &self.register_marker_name,
             &self.client_name,
             &self.server_name,
-            &self.service_name_const,
         ]
         .into_iter()
     }
 }
 
 /// Reject a service whose module-scope items collide with one already
-/// claimed by another service of the same package (issue [#279]).
+/// claimed by another service of the same package (issue [#279]), or with a
+/// type buffa puts in that module (issue [#330]).
 ///
 /// Each service emits its trait, `*Ext`, `*RegisterMarker`, `*Client`,
 /// `*Server`, `*_SERVICE_NAME`, and one `{SERVICE}_{METHOD}_SPEC` per
@@ -1445,6 +1576,7 @@ impl ServiceIdents {
 /// in generated code.
 ///
 /// [#279]: https://github.com/connectrpc/connect-rust/issues/279
+/// [#330]: https://github.com/connectrpc/connect-rust/issues/330
 fn check_module_collisions(
     file: &FileDescriptorProto,
     full_service_name: &str,
@@ -1455,10 +1587,19 @@ fn check_module_collisions(
     use std::collections::btree_map::Entry;
 
     let file_name = file.name.as_deref().unwrap_or("");
-    let module = batch
-        .module_idents
-        .entry(file.package.clone().unwrap_or_default())
-        .or_default();
+    let package = file.package.as_deref().unwrap_or("");
+    if let Some(root_types) = batch.root_types.get(package) {
+        for ident in idents.types() {
+            if let Some(prev) = root_types.get(&ident.to_string()) {
+                anyhow::bail!(
+                    "{prev} and service {full_service_name} in {file_name} both \
+                     generate Rust identifier `{ident}`; rename one in the proto, \
+                     or set `type_name_prefix` in the buffa config"
+                );
+            }
+        }
+    }
+    let module = batch.module_idents.entry(package.to_string()).or_default();
     // Producers are rendered for the message up front, with their kind
     // and file, so the user can find both sides without guessing whether
     // `pkg.XGet.Foo` is a service or a method.
@@ -2629,7 +2770,9 @@ fn find_comment(source_info: &SourceCodeInfo, target_path: &[i32]) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffa_codegen::generated::descriptor::DescriptorProto;
+    use buffa_codegen::generated::descriptor::{
+        DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto,
+    };
     use quote::ToTokens;
 
     #[test]
@@ -3951,8 +4094,13 @@ mod tests {
     /// Run `files` through the unified generation path exactly as the plugin
     /// does, returning the error message for a batch that must be rejected.
     fn generate_files_err(files: &[FileDescriptorProto]) -> String {
+        generate_files_err_with(files, &Options::default())
+    }
+
+    #[track_caller]
+    fn generate_files_err_with(files: &[FileDescriptorProto], options: &Options) -> String {
         let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
-        generate_files(files, &targets, &Options::default())
+        generate_files(files, &targets, options)
             .expect_err("a colliding batch must fail generation")
             .to_string()
     }
@@ -4093,6 +4241,406 @@ mod tests {
             .map(|f| f.content.matches("pub const X_GET_FOO_SPEC:").count())
             .sum::<usize>();
         assert_eq!(consts, 2, "one constant per package module");
+    }
+
+    /// `file` with more top-level messages and enums.
+    fn with_types(
+        mut file: FileDescriptorProto,
+        messages: &[&str],
+        enums: &[&str],
+    ) -> FileDescriptorProto {
+        file.message_type
+            .extend(messages.iter().map(|name| DescriptorProto {
+                name: Some((*name).into()),
+                ..Default::default()
+            }));
+        file.enum_type
+            .extend(enums.iter().map(|name| EnumDescriptorProto {
+                name: Some((*name).into()),
+                value: vec![EnumValueDescriptorProto {
+                    name: Some(format!("{}_UNSPECIFIED", name.to_uppercase())),
+                    number: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+        file
+    }
+
+    /// The service stubs that the unified path generates for `files`.
+    #[track_caller]
+    fn unified_stubs(files: &[FileDescriptorProto], options: &Options) -> String {
+        let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
+        generate_files(files, &targets, options)
+            .expect("the batch must be accepted")
+            .into_iter()
+            .filter(|f| f.kind == GeneratedFileKind::Companion)
+            .map(|f| f.content)
+            .collect()
+    }
+
+    /// The service stubs that the split path generates for `files`.
+    #[track_caller]
+    fn split_stubs(files: &[FileDescriptorProto]) -> String {
+        let targets: Vec<String> = files.iter().filter_map(|f| f.name.clone()).collect();
+        let mut options = Options::default();
+        options
+            .buffa
+            .extern_paths
+            .push((".".into(), "crate::proto".into()));
+        generate_services(files, &targets, &options)
+            .expect("the batch must be accepted")
+            .into_iter()
+            .map(|f| f.content)
+            .collect()
+    }
+
+    /// The error for `prev` and `service pkg.{service}`, both in `pkg.proto`.
+    fn root_type_collision(prev: &str, service: &str, ident: &str) -> String {
+        format!(
+            "{prev} in pkg.proto and service pkg.{service} in pkg.proto both generate Rust \
+             identifier `{ident}`; rename one in the proto, or set `type_name_prefix` in the \
+             buffa config"
+        )
+    }
+
+    #[test]
+    fn message_or_enum_named_like_a_service_type_errors() {
+        for name in [
+            "Foo",
+            "FooExt",
+            "FooRegisterMarker",
+            "FooClient",
+            "FooServer",
+        ] {
+            let service = || services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+            for (kind, file) in [
+                ("message", with_types(service(), &[name], &[])),
+                ("enum", with_types(service(), &[], &[name])),
+            ] {
+                assert_eq!(
+                    generate_files_err(&[file]),
+                    root_type_collision(&format!("{kind} pkg.{name}"), "Foo", name)
+                );
+            }
+        }
+    }
+
+    /// buffa re-exports each message's views next to the message.
+    #[test]
+    fn service_named_like_a_message_view_errors() {
+        for name in ["EmptyView", "EmptyOwnedView"] {
+            let file = services_file("pkg.proto", "pkg", &[(name, &["Ping"])]);
+            assert_eq!(
+                generate_files_err(&[file]),
+                root_type_collision("message pkg.Empty", name, name)
+            );
+        }
+    }
+
+    #[test]
+    fn service_named_like_a_lazy_view_errors_only_with_lazy_views() {
+        let file = services_file("pkg.proto", "pkg", &[("EmptyLazyView", &["Ping"])]);
+        let mut options = Options::default();
+        unified_stubs(std::slice::from_ref(&file), &options);
+
+        options.buffa.lazy_views = true;
+        assert_eq!(
+            generate_files_err_with(&[file], &options),
+            root_type_collision("message pkg.Empty", "EmptyLazyView", "EmptyLazyView")
+        );
+    }
+
+    /// buffa drops `Empty`'s `pub use` in favour of `message EmptyView`, so
+    /// the error names the message that has the name.
+    #[test]
+    fn message_that_replaces_a_view_is_the_one_reported() {
+        let file = services_file("pkg.proto", "pkg", &[("empty_view", &["Ping"])]);
+        assert_eq!(
+            generate_files_err(&[with_types(file, &["EmptyView"], &[])]),
+            root_type_collision("message pkg.EmptyView", "empty_view", "EmptyView")
+        );
+    }
+
+    /// A package's files share one module, whichever is generated first.
+    #[test]
+    fn message_in_a_sibling_file_collides_with_a_service_type() {
+        let service = services_file("a.proto", "pkg", &[("Foo", &["Ping"])]);
+        let message = with_types(
+            FileDescriptorProto {
+                name: Some("b.proto".into()),
+                package: Some("pkg".into()),
+                ..Default::default()
+            },
+            &["FooClient"],
+            &[],
+        );
+        let expected = "message pkg.FooClient in b.proto and service pkg.Foo in a.proto both \
+                        generate Rust identifier `FooClient`; rename one in the proto, or set \
+                        `type_name_prefix` in the buffa config";
+        assert_eq!(
+            generate_files_err(&[service.clone(), message.clone()]),
+            expected
+        );
+        assert_eq!(generate_files_err(&[message, service]), expected);
+    }
+
+    #[test]
+    fn message_without_a_package_collides_with_a_service_type() {
+        let mut file = four_shape_file("Foo", "Req", "FooClient");
+        file.package = None;
+        for method in &mut file.service[0].method {
+            method.input_type = Some(".Req".into());
+            method.output_type = Some(".FooClient".into());
+        }
+        assert_eq!(
+            generate_files_err(&[file]),
+            "message FooClient in pkg.proto and service Foo in pkg.proto both generate Rust \
+             identifier `FooClient`; rename one in the proto, or set `type_name_prefix` in the \
+             buffa config"
+        );
+    }
+
+    /// buffa declares a message that `extern_paths` maps elsewhere: the
+    /// mapping changes only how references to it resolve.
+    #[test]
+    fn extern_mapped_message_collides_with_a_service_type() {
+        let file = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        let mut options = Options::default();
+        options
+            .buffa
+            .extern_paths
+            .push((".pkg.FooClient".into(), "::other::FooClient".into()));
+        assert_eq!(
+            generate_files_err_with(&[with_types(file, &["FooClient"], &[])], &options),
+            root_type_collision("message pkg.FooClient", "Foo", "FooClient")
+        );
+    }
+
+    #[test]
+    fn type_name_prefix_moves_the_names_that_collide() {
+        let mut options = Options::default();
+        options.buffa.type_name_prefix = "Pb".into();
+
+        let file = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        unified_stubs(&[with_types(file, &["FooClient"], &[])], &options);
+
+        for name in ["PbEmpty", "PbEmptyView"] {
+            let file = services_file("pkg.proto", "pkg", &[(name, &["Ping"])]);
+            assert_eq!(
+                generate_files_err_with(&[file], &options),
+                root_type_collision("message pkg.Empty", name, name)
+            );
+        }
+    }
+
+    #[test]
+    fn split_layout_accepts_a_message_named_like_a_service_type() {
+        let file = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        let stubs = split_stubs(&[with_types(file, &["FooClient"], &["FooServer"])]);
+        assert!(stubs.contains("pub struct FooClient<T>"), "{stubs}");
+    }
+
+    #[test]
+    fn message_in_another_module_does_not_collide_with_a_service_type() {
+        let service = || services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+
+        let other = with_types(
+            FileDescriptorProto {
+                name: Some("other.proto".into()),
+                package: Some("other".into()),
+                ..Default::default()
+            },
+            &["FooClient"],
+            &[],
+        );
+        unified_stubs(&[service(), other], &Options::default());
+
+        // `pkg.Empty.FooClient` is `empty::FooClient`.
+        let mut nested = service();
+        nested.message_type[0].nested_type = vec![DescriptorProto {
+            name: Some("FooClient".into()),
+            ..Default::default()
+        }];
+        unified_stubs(&[nested], &Options::default());
+    }
+
+    /// A message is a type and the constants are values.
+    #[test]
+    fn message_named_like_a_service_constant_is_accepted() {
+        let file = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        let file = with_types(file, &["FOO_SERVICE_NAME", "FOO_PING_SPEC"], &[]);
+        unified_stubs(&[file], &Options::default());
+    }
+
+    /// `Bar`'s lazy view and `BarLazy`'s view claim one name, so buffa
+    /// re-exports neither, whichever files the messages are in.
+    #[test]
+    fn service_named_like_a_view_that_two_messages_claim_is_accepted() {
+        let mut options = Options::default();
+        options.buffa.lazy_views = true;
+        let file = services_file("pkg.proto", "pkg", &[("BarLazyView", &["Ping"])]);
+        let sibling = with_types(
+            FileDescriptorProto {
+                name: Some("sibling.proto".into()),
+                package: Some("pkg".into()),
+                ..Default::default()
+            },
+            &["BarLazy"],
+            &[],
+        );
+        unified_stubs(&[with_types(file, &["Bar"], &[]), sibling], &options);
+    }
+
+    /// buffa generates only the files in `file_to_generate`.
+    #[test]
+    fn message_in_a_file_that_is_not_generated_does_not_collide() {
+        let service = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        let import = with_types(
+            FileDescriptorProto {
+                name: Some("import.proto".into()),
+                package: Some("pkg".into()),
+                ..Default::default()
+            },
+            &["FooClient"],
+            &[],
+        );
+        generate_files(
+            &[service, import],
+            &["pkg.proto".to_string()],
+            &Options::default(),
+        )
+        .expect("only pkg.proto is generated");
+    }
+
+    #[test]
+    fn file_per_package_rejects_a_message_named_like_a_service_type() {
+        let mut options = Options::default();
+        options.buffa.file_per_package = true;
+        let file = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        assert_eq!(
+            generate_files_err_with(&[with_types(file, &["FooClient"], &[])], &options),
+            root_type_collision("message pkg.FooClient", "Foo", "FooClient")
+        );
+    }
+
+    /// With the client behind a Cargo feature, the pair compiles only while
+    /// the feature is off.
+    #[test]
+    fn gated_client_collides_with_a_message() {
+        let options = Options {
+            gate_client_feature: true,
+            ..Options::default()
+        };
+        let file = services_file("pkg.proto", "pkg", &[("Foo", &["Ping"])]);
+        assert_eq!(
+            generate_files_err_with(&[with_types(file, &["FooClient"], &[])], &options),
+            root_type_collision("message pkg.FooClient", "Foo", "FooClient")
+        );
+    }
+
+    fn use_leaves(tree: &syn::UseTree, out: &mut std::collections::BTreeSet<String>) {
+        match tree {
+            syn::UseTree::Path(path) => use_leaves(&path.tree, out),
+            syn::UseTree::Name(name) => {
+                out.insert(name.ident.to_string());
+            }
+            syn::UseTree::Rename(rename) => {
+                out.insert(rename.rename.to_string());
+            }
+            syn::UseTree::Group(group) => group.items.iter().for_each(|t| use_leaves(t, out)),
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    /// `buffa_root_types` re-implements rules that buffa keeps private, so
+    /// this compares it with the capitalized names at the root of what buffa
+    /// generates. The schema has a message that replaces a view
+    /// (`EmptyView`), and with `lazy_views` a view that two messages claim
+    /// (`BarLazyView`).
+    #[test]
+    fn root_types_match_what_buffa_generates() {
+        use std::collections::BTreeSet;
+
+        let files = [with_types(
+            services_file("pkg.proto", "pkg", &[]),
+            &["EmptyView", "Bar", "BarLazy"],
+            &["Kind"],
+        )];
+        let targets = ["pkg.proto".to_string()];
+        let mut all_options = Options::default();
+        all_options.buffa.lazy_views = true;
+        all_options.buffa.type_name_prefix = "Pb".into();
+
+        for options in [Options::default(), all_options] {
+            let config = options.to_buffa_config();
+            let mut generated = BTreeSet::new();
+            for file in buffa_codegen::generate(&files, &targets, &config).unwrap() {
+                if !matches!(
+                    file.kind,
+                    GeneratedFileKind::Owned | GeneratedFileKind::PackageMod
+                ) {
+                    continue;
+                }
+                for item in syn::parse_file(&file.content).unwrap().items {
+                    match item {
+                        syn::Item::Struct(item) => {
+                            generated.insert(item.ident.to_string());
+                        }
+                        syn::Item::Enum(item) => {
+                            generated.insert(item.ident.to_string());
+                        }
+                        syn::Item::Use(item) => use_leaves(&item.tree, &mut generated),
+                        _ => {}
+                    }
+                }
+            }
+            generated.retain(|name| name.starts_with(char::is_uppercase));
+
+            let resolver = TypeResolver::new(&files, &targets, &config, false);
+            let listed: BTreeSet<String> = buffa_root_types(&files, &targets, &resolver)["pkg"]
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(listed, generated);
+        }
+    }
+
+    const REQ_RESP_ALIASES: [&str; 2] = ["pub type OwnedReqView =", "pub type OwnedRespView ="];
+
+    #[track_caller]
+    fn assert_aliases(stubs: &str, present: bool) {
+        for alias in REQ_RESP_ALIASES {
+            assert_eq!(stubs.contains(alias), present, "`{alias}` in: {stubs}");
+        }
+    }
+
+    #[test]
+    fn alias_named_like_a_message_enum_or_view_is_left_out() {
+        let file = || four_shape_file("Svc", "Req", "Resp");
+        assert_aliases(&unified_stubs(&[file()], &Options::default()), true);
+
+        // `OwnedResp`'s view is `OwnedRespView`.
+        for taken in [
+            with_types(file(), &["OwnedReqView", "OwnedResp"], &[]),
+            with_types(file(), &[], &["OwnedReqView", "OwnedRespView"]),
+        ] {
+            let taken = std::slice::from_ref(&taken);
+            assert_aliases(&unified_stubs(taken, &Options::default()), false);
+            assert_aliases(&split_stubs(taken), true);
+        }
+    }
+
+    /// The services are in the module in both layouts.
+    #[test]
+    fn alias_named_like_a_service_is_left_out() {
+        let mut file = four_shape_file("OwnedReqView", "Req", "Resp");
+        let mut sibling = file.service[0].clone();
+        sibling.name = Some("owned_resp_view".into());
+        file.service.push(sibling);
+        let file = std::slice::from_ref(&file);
+        assert_aliases(&unified_stubs(file, &Options::default()), false);
+        assert_aliases(&split_stubs(file), false);
     }
 
     /// Two services that merely share a prefix (`X` / `XGet`) produce
