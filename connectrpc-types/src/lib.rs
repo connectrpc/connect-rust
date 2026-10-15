@@ -187,8 +187,8 @@
 //!
 //! [googleapis]: https://github.com/googleapis/googleapis
 //! [proto-only build]: https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md#proto-only-no-json-builds
-//! [`ErrorDetail::from_message`]: https://docs.rs/connectrpc/0.9/connectrpc/struct.ErrorDetail.html#method.from_message
-//! [`ErrorDetail::value`]: https://docs.rs/connectrpc/0.9/connectrpc/struct.ErrorDetail.html#structfield.value
+//! [`ErrorDetail::from_message`]: https://docs.rs/connectrpc/latest/connectrpc/error/struct.ErrorDetail.html#method.from_message
+//! [`ErrorDetail::value`]: https://docs.rs/connectrpc/latest/connectrpc/error/struct.ErrorDetail.html#structfield.value
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

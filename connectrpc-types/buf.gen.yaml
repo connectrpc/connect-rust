@@ -3,8 +3,12 @@
 # The google.rpc protos are vendored from googleapis under proto/ rather than
 # pulled from the Buf Schema Registry: googleapis moves often, and an unpinned
 # module input would let the check-generated-code job go stale without a
-# change in this repo. The generated code is checked in, so neither buf nor
-# protoc is needed to build the crate:
+# change in this repo. The copies under proto/google/rpc/ match googleapis
+# commit ebd1d23ac613b177828dad42ad8dfb13ba498279 (2026-03-31), the latest
+# change to any of the three files when they were vendored; diff against it
+# on a refresh.
+# The generated code is checked in, so neither buf nor protoc is needed to
+# build the crate:
 #   task connectrpc-types:generate
 #
 # No connect plugin: google.rpc declares messages and an enum, no services.

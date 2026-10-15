@@ -97,8 +97,9 @@ jobs:
       - name: Publish connectrpc-codegen
         run: /tmp/publish.sh connectrpc-codegen $DRY_RUN_FLAG
 
-      # No workspace dependencies, so it fully verifies in a dry run; kept
-      # with the tier-1 crates, ahead of the tier-2 steps that fail there.
+      # No published workspace dependencies, so it fully verifies in a dry
+      # run; kept with the tier-1 crates, ahead of the tier-2 steps that fail
+      # there.
       - name: Publish connectrpc-types
         run: /tmp/publish.sh connectrpc-types $DRY_RUN_FLAG
 
