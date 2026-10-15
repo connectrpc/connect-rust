@@ -677,7 +677,7 @@ poorly-compressible view items should return
 The `'a` on the trait method also lets the body borrow from `&self`
 (e.g. cached server state). View bodies only encode for the proto
 codec - JSON clients receive `unimplemented`; see
-[`MaybeBorrowed`'s codec note](https://docs.rs/connectrpc/latest/connectrpc/enum.MaybeBorrowed.html#codec-compatibility).
+[`MaybeBorrowed`'s codec note](https://docs.rs/connectrpc/latest/connectrpc/response/enum.MaybeBorrowed.html#codec-compatibility).
 View-body impls are not emitted for output types mapped via
 `extern_path` (the impl would be an orphan in the consuming crate) -
 the impls must live in the crate that owns the type. If you generate
