@@ -29,7 +29,8 @@ on:
       dry_run:
         description: >-
           Run cargo publish --dry-run (no upload, no auth). Tier-1 crates
-          (connectrpc, connectrpc-codegen) fully verify; tier-2 crates fail
+          (connectrpc, connectrpc-codegen, connectrpc-types) fully verify;
+          tier-2 crates fail
           verification until tier-1 is actually published (dep resolution
           hits crates.io, not the workspace). Expected.
         type: boolean
@@ -95,6 +96,12 @@ jobs:
 
       - name: Publish connectrpc-codegen
         run: /tmp/publish.sh connectrpc-codegen $DRY_RUN_FLAG
+
+      # No published workspace dependencies, so it fully verifies in a dry
+      # run; kept with the tier-1 crates, ahead of the tier-2 steps that fail
+      # there.
+      - name: Publish connectrpc-types
+        run: /tmp/publish.sh connectrpc-types $DRY_RUN_FLAG
 
       - name: Publish connectrpc-build
         run: /tmp/publish.sh connectrpc-build $DRY_RUN_FLAG

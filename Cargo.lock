@@ -648,6 +648,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "connectrpc-types"
+version = "0.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "buffa",
+ "buffa-types",
+ "connectrpc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cpp_demangle"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
