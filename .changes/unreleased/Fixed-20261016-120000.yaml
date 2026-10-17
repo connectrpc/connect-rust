@@ -1,0 +1,6 @@
+kind: Fixed
+body: |-
+    `connectrpc-health` and `connectrpc-reflection` no longer enable
+    `connectrpc`'s default features (`gzip`, `zstd`, `json`), so dependents
+    that disable them are not forced to compile them in. [#337]
+time: 2026-10-16T12:00:00.000000000+00:00
