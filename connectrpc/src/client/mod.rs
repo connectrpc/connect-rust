@@ -497,43 +497,118 @@ enum HttpClientInner {
 /// Install one with [`HttpClientBuilder::dns_resolver`] or
 /// [`Http2ConnectionBuilder::dns_resolver`] to replace the system resolver:
 /// to cache answers, coalesce concurrent lookups, use an async DNS client, or
-/// pin names in tests. Same idea as reqwest's `ClientBuilder::dns_resolver`.
+/// pin names in tests.
 ///
-/// # Example
+/// The resolver chooses only the addresses that the connector dials. The TLS
+/// server name, certificate verification and the request's authority still
+/// use the host in the URI.
+///
+/// # Examples
 ///
 /// ```rust
-/// use std::net::SocketAddr;
+/// use std::collections::HashMap;
+/// use std::net::IpAddr;
 /// use std::sync::Arc;
 ///
 /// use connectrpc::client::{HttpClient, Resolve, Resolving};
 ///
-/// struct Pinned(SocketAddr);
+/// /// Answers from a fixed table.
+/// struct Table(HashMap<String, Vec<IpAddr>>);
 ///
-/// impl Resolve for Pinned {
-///     fn resolve(&self, _host: &str) -> Resolving {
-///         let addr = self.0;
-///         Box::pin(async move { Ok(vec![addr]) })
+/// impl Resolve for Table {
+///     fn resolve(&self, host: &str) -> Resolving {
+///         // `host` keeps the URI's case. The future is `'static`, so it owns
+///         // its copy of `host` and of the answer.
+///         let host = host.to_ascii_lowercase();
+///         let ips = self.0.get(&host).cloned();
+///         Box::pin(async move {
+///             let ips = ips.ok_or_else(|| format!("{host} is not in the table"))?;
+///             Ok(ips.into_iter().map(|ip| (ip, 0).into()).collect())
+///         })
 ///     }
 /// }
 ///
+/// let table = HashMap::from([(
+///     "api.example.com".to_owned(),
+///     vec![IpAddr::from([192, 0, 2, 10])],
+/// )]);
 /// let http = HttpClient::builder()
-///     .dns_resolver(Arc::new(Pinned(([127, 0, 0, 1], 0).into())))
+///     .dns_resolver(Arc::new(Table(table)))
 ///     .plaintext();
 /// # let _ = http;
 /// ```
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub trait Resolve: Send + Sync + 'static {
-    /// Resolve `host` to the addresses to dial, in order of preference.
+    /// Resolve `host` to the addresses to dial.
     ///
-    /// Called once per new connection; hosts that are IP literals never reach
-    /// it. Return port `0`: the connector fills in the port from the request
-    /// URI, or the scheme's default when the URI has none. Dropping the future
-    /// cancels the lookup.
+    /// The connector calls this once per connection attempt, and calls for the
+    /// same host can overlap. `host` is the host of the URI that the connector
+    /// connects to: the request URI for [`HttpClient`], and the URI given to
+    /// the `lazy_*` / `connect_*` terminal for [`Http2Connection`]. It is passed
+    /// as written in the URI, so an implementation that compares names must
+    /// normalise the case itself. A host that is an IP literal is dialled
+    /// directly and does not reach the resolver.
+    ///
+    /// `resolve` and its future run on the task that opens the connection, so
+    /// they must not block: run a blocking lookup with
+    /// `tokio::task::spawn_blocking`.
+    ///
+    /// The future can be dropped at any `.await`: when
+    /// [`establishment_timeout`](HttpClientBuilder::establishment_timeout)
+    /// expires, and on [`HttpClient`] when the caller drops the request. Work
+    /// that the implementation started elsewhere, such as a spawned task,
+    /// continues unless the implementation stops it on drop. That timeout is
+    /// the only bound on the lookup, so a resolver used with
+    /// `no_establishment_timeout` must bound itself.
+    ///
+    /// # Returned addresses
+    ///
+    /// - **Order.** The connector dials the addresses of the first address's
+    ///   family in the returned order. It starts the other family's addresses
+    ///   after hyper's Happy Eyeballs delay, or as soon as the first family
+    ///   fails. With
+    ///   [`local_address`](Http2ConnectionBuilder::local_address) set, it dials
+    ///   only the addresses of that address's family.
+    /// - **Count.** A long list leaves each address a short timeout, because
+    ///   [`tcp_connect_timeout`](HttpClientBuilder::tcp_connect_timeout) is
+    ///   divided across the addresses.
+    /// - **Port.** With port `0`, the connector dials the URI's port, or the
+    ///   scheme's default port when the URI has none. A non-zero port is
+    ///   dialled only when the URI has no explicit port. An explicit URI port
+    ///   replaces it.
+    ///
+    /// # Errors
+    ///
+    /// Return `Err` when `host` has no addresses. The connector treats an empty
+    /// `Vec` as that error. Either one fails the connection attempt:
+    ///
+    /// - [`HttpClient`] and the `connect_*` terminals of [`Http2Connection`]
+    ///   return [`ErrorCode::Unavailable`], whatever the resolver's error is.
+    /// - [`SharedHttp2Connection`] returns [`ErrorCode::Unavailable`] too, unless
+    ///   the resolver's error is a [`ConnectError`] or has one in its `source()`
+    ///   chain. It returns that `ConnectError` as is, with its own code.
+    /// - An [`Http2Connection`] used directly as a `tower::Service` returns
+    ///   hyper's `dns error` from the next `call`.
+    ///
+    /// Except for that `ConnectError`, the returned error has the resolver's
+    /// error in its `source()` chain and omits it from its message (for example
+    /// `h2 connect failed: dns error`), so walk `source()` to log the cause.
+    ///
+    /// # Panics
+    ///
+    /// An implementation must not panic: return `Err` instead. A panic in
+    /// `resolve` or in its future unwinds the task that opens the connection.
+    /// An [`Http2Connection`] keeps the panicked attempt and polls it again, so
+    /// the connection does not recover. Each later `poll_ready` panics, and each
+    /// later call on a [`SharedHttp2Connection`] or its clones fails with
+    /// [`ErrorCode::Internal`].
     fn resolve(&self, host: &str) -> Resolving;
 }
 
 /// The future returned by [`Resolve::resolve`].
+///
+/// It is `'static`, so it cannot borrow from `self` or from `host`.
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub type Resolving =
@@ -567,9 +642,9 @@ impl std::fmt::Debug for DnsResolver {
     }
 }
 
-// The builders were `UnwindSafe` before they carried a resolver; `dyn Resolve`
-// would silently drop that auto trait. The builders only store and clone the
-// `Arc`, so there is no broken invariant for an unwind to expose.
+// Keeps `HttpClientBuilder` `UnwindSafe`: a `dyn Resolve` field drops that
+// auto trait. The builder only stores and clones the `Arc`, so there is no
+// broken invariant for an unwind to expose.
 #[cfg(feature = "client")]
 impl std::panic::UnwindSafe for DnsResolver {}
 #[cfg(feature = "client")]
@@ -591,14 +666,23 @@ impl tower::Service<hyper_util::client::legacy::connect::dns::Name> for DnsResol
     fn call(&mut self, name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
         match self {
             Self::System(gai) => {
-                // The boxed future owns the `GaiFuture`, so dropping it still
-                // aborts the lookup.
+                // The boxed future owns the `GaiFuture`, whose drop aborts a
+                // lookup that the blocking pool has not started.
                 let fut = gai.call(name);
                 Box::pin(async move { Ok(fut.await?.collect::<Vec<_>>().into_iter()) })
             }
             Self::Custom(resolver) => {
                 let fut = resolver.resolve(name.as_str());
-                Box::pin(async move { Ok(fut.await?.into_iter()) })
+                Box::pin(async move {
+                    let addrs = fut.await?;
+                    // hyper reports an empty list as a "tcp connect error" with
+                    // the source "Network unreachable", which hides that the
+                    // lookup failed.
+                    if addrs.is_empty() {
+                        return Err(format!("resolver returned no addresses for {name}").into());
+                    }
+                    Ok(addrs.into_iter())
+                })
             }
         }
     }
@@ -778,8 +862,8 @@ impl HttpClientBuilder {
     /// This is hyper's [`HttpConnector::set_connect_timeout`][hyper-ct],
     /// applied to the inner connector for all three transport flavours. It
     /// covers only the TCP `connect(2)` call (per resolved address — hyper
-    /// divides the timeout evenly across the address set). It does **not**
-    /// cover DNS resolution or, for [`with_tls`](Self::with_tls), the TLS
+    /// divides the timeout evenly across the addresses of each family). It does
+    /// **not** cover DNS resolution or, for [`with_tls`](Self::with_tls), the TLS
     /// handshake — set [`establishment_timeout`](Self::establishment_timeout) too to
     /// bound those. Use a per-request timeout (e.g.
     /// [`CallOptions::with_timeout`]) to bound DNS+connect+TLS+request as a
@@ -853,13 +937,12 @@ impl HttpClientBuilder {
     ///
     /// The default, hyper's [`GaiResolver`][hyper-gai], runs one uncached
     /// `getaddrinfo` on tokio's blocking pool for **every new connection**, so
-    /// a burst of new connections is a burst of blocking jobs. See [`Resolve`].
+    /// a burst of new connections is a burst of blocking jobs.
     ///
-    /// Applies to all three transport flavours. Hosts that are IP literals
-    /// never reach the resolver. The lookup stays inside
-    /// [`establishment_timeout`](Self::establishment_timeout), and a resolver
-    /// error surfaces like any other connect failure
-    /// ([`ErrorCode::Unavailable`]).
+    /// Applies to all three transport flavours. The lookup counts against
+    /// [`establishment_timeout`](Self::establishment_timeout).
+    /// [`Resolve::resolve`] says when the connector calls the resolver, how it
+    /// uses the addresses, and how a resolver error reaches the caller.
     ///
     /// [hyper-gai]: hyper_util::client::legacy::connect::dns::GaiResolver
     pub fn dns_resolver(mut self, resolver: std::sync::Arc<dyn Resolve>) -> Self {
@@ -5869,23 +5952,33 @@ mod tests {
 
     /// Test resolver: counts calls and answers with a fixed result.
     #[cfg(feature = "client")]
-    struct TestResolver {
+    pub(super) struct TestResolver {
         calls: std::sync::atomic::AtomicUsize,
-        answer: fn() -> Resolving,
+        answer: Box<dyn Fn() -> Resolving + Send + Sync>,
     }
 
     #[cfg(feature = "client")]
     impl TestResolver {
-        fn new(answer: fn() -> Resolving) -> std::sync::Arc<Self> {
+        pub(super) fn new(
+            answer: impl Fn() -> Resolving + Send + Sync + 'static,
+        ) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                answer,
+                answer: Box::new(answer),
             })
         }
 
-        fn calls(&self) -> usize {
+        pub(super) fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+
+    /// The `Display` text of `err` and of each error in its `source()` chain.
+    #[cfg(feature = "client")]
+    pub(super) fn error_chain(err: &(dyn std::error::Error + 'static)) -> Vec<String> {
+        std::iter::successors(Some(err), |e| e.source())
+            .map(ToString::to_string)
+            .collect()
     }
 
     #[cfg(feature = "client")]
@@ -5900,14 +5993,23 @@ mod tests {
     /// Accept one connection and answer any request with an empty 200.
     #[cfg(feature = "client")]
     async fn serve_one_http1_ok(listener: tokio::net::TcpListener) {
+        let (stream, _) = listener.accept().await.unwrap();
+        answer_http1_ok(stream).await;
+    }
+
+    #[cfg(feature = "client")]
+    async fn answer_http1_ok(
+        mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf).await;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
             .await
             .unwrap();
+        // Flushes a TLS stream's buffered records before the drop.
+        stream.shutdown().await.unwrap();
     }
 
     #[cfg(feature = "client")]
@@ -5976,7 +6078,189 @@ mod tests {
             .await
             .expect_err("a resolver error must fail the request");
         assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(
+            error_chain(&err).last().map(String::as_str),
+            Some("no such host"),
+            "the resolver's error must stay in the source chain: {err:?}"
+        );
         assert_eq!(resolver.calls(), 1);
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_dns_resolver_connect_error_is_unavailable() {
+        let resolver = TestResolver::new(|| {
+            Box::pin(async { Err(ConnectError::permission_denied("blocked by policy").into()) })
+        });
+        let http = HttpClient::builder().dns_resolver(resolver).plaintext();
+
+        let err = http
+            .send(post("http://resolver-test.invalid:80/".to_owned()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+    }
+
+    /// hyper reports an empty address list as a TCP failure ("Network
+    /// unreachable"), so the adapter fails the lookup instead.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_dns_resolver_empty_answer_fails_the_lookup() {
+        let resolver = TestResolver::new(|| Box::pin(async { Ok(vec![]) }));
+        let http = HttpClient::builder()
+            .dns_resolver(resolver.clone())
+            .plaintext();
+
+        let err = http
+            .send(post("http://resolver-test.invalid:80/".to_owned()))
+            .await
+            .expect_err("an empty answer must fail the request");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert_eq!(
+            error_chain(&err).last().map(String::as_str),
+            Some("resolver returned no addresses for resolver-test.invalid"),
+            "{err:?}"
+        );
+    }
+
+    /// Pins half of hyper-util's port rule, which [`Resolve::resolve`] documents.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_dns_resolver_port_is_dialled_without_a_uri_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_one_http1_ok(listener));
+
+        let resolver = TestResolver::new(move || {
+            Box::pin(async move { Ok(vec![([127, 0, 0, 1], port).into()]) })
+        });
+        let http = HttpClient::builder().dns_resolver(resolver).plaintext();
+
+        let resp = http
+            .send(post("http://resolver-test.invalid/".to_owned()))
+            .await
+            .expect("the resolver's port must be dialled");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    /// Pins half of hyper-util's port rule, which [`Resolve::resolve`] documents.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn http_client_dns_resolver_port_yields_to_an_explicit_uri_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_one_http1_ok(listener));
+
+        // Port 1 should not have a listener, so dialling it would fail.
+        let resolver =
+            TestResolver::new(|| Box::pin(async { Ok(vec![([127, 0, 0, 1], 1).into()]) }));
+        let http = HttpClient::builder().dns_resolver(resolver).plaintext();
+
+        let resp = http
+            .send(post(format!("http://resolver-test.invalid:{port}/")))
+            .await
+            .expect("the URI's port must replace the resolver's");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    /// A server config whose certificate names only `resolver-test.invalid`,
+    /// and a client config that trusts that certificate.
+    #[cfg(feature = "client-tls")]
+    fn resolver_test_pki() -> (rustls::ServerConfig, std::sync::Arc<rustls::ClientConfig>) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(["resolver-test.invalid".to_owned()]).unwrap();
+        let cert = cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key.into())
+            .unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (server, std::sync::Arc::new(client))
+    }
+
+    /// Accept one TLS connection. Returns the server name that the client
+    /// sent, and the stream.
+    #[cfg(feature = "client-tls")]
+    async fn accept_tls(
+        listener: tokio::net::TcpListener,
+        config: rustls::ServerConfig,
+    ) -> (
+        String,
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    ) {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config))
+            .accept(tcp)
+            .await
+            .unwrap();
+        let server_name = tls.get_ref().1.server_name().unwrap().to_owned();
+        (server_name, tls)
+    }
+
+    /// The certificate names the URI's host and not the loopback address that
+    /// the resolver returns, so a completed handshake proves that verification
+    /// uses the URI's host.
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn http_client_tls_verifies_the_uri_host_with_a_dns_resolver() {
+        let (server_config, client_config) = resolver_test_pki();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (server_name, tls) = accept_tls(listener, server_config).await;
+            answer_http1_ok(tls).await;
+            server_name
+        });
+
+        let resolver =
+            TestResolver::new(|| Box::pin(async { Ok(vec![([127, 0, 0, 1], 0).into()]) }));
+        let http = HttpClient::builder()
+            .dns_resolver(resolver.clone())
+            .with_tls(client_config);
+
+        let resp = http
+            .send(post(format!("https://resolver-test.invalid:{port}/")))
+            .await
+            .expect("the handshake must verify the URI's host");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(resolver.calls(), 1);
+        assert_eq!(server.await.unwrap(), "resolver-test.invalid");
+    }
+
+    /// As `http_client_tls_verifies_the_uri_host_with_a_dns_resolver`, for
+    /// [`Http2Connection`]'s own TLS handshake.
+    #[cfg(feature = "client-tls")]
+    #[tokio::test]
+    async fn http2_connection_tls_verifies_the_uri_host_with_a_dns_resolver() {
+        let (mut server_config, client_config) = resolver_test_pki();
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(accept_tls(listener, server_config));
+
+        let resolver =
+            TestResolver::new(|| Box::pin(async { Ok(vec![([127, 0, 0, 1], 0).into()]) }));
+        let _conn = Http2Connection::builder()
+            .dns_resolver(resolver.clone())
+            .connect_tls(
+                format!("https://resolver-test.invalid:{port}")
+                    .parse()
+                    .unwrap(),
+                client_config,
+            )
+            .await
+            .expect("the handshake must verify the URI's host");
+        assert_eq!(resolver.calls(), 1);
+        let (server_name, _tls) = server.await.unwrap();
+        assert_eq!(server_name, "resolver-test.invalid");
     }
 
     #[cfg(feature = "client")]
@@ -6004,13 +6288,26 @@ mod tests {
         );
     }
 
-    /// Carrying `Arc<dyn Resolve>` must not cost the builders an auto trait
-    /// they had before.
+    /// Carrying `Arc<dyn Resolve>` must not cost a builder an auto trait.
     #[cfg(feature = "client")]
     #[test]
     fn builders_keep_their_auto_traits() {
         fn check<T: Send + Sync + Clone + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        fn check_thread_safe<T: Send + Sync + Clone>() {}
+
         check::<HttpClientBuilder>();
+        // hyper's `Arc<dyn Timer>` makes this builder `!UnwindSafe` whatever
+        // the resolver field is.
+        check_thread_safe::<Http2ConnectionBuilder>();
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn builder_debug_names_the_resolver_kind() {
+        let builder = HttpClient::builder();
+        assert!(format!("{builder:?}").contains("dns_resolver: System"));
+        let builder = builder.dns_resolver(TestResolver::new(|| Box::pin(std::future::pending())));
+        assert!(format!("{builder:?}").contains("dns_resolver: Custom"));
     }
 
     #[cfg(feature = "client")]
