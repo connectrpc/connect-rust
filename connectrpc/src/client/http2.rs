@@ -530,6 +530,7 @@ pub struct Http2ConnectionBuilder {
     tcp_connect_timeout: Option<Duration>,
     establishment_timeout: Option<Duration>,
     local_address: Option<IpAddr>,
+    dns_resolver: super::DnsResolver,
     h2_builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
 }
 
@@ -567,6 +568,7 @@ impl Default for Http2ConnectionBuilder {
             tcp_connect_timeout: Some(DEFAULT_TCP_CONNECT_TIMEOUT),
             establishment_timeout: Some(DEFAULT_ESTABLISHMENT_TIMEOUT),
             local_address: None,
+            dns_resolver: super::DnsResolver::default(),
             h2_builder,
         }
     }
@@ -666,6 +668,19 @@ impl Http2ConnectionBuilder {
     #[doc(alias = "source_address")]
     pub fn local_address(mut self, addr: IpAddr) -> Self {
         self.local_address = Some(addr);
+        self
+    }
+
+    /// Resolve host names with `resolver` instead of the system resolver
+    /// (`getaddrinfo` on tokio's blocking pool, once per (re)connect). See
+    /// [`Resolve`](super::Resolve) and
+    /// [`HttpClientBuilder::dns_resolver`](super::HttpClientBuilder::dns_resolver).
+    ///
+    /// Like [`tcp_connect_timeout`](Self::tcp_connect_timeout), this
+    /// configures the built-in connector and is **ignored** by the
+    /// custom-connector / Unix-socket terminals.
+    pub fn dns_resolver(mut self, resolver: std::sync::Arc<dyn super::Resolve>) -> Self {
+        self.dns_resolver = super::DnsResolver::Custom(resolver);
         self
     }
 
@@ -893,8 +908,12 @@ impl Http2ConnectionBuilder {
     /// Built-in TCP connector with `nodelay` and the configured
     /// `tcp_connect_timeout` / `local_address` applied. Mirrors
     /// `HttpClientBuilder::http_connector` (which has no `local_address`).
-    fn http_connector(&self) -> hyper_util::client::legacy::connect::HttpConnector {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    fn http_connector(
+        &self,
+    ) -> hyper_util::client::legacy::connect::HttpConnector<super::DnsResolver> {
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
+            self.dns_resolver.clone(),
+        );
         connector.set_nodelay(true);
         connector.set_connect_timeout(self.tcp_connect_timeout);
         // The family filtering documented on `local_address` is hyper's
@@ -1399,7 +1418,7 @@ impl tower::Service<Request<ClientBody>> for SendRequest {
 /// HTTP/2 handshake, returning a ready `SendRequest`. Used by [`Reconnect`]
 /// to (re)establish connections.
 struct MakeSendRequest {
-    connector: hyper_util::client::legacy::connect::HttpConnector,
+    connector: hyper_util::client::legacy::connect::HttpConnector<super::DnsResolver>,
     builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
     /// TLS config for https:// connections. When `Some`, the URI scheme
     /// must be https:// and a TLS handshake happens after TCP connect.
@@ -2343,6 +2362,33 @@ mod tests {
             .await
             .expect_err("v6 local address to a v4-only peer must not connect");
         assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+    }
+
+    /// `.invalid` (RFC 2606) never resolves through the system resolver, so a
+    /// completed connect proves the custom resolver supplied the address.
+    #[tokio::test]
+    async fn builder_dns_resolver_replaces_system_lookup() {
+        struct Loopback;
+        impl super::super::Resolve for Loopback {
+            fn resolve(&self, host: &str) -> super::super::Resolving {
+                assert_eq!(host, "resolver-test.invalid");
+                Box::pin(async { Ok(vec![([127, 0, 0, 1], 0).into()]) })
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let uri: Uri = format!("http://resolver-test.invalid:{port}")
+            .parse()
+            .unwrap();
+        // As in `builder_local_address_is_the_observed_peer`: TCP completes into
+        // the backlog and the h2c handshake resolves locally.
+        let _conn = Http2Connection::builder()
+            .dns_resolver(std::sync::Arc::new(Loopback))
+            .connect_plaintext(uri)
+            .await
+            .unwrap();
+        listener.accept().await.unwrap();
     }
 
     #[tokio::test]
