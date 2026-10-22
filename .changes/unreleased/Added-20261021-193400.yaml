@@ -1,0 +1,11 @@
+kind: Added
+body: |-
+    **`HttpClient` and `Http2Connection` can take a custom DNS resolver.**
+    `HttpClientBuilder::dns_resolver` and `Http2ConnectionBuilder::dns_resolver`
+    accept an `Arc<dyn client::Resolve>` that replaces the system resolver (one
+    `getaddrinfo` on tokio's blocking pool per new connection) in the built-in
+    connector, so callers can cache answers, coalesce lookups or use an async
+    DNS client. `Resolve` has one method, which returns the new
+    `client::Resolving` future. The client types do not change, and callers who
+    do not set a resolver keep the system resolver.
+time: 2026-10-21T19:34:00.000000000+00:00

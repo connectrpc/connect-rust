@@ -2104,6 +2104,8 @@ let conn = Http2Connection::builder()
 
 On a multi-homed host, `Http2ConnectionBuilder::local_address(IpAddr)` binds the built-in connector's socket to one of the host's addresses before connecting, so the connection (and every reconnect) originates from that address — useful when the peer keys on the source address it observes, or when egress must leave a particular interface. The resolved peer addresses are filtered to that address's family; a peer with no address of that family fails to connect rather than connecting from a kernel-chosen source. Like `tcp_connect_timeout`, it applies only to the built-in TCP connector, not to the custom-connector / Unix-socket terminals. (`HttpClientBuilder` does not expose this; use `Http2Connection` when you need a pinned source address.)
 
+By default the built-in connector resolves host names with one uncached `getaddrinfo` call on tokio's blocking pool for every new connection. To cache answers, coalesce concurrent lookups, use an async DNS client, or pin a name in a test, implement `connectrpc::client::Resolve` and pass it to `dns_resolver(Arc<dyn Resolve>)` on either builder. The resolver chooses only the addresses to dial: the TLS server name, certificate verification and the request's authority still use the URI's host, and a host that is an IP literal does not reach the resolver. The lookup counts against `establishment_timeout`. The `Resolve::resolve` documentation gives the rules for ports, address order, errors and panics. Like `tcp_connect_timeout`, the resolver applies only to the built-in TCP connector.
+
 ### ClientConfig
 
 `ClientConfig` carries the base URI and per-call defaults that apply
