@@ -1,0 +1,4 @@
+kind: Fixed
+body: |-
+    Use zstd 0.14 so the crate no longer depends on zstd 0.13, which has open advisories RUSTSEC-2026-0391, RUSTSEC-2026-0398, and RUSTSEC-2026-0403. The `zstd` compression feature behaves the same for callers.
+time: 2026-10-27T12:05:47.791237464+00:00
