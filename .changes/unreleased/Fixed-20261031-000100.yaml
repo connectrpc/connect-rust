@@ -1,0 +1,13 @@
+kind: Fixed
+body: |-
+    **A gRPC or gRPC-Web Trailers-Only stream end now reports its trailers**
+    ([#346]). When a server ends a server-streaming or bidirectional call with
+    no messages and its status in the response headers, the trailing metadata
+    it set arrives in those headers, and `ServerStream::trailers()` (so also
+    `BidiStream::trailers()` and `BidiRecvHalf::trailers()`) returned `None`.
+    It now returns the response headers minus `content-type`, as connect-go
+    does, so every other header, including `grpc-status`, appears in both
+    `headers()` and `trailers()`. `headers()` is unchanged.
+
+    [#346]: https://github.com/connectrpc/connect-rust/issues/346
+time: 2026-10-31T00:01:00.000000000+00:00

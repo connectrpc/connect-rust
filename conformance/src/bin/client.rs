@@ -1315,6 +1315,27 @@ async fn do_bidi_stream_call(
         };
     }
 
+    // Helper: the response headers and trailers to report. A stream whose
+    // response-head handling failed (a gRPC or gRPC-Web Trailers-Only error,
+    // a non-200 reply, a rejected content type) has no headers or trailers
+    // of its own; the error returned by `message()` carries them, so fall
+    // back to it.
+    macro_rules! response_metadata {
+        () => {{
+            let err = stream.error();
+            let headers = stream
+                .headers()
+                .or_else(|| err.map(ConnectError::response_headers));
+            let trailers = stream
+                .trailers()
+                .or_else(|| err.map(ConnectError::trailers));
+            (
+                headers.map(headers_to_conformance).unwrap_or_default(),
+                trailers.map(headers_to_conformance).unwrap_or_default(),
+            )
+        }};
+    }
+
     // Send loop: for each request, sleep the request delay, send it.
     // In full-duplex mode, also receive one response per request.
     for (i, msg) in requests.into_iter().enumerate() {
@@ -1411,17 +1432,12 @@ async fn do_bidi_stream_call(
     // If we already hit an error in the send loop, don't drain — just
     // return what we have (matches Go reference's early-return).
     if let Some(err) = proto_error {
+        let (response_headers, response_trailers) = response_metadata!();
         return Ok(ClientResponseResult {
-            response_headers: stream
-                .headers()
-                .map(headers_to_conformance)
-                .unwrap_or_default(),
+            response_headers,
             payloads,
             error: err.into(),
-            response_trailers: stream
-                .trailers()
-                .map(headers_to_conformance)
-                .unwrap_or_default(),
+            response_trailers,
             num_unsent_requests: num_unsent,
             http_status_code: None,
             feedback: vec![],
@@ -1516,14 +1532,7 @@ async fn do_bidi_stream_call(
     }
 
     // Stream ended — collect headers/trailers/error.
-    let response_headers = stream
-        .headers()
-        .map(headers_to_conformance)
-        .unwrap_or_default();
-    let response_trailers = stream
-        .trailers()
-        .map(headers_to_conformance)
-        .unwrap_or_default();
+    let (response_headers, response_trailers) = response_metadata!();
     let stream_error = proto_error.map(Into::into).unwrap_or_else(|| {
         stream
             .error()
