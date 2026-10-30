@@ -1,0 +1,13 @@
+kind: Fixed
+body: |-
+    **gRPC and gRPC-Web streams that end part-way through a message now fail
+    with `internal`** ([#346]). A server-streaming or bidirectional response
+    body cut off inside an envelope, in its 5-byte prefix or in its payload,
+    and then closed with `grpc-status: 0` was reported as a clean end, so the
+    partial message was dropped without an error. The stream now ends with
+    `internal`, the code grpc-go reports. An end that already failed keeps its
+    own error: a server error in the trailers, the deadline, or a missing
+    status.
+
+    [#346]: https://github.com/connectrpc/connect-rust/issues/346
+time: 2026-10-31T00:00:00.000000000+00:00
