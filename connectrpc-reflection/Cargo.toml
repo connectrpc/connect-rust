@@ -24,7 +24,7 @@ default = ["client"]
 client = ["connectrpc/client"]
 
 [dependencies]
-connectrpc = { path = "../connectrpc", version = "0.9", features = ["server"] }
+connectrpc = { path = "../connectrpc", version = "0.9", default-features = false, features = ["server"] }
 
 # Protobuf + serde (pulled in by the generated module paths)
 buffa = { workspace = true }
