@@ -144,7 +144,7 @@ and the three client suites.
 
 ## Checked-In Generated Code
 
-Six directories contain checked-in `buf generate` output and **must be
+Seven directories contain checked-in `buf generate` output and **must be
 regenerated** whenever `connectrpc-codegen` output changes (or the buffa
 dependency is bumped):
 
@@ -154,6 +154,7 @@ dependency is bumped):
 - `benches/rpc/src/generated/`
 - `connectrpc-health/src/generated/`
 - `connectrpc-reflection/src/generated/`
+- `connectrpc-types/src/generated/`
 
 Regenerate all of them with:
 
@@ -229,7 +230,8 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
   `-p connectrpc --no-default-features`. Because the tests run, a test that
   needs `json`, `gzip` or `zstd` must be
   `#[cfg(feature = "...")]`-gated or it fails here while passing the
-  default-feature suite
+  default-feature suite. Also checks and tests `connectrpc-types` with no
+  features, and checks it with only `json` and with only `views`
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
 - **Latest dependencies** (weekly, separate workflow) — `cargo update` to
   the newest compatible versions, then the test suite

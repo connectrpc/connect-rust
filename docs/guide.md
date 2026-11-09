@@ -27,7 +27,7 @@ with the [README quick start](../README.md#quick-start) and the
 
 ## Installation
 
-`connectrpc` ships as five crates:
+`connectrpc` ships as six crates:
 
 | Crate | Purpose |
 |---|---|
@@ -36,6 +36,7 @@ with the [README quick start](../README.md#quick-start) and the
 | `connectrpc-build` | `build.rs` integration that runs the codegen at build time |
 | `connectrpc-health` | The standard `grpc.health.v1.Health` service for liveness / readiness probes ([Health checking](#health-checking)) |
 | `connectrpc-reflection` | The standard gRPC server reflection service (`grpc.reflection.v1` + `v1alpha`) for `grpcurl` / `buf curl` / Postman / `grpcui` ([Server reflection](#server-reflection)) |
+| `connectrpc-types` | Shared `google.rpc` message types: `Status`, `Code`, and the standard error details ([Errors and status codes](#errors-and-status-codes)) |
 
 Generated code references a small set of crates from your namespace, so
 a working `Cargo.toml` needs more than the runtime itself — this is the
@@ -152,6 +153,20 @@ feature unification turns it back on for the whole build, the markers revert to
 compiling (`Serialize is not satisfied` — note the error names the trait, not
 the feature). Proto-only mode therefore fits a leaf binary or a fully
 proto-only graph, not one library inside a mixed workspace.
+
+The `connectrpc-types` crate has a default-on `json` feature of its own for the
+serde impls on the `google.rpc` types. A proto-only build still compiles with it
+on, because `connectrpc-types` does not depend on `connectrpc`. To drop the
+unused serde impls, turn it off the same way, and re-list `views` if generated
+code has these types as fields:
+
+```toml
+connectrpc-types = { version = "0.9", default-features = false, features = ["views"] }
+```
+
+Such code comes from `protoc-gen-buffa`, so remove its serde impls by leaving
+`json=true` out of that plugin's `opt`; `protoc-gen-connect-rust` ignores
+`no_json`.
 
 > View-body responses are already proto-only and return `Unimplemented` for the
 > JSON codec — see [Returning a view body](#returning-a-view-body) — so a
@@ -677,7 +692,7 @@ poorly-compressible view items should return
 The `'a` on the trait method also lets the body borrow from `&self`
 (e.g. cached server state). View bodies only encode for the proto
 codec - JSON clients receive `unimplemented`; see
-[`MaybeBorrowed`'s codec note](https://docs.rs/connectrpc/latest/connectrpc/enum.MaybeBorrowed.html#codec-compatibility).
+[`MaybeBorrowed`'s codec note](https://docs.rs/connectrpc/latest/connectrpc/response/enum.MaybeBorrowed.html#codec-compatibility).
 View-body impls are not emitted for output types mapped via
 `extern_path` (the impl would be an orphan in the consuming crate) -
 the impls must live in the crate that owns the type. If you generate
@@ -2089,6 +2104,8 @@ let conn = Http2Connection::builder()
 
 On a multi-homed host, `Http2ConnectionBuilder::local_address(IpAddr)` binds the built-in connector's socket to one of the host's addresses before connecting, so the connection (and every reconnect) originates from that address — useful when the peer keys on the source address it observes, or when egress must leave a particular interface. The resolved peer addresses are filtered to that address's family; a peer with no address of that family fails to connect rather than connecting from a kernel-chosen source. Like `tcp_connect_timeout`, it applies only to the built-in TCP connector, not to the custom-connector / Unix-socket terminals. (`HttpClientBuilder` does not expose this; use `Http2Connection` when you need a pinned source address.)
 
+By default the built-in connector resolves host names with one uncached `getaddrinfo` call on tokio's blocking pool for every new connection. To cache answers, coalesce concurrent lookups, use an async DNS client, or pin a name in a test, implement `connectrpc::client::Resolve` and pass it to `dns_resolver(Arc<dyn Resolve>)` on either builder. The resolver chooses only the addresses to dial: the TLS server name, certificate verification and the request's authority still use the URI's host, and a host that is an IP literal does not reach the resolver. The lookup counts against `establishment_timeout`. The `Resolve::resolve` documentation gives the rules for ports, address order, errors and panics. Like `tcp_connect_timeout`, the resolver applies only to the built-in TCP connector.
+
 ### ClientConfig
 
 `ClientConfig` carries the base URI and per-call defaults that apply
@@ -2233,6 +2250,38 @@ protocol they're speaking.
 For more structured errors, attach `ErrorDetail` entries (which carry
 typed protobuf messages) before returning. These flow through to
 clients in the standard Connect error-detail wire format.
+
+The standard detail messages — `BadRequest`, `ErrorInfo`, `RetryInfo`,
+`QuotaFailure` and the rest of `google/rpc/error_details.proto` — ship
+ready-made in the `connectrpc-types` crate, so peers in other languages
+recognise them:
+
+```toml
+connectrpc-types = "0.9"
+```
+
+```rust
+use buffa::MessageName;
+use connectrpc::{ConnectError, ErrorDetail};
+use connectrpc_types::google::rpc::{BadRequest, bad_request};
+
+let bad = BadRequest {
+    field_violations: vec![bad_request::FieldViolation {
+        field: "page_size".to_owned(),
+        description: "must be between 1 and 100".to_owned(),
+        ..Default::default()
+    }],
+    ..Default::default()
+};
+return Err(ConnectError::invalid_argument("invalid page_size")
+    .with_detail(ErrorDetail::from_message(BadRequest::FULL_NAME, &bad)));
+```
+
+Pass `FULL_NAME` (`google.rpc.BadRequest`), not the `TYPE_URL` constant
+next to it: the Connect protocol sends the bare name, and the gRPC path
+adds the `type.googleapis.com/` prefix itself. On the receiving side a
+detail's name is bare over Connect but prefixed over gRPC, so a lookup
+has to accept both; the `connectrpc-types` crate docs show one.
 
 To keep an underlying error's cause available for logging without
 sending it to the client, attach it with `.with_source(err)`. It is

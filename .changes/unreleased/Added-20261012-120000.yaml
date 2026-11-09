@@ -1,0 +1,16 @@
+kind: Added
+body: |-
+    **New `connectrpc-types` crate with the `google.rpc` message types.**
+    `Status`, the `Code` enum, and the `error_details.proto` payloads
+    (`BadRequest`, `ErrorInfo`, `RetryInfo`, `QuotaFailure`,
+    `PreconditionFailure`, `ResourceInfo`, `RequestInfo`, `Help`,
+    `LocalizedMessage`, `DebugInfo`) are generated with buffa and checked in,
+    so they can be attached with
+    `ErrorDetail::from_message(BadRequest::FULL_NAME, &detail)` without each
+    service generating its own copy. Pass `FULL_NAME`, not `TYPE_URL`: the
+    Connect protocol sends the bare name. Schemas that import
+    `google/rpc/status.proto` can map the package to the crate with the buffa
+    plugin's `extern_path=.google.rpc=::connectrpc_types::google::rpc`. The
+    serde impls and the view types are behind the `json` and `views` features,
+    both on by default.
+time: 2026-10-12T12:00:00.000000000+00:00

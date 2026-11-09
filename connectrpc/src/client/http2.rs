@@ -514,13 +514,15 @@ impl Http2Connection {
 /// caller-supplied connectors, and Unix sockets. HTTP/2 keep-alive and
 /// flow-control knobs are proxied directly; for hyper settings not surfaced
 /// here use [`h2_settings`](Self::h2_settings). [`tcp_connect_timeout`] (the
-/// per-address TCP bound) and [`local_address`] (the source-address bind)
-/// configure the built-in connector and are ignored by the custom-connector /
-/// Unix-socket terminals — use [`establishment_timeout`] there as the
-/// establishment bound, and bind inside your own connector.
+/// per-address TCP bound), [`local_address`] (the source-address bind) and
+/// [`dns_resolver`] (the host-name lookup) configure the built-in connector and
+/// are ignored by the custom-connector / Unix-socket terminals — use
+/// [`establishment_timeout`] there as the establishment bound, and bind and
+/// resolve inside your own connector.
 ///
 /// [`tcp_connect_timeout`]: Self::tcp_connect_timeout
 /// [`local_address`]: Self::local_address
+/// [`dns_resolver`]: Self::dns_resolver
 /// [`establishment_timeout`]: Self::establishment_timeout
 ///
 /// [`CallOptions::with_timeout`]: super::CallOptions::with_timeout
@@ -530,6 +532,7 @@ pub struct Http2ConnectionBuilder {
     tcp_connect_timeout: Option<Duration>,
     establishment_timeout: Option<Duration>,
     local_address: Option<IpAddr>,
+    dns_resolver: super::DnsResolver,
     h2_builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
 }
 
@@ -567,6 +570,7 @@ impl Default for Http2ConnectionBuilder {
             tcp_connect_timeout: Some(DEFAULT_TCP_CONNECT_TIMEOUT),
             establishment_timeout: Some(DEFAULT_ESTABLISHMENT_TIMEOUT),
             local_address: None,
+            dns_resolver: super::DnsResolver::default(),
             h2_builder,
         }
     }
@@ -578,8 +582,9 @@ impl Http2ConnectionBuilder {
     /// Applied to the built-in connector via hyper's
     /// [`HttpConnector::set_connect_timeout`][hyper-ct]; it covers only the TCP
     /// `connect(2)` call (per resolved address — the budget is divided across
-    /// the address set), so the connector moves on to the next address rather
-    /// than burning the whole [`establishment_timeout`] on one blackholed peer.
+    /// the addresses of each family), so the connector moves on to the next
+    /// address rather than burning the whole [`establishment_timeout`] on one
+    /// blackholed peer.
     /// It is **ignored** by the custom-connector / Unix-socket terminals (which
     /// have no built-in `HttpConnector` to apply it to).
     ///
@@ -666,6 +671,24 @@ impl Http2ConnectionBuilder {
     #[doc(alias = "source_address")]
     pub fn local_address(mut self, addr: IpAddr) -> Self {
         self.local_address = Some(addr);
+        self
+    }
+
+    /// Resolve host names with `resolver` instead of the system resolver.
+    ///
+    /// The connector calls the resolver on every connect and reconnect, and the
+    /// lookup counts against
+    /// [`establishment_timeout`](Self::establishment_timeout).
+    /// [`Resolve::resolve`](super::Resolve::resolve) says how the connector uses
+    /// the addresses and how a resolver error reaches the caller.
+    /// [`HttpClientBuilder::dns_resolver`](super::HttpClientBuilder::dns_resolver)
+    /// describes the system resolver that this replaces.
+    ///
+    /// Like [`tcp_connect_timeout`](Self::tcp_connect_timeout), this
+    /// configures the built-in connector and is **ignored** by the
+    /// custom-connector / Unix-socket terminals.
+    pub fn dns_resolver(mut self, resolver: std::sync::Arc<dyn super::Resolve>) -> Self {
+        self.dns_resolver = super::DnsResolver::Custom(resolver);
         self
     }
 
@@ -817,10 +840,10 @@ impl Http2ConnectionBuilder {
     ///
     /// `establishment_timeout` bounds the connector's dial *and* the HTTP/2 preface
     /// as one wall-clock budget — the same semantics as the built-in
-    /// transports. `tcp_connect_timeout` and `local_address` configure the
-    /// built-in connector and are **ignored** here; to bound the dial separately
-    /// from the preface, wrap the connector in `tower::timeout::Timeout`, and
-    /// bind inside the connector if you need a source address.
+    /// transports. `tcp_connect_timeout`, `local_address` and `dns_resolver`
+    /// configure the built-in connector and are **ignored** here; to bound the
+    /// dial separately from the preface, wrap the connector in
+    /// `tower::timeout::Timeout`, and bind and resolve inside the connector.
     #[must_use]
     pub fn lazy_with_connector<C>(self, connector: C, authority: Uri) -> Http2Connection
     where
@@ -891,15 +914,19 @@ impl Http2ConnectionBuilder {
     }
 
     /// Built-in TCP connector with `nodelay` and the configured
-    /// `tcp_connect_timeout` / `local_address` applied. Mirrors
+    /// `dns_resolver` / `tcp_connect_timeout` / `local_address` applied. Mirrors
     /// `HttpClientBuilder::http_connector` (which has no `local_address`).
-    fn http_connector(&self) -> hyper_util::client::legacy::connect::HttpConnector {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    fn http_connector(
+        &self,
+    ) -> hyper_util::client::legacy::connect::HttpConnector<super::DnsResolver> {
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
+            self.dns_resolver.clone(),
+        );
         connector.set_nodelay(true);
         connector.set_connect_timeout(self.tcp_connect_timeout);
         // The family filtering documented on `local_address` is hyper's
         // happy-eyeballs path; with it disabled hyper skips a mismatched-family
-        // bind silently. `HttpConnector::new()` enables it — keep it that way.
+        // bind silently. `new_with_resolver` enables it — keep it that way.
         connector.set_local_address(self.local_address);
         connector
     }
@@ -931,8 +958,9 @@ impl Http2ConnectionBuilder {
     fn make_custom(self, conn: BoxedConnector) -> MakeSendRequest {
         MakeSendRequest {
             // Unused when `custom` is Some — `call()` branches to the custom
-            // connector before touching it. `tcp_connect_timeout` is therefore
-            // dropped here (it's the per-address TCP bound on this connector).
+            // connector before touching it. `tcp_connect_timeout` and
+            // `dns_resolver`, which configure this connector, therefore have no
+            // effect here.
             connector: self.http_connector(),
             builder: self.h2_builder,
             #[cfg(feature = "client-tls")]
@@ -1399,7 +1427,7 @@ impl tower::Service<Request<ClientBody>> for SendRequest {
 /// HTTP/2 handshake, returning a ready `SendRequest`. Used by [`Reconnect`]
 /// to (re)establish connections.
 struct MakeSendRequest {
-    connector: hyper_util::client::legacy::connect::HttpConnector,
+    connector: hyper_util::client::legacy::connect::HttpConnector<super::DnsResolver>,
     builder: hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
     /// TLS config for https:// connections. When `Some`, the URI scheme
     /// must be https:// and a TLS handshake happens after TCP connect.
@@ -1715,6 +1743,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::tests::{TestResolver, error_chain};
 
     #[test]
     fn lazy_plaintext_starts_idle() {
@@ -2343,6 +2372,192 @@ mod tests {
             .await
             .expect_err("v6 local address to a v4-only peer must not connect");
         assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+    }
+
+    /// `.invalid` (RFC 2606) never resolves through the system resolver, so a
+    /// completed connect proves the custom resolver supplied the address.
+    #[tokio::test]
+    async fn builder_dns_resolver_replaces_system_lookup() {
+        let resolver =
+            TestResolver::new(|| Box::pin(async { Ok(vec![([127, 0, 0, 1], 0).into()]) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let uri: Uri = format!("http://resolver-test.invalid:{port}")
+            .parse()
+            .unwrap();
+        // As in `builder_local_address_is_the_observed_peer`: TCP completes into
+        // the backlog and the h2c handshake resolves locally.
+        let _conn = Http2Connection::builder()
+            .dns_resolver(resolver)
+            .connect_plaintext(uri)
+            .await
+            .unwrap();
+        listener.accept().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn builder_dns_resolver_error_fails_connect_as_unavailable() {
+        let resolver = TestResolver::new(|| Box::pin(async { Err("no such host".into()) }));
+        let err = Http2Connection::builder()
+            .dns_resolver(resolver.clone())
+            .connect_plaintext("http://resolver-test.invalid:80".parse().unwrap())
+            .await
+            .expect_err("a resolver error must fail the connect");
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+        assert_eq!(
+            error_chain(&err).last().map(String::as_str),
+            Some("no such host"),
+            "the resolver's error must stay in the source chain: {err:?}"
+        );
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn builder_dns_resolver_connect_error_fails_connect_as_unavailable() {
+        let resolver = TestResolver::new(|| {
+            Box::pin(async { Err(ConnectError::permission_denied("blocked by policy").into()) })
+        });
+        let err = Http2Connection::builder()
+            .dns_resolver(resolver)
+            .connect_plaintext("http://resolver-test.invalid:80".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn establishment_timeout_bounds_hung_dns_resolver() {
+        use std::time::Instant;
+
+        let resolver = TestResolver::new(|| Box::pin(std::future::pending()));
+        let start = Instant::now();
+        let err = Http2Connection::builder()
+            .establishment_timeout(Duration::from_millis(150))
+            .dns_resolver(resolver.clone())
+            .connect_plaintext("http://resolver-test.invalid:80".parse().unwrap())
+            .await
+            .expect_err("a hung resolver must not hang the connect");
+        let elapsed = start.elapsed();
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+        assert_eq!(resolver.calls(), 1);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "establishment_timeout(150ms) should fire within ~2s, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_send_calls_the_dns_resolver_on_every_attempt() {
+        let resolver = TestResolver::new(|| Box::pin(async { Err("no such host".into()) }));
+        let shared = Http2Connection::builder()
+            .dns_resolver(resolver.clone())
+            .lazy_plaintext("http://resolver-test.invalid:80".parse().unwrap())
+            .shared(1);
+
+        for expected_calls in [1, 2] {
+            let err = ClientTransport::send(&shared, empty_request())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, crate::error::ErrorCode::Unavailable, "{err:?}");
+            assert_eq!(resolver.calls(), expected_calls);
+        }
+    }
+
+    /// A resolver can classify its own failure: `h2_transport_error` returns a
+    /// `ConnectError` from the chain with its own code.
+    #[tokio::test]
+    async fn shared_send_returns_a_connect_error_from_the_dns_resolver_verbatim() {
+        let resolver = TestResolver::new(|| {
+            Box::pin(async { Err(ConnectError::permission_denied("blocked by policy").into()) })
+        });
+        let shared = Http2Connection::builder()
+            .dns_resolver(resolver)
+            .lazy_plaintext("http://resolver-test.invalid:80".parse().unwrap())
+            .shared(1);
+
+        let err = ClientTransport::send(&shared, empty_request())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::error::ErrorCode::PermissionDenied,
+            "{err:?}"
+        );
+        assert_eq!(err.message.as_deref(), Some("blocked by policy"));
+    }
+
+    /// Pins the `# Panics` section of `Resolve::resolve`: `Reconnect` keeps the
+    /// panicked connect future, so later attempts poll it again and do not reach
+    /// the resolver.
+    #[tokio::test]
+    async fn connection_does_not_recover_from_a_dns_resolver_panic() {
+        use futures::FutureExt as _;
+        use std::future::poll_fn;
+        use std::panic::AssertUnwindSafe;
+        use tower::Service as _;
+
+        let uri: Uri = "http://resolver-test.invalid:80".parse().unwrap();
+
+        let resolver = TestResolver::new(|| panic!("resolver bug"));
+        let shared = Http2Connection::builder()
+            .dns_resolver(resolver.clone())
+            .lazy_plaintext(uri.clone())
+            .shared(1);
+        for _ in 0..2 {
+            let err = ClientTransport::send(&shared.clone(), empty_request())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, crate::error::ErrorCode::Internal, "{err:?}");
+            assert_eq!(resolver.calls(), 1);
+        }
+
+        let resolver = TestResolver::new(|| panic!("resolver bug"));
+        let mut conn = Http2Connection::builder()
+            .dns_resolver(resolver.clone())
+            .lazy_plaintext(uri);
+        for _ in 0..2 {
+            AssertUnwindSafe(poll_fn(|cx| conn.poll_ready(cx)))
+                .catch_unwind()
+                .await
+                .expect_err("poll_ready must panic");
+            assert_eq!(resolver.calls(), 1);
+        }
+    }
+
+    /// A lazy connection defers the failure to `call`, which returns hyper's
+    /// error with the resolver's error as its source.
+    #[tokio::test]
+    async fn lazy_connection_returns_the_dns_error_from_call() {
+        use std::future::poll_fn;
+        use tower::Service as _;
+
+        let resolver = TestResolver::new(|| Box::pin(async { Err("no such host".into()) }));
+        let mut conn = Http2Connection::builder()
+            .dns_resolver(resolver)
+            .lazy_plaintext("http://resolver-test.invalid:80".parse().unwrap());
+        poll_fn(|cx| conn.poll_ready(cx)).await.unwrap();
+        let err = conn.call(empty_request()).await.unwrap_err();
+        assert_eq!(error_chain(&*err), ["dns error", "no such host"]);
+    }
+
+    #[tokio::test]
+    async fn custom_connector_ignores_the_dns_resolver() {
+        let refuse = tower::service_fn(|_uri: Uri| async {
+            Err::<hyper_util::rt::TokioIo<tokio::io::DuplexStream>, _>(std::io::Error::other(
+                "dial refused",
+            ))
+        });
+        let resolver = TestResolver::new(|| Box::pin(async { Err("must not be called".into()) }));
+        let err = Http2Connection::builder()
+            .dns_resolver(resolver.clone())
+            .connect_with_connector(refuse, "http://resolver-test.invalid".parse().unwrap())
+            .await
+            .expect_err("the connector refuses the dial");
+        assert!(
+            error_chain(&err).iter().any(|e| e == "dial refused"),
+            "{err:?}"
+        );
+        assert_eq!(resolver.calls(), 0);
     }
 
     #[tokio::test]
