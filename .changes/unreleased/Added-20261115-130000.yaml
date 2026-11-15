@@ -1,0 +1,13 @@
+kind: Added
+body: |-
+    **`CompressionRegistry::with_preference` states the order of the
+    `accept-encoding` list.** The header a client sends (`accept-encoding` for
+    Connect, `grpc-accept-encoding` for gRPC and gRPC-Web) listed the
+    registry's encodings sorted by name, and a server answers with the first
+    one it supports, so a default client always got `gzip` ahead of `zstd`.
+    `CompressionRegistry::default().with_preference(["zstd", "gzip"])` lists
+    the named encodings first, in that order, and the rest sorted after them.
+    A name with no registered provider is skipped, and the order holds whether
+    it is set before or after `register`. Registries that do not call it
+    advertise the same sorted list as before.
+time: 2026-11-15T13:00:00.000000000+00:00

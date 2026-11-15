@@ -157,9 +157,16 @@ pub trait CompressionProvider: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct CompressionRegistry {
     providers: Arc<HashMap<&'static str, Arc<dyn CompressionProvider>>>,
-    /// Sorted, comma-joined list of supported encodings as an
-    /// `accept-encoding` header value, rebuilt when providers are registered
-    /// rather than on every request; `None` while no providers are registered.
+    /// Encodings to list first, in order, set by
+    /// [`with_preference`](CompressionRegistry::with_preference). Entries
+    /// that have no registered provider are skipped, so the order survives
+    /// registering the provider afterwards.
+    preference: Vec<String>,
+    /// Comma-joined list of supported encodings as an `accept-encoding`
+    /// header value (the preferred ones in their stated order, then the rest
+    /// sorted), rebuilt when providers are registered or the preference
+    /// changes rather than on every request; `None` while no providers are
+    /// registered.
     accept_encoding: Option<http::HeaderValue>,
 }
 
@@ -179,14 +186,25 @@ impl CompressionRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(HashMap::new()),
+            preference: Vec::new(),
             accept_encoding: None,
         }
     }
 
     /// Recompute the cached accept-encoding value from the current provider set.
     fn rebuild_accept_encoding(&mut self) {
-        let mut encodings: Vec<_> = self.providers.keys().copied().collect();
-        encodings.sort_unstable();
+        let mut rest: Vec<_> = self.providers.keys().copied().collect();
+        rest.sort_unstable();
+        let mut encodings = Vec::with_capacity(rest.len());
+        for name in &self.preference {
+            if let Some(&name) = self.providers.get_key_value(name.as_str()).map(|(k, _)| k)
+                && !encodings.contains(&name)
+            {
+                encodings.push(name);
+            }
+        }
+        rest.retain(|name| !encodings.contains(name));
+        encodings.extend(rest);
         self.accept_encoding = if encodings.is_empty() {
             None
         } else {
@@ -197,9 +215,11 @@ impl CompressionRegistry {
     }
 
     /// The supported encodings as a ready-made `accept-encoding` /
-    /// `grpc-accept-encoding` header value (sorted, comma-separated), or
-    /// `None` when no providers are registered. Built once when providers
-    /// are registered, so attaching it to a request costs no allocation.
+    /// `grpc-accept-encoding` header value (comma-separated: the encodings
+    /// named in [`with_preference`](Self::with_preference) first, in that
+    /// order, then the rest sorted), or `None` when no providers are
+    /// registered. Built once when providers are registered, so attaching it
+    /// to a request costs no allocation.
     #[must_use]
     pub fn accept_encoding_value(&self) -> Option<&http::HeaderValue> {
         self.accept_encoding.as_ref()
@@ -244,6 +264,58 @@ impl CompressionRegistry {
         );
         let providers = Arc::make_mut(&mut self.providers);
         providers.insert(name, Arc::new(provider));
+        self.rebuild_accept_encoding();
+        self
+    }
+
+    /// State the order in which this registry lists its encodings in the
+    /// `accept-encoding` / `grpc-accept-encoding` header it sends, most
+    /// preferred first.
+    ///
+    /// A server answers with the first encoding in the client's list that it
+    /// supports, so the order is how a client prefers one encoding over
+    /// another while still accepting both. Without a preference the list is
+    /// sorted by name, which makes a default client ask for `gzip` ahead of
+    /// `zstd`. Encodings that are registered but not named here follow the
+    /// named ones, sorted by name. A name with no registered provider is
+    /// skipped, so the order is the same whether it is set before or after
+    /// [`register`](Self::register), and a build without the `zstd` feature
+    /// can use the same list. Calling this again replaces the earlier order.
+    ///
+    /// # Panics
+    ///
+    /// If a name is empty or contains a byte outside the RFC 9110 `tchar` set,
+    /// as [`register`](Self::register) does for a provider's name.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(all(feature = "gzip", feature = "zstd"))] {
+    /// use connectrpc::compression::CompressionRegistry;
+    ///
+    /// let registry = CompressionRegistry::default().with_preference(["zstd", "gzip"]);
+    /// assert_eq!(registry.accept_encoding_header(), "zstd, gzip");
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_preference<I, S>(mut self, encodings: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.preference = encodings
+            .into_iter()
+            .map(|name| {
+                let name = name.into();
+                assert!(
+                    is_http_token(&name),
+                    "with_preference() was given {name:?}: an encoding name must be a non-empty \
+                     HTTP token (ASCII alphanumerics and !#$%&'*+-.^_`|~), because it is sent in \
+                     accept-encoding headers"
+                );
+                name
+            })
+            .collect();
         self.rebuild_accept_encoding();
         self
     }
@@ -1850,6 +1922,87 @@ mod tests {
             .register(Named("br"));
         assert_eq!(registry.accept_encoding_header(), "br, x-snappy");
         assert_eq!(registry.accept_encoding_value().unwrap(), "br, x-snappy");
+    }
+
+    fn three() -> CompressionRegistry {
+        CompressionRegistry::new()
+            .register(Named("a"))
+            .register(Named("b"))
+            .register(Named("c"))
+    }
+
+    #[test]
+    fn with_preference_lists_preferred_first_then_the_rest_sorted() {
+        let registry = three().with_preference(["c", "a"]);
+        assert_eq!(registry.accept_encoding_header(), "c, a, b");
+        assert_eq!(registry.accept_encoding_value().unwrap(), "c, a, b");
+        // It is the order a server honours.
+        assert_eq!(
+            registry.negotiate_encoding(Some(registry.accept_encoding_header()), None),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn with_preference_survives_later_registration() {
+        let registry = CompressionRegistry::new()
+            .register(Named("a"))
+            .with_preference(["z", "a"])
+            .register(Named("b"))
+            .register(Named("z"));
+        assert_eq!(registry.accept_encoding_header(), "z, a, b");
+    }
+
+    #[test]
+    fn with_preference_skips_unregistered_and_repeated_names() {
+        let registry = three().with_preference(["x", "b", "identity", "b", "a"]);
+        assert_eq!(registry.accept_encoding_header(), "b, a, c");
+        // Nothing registered: still no header value.
+        let empty = CompressionRegistry::new().with_preference(["a"]);
+        assert!(empty.accept_encoding_value().is_none());
+    }
+
+    #[test]
+    fn with_preference_replaces_an_earlier_order() {
+        let registry = three().with_preference(["c"]).with_preference(["b"]);
+        assert_eq!(registry.accept_encoding_header(), "b, a, c");
+        let registry = registry.with_preference(Vec::<String>::new());
+        assert_eq!(registry.accept_encoding_header(), "a, b, c");
+    }
+
+    #[test]
+    fn with_preference_is_kept_by_clone() {
+        let registry = three().with_preference(["b"]).clone();
+        assert_eq!(registry.accept_encoding_header(), "b, a, c");
+    }
+
+    #[cfg(all(feature = "gzip", feature = "zstd"))]
+    #[test]
+    fn default_registry_with_zstd_preferred_negotiates_zstd() {
+        let default = CompressionRegistry::default();
+        let header = default.accept_encoding_header();
+        assert_eq!(header, "gzip, zstd");
+        assert_eq!(default.negotiate_encoding(Some(header), None), Some("gzip"));
+
+        let registry = default.with_preference(["zstd", "gzip"]);
+        let header = registry.accept_encoding_header();
+        assert_eq!(header, "zstd, gzip");
+        assert_eq!(
+            registry.negotiate_encoding(Some(header), None),
+            Some("zstd")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a non-empty HTTP token")]
+    fn with_preference_rejects_a_name_that_is_not_a_token() {
+        let _ = three().with_preference(["a, b"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a non-empty HTTP token")]
+    fn with_preference_rejects_an_empty_name() {
+        let _ = three().with_preference([""]);
     }
 
     #[test]

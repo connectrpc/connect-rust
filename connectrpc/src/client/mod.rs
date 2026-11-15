@@ -1194,6 +1194,12 @@ impl ClientConfig {
 
     /// Set the compression registry.
     ///
+    /// The registry's encodings are what the client accepts in responses,
+    /// listed in the `accept-encoding` / `grpc-accept-encoding` request
+    /// header sorted by name, so a server that supports both picks `gzip`
+    /// over `zstd`. To prefer another one while still accepting both, use
+    /// [`CompressionRegistry::with_preference`].
+    ///
     /// Read via [`Self::compression`].
     #[must_use]
     pub fn with_compression(mut self, registry: CompressionRegistry) -> Self {
@@ -10186,6 +10192,49 @@ mod tests {
             add_unary_request_headers(builder, &config, Some(Duration::from_millis(500)), None);
         let req = builder.body(()).unwrap();
         assert_eq!(req.headers().get("grpc-timeout").unwrap(), "500m");
+    }
+
+    #[test]
+    fn unary_request_advertises_the_registry_preference_order() {
+        struct Named(&'static str);
+        impl crate::compression::CompressionProvider for Named {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+            fn compress(&self, data: &[u8]) -> Result<Bytes, ConnectError> {
+                Ok(Bytes::copy_from_slice(data))
+            }
+            fn decompressor<'a>(
+                &self,
+                data: &'a [u8],
+            ) -> Result<Box<dyn std::io::Read + 'a>, ConnectError> {
+                Ok(Box::new(data))
+            }
+        }
+
+        let registry = CompressionRegistry::new()
+            .register(Named("a"))
+            .register(Named("b"));
+        for (protocol, header) in [
+            (Protocol::Connect, "accept-encoding"),
+            (Protocol::Grpc, "grpc-accept-encoding"),
+            (Protocol::GrpcWeb, "grpc-accept-encoding"),
+        ] {
+            let sent = |registry: &CompressionRegistry| {
+                let config = ClientConfig::new("http://localhost".parse().unwrap())
+                    .with_protocol(protocol)
+                    .with_compression(registry.clone());
+                add_unary_request_headers(http::Request::builder(), &config, None, None)
+                    .body(())
+                    .unwrap()
+                    .headers()
+                    .get(header)
+                    .cloned()
+            };
+            assert_eq!(sent(&registry).unwrap(), "a, b", "{protocol:?}");
+            let preferred = registry.clone().with_preference(["b", "a"]);
+            assert_eq!(sent(&preferred).unwrap(), "b, a", "{protocol:?}");
+        }
     }
 
     // ========================================================================
