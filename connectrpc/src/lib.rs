@@ -309,6 +309,7 @@ pub mod __codegen {
 pub use error::ConnectError;
 pub use error::ErrorCode;
 pub use error::ErrorDetail;
+pub use error::ErrorDetailDecodeError;
 pub use error::SharedSource;
 
 /// Re-export of the `http-body` crate whose [`Body`](http_body::Body) trait

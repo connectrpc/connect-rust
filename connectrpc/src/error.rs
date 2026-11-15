@@ -220,6 +220,76 @@ impl ErrorDetail {
             debug: None,
         }
     }
+
+    /// Decode this detail as the message type `M`.
+    ///
+    /// The counterpart of [`from_message`](Self::from_message), and the
+    /// way to read a typed detail off an error that was received:
+    ///
+    /// - `Ok(None)` if the detail's name is not `M`'s
+    ///   [`FULL_NAME`](buffa::MessageName::FULL_NAME). The name is compared
+    ///   in either of its forms, so the bare `google.rpc.RetryInfo` that
+    ///   Connect carries and the `type.googleapis.com/google.rpc.RetryInfo`
+    ///   that gRPC and gRPC-Web carry both match.
+    /// - `Ok(Some(message))` if the name matches and
+    ///   [`value`](Self::value) decodes. Base64 is accepted padded or
+    ///   unpadded, and an absent `value` is an empty message, as it is in
+    ///   `google.protobuf.Any`.
+    ///
+    /// To scan a whole error for one type, use [`ConnectError::detail`].
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorDetailDecodeError`] if the name matches `M` but `value` is not
+    /// valid base64 or the bytes are not a valid `M`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use buffa_types::google::protobuf::{Int32Value, StringValue};
+    /// use connectrpc::ErrorDetail;
+    ///
+    /// let msg = StringValue::from("quota exceeded");
+    /// let detail = ErrorDetail::from_message("google.protobuf.StringValue", &msg);
+    ///
+    /// assert_eq!(detail.decode::<StringValue>().unwrap(), Some(msg));
+    /// // A different message type is not an error, just not a match.
+    /// assert_eq!(detail.decode::<Int32Value>().unwrap(), None);
+    /// ```
+    pub fn decode<M: buffa::Message + buffa::MessageName>(
+        &self,
+    ) -> Result<Option<M>, ErrorDetailDecodeError> {
+        // `Any` type URLs end in the fully-qualified name after the last `/`.
+        let name = self
+            .type_url
+            .rsplit_once('/')
+            .map_or(self.type_url.as_str(), |(_, name)| name);
+        if name != M::FULL_NAME {
+            return Ok(None);
+        }
+        let bytes = match self.value.as_deref() {
+            Some(value) => detail_b64::decode_lenient(value)
+                .map_err(|_| ErrorDetailDecodeError::InvalidBase64)?,
+            None => Vec::new(),
+        };
+        M::decode_from_slice(&bytes)
+            .map(Some)
+            .map_err(ErrorDetailDecodeError::InvalidMessage)
+    }
+}
+
+/// An [`ErrorDetail`] named a message type but its value could not be decoded
+/// as that type. Returned by [`ErrorDetail::decode`].
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ErrorDetailDecodeError {
+    /// The detail's `value` is not valid base64.
+    #[error("error detail value is not valid base64")]
+    InvalidBase64,
+    /// The base64 decoded, but the bytes are not a valid encoding of the
+    /// message type.
+    #[error("error detail value is not a valid message: {0}")]
+    InvalidMessage(#[source] buffa::DecodeError),
 }
 
 /// The base64 form the Connect protocol uses for error-detail values:
@@ -490,6 +560,38 @@ impl ConnectError {
         self
     }
 
+    /// Return the first detail that decodes as the message type `M`.
+    ///
+    /// A convenience over [`ErrorDetail::decode`] for the common case of
+    /// looking for one standard detail, such as `google.rpc.RetryInfo`
+    /// (from the `connectrpc-types` crate), on a received error. A detail
+    /// that is named `M` but whose value cannot be decoded is skipped, as if
+    /// it were absent, so a later detail of the same type can still match;
+    /// call [`ErrorDetail::decode`] on [`details`](Self::details) to tell a
+    /// malformed detail from a missing one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use buffa_types::google::protobuf::StringValue;
+    /// use connectrpc::{ConnectError, ErrorDetail};
+    ///
+    /// let err = ConnectError::unavailable("draining").with_detail(
+    ///     ErrorDetail::from_message("google.protobuf.StringValue", &StringValue::from("hi")),
+    /// );
+    ///
+    /// if let Some(hint) = err.detail::<StringValue>() {
+    ///     // act on the typed detail
+    /// #   assert_eq!(hint.value, "hi");
+    /// }
+    /// # assert!(err.detail::<StringValue>().is_some());
+    /// ```
+    pub fn detail<M: buffa::Message + buffa::MessageName>(&self) -> Option<M> {
+        self.details
+            .iter()
+            .find_map(|detail| detail.decode::<M>().ok().flatten())
+    }
+
     /// Attach the underlying cause, surfaced through
     /// [`Error::source`](std::error::Error::source).
     ///
@@ -637,6 +739,94 @@ impl From<http::Error> for ConnectError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa_types::google::protobuf::{Int32Value, StringValue};
+
+    fn string_detail(name: &str, text: &str) -> ErrorDetail {
+        ErrorDetail::from_message(name, &StringValue::from(text))
+    }
+
+    #[test]
+    fn decode_accepts_the_bare_and_prefixed_name() {
+        let mut detail = string_detail("google.protobuf.StringValue", "a");
+        assert_eq!(
+            detail.decode::<StringValue>().unwrap(),
+            Some(StringValue::from("a"))
+        );
+        detail.type_url = "type.googleapis.com/google.protobuf.StringValue".into();
+        assert_eq!(
+            detail.decode::<StringValue>().unwrap(),
+            Some(StringValue::from("a"))
+        );
+    }
+
+    #[test]
+    fn decode_other_type_is_none_even_with_a_bad_value() {
+        let mut detail = string_detail("google.protobuf.StringValue", "a");
+        assert_eq!(detail.decode::<Int32Value>().unwrap(), None);
+        // A name that merely ends with `M`'s name is a different type.
+        detail.type_url = "x.google.protobuf.StringValue".into();
+        assert_eq!(detail.decode::<StringValue>().unwrap(), None);
+        // The name decides before the value is looked at.
+        detail.value = Some("!!not base64!!".into());
+        assert_eq!(detail.decode::<StringValue>().unwrap(), None);
+    }
+
+    #[test]
+    fn decode_accepts_padded_base64() {
+        use base64::Engine as _;
+        let msg = StringValue::from("ab");
+        let mut detail = string_detail("google.protobuf.StringValue", "ab");
+        // 4 wire bytes: not a multiple of 3, so padding differs.
+        detail.value = Some(
+            base64::engine::general_purpose::STANDARD.encode(buffa::Message::encode_to_vec(&msg)),
+        );
+        assert!(detail.value.as_deref().unwrap().ends_with('='));
+        assert_eq!(detail.decode::<StringValue>().unwrap(), Some(msg));
+    }
+
+    #[test]
+    fn decode_absent_value_is_the_empty_message() {
+        let mut detail = string_detail("google.protobuf.StringValue", "a");
+        detail.value = None;
+        assert_eq!(
+            detail.decode::<StringValue>().unwrap(),
+            Some(StringValue::default())
+        );
+    }
+
+    #[test]
+    fn decode_reports_a_matching_name_with_a_bad_value() {
+        let mut detail = string_detail("google.protobuf.StringValue", "a");
+        detail.value = Some("!!not base64!!".into());
+        assert_eq!(
+            detail.decode::<StringValue>().unwrap_err(),
+            ErrorDetailDecodeError::InvalidBase64
+        );
+        // Valid base64 of bytes that are not a message (truncated field).
+        detail.value = Some(detail_b64::encode(&[0x0a, 0x05, b'a']));
+        let err = detail.decode::<StringValue>().unwrap_err();
+        assert!(matches!(err, ErrorDetailDecodeError::InvalidMessage(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn connect_error_detail_returns_the_first_decodable_match() {
+        let mut broken = string_detail("google.protobuf.StringValue", "broken");
+        broken.value = Some(detail_b64::encode(&[0x0a, 0x05, b'a']));
+        let err = ConnectError::unavailable("x")
+            .with_detail(string_detail("google.protobuf.Int32Value", "other"))
+            .with_detail(broken)
+            .with_detail(string_detail(
+                "type.googleapis.com/google.protobuf.StringValue",
+                "first",
+            ))
+            .with_detail(string_detail("google.protobuf.StringValue", "second"));
+        assert_eq!(
+            err.detail::<StringValue>(),
+            Some(StringValue::from("first"))
+        );
+        assert_eq!(ConnectError::unavailable("x").detail::<StringValue>(), None);
+    }
 
     #[test]
     fn from_http_error_is_internal() {

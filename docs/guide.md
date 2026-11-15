@@ -2280,8 +2280,22 @@ return Err(ConnectError::invalid_argument("invalid page_size")
 Pass `FULL_NAME` (`google.rpc.BadRequest`), not the `TYPE_URL` constant
 next to it: the Connect protocol sends the bare name, and the gRPC path
 adds the `type.googleapis.com/` prefix itself. On the receiving side a
-detail's name is bare over Connect but prefixed over gRPC, so a lookup
-has to accept both; the `connectrpc-types` crate docs show one.
+detail's name is bare over Connect but prefixed over gRPC, so don't
+compare `type_url` yourself: `ConnectError::detail::<M>()` returns the
+first detail that decodes as `M`, whichever form of the name and of the
+base64 the peer used:
+
+```rust
+use connectrpc_types::google::rpc::RetryInfo;
+
+if let Some(retry) = err.detail::<RetryInfo>() {
+    // back off for retry.retry_delay
+}
+```
+
+`ErrorDetail::decode::<M>()` reads a single detail and returns
+`Ok(None)` for a different type, so unlike `detail` it can report a
+detail that is named for `M` but whose value is malformed.
 
 To keep an underlying error's cause available for logging without
 sending it to the client, attach it with `.with_source(err)`. It is
