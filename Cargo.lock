@@ -651,7 +651,6 @@ dependencies = [
 name = "connectrpc-types"
 version = "0.9.0"
 dependencies = [
- "base64 0.22.1",
  "buffa",
  "buffa-types",
  "connectrpc",

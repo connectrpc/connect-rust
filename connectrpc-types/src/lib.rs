@@ -95,42 +95,32 @@
 //!
 //! # Reading error details
 //!
-//! A received detail carries the message as base64 in
-//! [`ErrorDetail::value`], and its name differs by protocol: bare over
-//! Connect, `type.googleapis.com/`-prefixed over gRPC and gRPC-Web. A lookup
-//! has to accept both, and both padded and unpadded base64:
+//! [`ConnectError::detail`] returns the first detail of an error that decodes
+//! as a given message type:
 //!
 //! ```
-//! use base64::Engine as _;
-//! use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-//! use buffa::{Message, MessageName};
 //! use connectrpc::ConnectError;
 //! use connectrpc_types::google::rpc::RetryInfo;
 //!
-//! fn find_detail<M: Message + MessageName>(err: &ConnectError) -> Option<M> {
-//!     err.details.iter().find_map(|d| {
-//!         let name = d.type_url.rsplit_once('/').map_or(d.type_url.as_str(), |(_, n)| n);
-//!         if name != M::FULL_NAME {
-//!             return None;
-//!         }
-//!         let value = d.value.as_deref()?;
-//!         let bytes = STANDARD_NO_PAD.decode(value).or_else(|_| STANDARD.decode(value)).ok()?;
-//!         M::decode_from_slice(&bytes).ok()
-//!     })
-//! }
-//!
+//! # use buffa::MessageName;
 //! # use connectrpc::ErrorDetail;
 //! # let retry = RetryInfo::default();
 //! # let mut err = ConnectError::unavailable("draining")
 //! #     .with_detail(ErrorDetail::from_message(RetryInfo::FULL_NAME, &retry));
-//! # assert_eq!(find_detail::<RetryInfo>(&err), Some(retry.clone()));
+//! # assert_eq!(err.detail::<RetryInfo>(), Some(retry.clone()));
 //! # err.details[0].type_url = RetryInfo::TYPE_URL.to_owned(); // as decoded off gRPC
-//! # assert_eq!(find_detail::<RetryInfo>(&err), Some(retry));
-//! if let Some(retry) = find_detail::<RetryInfo>(&err) {
+//! # assert_eq!(err.detail::<RetryInfo>(), Some(retry));
+//! if let Some(retry) = err.detail::<RetryInfo>() {
 //!     // back off for retry.retry_delay
 //! #   let _ = retry;
 //! }
 //! ```
+//!
+//! A received detail's name is bare over Connect and
+//! `type.googleapis.com/`-prefixed over gRPC and gRPC-Web, and its value may
+//! be padded or unpadded base64; `detail` accepts either of each.
+//! [`ErrorDetail::decode`] reads one detail and, unlike `detail`, reports a
+//! detail that is named for the type but cannot be decoded.
 //!
 //! # Using these types from generated code
 //!
@@ -188,7 +178,8 @@
 //! [googleapis]: https://github.com/googleapis/googleapis
 //! [proto-only build]: https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md#proto-only-no-json-builds
 //! [`ErrorDetail::from_message`]: https://docs.rs/connectrpc/latest/connectrpc/error/struct.ErrorDetail.html#method.from_message
-//! [`ErrorDetail::value`]: https://docs.rs/connectrpc/latest/connectrpc/error/struct.ErrorDetail.html#structfield.value
+//! [`ErrorDetail::decode`]: https://docs.rs/connectrpc/latest/connectrpc/error/struct.ErrorDetail.html#method.decode
+//! [`ConnectError::detail`]: https://docs.rs/connectrpc/latest/connectrpc/error/struct.ConnectError.html#method.detail
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

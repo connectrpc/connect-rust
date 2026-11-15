@@ -1,0 +1,14 @@
+kind: Added
+body: |-
+    **`ErrorDetail::decode` and `ConnectError::detail` read a typed error
+    detail.** `ErrorDetail::decode::<M>()` is the counterpart of
+    `ErrorDetail::from_message`: it returns `Ok(None)` when the detail's name
+    is not `M::FULL_NAME` (the bare form Connect carries and the
+    `type.googleapis.com/` form gRPC and gRPC-Web carry both match),
+    `Ok(Some(message))` when it decodes (padded or unpadded base64, an absent
+    value being the empty message), and an `ErrorDetailDecodeError` when the
+    name matches but the value is not valid. `ConnectError::detail::<M>()`
+    returns the first detail that decodes as `M`, so reading a
+    `google.rpc.RetryInfo` off a received error no longer needs a hand-written
+    lookup or a direct `base64` dependency.
+time: 2026-11-15T12:00:00.000000000+00:00
