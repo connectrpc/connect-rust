@@ -2358,6 +2358,28 @@ async fn greet(
 }
 ```
 
+### Preferring an encoding in a client
+
+A client lists every encoding in its `CompressionRegistry` in the
+`accept-encoding` (Connect) or `grpc-accept-encoding` (gRPC, gRPC-Web)
+request header, and a server answers with the first one in that list
+that it supports. The list is sorted by name, so a default client asks
+for `gzip` ahead of `zstd`. To prefer `zstd` while still accepting
+`gzip`, state the order on the registry:
+
+```rust
+use connectrpc::CompressionRegistry;
+use connectrpc::client::ClientConfig;
+
+let registry = CompressionRegistry::default().with_preference(["zstd", "gzip"]);
+let config = ClientConfig::new(uri).with_compression(registry);
+// sends `accept-encoding: zstd, gzip`
+```
+
+Encodings the registry has but the list leaves out follow it, sorted,
+and names with no registered provider are skipped, so the same list
+works in a build without the `zstd` feature.
+
 ### Custom compression algorithms
 
 `CompressionRegistry` is pluggable. Implement `CompressionProvider`
