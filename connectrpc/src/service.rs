@@ -2773,7 +2773,7 @@ async fn handle_client_streaming_request<D, B>(
 where
     D: Dispatcher,
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     let request_stream = decode_request_body(
         body,
@@ -2930,7 +2930,7 @@ fn decode_request_body<B>(
 ) -> BoxStream<Result<Bytes, ConnectError>>
 where
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     Box::pin(RequestBodyStream {
         decoding: Some(DecodeState {
@@ -2947,7 +2947,7 @@ where
 struct RequestBodyStream<B>
 where
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     /// `None` once the stream has ended.
     decoding: Option<DecodeState<B>>,
@@ -2969,7 +2969,7 @@ struct DecodeState<B> {
 impl<B> RequestBodyStream<B>
 where
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     /// End the stream and drain the rest of the body. `end_stream` marks the
     /// END_STREAM case, after which any further request data is a protocol
@@ -2993,7 +2993,7 @@ where
 impl<B> Drop for RequestBodyStream<B>
 where
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         // The handler let go of the stream before it ended.
@@ -3004,7 +3004,7 @@ where
 impl<B> Stream for RequestBodyStream<B>
 where
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     type Item = Result<Bytes, ConnectError>;
 
@@ -3035,9 +3035,12 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    // The body is over, so there is nothing to drain. The code
-                    // is `internal` deliberately, for parity with the unary
-                    // body-read path (`collect_body_limited`): the same
+                    // The body is over, so there is nothing to drain. An error
+                    // the body carries as a `ConnectError` (or wraps one) is
+                    // forwarded as it is, and a `LengthLimitError` is
+                    // `resource_exhausted`, as on the unary path
+                    // (`collect_body_limited`). Anything else is `internal`,
+                    // deliberately, for parity with that path: the same
                     // transport failure reports the same code regardless of
                     // RPC shape. connect-go reports `unknown` here; if the
                     // attribution is ever revisited (a broken inbound
@@ -3045,9 +3048,7 @@ where
                     // together.
                     tracing::debug!(error = %e, "request body error, ending request stream");
                     this.decoding = None;
-                    return Poll::Ready(Some(Err(ConnectError::internal(format!(
-                        "failed to read request body: {e}"
-                    )))));
+                    return Poll::Ready(Some(Err(body_read_error(&e))));
                 }
                 None => {
                     // A client may end the body without an END_STREAM
@@ -3059,6 +3060,26 @@ where
             }
         }
     }
+}
+
+/// The error a request-body read failure reports to the handler. Walks the
+/// source chain: a [`ConnectError`] is forwarded as it is, a
+/// `LengthLimitError` (from a `Limited` body) is `resource_exhausted`, and
+/// anything else is `internal`.
+fn body_read_error(err: &(dyn std::error::Error + 'static)) -> ConnectError {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(connect) = e.downcast_ref::<ConnectError>() {
+            return connect.clone();
+        }
+        if e.downcast_ref::<http_body_util::LengthLimitError>()
+            .is_some()
+        {
+            return ConnectError::resource_exhausted("request body size exceeds limit");
+        }
+        cur = e.source();
+    }
+    ConnectError::internal(format!("failed to read request body: {err}"))
 }
 
 /// The drain of what a request stream left of its body: a future that reads
@@ -3091,7 +3112,7 @@ fn request_body_drain<B>(
 ) -> Option<impl Future<Output = ()> + Send + 'static>
 where
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut drained = Drained {
         bytes: 0,
@@ -3189,7 +3210,7 @@ async fn handle_bidi_streaming_request<D, B>(
 where
     D: Dispatcher,
     B: Body<Data = Bytes> + Send + 'static,
-    B::Error: std::fmt::Display + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     let request_stream = decode_request_body(
         body,
@@ -6377,6 +6398,115 @@ mod tests {
             request_stream.next().await.is_none(),
             "no further items after the body error"
         );
+    }
+
+    /// A body that yields one valid message and then an arbitrary error.
+    struct ErrorBody<E> {
+        sent: bool,
+        err: Option<E>,
+    }
+
+    impl<E: std::error::Error + Send + Sync + Unpin + 'static> Body for ErrorBody<E> {
+        type Data = Bytes;
+        type Error = E;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if !this.sent {
+                this.sent = true;
+                return Poll::Ready(Some(Ok(Frame::data(
+                    Envelope::data(Bytes::from_static(b"hello")).encode(),
+                ))));
+            }
+            Poll::Ready(this.err.take().map(Err))
+        }
+    }
+
+    /// The error the handler's request stream reports when the body fails
+    /// with `err` after one message.
+    async fn error_after_message<E>(err: E) -> ConnectError
+    where
+        E: std::error::Error + Send + Sync + Unpin + 'static,
+    {
+        let body = ErrorBody {
+            sent: false,
+            err: Some(err),
+        };
+        let mut stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        stream.next().await.unwrap().expect("first message");
+        stream.next().await.unwrap().expect_err("body error")
+    }
+
+    /// A body error that is a `ConnectError` reaches the handler unchanged.
+    #[tokio::test]
+    async fn test_body_reader_forwards_a_connect_error_from_the_body() {
+        let err = error_after_message(ConnectError::resource_exhausted("stream too large")).await;
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        assert_eq!(err.message.as_deref(), Some("stream too large"));
+    }
+
+    /// A `ConnectError` further down the source chain is found.
+    #[tokio::test]
+    async fn test_body_reader_finds_a_connect_error_in_the_source_chain() {
+        #[derive(Debug)]
+        struct Wrapper(ConnectError);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapped")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let err = error_after_message(Wrapper(ConnectError::unavailable("shedding"))).await;
+        assert_eq!(err.code, crate::error::ErrorCode::Unavailable);
+        assert_eq!(err.message.as_deref(), Some("shedding"));
+    }
+
+    /// A stream bounded in total with `http_body_util::Limited` reports
+    /// `resource_exhausted`, as the unary path does.
+    #[tokio::test]
+    async fn test_body_reader_maps_a_length_limit_to_resource_exhausted() {
+        let mut frames = Envelope::data(Bytes::from_static(b"hello"))
+            .encode()
+            .to_vec();
+        frames.extend_from_slice(&Envelope::data(Bytes::from_static(b"world")).encode());
+        // `Limited`'s error is a `Box<dyn Error>`, which is not itself an
+        // `Error`, so a server adapts it with a newtype that keeps the source.
+        #[derive(Debug)]
+        struct Boxed(Box<dyn std::error::Error + Send + Sync>);
+        impl std::fmt::Display for Boxed {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+        impl std::error::Error for Boxed {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.0)
+            }
+        }
+        let body = http_body_util::BodyExt::map_err(
+            http_body_util::Limited::new(Full::new(Bytes::from(frames)), 12),
+            Boxed,
+        );
+        let mut stream = decode_request_body(
+            body,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            None,
+            Arc::new(CompressionRegistry::new()),
+        );
+        let err = stream.next().await.unwrap().expect_err("limit error");
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
     }
 
     /// Once the stream has finished decoding (here: a clean END_STREAM), a

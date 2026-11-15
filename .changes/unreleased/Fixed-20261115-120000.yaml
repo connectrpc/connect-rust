@@ -1,0 +1,10 @@
+kind: Fixed
+body: |-
+    **A streaming request body that fails is no longer always `internal`**
+    ([#352]). The error the body fails with is searched along its source
+    chain: a `ConnectError` is forwarded as it is and an
+    `http_body_util::LengthLimitError` is `resource_exhausted`, as on the
+    unary path. Any other error stays `internal`.
+
+    [#352]: https://github.com/connectrpc/connect-rust/issues/352
+time: 2026-11-15T12:00:00.000000000+00:00
