@@ -1879,15 +1879,17 @@ fn deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
 /// its `Display` text goes in `message`, the typed error is retained for
 /// `downcast_ref`. Unlike [`map_transport_send_error`], a `ConnectError`
 /// found in the read error is not surfaced verbatim — the read failure is
-/// reported as this client's, with that error as its cause. Before the
-/// deadline its code is kept, though, since the transport that classified
-/// the failure knows its protocol's rule for it: a WebSocket that closes
-/// before the end of the stream is `unavailable`. That holds for the
-/// `deadline_exceeded` arm too — the deadline only explains
+/// reported as this client's, with that error as its cause. That holds for
+/// the `deadline_exceeded` arm too — the deadline only explains
 /// *why* the stream died, and the error that reported it (a reset, a closed
 /// connection) is still the most specific fact available. The deadline
 /// errors that stay source-less are those [`with_deadline`] synthesises
 /// when the local timer fires first; there is nothing to attach.
+///
+/// Before the deadline, the code of a `ConnectError` in the read error is
+/// kept, since the transport that classified the failure knows its
+/// protocol's rule for it: a WebSocket that closes before the end of the
+/// stream is `unavailable`.
 ///
 /// The bound is `Into<Box<dyn Error>>` rather than `Error` so that bodies
 /// whose error type is already the boxed form (`http_body_util::Limited`,
@@ -2592,9 +2594,10 @@ where
         )));
     }
 
-    let message =
-        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options());
-    report_decode(decode_report, &message);
+    let message = report_decode(
+        decode_report,
+        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options()),
+    );
     let message = message.map_err(&attach)?;
     drop(attach);
 
@@ -4724,9 +4727,10 @@ where
         &resp_headers,
     )?;
     // The trailers are parsed by now, so a decode failure reports them too.
-    let message =
-        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options());
-    report_decode(decode_report, &message);
+    let message = report_decode(
+        decode_report,
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options()),
+    );
     let message = message.map_err(with_response_metadata(&resp_headers, &trailers))?;
 
     Ok(UnaryResponse {
@@ -4950,18 +4954,26 @@ fn take_decode_report(extensions: &mut http::Extensions) -> Option<DecodeReport>
 
 /// Tell the transport behind `report`, if any, that a response message did
 /// not decode. A resource limit of this client's own is not the peer's fault.
-fn report_decode<T>(report: Option<DecodeReport>, result: &Result<T, ConnectError>) {
+/// Over WebSocket the RPC then fails with `invalid_argument` (§6.1).
+fn report_decode<T>(
+    report: Option<DecodeReport>,
+    result: Result<T, ConnectError>,
+) -> Result<T, ConnectError> {
     #[cfg(all(feature = "websocket", feature = "client", not(target_arch = "wasm32")))]
-    if let (Some(report), Err(err)) = (report, result)
-        && err.code == ErrorCode::Internal
-    {
-        report.fail(err);
+    if let Some(report) = report {
+        return result.map_err(|mut err| {
+            if err.code == ErrorCode::Internal {
+                report.fail(&err);
+                err.code = ErrorCode::InvalidArgument;
+            }
+            err
+        });
     }
     #[cfg(not(all(feature = "websocket", feature = "client", not(target_arch = "wasm32"))))]
     if let Some(never) = report {
-        let _ = result;
         match never {}
     }
+    result
 }
 
 /// Error response structure from ConnectRPC.

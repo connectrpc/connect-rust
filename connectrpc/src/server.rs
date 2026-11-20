@@ -2967,8 +2967,7 @@ where
 
     // Drop the listener (refuse new conns), then signal & drain existing ones.
     drop(listener);
-    // Errors only if every connection already finished (no receivers left),
-    // in which case there is nothing to drain.
+    // Errors only when nothing holds a receiver, so there is nothing to drain.
     let _ = global_shutdown_tx.send(true);
     while let Some(result) = connections.join_next().await {
         log_connection_task_result(result);

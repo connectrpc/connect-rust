@@ -38,6 +38,7 @@ impl Drop for DropFlag {
 
 fn router(hang_dropped: Flag) -> Router {
     let flood_dropped = Arc::clone(&hang_dropped);
+    let mirror_dropped = Arc::clone(&hang_dropped);
     Router::new()
         .route(
             SVC,
@@ -46,6 +47,16 @@ fn router(hang_dropped: Flag) -> Router {
                 if req.value == "fail" {
                     return Err(ConnectError::not_found("no such thing")
                         .with_trailers(trailer("x-why", "missing")));
+                }
+                if req.value == "connect-header" {
+                    return Ok(Response::new(req)
+                        .with_header("x-ok", "1")
+                        .with_header("connect-custom", "1"));
+                }
+                if req.value == "connect-trailer" {
+                    return Ok(Response::new(req)
+                        .with_trailer("x-ok", "1")
+                        .with_trailer("connect-custom", "1"));
                 }
                 let via = if ctx.extensions().get::<WebSocketRpc>().is_some() {
                     "ws"
@@ -116,6 +127,21 @@ fn router(hang_dropped: Flag) -> Router {
                 },
             ),
         )
+        .route_bidi_stream(
+            SVC,
+            "Mirror",
+            bidi_streaming_handler_fn(
+                move |_ctx: RequestContext, requests: crate::ServiceStream<StringValue>| {
+                    let guard = DropFlag(Arc::clone(&mirror_dropped));
+                    async move {
+                        Response::stream_ok(requests.map(move |req| {
+                            let _ = &guard;
+                            req
+                        }))
+                    }
+                },
+            ),
+        )
         .route_server_stream(
             SVC,
             "Flood",
@@ -140,6 +166,32 @@ fn router(hang_dropped: Flag) -> Router {
                 Response::ok(StringValue::default())
             }),
         )
+        .route_client_stream(
+            SVC,
+            "Spawn",
+            client_streaming_handler_fn(
+                |_ctx: RequestContext, mut requests: crate::ServiceStream<StringValue>| async move {
+                    tokio::spawn(async move {
+                        let mut tag = None;
+                        let outcome = loop {
+                            match requests.next().await {
+                                Some(Ok(req)) => {
+                                    tag.get_or_insert(req.value);
+                                }
+                                Some(Err(err)) => break Err(err.code),
+                                None => break Ok(()),
+                            }
+                        };
+                        SPAWNED
+                            .lock()
+                            .unwrap()
+                            .push((tag.unwrap_or_default(), outcome));
+                    });
+                    std::future::pending::<()>().await;
+                    Response::ok(StringValue::default())
+                },
+            ),
+        )
         .route(
             SVC,
             "Keep",
@@ -149,6 +201,11 @@ fn router(hang_dropped: Flag) -> Router {
             }),
         )
 }
+
+/// What `Spawn`'s detached readers saw at the end of their request streams,
+/// by the first message's value.
+type SpawnedOutcome = (String, Result<(), crate::ErrorCode>);
+static SPAWNED: std::sync::Mutex<Vec<SpawnedOutcome>> = std::sync::Mutex::new(Vec::new());
 
 /// Request extensions a handler keeps past its RPC.
 static KEPT: std::sync::Mutex<Vec<http::Extensions>> = std::sync::Mutex::new(Vec::new());
@@ -391,6 +448,39 @@ async fn effective_headers_join_handshake_and_metadata() {
     assert_eq!(code, Some(1000));
 }
 
+/// §7.4, §9: a server fails an RPC whose handler set a `connect-` header or
+/// trailer with `internal`, leaves the key out, and closes with 1000.
+#[tokio::test]
+async fn a_connect_response_key_fails_the_rpc() {
+    for (value, kind) in [("connect-header", "header"), ("connect-trailer", "trailer")] {
+        let (addr, _) = serve(WebSocketConfig::new().with_keep_alive(None)).await;
+        let mut ws = raw_connect_with(addr, &format!("/{SVC}/Echo"), "connectrpc.1+json", &[])
+            .await
+            .unwrap();
+        for message in [text("M[]"), text(&format!("B\"{value}\"")), text("C")] {
+            ws.send(message).await.unwrap();
+        }
+        let (received, close_code) = read_all(&mut ws).await;
+        assert_eq!(close_code, Some(1000), "{received:?}");
+        let Message::Text(metadata) = &received[0] else {
+            panic!("M must be text: {received:?}");
+        };
+        let end = end_stream(received.last().expect("an S message"));
+        assert_eq!(end["error"]["code"], "internal", "{received:?}");
+        assert_eq!(
+            end["error"]["message"],
+            format!("response {kind} \"connect-custom\" is reserved for the protocol")
+        );
+        assert!(!metadata.as_str().contains("connect-"), "{received:?}");
+        if kind == "header" {
+            assert_eq!(metadata.as_str(), r#"M[["x-ok","1"]]"#);
+            assert_eq!(received.len(), 2, "no B after a failed M: {received:?}");
+        } else {
+            assert_eq!(end["metadata"], serde_json::json!({"x-ok": ["1"]}));
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_undecodable_request_is_a_protocol_error() {
     for method in ["Echo", "Count", "Join", "Chat"] {
@@ -399,7 +489,17 @@ async fn an_undecodable_request_is_a_protocol_error() {
             "connectrpc.1+json",
             &[],
             vec![text("M[]"), text("B5"), text("C")],
-            "internal",
+            "invalid_argument",
+            1002,
+        )
+        .await;
+        // §6.1: an empty JSON payload goes to the codec, which rejects it.
+        expect_fault_at(
+            method,
+            "connectrpc.1+json",
+            &[],
+            vec![text("M[]"), text("B"), text("C")],
+            "invalid_argument",
             1002,
         )
         .await;
@@ -412,7 +512,7 @@ async fn an_undecodable_request_is_a_protocol_error() {
                 Message::Binary(Bytes::from_static(b"B\xff")),
                 text("C"),
             ],
-            "internal",
+            "invalid_argument",
             1002,
         )
         .await;
@@ -466,6 +566,48 @@ async fn oversized_message_is_resource_exhausted() {
             .unwrap()
             .contains("16 byte limit")
     );
+    assert_eq!(code, Some(1009));
+}
+
+#[tokio::test]
+async fn a_far_oversized_message_still_gets_its_close() {
+    let service = ConnectRpcService::new(router(Flag::default()))
+        .with_limits(crate::Limits::default().with_max_message_size(16))
+        .with_websocket(WebSocketConfig::new());
+    let bound = crate::Server::bind("127.0.0.1:0").await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    tokio::spawn(bound.serve_with_service(service));
+    let ws = raw_connect(addr, "/test.v1.EchoService/Chat", "connectrpc.1+json", None)
+        .await
+        .unwrap();
+    let (mut sink, mut stream) = ws.split();
+    sink.send(text("M[]")).await.unwrap();
+    // The server stops reading at the frame header and leaves the rest of
+    // this unread; it must not reset the connection over it.
+    let big = format!("B\"{}\"", "x".repeat(4 << 20));
+    let sender = tokio::spawn(async move {
+        let _ = sink.send(text(&big)).await;
+        sink
+    });
+    let mut code = None;
+    let mut saw_s = false;
+    while let Ok(Some(message)) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .map(|m| m.and_then(Result::ok))
+    {
+        match message {
+            Message::Close(frame) => {
+                code = frame.map(|f| u16::from(f.code));
+                break;
+            }
+            Message::Text(ref t) if t.starts_with('S') => {
+                saw_s = end_stream(&message)["error"]["code"] == "resource_exhausted";
+            }
+            _ => {}
+        }
+    }
+    let _ = sender.await;
+    assert!(saw_s, "no S");
     assert_eq!(code, Some(1009));
 }
 
@@ -557,6 +699,43 @@ async fn closing_before_s_cancels_the_handler() {
 }
 
 #[tokio::test]
+async fn a_dropped_connection_fails_a_detached_request_stream() {
+    let (addr, _) = serve(WebSocketConfig::new()).await;
+    for (tag, finish) in [("ended", true), ("dropped", false)] {
+        let mut ws = raw_connect(
+            addr,
+            "/test.v1.EchoService/Spawn",
+            "connectrpc.1+json",
+            None,
+        )
+        .await
+        .unwrap();
+        ws.send(text("M[]")).await.unwrap();
+        ws.send(text(&format!("B\"{tag}\""))).await.unwrap();
+        if finish {
+            ws.send(text("C")).await.unwrap();
+        }
+        // Let the handler start, so its reader is running when the client goes.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ws.close(None).await.unwrap();
+    }
+    for _ in 0..200 {
+        let seen = SPAWNED.lock().unwrap().clone();
+        if seen.len() == 2 {
+            let outcome = |tag: &str| seen.iter().find(|(t, _)| t == tag).map(|(_, o)| *o);
+            assert_eq!(outcome("ended"), Some(Ok(())), "{seen:?}");
+            assert!(matches!(outcome("dropped"), Some(Err(_))), "{seen:?}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the detached readers did not finish: {:?}",
+        SPAWNED.lock().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn handshake_failures_are_http_statuses() {
     let (addr, _) = serve(WebSocketConfig::new()).await;
     let status = |err: WsError| match err {
@@ -585,6 +764,10 @@ async fn handshake_failures_are_http_statuses() {
     .await
     .unwrap_err();
     assert_eq!(status(err), 403);
+    let err = raw_connect(addr, "/test.v1.EchoService/Nope", "connectrpc.1+json", None)
+        .await
+        .unwrap_err();
+    assert_eq!(status(err), 404);
     let same_origin = format!("https://{addr}");
     assert!(
         raw_connect(
@@ -654,6 +837,44 @@ async fn keep_alive_hangs_up_on_a_silent_client() {
     let (_, code) = read_all(&mut silent).await;
     assert_eq!(code, Some(1011));
     assert!(hang_dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn keep_alive_hangs_up_on_a_client_that_sends_but_never_reads() {
+    let config = WebSocketConfig::new()
+        .with_keep_alive(Some(Duration::from_millis(20)))
+        .with_keep_alive_timeout(Duration::from_millis(60))
+        .with_max_timeout(None);
+    let (addr, mirror_dropped) = serve(config).await;
+    let mut ws = raw_connect(
+        addr,
+        "/test.v1.EchoService/Mirror",
+        "connectrpc.1+json",
+        None,
+    )
+    .await
+    .unwrap();
+    ws.send(text("M[]")).await.unwrap();
+    // The echoes fill the socket, so the handler stops taking requests and
+    // the server stops reading; this client's sends then stall too.
+    let big = format!("B\"{}\"", "y".repeat(64 * 1024));
+    let sender = tokio::spawn(async move {
+        for _ in 0..512 {
+            if ws.send(text(&big)).await.is_err() {
+                break;
+            }
+        }
+        ws
+    });
+    for _ in 0..150 {
+        if mirror_dropped.load(Ordering::SeqCst) {
+            sender.abort();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sender.abort();
+    panic!("a client that stopped reading held its session");
 }
 
 #[tokio::test]

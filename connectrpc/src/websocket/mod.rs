@@ -22,7 +22,10 @@
 //!
 //! The upgrade needs an HTTP/1.1 connection whose server supports hyper
 //! upgrades: the built-in `Server`, `server::serve_connection`, and
-//! `axum::serve` all do. An RPC over WebSocket runs through the same
+//! `axum::serve` all do. In your own accept loop, serve connections with
+//! hyper-util's `serve_connection_with_upgrades`, or with `.with_upgrades()`
+//! on hyper's HTTP/1 connection; otherwise the handshake fails with a `500`.
+//! An RPC over WebSocket runs through the same
 //! interceptors, limits, and deadline policy as one over HTTP. Handlers and
 //! interceptors can tell the two apart with the [`WebSocketRpc`] request
 //! extension.
@@ -60,8 +63,9 @@
 //! The server ends every RPC whose client is still connected with an `S`
 //! message, and closes with:
 //!
-//! - 1000 after a normal end, an error from the handler, or an RPC refused
-//!   in-band (a bad or zero `connect-timeout-ms`, a deadline);
+//! - 1000 after a normal end, an error from the handler, a handler that set
+//!   a `connect-` response header or trailer (reported as `internal`), or an
+//!   RPC refused in-band (a bad or zero `connect-timeout-ms`, a deadline);
 //! - 1001 when the server shuts down;
 //! - 1002 after a protocol error by the client, including a request message
 //!   that does not decode, and 1009 after an oversized message;
@@ -69,7 +73,8 @@
 //!   response from the service), and, with no `S`, for a client that
 //!   stopped answering Pings.
 //!
-//! The `S` reports a client's protocol mistake as `internal`, and an
+//! The `S` reports a client's protocol mistake as `internal`, except a
+//! request message that does not decode, which is `invalid_argument`, and an
 //! oversized message as `resource_exhausted`. A text message that is not
 //! UTF-8 closes the connection with 1007 and no `S`.
 //!
@@ -77,7 +82,8 @@
 //! caller gives up on it. When the server broke the protocol, it closes with
 //! 3102, since a browser cannot send 1002, and the Close reason says how;
 //! the RPC fails with `internal`. A response message that does not decode
-//! counts, for unary and client-streaming RPCs. The client closes with 1007
+//! counts, for unary and client-streaming RPCs, but fails the RPC with
+//! `invalid_argument`. The client closes with 1007
 //! after a text message that is not UTF-8, and 1009 after an oversized message,
 //! which fails the RPC with `resource_exhausted`. A local failure closes
 //! with 3102 and the reason "client error". A connection that ends without
@@ -269,9 +275,22 @@ impl WebSocketConfig {
     /// because this deployment's own infrastructure sets them. A trailing
     /// `*` matches any suffix; matching ignores ASCII case.
     ///
-    /// The default is `Forwarded`, `X-Forwarded-*` and `X-Real-IP`. This
-    /// list does not affect the names the Fetch standard forbids or the ones
-    /// the protocol controls; those are always reserved.
+    /// The default is `Forwarded`, `X-Forwarded-*` and `X-Real-IP`. The
+    /// names given replace it, so list the defaults too when adding a name;
+    /// leaving them out lets a browser forge them:
+    ///
+    /// ```
+    /// # use connectrpc::websocket::WebSocketConfig;
+    /// let config = WebSocketConfig::new().with_infrastructure_headers([
+    ///     "forwarded",
+    ///     "x-forwarded-*",
+    ///     "x-real-ip",
+    ///     "x-tenant-id",
+    /// ]);
+    /// ```
+    ///
+    /// This list does not affect the names the Fetch standard forbids or the
+    /// ones the protocol controls; those are always reserved.
     #[must_use]
     pub fn with_infrastructure_headers<I, S>(mut self, names: I) -> Self
     where

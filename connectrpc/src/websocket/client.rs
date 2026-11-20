@@ -24,7 +24,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as FrameConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -300,6 +299,7 @@ async fn start(
         outbound: Outbound::default(),
         codec: call.codec,
         max_message_size: options.max_message_size,
+        read_failed: false,
     };
     crate::spawn_detached(session.run(call, metadata, body, head_tx));
     head_rx.await.unwrap_or_else(|_| {
@@ -332,9 +332,9 @@ fn websocket_uri(uri: &Uri, timeout: Option<&str>) -> Result<Uri, ConnectError> 
         target.push('=');
         target.push_str(timeout);
     }
-    target
-        .parse()
-        .map_err(|e| ConnectError::internal(format!("invalid WebSocket URI {target:?}: {e}")))
+    target.parse().map_err(|e| {
+        ConnectError::invalid_argument(format!("invalid WebSocket URI {target:?}: {e}"))
+    })
 }
 
 /// Request headers the protocol carries some other way, or that describe
@@ -363,12 +363,15 @@ type Socket = WebSocketStream<Box<dyn Io>>;
 async fn connect(options: &Options, uri: Uri, codec: CodecFormat) -> Result<Socket, ConnectError> {
     let host = uri
         .host()
-        .ok_or_else(|| ConnectError::internal("WebSocket URI has no host"))?;
+        .ok_or_else(|| ConnectError::invalid_argument("WebSocket URI has no host"))?;
     let host = host
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_owned();
     let secure = uri.scheme_str() == Some("wss");
+    if secure && !has_tls(options) {
+        return Err(no_tls());
+    }
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
@@ -387,18 +390,14 @@ async fn connect(options: &Options, uri: Uri, codec: CodecFormat) -> Result<Sock
         header::SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(wire::subprotocol_token(codec)),
     );
-    let max = options.max_message_size.saturating_add(1);
-    let config = FrameConfig::default()
-        .max_message_size(Some(max))
-        .max_frame_size(Some(max));
+    let config = wire::frame_config(options.max_message_size);
     // tungstenite fails the handshake, before the socket opens, when the
     // server echoes no subprotocol or one that was not offered (§4.3).
     let (mut ws, response) = tokio_tungstenite::client_async_with_config(request, io, Some(config))
         .await
         .map_err(handshake_error)?;
-    // Compression is never offered, so any negotiated extension is the
-    // server imposing one, which this binding forbids without
-    // no_context_takeover in both directions (§10).
+    // Compression is never offered, so a negotiated extension is the server
+    // imposing one, which §10 forbids without no_context_takeover.
     if let Some(extensions) = response.headers().get(header::SEC_WEBSOCKET_EXTENSIONS) {
         let message = format!(
             "the server negotiated the WebSocket extension {:?}, which was not offered",
@@ -439,8 +438,18 @@ async fn tls_wrap(
     Err(no_tls())
 }
 
+fn has_tls(options: &Options) -> bool {
+    #[cfg(feature = "client-tls")]
+    return options.tls.is_some();
+    #[cfg(not(feature = "client-tls"))]
+    {
+        let _ = options;
+        false
+    }
+}
+
 fn no_tls() -> ConnectError {
-    ConnectError::internal(
+    ConnectError::invalid_argument(
         "wss:// needs a TLS transport; build it with WebSocketTransport::with_tls \
          (requires the client-tls feature)",
     )
@@ -531,6 +540,8 @@ struct Session {
     outbound: Outbound,
     codec: CodecFormat,
     max_message_size: usize,
+    /// tungstenite reads nothing more after an error.
+    read_failed: bool,
 }
 
 /// Where the RPC's response goes.
@@ -615,7 +626,7 @@ impl Session {
                         request.leftover = Bytes::new();
                     }
                 }
-                permit = reserve(delivery.body.as_ref()), if delivery.pending.is_some() => {
+                permit = wire::reserve(delivery.body.as_ref()), if delivery.pending.is_some() => {
                     match (permit, delivery.pending.take()) {
                         (Some(permit), Some(item)) => {
                             permit.send(Ok(item));
@@ -627,7 +638,10 @@ impl Session {
                     let message = match message {
                         Some(Ok(Message::Close(frame))) => return connection_lost(frame),
                         Some(Ok(message)) => message,
-                        Some(Err(err)) => return self.read_error(err),
+                        Some(Err(err)) => {
+                            self.read_failed = true;
+                            return self.read_error(err);
+                        }
                         None => return connection_lost(None),
                     };
                     let message = match wire::classify(message, Side::Client, self.codec) {
@@ -743,7 +757,7 @@ impl Session {
                 "a text message is not valid UTF-8",
             )),
             WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => connection_lost(None),
-            WsError::Protocol(err) => End::from(protocol_error(&format!(
+            WsError::Protocol(err) => End::from(WireError::protocol(format!(
                 "WebSocket protocol violation: {err}"
             ))),
             WsError::Io(err) => End::Fail(
@@ -777,22 +791,25 @@ impl Session {
             }
             End::Abandoned => (None, Some((close_code::NORMAL, String::new()))),
         };
+        // The socket is released before the outcome is delivered.
         if let Some((code, reason)) = close {
-            let frame = wire::close_frame(code, &reason);
-            self.outbound.push(Message::Close(Some(frame)));
-            let written = tokio::time::timeout(
-                crate::service::DRAIN_TIMEOUT,
-                self.outbound.write(&mut self.sink),
-            )
-            .await;
+            let Self {
+                mut sink,
+                stream,
+                mut outbound,
+                read_failed,
+                ..
+            } = self;
+            outbound.push(Message::Close(Some(wire::close_frame(code, &reason))));
+            let written =
+                tokio::time::timeout(crate::service::DRAIN_TIMEOUT, outbound.write(&mut sink))
+                    .await;
             if matches!(written, Ok(Ok(()))) {
-                let _ = tokio::time::timeout(crate::service::DRAIN_TIMEOUT, async {
-                    while let Some(Ok(_)) = self.stream.next().await {}
-                })
-                .await;
+                wire::drain(sink, stream, read_failed).await;
             }
+        } else {
+            drop(self);
         }
-        drop(self);
         deliver(&mut delivery, error).await;
     }
 }
@@ -863,7 +880,7 @@ fn receive(
 ) -> Result<bool, End> {
     let Some(headers) = &received.headers else {
         if message.marker != Marker::Metadata {
-            return Err(protocol_error(
+            return Err(WireError::protocol(
                 "the first message must be a Leading-Metadata ('M') message",
             )
             .into());
@@ -872,9 +889,7 @@ fn receive(
         if !call.unary {
             let (tx, rx) = mpsc::channel(RESPONSE_QUEUE);
             let mut response = streaming_head(&headers, call.codec, rx);
-            let (report, verdict) = DecodeReport::new();
-            response.extensions_mut().insert(report);
-            delivery.verdict = Some(verdict);
+            watch_decoding(&mut response, delivery);
             let delivered = delivery
                 .head
                 .take()
@@ -888,7 +903,9 @@ fn receive(
         return Ok(false);
     };
     match message.marker {
-        Marker::Metadata => Err(protocol_error("a second Leading-Metadata ('M') message").into()),
+        Marker::Metadata => {
+            Err(WireError::protocol("a second Leading-Metadata ('M') message").into())
+        }
         Marker::Body if call.unary => {
             if received.unary_message.is_some() {
                 received.extra_message = true;
@@ -898,18 +915,11 @@ fn receive(
             Ok(false)
         }
         Marker::Body => {
-            let item = wire::envelope(flags::DATA, &message.payload).map_err(internal)?;
-            delivery.pending = offer(delivery.body.as_ref(), item);
+            forward(delivery, flags::DATA, &message.payload)?;
             Ok(false)
         }
         Marker::ServerEnd if call.unary => {
-            let end =
-                crate::client::parse_connect_end_stream(&message.payload).map_err(|error| {
-                    WireError {
-                        fault: Fault::Protocol,
-                        error,
-                    }
-                })?;
+            let end = parse_end_stream(&message.payload)?;
             let mut response = if received.extra_message && end.error.is_none() {
                 Err(ConnectError::unimplemented(
                     "the server sent more than one message for a unary RPC",
@@ -923,9 +933,7 @@ fn receive(
                 )
             };
             if let Ok(response) = &mut response {
-                let (report, verdict) = DecodeReport::new();
-                response.extensions_mut().insert(report);
-                delivery.verdict = Some(verdict);
+                watch_decoding(response, delivery);
             }
             if let Some(head) = delivery.head.take() {
                 let _ = head.send(response);
@@ -933,22 +941,33 @@ fn receive(
             Ok(true)
         }
         Marker::ServerEnd => {
-            crate::client::parse_connect_end_stream(&message.payload).map_err(|error| {
-                WireError {
-                    fault: Fault::Protocol,
-                    error,
-                }
-            })?;
-            let item = wire::envelope(flags::END_STREAM, &message.payload).map_err(internal)?;
-            delivery.pending = offer(delivery.body.as_ref(), item);
+            parse_end_stream(&message.payload)?;
+            forward(delivery, flags::END_STREAM, &message.payload)?;
             Ok(true)
         }
-        Marker::ClientEnd => Err(protocol_error("'C' is not valid from a server").into()),
+        Marker::ClientEnd => Err(WireError::protocol("'C' is not valid from a server").into()),
     }
 }
 
-fn protocol_error(message: &str) -> WireError {
-    WireError::protocol(message)
+fn parse_end_stream(payload: &[u8]) -> Result<crate::client::ClientEndStreamResponse, WireError> {
+    crate::client::parse_connect_end_stream(payload).map_err(|error| WireError {
+        fault: Fault::Protocol,
+        error,
+    })
+}
+
+/// Queue a streaming response's message for the caller as an envelope.
+fn forward(delivery: &mut Delivery, flag: u8, payload: &[u8]) -> Result<(), End> {
+    let item = wire::envelope(flag, payload).map_err(internal)?;
+    delivery.pending = wire::offer(delivery.body.as_ref(), Ok(item)).and_then(Result::ok);
+    Ok(())
+}
+
+/// Let the call path report whether it could decode `response`.
+fn watch_decoding<B>(response: &mut Response<B>, delivery: &mut Delivery) {
+    let (report, verdict) = DecodeReport::new();
+    response.extensions_mut().insert(report);
+    delivery.verdict = Some(verdict);
 }
 
 fn internal(err: ConnectError) -> End {
@@ -981,11 +1000,7 @@ fn connection_lost(frame: Option<CloseFrame>) -> End {
 
 fn metadata_headers(payload: &[u8]) -> Result<HeaderMap, WireError> {
     let mut headers = HeaderMap::new();
-    for (name, values) in decode_metadata(payload)? {
-        for value in values {
-            headers.append(name.clone(), value);
-        }
-    }
+    wire::append_metadata(&mut headers, decode_metadata(payload)?);
     Ok(headers)
 }
 
@@ -1044,19 +1059,6 @@ fn unary_response(
         HeaderValue::from_static(codec.content_type()),
     );
     Ok(response)
-}
-
-fn offer(tx: Option<&BodySender>, item: Bytes) -> Option<Bytes> {
-    match tx?.try_send(Ok(item)) {
-        Err(mpsc::error::TrySendError::Full(Ok(item))) => Some(item),
-        _ => None,
-    }
-}
-
-async fn reserve(
-    tx: Option<&BodySender>,
-) -> Option<mpsc::OwnedPermit<Result<Bytes, ConnectError>>> {
-    tx?.clone().reserve_owned().await.ok()
 }
 
 async fn next_frame(body: &mut Option<ClientBody>) -> Option<Result<Frame<Bytes>, ConnectError>> {

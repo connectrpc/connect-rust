@@ -2,13 +2,20 @@
 //! the client transport: message markers, the Leading-Metadata JSON object,
 //! the names a client may not set, and the close codes.
 
+use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{Sink, SinkExt};
+use futures::stream::{SplitSink, SplitStream};
+use futures::{Sink, SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::sync::mpsc;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as FrameConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Utf8Bytes};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -94,6 +101,15 @@ impl WireError {
     /// A protocol error described by `message`.
     pub(crate) fn protocol(message: impl Into<String>) -> Self {
         Self::new(Fault::Protocol, message)
+    }
+
+    /// A `B` payload that did not decode: a protocol error, but reported as
+    /// `invalid_argument` to match Connect over HTTP (§6.1).
+    pub(crate) fn undecodable(message: impl Into<String>) -> Self {
+        Self {
+            fault: Fault::Protocol,
+            error: ConnectError::invalid_argument(message),
+        }
     }
 }
 
@@ -186,11 +202,6 @@ pub(crate) fn classify(
         Marker::ClientEnd if !payload.is_empty() => {
             return Err(WireError::protocol("'C' message carries a payload"));
         }
-        Marker::Body if !binary && payload.is_empty() => {
-            return Err(WireError::protocol(
-                "text 'B' message has no payload; an empty JSON message is {}",
-            ));
-        }
         _ => {}
     }
     Ok(Some(WireMessage { marker, payload }))
@@ -243,13 +254,20 @@ pub(crate) fn encode_json(marker: Marker, payload: &[u8]) -> Message {
 #[derive(Default)]
 pub(crate) struct Outbound {
     queue: VecDeque<Message>,
+    queued_bytes: usize,
     flushing: bool,
 }
 
 impl Outbound {
     /// Whether nothing is queued, so the caller may produce more.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// The payload bytes queued and not yet handed to the sink.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.queued_bytes
     }
 
     /// Whether there is anything to write or flush.
@@ -258,6 +276,7 @@ impl Outbound {
     }
 
     pub(crate) fn push(&mut self, message: Message) {
+        self.queued_bytes += message.len();
         self.queue.push_back(message);
     }
 
@@ -265,6 +284,7 @@ impl Outbound {
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
+        self.queued_bytes = 0;
     }
 
     /// Write and flush everything queued.
@@ -279,6 +299,7 @@ impl Outbound {
         while !self.queue.is_empty() {
             ready!(sink.poll_ready_unpin(cx))?;
             if let Some(message) = self.queue.pop_front() {
+                self.queued_bytes -= message.len();
                 sink.start_send_unpin(message)?;
                 self.flushing = true;
             }
@@ -294,6 +315,94 @@ impl Outbound {
     {
         std::future::poll_fn(|cx| self.poll_write(sink, cx)).await
     }
+}
+
+/// The frame limits for messages of up to `max_message_size` bytes, plus
+/// one for the marker.
+pub(crate) fn frame_config(max_message_size: usize) -> FrameConfig {
+    let max = max_message_size.saturating_add(1);
+    FrameConfig::default()
+        .max_message_size(Some(max))
+        .max_frame_size(Some(max))
+}
+
+/// Queue `item` for the peer's side of the RPC. Returns it back when the
+/// queue is full, so the caller holds it and stops reading until there is
+/// room. A receiver that has gone gets nothing more.
+pub(crate) fn offer<T>(tx: Option<&mpsc::Sender<T>>, item: T) -> Option<T> {
+    match tx?.try_send(item) {
+        Err(mpsc::error::TrySendError::Full(item)) => Some(item),
+        _ => None,
+    }
+}
+
+pub(crate) async fn reserve<T>(tx: Option<&mpsc::Sender<T>>) -> Option<mpsc::OwnedPermit<T>> {
+    tx?.clone().reserve_owned().await.ok()
+}
+
+/// Fail an End-of-Stream payload whose metadata has a `connect-` key, which a
+/// server must not send (§9): the keys are left out, and the error `error`
+/// builds from the first key replaces the payload's. `None` if there is none.
+pub(crate) fn fail_connect_metadata(
+    json: &[u8],
+    error: impl FnOnce(&str) -> Bytes,
+) -> Option<Bytes> {
+    if !json.windows(9).any(|w| w == b"\"connect-") {
+        return None;
+    }
+    let mut value = serde_json::from_slice::<serde_json::Value>(json).ok()?;
+    let metadata = value.get_mut("metadata")?.as_object_mut()?;
+    let key = metadata
+        .keys()
+        .find(|key| key.starts_with("connect-"))?
+        .clone();
+    metadata.retain(|key, _| !key.starts_with("connect-"));
+    let error = serde_json::from_slice::<serde_json::Value>(&error(&key)).ok()?;
+    value["error"] = error.get("error")?.clone();
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+/// An End-of-Stream payload without the `connect-` metadata keys no peer
+/// may send (§9). It is parsed only when one may be present.
+pub(crate) fn without_connect_metadata(json: Bytes) -> Bytes {
+    if !json.windows(9).any(|w| w == b"\"connect-") {
+        return json;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&json) else {
+        return json;
+    };
+    if let Some(metadata) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        metadata.retain(|key, _| !key.starts_with("connect-"));
+    }
+    serde_json::to_vec(&value).map_or(json, Bytes::from)
+}
+
+/// Read and discard until the peer closes or the drain window passes, so
+/// that a TCP reset over unread data cannot destroy what was sent (§13.2),
+/// and so that tungstenite answers the peer's Close. After a read error
+/// tungstenite reads nothing more, so the raw connection is drained instead.
+pub(crate) async fn drain<T>(
+    sink: SplitSink<WebSocketStream<T>, Message>,
+    mut stream: SplitStream<WebSocketStream<T>>,
+    mut read_failed: bool,
+) where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(crate::service::DRAIN_TIMEOUT, async {
+        while !read_failed {
+            match stream.next().await {
+                Some(Ok(_)) => {}
+                Some(Err(_)) => read_failed = true,
+                None => return,
+            }
+        }
+        let Ok(mut ws) = stream.reunite(sink) else {
+            return;
+        };
+        let mut buf = [0; 8192];
+        while matches!(ws.get_mut().read(&mut buf).await, Ok(n) if n > 0) {}
+    })
+    .await;
 }
 
 /// Frame `payload` as a Connect envelope with `flag`.
@@ -316,6 +425,14 @@ pub(crate) fn envelope(flag: u8, payload: &[u8]) -> Result<Bytes, ConnectError> 
 // Leading-Metadata
 // ============================================================================
 
+/// The most values a Leading-Metadata message may carry. It keeps a peer's
+/// metadata well inside a `HeaderMap`'s capacity, past which it panics.
+pub(crate) const MAX_METADATA_VALUES: usize = 1024;
+
+/// The most entries and strings that metadata within [`MAX_METADATA_VALUES`]
+/// can hold: one entry and key per value.
+const MAX_METADATA_ITEMS: usize = 3 * MAX_METADATA_VALUES;
+
 /// Decode a Leading-Metadata payload into header entries, enforcing §7.3.1:
 /// an array of entries, each a key and at least one value, keys that are
 /// lower-case field names and appear once, and values of visible ASCII,
@@ -323,16 +440,22 @@ pub(crate) fn envelope(flag: u8, payload: &[u8]) -> Result<Bytes, ConnectError> 
 ///
 /// A `-bin` value is not checked for base64 here: the spec leaves that
 /// to the application that decodes it.
-/// The most values a Leading-Metadata message may carry. It keeps a peer's
-/// metadata well inside a `HeaderMap`'s capacity, past which it panics.
-pub(crate) const MAX_METADATA_VALUES: usize = 1024;
-
 pub(crate) fn decode_metadata(
     payload: &[u8],
 ) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, WireError> {
-    let raw: Vec<Vec<String>> = serde_json::from_slice(payload).map_err(|e| {
-        WireError::protocol(format!("metadata is not an array of string arrays: {e}"))
-    })?;
+    let budget = Cell::new(MAX_METADATA_ITEMS);
+    let mut parser = serde_json::Deserializer::from_slice(payload);
+    let raw = serde::de::DeserializeSeed::deserialize(Entries(&budget), &mut parser)
+        .and_then(|raw| parser.end().map(|()| raw))
+        .map_err(|e| {
+            if budget.get() == 0 {
+                return WireError::new(
+                    Fault::TooLarge,
+                    format!("metadata has more than {MAX_METADATA_VALUES} values"),
+                );
+            }
+            WireError::protocol(format!("metadata is not an array of string arrays: {e}"))
+        })?;
     let total: usize = raw.iter().map(|entry| entry.len().saturating_sub(1)).sum();
     if total > MAX_METADATA_VALUES {
         return Err(WireError::new(
@@ -374,6 +497,85 @@ pub(crate) fn decode_metadata(
         entries.push((name, values));
     }
     Ok(entries)
+}
+
+/// Add decoded metadata to `headers`, keeping each key's values in order.
+pub(crate) fn append_metadata(
+    headers: &mut HeaderMap,
+    metadata: Vec<(HeaderName, Vec<HeaderValue>)>,
+) {
+    for (name, values) in metadata {
+        for value in values {
+            headers.append(name.clone(), value);
+        }
+    }
+}
+
+/// Parses the metadata array, failing once it has taken more entries and
+/// strings than the budget allows, so that a peer cannot make it allocate
+/// many times the payload's size.
+struct Entries<'a>(&'a Cell<usize>);
+
+/// One entry's strings, charged to the same budget.
+struct Strings<'a>(&'a Cell<usize>);
+
+fn charge<E: serde::de::Error>(budget: &Cell<usize>) -> Result<(), E> {
+    let left = budget
+        .get()
+        .checked_sub(1)
+        .ok_or_else(|| E::custom("too many items"))?;
+    budget.set(left);
+    Ok(())
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Entries<'_> {
+    type Value = Vec<Vec<String>>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Entries<'_> {
+    type Value = Vec<Vec<String>>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an array of string arrays")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(entry) = seq.next_element_seed(Strings(self.0))? {
+            charge(self.0)?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Strings<'_> {
+    type Value = Vec<String>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Strings<'_> {
+    type Value = Vec<String>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an array of strings")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut strings = Vec::new();
+        while let Some(string) = seq.next_element::<String>()? {
+            charge(self.0)?;
+            strings.push(string);
+        }
+        Ok(strings)
+    }
 }
 
 /// A metadata value: visible ASCII, space and tab only, with surrounding
@@ -660,7 +862,6 @@ mod tests {
     #[test]
     fn classify_checks_payload_presence() {
         for (message, side) in [
-            (text("B"), Side::Client),
             (text("M"), Side::Client),
             (text("S"), Side::Client),
             (text("C{}"), Side::Server),
@@ -669,6 +870,8 @@ mod tests {
             assert_eq!(err.fault, Fault::Protocol);
         }
         assert!(classify(text("C"), Side::Server, CodecFormat::Json).is_ok());
+        // An empty body is the codec's to reject (§6.1).
+        assert!(classify(text("B"), Side::Client, CodecFormat::Json).is_ok());
     }
 
     #[test]
@@ -744,6 +947,35 @@ mod tests {
         let err = decode_metadata(payload.as_bytes()).unwrap_err();
         assert_eq!(err.fault, Fault::TooLarge);
         assert_eq!(err.error.code, ErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn end_stream_metadata_loses_connect_keys() {
+        let json = Bytes::from_static(
+            br#"{"error":{"code":"internal","message":"\"connect-x\""},"metadata":{"connect-a":["1"],"x":["2"]}}"#,
+        );
+        let out: serde_json::Value =
+            serde_json::from_slice(&without_connect_metadata(json)).unwrap();
+        assert_eq!(out["metadata"], serde_json::json!({"x": ["2"]}));
+        assert_eq!(out["error"]["message"], "\"connect-x\"");
+        let plain = Bytes::from_static(br#"{"metadata":{"x":["2"]}}"#);
+        assert_eq!(without_connect_metadata(plain.clone()), plain);
+    }
+
+    #[test]
+    fn decode_metadata_stops_parsing_at_the_item_budget() {
+        // Entries with no values, which the value count alone would not see.
+        for entry in ["[]", r#"[""]"#] {
+            let payload = format!("[{}]", vec![entry; MAX_METADATA_ITEMS + 1].join(","));
+            let err = decode_metadata(payload.as_bytes()).unwrap_err();
+            assert_eq!(err.fault, Fault::TooLarge, "{entry}");
+        }
+        let one_entry = format!(
+            r#"[["k",{}]]"#,
+            vec![r#""v""#; MAX_METADATA_ITEMS].join(",")
+        );
+        let err = decode_metadata(one_entry.as_bytes()).unwrap_err();
+        assert_eq!(err.fault, Fault::TooLarge);
     }
 
     #[test]

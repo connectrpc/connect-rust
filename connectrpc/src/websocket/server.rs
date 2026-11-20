@@ -14,9 +14,9 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -33,7 +33,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig as FrameConfig};
+use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tower::Service;
 
@@ -47,17 +47,23 @@ use crate::codec::CodecFormat;
 use crate::dispatcher::Dispatcher;
 use crate::envelope::{EnvelopeAssembler, flags};
 use crate::error::ConnectError;
-use crate::service::{ConnectRpcBody, ConnectRpcService, DRAIN_TIMEOUT, end_stream_error_json};
+use crate::service::{
+    ConnectRpcBody, ConnectRpcService, DRAIN_TIMEOUT, end_stream_error_json, error_response_either,
+};
 
 /// How many request messages may wait for the handler, beyond the one the
 /// session holds, before it stops reading the connection. Each can be up to
 /// the message size limit, so this stays small.
 const REQUEST_QUEUE: usize = 1;
 
+/// About how many response bytes are queued before they are written and
+/// flushed together.
+const WRITE_BATCH: usize = 64 * 1024;
+
 /// Request extension marking a synthesized request whose unary method may be
 /// served with streaming framing. The service reports through it whether the
 /// RPC ended because a request message did not decode, which on a WebSocket
-/// is a protocol error (§6.1) rather than the handler's `invalid_argument`.
+/// is a protocol error (§6.1): still `invalid_argument`, but closed with 1002.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WebSocketDispatch {
     undecodable: Arc<OnceLock<String>>,
@@ -260,6 +266,16 @@ where
             "cross-origin WebSocket handshake refused",
         );
     }
+    if service
+        .dispatcher()
+        .lookup(procedure.trim_start_matches('/'))
+        .is_none()
+    {
+        return error_response_either(
+            ConnectError::unimplemented(format!("method not found: {procedure}"))
+                .with_http_status(StatusCode::NOT_FOUND),
+        );
+    }
     let Some(on_upgrade) = parts.extensions.remove::<OnUpgrade>() else {
         if parts.version == http::Version::HTTP_11 {
             tracing::error!(
@@ -325,8 +341,6 @@ enum End {
     Abort(u16, String),
     /// The connection ended before `S`: the client canceled.
     Canceled,
-    /// The client stopped answering; hang up with 1011.
-    Silent,
 }
 
 impl From<WireError> for End {
@@ -342,7 +356,6 @@ impl From<WireError> for End {
 
 type ResponseFuture =
     Pin<Box<dyn Future<Output = Result<Response<ConnectRpcBody>, Infallible>> + Send>>;
-type RequestItem = Result<Bytes, Canceled>;
 type Socket = WebSocketStream<TokioIo<Upgraded>>;
 
 async fn run_session<D: Dispatcher>(
@@ -364,11 +377,7 @@ async fn run_session<D: Dispatcher>(
         .lookup(path)
         .and_then(|desc| desc.limits)
         .unwrap_or(*service.limits());
-    // One byte more than a message, for the marker.
-    let max = limits.max_message_size().saturating_add(1);
-    let frame_config = FrameConfig::default()
-        .max_message_size(Some(max))
-        .max_frame_size(Some(max));
+    let frame_config = wire::frame_config(limits.max_message_size());
     let ws: Socket =
         WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(frame_config))
             .await;
@@ -381,14 +390,21 @@ async fn run_session<D: Dispatcher>(
         dispatch: WebSocketDispatch::default(),
         sent_metadata: false,
         sent_end: false,
+        read_failed: false,
         max_message_size: limits.max_message_size(),
     };
     let shutdown = guard.as_ref().map(|guard| guard.0.0.shutdown.clone());
+    let procedure = handshake.procedure.clone();
     let driven = AssertUnwindSafe(session.drive(service, handshake, shutdown))
         .catch_unwind()
         .await;
-    let end = driven.unwrap_or_else(|_| {
-        tracing::error!("a WebSocket RPC handler panicked");
+    let end = driven.unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("handler panicked");
+        tracing::error!(procedure, "a WebSocket RPC handler panicked: {message}");
         End::Fail(
             ConnectError::internal("internal server error"),
             close_code::INTERNAL_ERROR,
@@ -407,17 +423,22 @@ struct Session {
     sent_metadata: bool,
     /// `S` is queued, so nothing may follow it but the close.
     sent_end: bool,
+    /// tungstenite reads nothing more after an error.
+    read_failed: bool,
     max_message_size: usize,
 }
 
 /// Request-side state: what the client has sent and where it goes.
 #[derive(Default)]
 struct Inbound {
-    tx: Option<mpsc::Sender<RequestItem>>,
+    tx: Option<mpsc::Sender<Bytes>>,
     /// A message waiting for room in the handler's queue. While one waits,
     /// the connection is not read.
     pending: Option<Bytes>,
     client_done: bool,
+    /// Shared with the request body, so that it can tell a `C` from a
+    /// connection that ended.
+    client_ended: Arc<AtomicBool>,
 }
 
 /// Response-side state: the handler's future, then its body.
@@ -437,34 +458,17 @@ impl Session {
     async fn drive<D: Dispatcher>(
         &mut self,
         service: ConnectRpcService<D>,
-        handshake: Handshake,
+        mut handshake: Handshake,
         mut shutdown: Option<watch::Receiver<bool>>,
     ) -> End {
-        let config = Arc::clone(&handshake.config);
-        let client_timeout = match handshake.timeout {
-            Ok(Some(Duration::ZERO)) => {
-                return End::Fail(
-                    ConnectError::deadline_exceeded("the client's deadline was zero"),
-                    close_code::NORMAL,
-                );
-            }
-            Ok(timeout) => timeout,
+        let (deadline, opening_deadline) = match handshake.deadlines() {
+            Ok(deadlines) => deadlines,
             Err(err) => return End::Fail(err, close_code::NORMAL),
         };
-        let limit = [client_timeout, config.max_timeout]
-            .into_iter()
-            .flatten()
-            .min();
-        let deadline = limit.and_then(|limit| handshake.accepted_at.checked_add(limit));
-        let opening_deadline = config
-            .opening_timeout
-            .and_then(|timeout| handshake.accepted_at.checked_add(timeout))
-            .filter(|opening| deadline.is_none_or(|deadline| *opening < deadline));
         let mut deadline_sleep = std::pin::pin!(sleep_until(opening_deadline.or(deadline)));
         let mut opening = opening_deadline.is_some();
-
-        let mut pending_handshake = Some((handshake.headers, handshake.extensions));
-        let procedure = handshake.procedure;
+        let mut keep_alive = KeepAlive::new(&handshake.config);
+        let mut pending_handshake = Some(handshake);
         let mut inbound = Inbound::default();
         let mut out = Outflow {
             response: None,
@@ -473,15 +477,6 @@ impl Session {
             leftover: Bytes::new(),
             ended: false,
         };
-        let mut last_heard = Instant::now();
-        let silence_limit = config
-            .keep_alive_interval
-            .map(|interval| config.keep_alive_timeout.max(interval.saturating_mul(2)));
-        let mut keep_alive = config.keep_alive_interval.map(|interval| {
-            let mut ticker = tokio::time::interval_at(Instant::now() + interval, interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker
-        });
 
         loop {
             if let Err(end) = self.pump(&mut out) {
@@ -490,22 +485,16 @@ impl Session {
             if out.ended && !self.outbound.is_busy() {
                 return End::Finished;
             }
-            let can_produce = self.outbound.is_empty() && !out.ended;
+            let can_produce = self.outbound.queued_bytes() < WRITE_BATCH && !out.ended;
             tokio::select! {
                 biased;
                 () = &mut deadline_sleep => {
-                    if opening {
-                        return End::Fail(
-                            ConnectError::deadline_exceeded(
-                                "no Leading-Metadata message arrived before the opening timeout",
-                            ),
-                            close_code::NORMAL,
-                        );
-                    }
-                    return End::Fail(
-                        ConnectError::deadline_exceeded("the RPC deadline expired"),
-                        close_code::NORMAL,
-                    );
+                    let message = if opening {
+                        "no Leading-Metadata message arrived before the opening timeout"
+                    } else {
+                        "the RPC deadline expired"
+                    };
+                    return End::Fail(ConnectError::deadline_exceeded(message), close_code::NORMAL);
                 }
                 () = wait_shutdown(shutdown.as_mut()) => {
                     return End::Fail(
@@ -520,10 +509,10 @@ impl Session {
                         return End::Canceled;
                     }
                 }
-                permit = reserve(inbound.tx.as_ref()), if inbound.pending.is_some() => {
+                permit = wire::reserve(inbound.tx.as_ref()), if inbound.pending.is_some() => {
                     match (permit, inbound.pending.take()) {
                         (Some(permit), Some(item)) => {
-                            permit.send(Ok(item));
+                            permit.send(item);
                         }
                         // The handler dropped its request stream: what the
                         // client sends now goes nowhere.
@@ -534,11 +523,14 @@ impl Session {
                     }
                 }
                 message = self.stream.next(), if inbound.pending.is_none() => {
-                    last_heard = Instant::now();
+                    keep_alive.heard();
                     let message = match message {
                         Some(Ok(Message::Close(_))) | None => return End::Canceled,
                         Some(Ok(message)) => message,
-                        Some(Err(err)) => return self.read_error(err),
+                        Some(Err(err)) => {
+                            self.read_failed = true;
+                            return self.read_error(err);
+                        }
                     };
                     if out.ended {
                         continue;
@@ -548,80 +540,39 @@ impl Session {
                         Ok(None) => continue,
                         Err(err) => return err.into(),
                     };
-                    if let Some((headers, extensions)) = pending_handshake.take() {
-                        if message.marker != Marker::Metadata {
-                            return protocol_error(
-                                "the first message must be a Leading-Metadata ('M') message",
-                            )
-                            .into();
-                        }
-                        let request = match build_request(
-                            &procedure,
-                            headers,
-                            extensions,
-                            self.dispatch.clone(),
-                            &message.payload,
-                            &config,
-                            self.codec,
-                            deadline,
-                        ) {
-                            Ok(request) => request,
-                            Err(err) => return err.into(),
-                        };
-                        let (tx, rx) = mpsc::channel(REQUEST_QUEUE);
-                        inbound.tx = Some(tx);
-                        out.response = Some(service.clone().call(request.map(|()| RequestBody { rx })));
+                    let result = match pending_handshake.take() {
+                        Some(handshake) => self
+                            .open(&service, handshake, message, &mut inbound, deadline)
+                            .map(|response| out.response = Some(response)),
+                        None => receive(&mut inbound, message),
+                    };
+                    if let Err(end) = result {
+                        return end;
+                    }
+                    if out.response.is_some() && opening {
                         opening = false;
                         deadline_sleep.set(sleep_until(deadline));
-                        continue;
-                    }
-                    if let Err(end) = receive(&mut inbound, message) {
-                        return end;
                     }
                 }
                 result = next_response(&mut out.response), if can_produce => {
                     out.response = None;
-                    let (parts, response_body) = result.into_parts();
-                    if parts.status != StatusCode::OK {
-                        return End::Fail(
-                            ConnectError::internal(format!(
-                                "unexpected HTTP status {} from the service",
-                                parts.status
-                            )),
-                            close_code::INTERNAL_ERROR,
-                        );
+                    if let Err(end) = self.start_response(&mut out, result) {
+                        return end;
                     }
-                    let metadata = encode_metadata(&parts.headers, skip_response_header);
-                    self.outbound.push(wire::encode_json(Marker::Metadata, &metadata));
-                    self.sent_metadata = true;
-                    out.body = Some(response_body);
                 }
                 frame = next_frame(&mut out.body), if can_produce && out.leftover.is_empty() => {
-                    match frame {
-                        Some(Ok(frame)) => {
-                            if let Ok(data) = frame.into_data() {
-                                out.leftover = data;
-                            }
-                        }
-                        Some(Err(never)) => match never {},
-                        None => {
-                            return End::Fail(
-                                ConnectError::internal(
-                                    "the response ended without an end-of-stream message",
-                                ),
-                                close_code::INTERNAL_ERROR,
-                            );
-                        }
+                    if let Err(end) = self.take_frames(&mut out, frame) {
+                        return end;
                     }
                 }
-                () = tick(keep_alive.as_mut()) => {
-                    if inbound.pending.is_some() {
-                        // A message this end has not taken yet is not the
-                        // client's silence.
-                        last_heard = Instant::now();
+                () = keep_alive.tick() => {
+                    if inbound.pending.is_some() && !self.outbound.is_busy() {
+                        // The handler, not the client, is slow to take this
+                        // message; a stalled write means the client stopped reading.
+                        keep_alive.heard();
                     }
-                    if silence_limit.is_some_and(|limit| last_heard.elapsed() > limit) {
-                        return End::Silent;
+                    if keep_alive.silent() {
+                        return End::Abort(close_code::INTERNAL_ERROR, "the client stopped responding".into());
                     }
                     if !self.outbound.is_busy() {
                         self.outbound.push(Message::Ping(Bytes::new()));
@@ -631,43 +582,147 @@ impl Session {
         }
     }
 
-    /// Cut at most one envelope from the response body into the outbound
-    /// queue, so that a stalled write stops the handler rather than buffering
-    /// its whole stream.
-    fn pump(&mut self, out: &mut Outflow) -> Result<(), End> {
-        if !self.outbound.is_empty() || out.ended || out.leftover.is_empty() {
-            return Ok(());
-        }
-        let envelope = out.assembler.feed(&mut out.leftover).map_err(|err| {
-            End::Fail(
-                ConnectError::internal(format!("malformed response from the service: {err}")),
-                close_code::INTERNAL_ERROR,
+    /// Dispatch the RPC once its opening `M` arrives.
+    fn open<D: Dispatcher>(
+        &mut self,
+        service: &ConnectRpcService<D>,
+        handshake: Handshake,
+        message: wire::WireMessage,
+        inbound: &mut Inbound,
+        deadline: Option<Instant>,
+    ) -> Result<ResponseFuture, End> {
+        if message.marker != Marker::Metadata {
+            return Err(WireError::protocol(
+                "the first message must be a Leading-Metadata ('M') message",
             )
-        })?;
-        let Some(envelope) = envelope else {
-            return Ok(());
+            .into());
+        }
+        let request = handshake.into_request(&message.payload, self.dispatch.clone(), deadline)?;
+        let (tx, rx) = mpsc::channel(REQUEST_QUEUE);
+        inbound.tx = Some(tx);
+        let body = RequestBody {
+            rx,
+            client_ended: Arc::clone(&inbound.client_ended),
+            canceled: false,
         };
-        if envelope.is_compressed() {
+        Ok(service.clone().call(request.map(|()| body)))
+    }
+
+    /// Queue the response's `M`, and keep its body to cut into messages.
+    fn start_response(
+        &mut self,
+        out: &mut Outflow,
+        response: Response<ConnectRpcBody>,
+    ) -> Result<(), End> {
+        let (parts, body) = response.into_parts();
+        if parts.status != StatusCode::OK {
             return Err(End::Fail(
-                ConnectError::internal("the service compressed a WebSocket response message"),
+                ConnectError::internal(format!(
+                    "unexpected HTTP status {} from the service",
+                    parts.status
+                )),
                 close_code::INTERNAL_ERROR,
             ));
         }
-        if envelope.is_end_stream() {
-            if let Some(message) = self.dispatch.undecodable() {
-                return Err(WireError::protocol(message).into());
+        let metadata = encode_metadata(&parts.headers, skip_response_header);
+        self.outbound
+            .push(wire::encode_json(Marker::Metadata, &metadata));
+        self.sent_metadata = true;
+        if let Some(name) = handler_connect_header(&parts.headers) {
+            return Err(End::Fail(
+                ConnectError::internal(format!(
+                    "response header {:?} is reserved for the protocol",
+                    name.as_str()
+                )),
+                close_code::NORMAL,
+            ));
+        }
+        out.body = Some(body);
+        Ok(())
+    }
+
+    /// Take `frame` and any further response frames that are ready, cutting
+    /// them into messages until a batch is queued, so that one flush carries
+    /// them all.
+    fn take_frames(
+        &mut self,
+        out: &mut Outflow,
+        mut frame: Option<Result<Frame<Bytes>, Infallible>>,
+    ) -> Result<(), End> {
+        loop {
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        out.leftover = data;
+                    }
+                }
+                Some(Err(never)) => match never {},
+                None => {
+                    return Err(End::Fail(
+                        ConnectError::internal(
+                            "the response ended without an end-of-stream message",
+                        ),
+                        close_code::INTERNAL_ERROR,
+                    ));
+                }
             }
-            let message = wire::encode(Marker::ServerEnd, &envelope.data, false)
+            self.pump(out)?;
+            if !out.leftover.is_empty() || out.ended {
+                return Ok(());
+            }
+            match out
+                .body
+                .as_mut()
+                .and_then(|body| body.frame().now_or_never())
+            {
+                Some(next) => frame = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Cut envelopes from the response body into the outbound queue until
+    /// about a batch is queued, so that a stalled write stops the handler
+    /// rather than buffering its whole stream.
+    fn pump(&mut self, out: &mut Outflow) -> Result<(), End> {
+        while !out.ended && !out.leftover.is_empty() && self.outbound.queued_bytes() < WRITE_BATCH {
+            let envelope = out.assembler.feed(&mut out.leftover).map_err(|err| {
+                End::Fail(
+                    ConnectError::internal(format!("malformed response from the service: {err}")),
+                    close_code::INTERNAL_ERROR,
+                )
+            })?;
+            let Some(envelope) = envelope else {
+                continue;
+            };
+            if envelope.is_compressed() {
+                return Err(End::Fail(
+                    ConnectError::internal("the service compressed a WebSocket response message"),
+                    close_code::INTERNAL_ERROR,
+                ));
+            }
+            if envelope.is_end_stream() {
+                if let Some(message) = self.dispatch.undecodable() {
+                    return Err(WireError::undecodable(message).into());
+                }
+                let payload = wire::fail_connect_metadata(&envelope.data, |key| {
+                    end_stream_error_json(&ConnectError::internal(format!(
+                        "response trailer {key:?} is reserved for the protocol"
+                    )))
+                })
+                .unwrap_or(envelope.data);
+                let message = wire::encode(Marker::ServerEnd, &payload, false)
+                    .map_err(|err| End::Fail(err, close_code::INTERNAL_ERROR))?;
+                self.outbound.push(message);
+                self.sent_end = true;
+                out.ended = true;
+                out.body = None;
+                return Ok(());
+            }
+            let message = wire::encode_body(&envelope.data, self.codec)
                 .map_err(|err| End::Fail(err, close_code::INTERNAL_ERROR))?;
             self.outbound.push(message);
-            self.sent_end = true;
-            out.ended = true;
-            out.body = None;
-            return Ok(());
         }
-        let message = wire::encode_body(&envelope.data, self.codec)
-            .map_err(|err| End::Fail(err, close_code::INTERNAL_ERROR))?;
-        self.outbound.push(message);
         Ok(())
     }
 
@@ -683,7 +738,7 @@ impl Session {
             )),
             WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => End::Canceled,
             WsError::Protocol(err) => {
-                protocol_error(&format!("WebSocket protocol violation: {err}")).into()
+                WireError::protocol(format!("WebSocket protocol violation: {err}")).into()
             }
             _ => End::Canceled,
         }
@@ -691,7 +746,7 @@ impl Session {
 
     /// Send whatever the end calls for, then close. Every write is bounded,
     /// since a client that stopped reading can stall them forever.
-    async fn finish(&mut self, end: End) {
+    async fn finish(mut self, end: End) {
         let end = match end {
             End::Fail(..) | End::Abort(..) if self.sent_end => End::Finished,
             end => end,
@@ -699,10 +754,6 @@ impl Session {
         let close = match end {
             End::Canceled => None,
             End::Finished => Some(wire::close_frame(close_code::NORMAL, "")),
-            End::Silent => Some(wire::close_frame(
-                close_code::INTERNAL_ERROR,
-                "the client stopped responding",
-            )),
             End::Abort(code, reason) => Some(wire::close_frame(code, &reason)),
             End::Fail(err, code) => {
                 if !self.sent_metadata {
@@ -711,7 +762,7 @@ impl Session {
                 }
                 self.outbound.push(wire::encode_json(
                     Marker::ServerEnd,
-                    &end_stream_error_json(&err),
+                    &wire::without_connect_metadata(end_stream_error_json(&err)),
                 ));
                 Some(wire::close_frame(
                     code,
@@ -726,115 +777,173 @@ impl Session {
         let written =
             tokio::time::timeout(DRAIN_TIMEOUT, self.outbound.write(&mut self.sink)).await;
         if matches!(written, Ok(Ok(()))) || !closing {
-            self.drain().await;
+            wire::drain(self.sink, self.stream, self.read_failed).await;
         }
-    }
-
-    /// Read and discard until the client closes or the drain window passes,
-    /// so a TCP reset cannot destroy what was sent, and so tungstenite
-    /// answers a client's Close.
-    async fn drain(&mut self) {
-        let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
-            while let Some(Ok(_)) = self.stream.next().await {}
-        })
-        .await;
     }
 }
 
 /// Take one message after the opening `M`.
 fn receive(inbound: &mut Inbound, message: wire::WireMessage) -> Result<(), End> {
     match message.marker {
-        Marker::Metadata => Err(protocol_error("a second Leading-Metadata ('M') message").into()),
+        Marker::Metadata => {
+            Err(WireError::protocol("a second Leading-Metadata ('M') message").into())
+        }
         _ if inbound.client_done => {
-            Err(protocol_error("a message after the Client-End-Stream ('C') message").into())
+            Err(WireError::protocol("a message after the Client-End-Stream ('C') message").into())
         }
         Marker::Body => {
             let item = wire::envelope(flags::DATA, &message.payload)
                 .map_err(|err| End::Fail(err, close_code::MESSAGE_TOO_BIG))?;
-            inbound.pending = offer(inbound.tx.as_ref(), item);
+            inbound.pending = wire::offer(inbound.tx.as_ref(), item);
             Ok(())
         }
         Marker::ClientEnd => {
             inbound.client_done = true;
+            inbound.client_ended.store(true, Ordering::Release);
             if inbound.pending.is_none() {
                 inbound.tx = None;
             }
             Ok(())
         }
-        Marker::ServerEnd => Err(protocol_error("'S' is not valid from a client").into()),
+        Marker::ServerEnd => Err(WireError::protocol("'S' is not valid from a client").into()),
     }
 }
 
-fn protocol_error(message: &str) -> WireError {
-    WireError::protocol(message)
+impl Handshake {
+    /// The RPC's deadline (§11.1), and the earlier one by which the opening
+    /// `M` must arrive. A timeout the RPC cannot run under is the error.
+    fn deadlines(&mut self) -> Result<(Option<Instant>, Option<Instant>), ConnectError> {
+        let client_timeout = match std::mem::replace(&mut self.timeout, Ok(None))? {
+            Some(Duration::ZERO) => {
+                return Err(ConnectError::deadline_exceeded(
+                    "the client's deadline was zero",
+                ));
+            }
+            timeout => timeout,
+        };
+        let limit = [client_timeout, self.config.max_timeout]
+            .into_iter()
+            .flatten()
+            .min();
+        let deadline = limit.and_then(|limit| self.accepted_at.checked_add(limit));
+        let opening = self
+            .config
+            .opening_timeout
+            .and_then(|timeout| self.accepted_at.checked_add(timeout))
+            .filter(|opening| deadline.is_none_or(|deadline| *opening < deadline));
+        Ok((deadline, opening))
+    }
+
+    /// The request the service dispatches, whose headers are the RPC's
+    /// effective headers (§7.1, §7.3): the handshake's, less the ones that
+    /// describe the connection, plus the client's metadata.
+    fn into_request(
+        self,
+        metadata: &[u8],
+        dispatch: WebSocketDispatch,
+        deadline: Option<Instant>,
+    ) -> Result<Request<()>, WireError> {
+        let Self {
+            mut headers,
+            mut extensions,
+            procedure,
+            codec,
+            config,
+            ..
+        } = self;
+        let metadata = decode_metadata(metadata)?;
+        for (name, _) in &metadata {
+            if is_reserved_request_key(name.as_str(), &config.infrastructure_headers) {
+                return Err(WireError::protocol(format!(
+                    "metadata key {:?} is reserved and may not be set by a client",
+                    name.as_str()
+                )));
+            }
+            if headers.contains_key(name) {
+                return Err(WireError::protocol(format!(
+                    "metadata key {:?} is also a handshake header",
+                    name.as_str()
+                )));
+            }
+        }
+        let connection_headers: Vec<HeaderName> = headers
+            .keys()
+            .filter(|name| is_connection_header(name.as_str()))
+            .cloned()
+            .collect();
+        for name in connection_headers {
+            headers.remove(name);
+        }
+        wire::append_metadata(&mut headers, metadata);
+        let content_type = match codec {
+            CodecFormat::Json => "application/connect+json",
+            _ => "application/connect+proto",
+        };
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        if let Some(deadline) = deadline {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            headers.insert(
+                HeaderName::from_static(wire::TIMEOUT_PARAM),
+                HeaderValue::from(remaining.min(9_999_999_999) as u64),
+            );
+        }
+        extensions.insert(WebSocketRpc);
+        extensions.insert(dispatch);
+        let mut request = Request::new(());
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = procedure
+            .parse()
+            .map_err(|_| WireError::protocol("the procedure path is not a valid URI path"))?;
+        *request.headers_mut() = headers;
+        *request.extensions_mut() = extensions;
+        Ok(request)
+    }
 }
 
-/// Build the request the service dispatches, whose headers are the RPC's
-/// effective headers (§7.1, §7.3): the handshake's, less the ones that
-/// describe the connection, plus the client's metadata.
-#[allow(clippy::too_many_arguments)]
-fn build_request(
-    procedure: &str,
-    mut headers: http::HeaderMap,
-    mut extensions: http::Extensions,
-    dispatch: WebSocketDispatch,
-    metadata: &[u8],
-    config: &WebSocketConfig,
-    codec: CodecFormat,
-    deadline: Option<Instant>,
-) -> Result<Request<()>, WireError> {
-    let metadata = decode_metadata(metadata)?;
-    for (name, _) in &metadata {
-        if is_reserved_request_key(name.as_str(), &config.infrastructure_headers) {
-            return Err(protocol_error(&format!(
-                "metadata key {:?} is reserved and may not be set by a client",
-                name.as_str()
-            )));
-        }
-        if headers.contains_key(name) {
-            return Err(protocol_error(&format!(
-                "metadata key {:?} is also a handshake header",
-                name.as_str()
-            )));
+/// The keep-alive Pings, and how long the client may stay silent (§4.6).
+struct KeepAlive {
+    ticker: Option<tokio::time::Interval>,
+    silence_limit: Option<Duration>,
+    last_heard: Instant,
+}
+
+impl KeepAlive {
+    fn new(config: &WebSocketConfig) -> Self {
+        let ticker = config.keep_alive_interval.and_then(|interval| {
+            let start = Instant::now().checked_add(interval)?;
+            let mut ticker = tokio::time::interval_at(start, interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(ticker)
+        });
+        let silence_limit = config
+            .keep_alive_interval
+            .map(|interval| config.keep_alive_timeout.max(interval.saturating_mul(2)));
+        Self {
+            ticker,
+            silence_limit,
+            last_heard: Instant::now(),
         }
     }
-    let connection_headers: Vec<HeaderName> = headers
-        .keys()
-        .filter(|name| is_connection_header(name.as_str()))
-        .cloned()
-        .collect();
-    for name in connection_headers {
-        headers.remove(name);
+
+    fn heard(&mut self) {
+        self.last_heard = Instant::now();
     }
-    for (name, values) in metadata {
-        for value in values {
-            headers.append(name.clone(), value);
+
+    fn silent(&self) -> bool {
+        self.silence_limit
+            .is_some_and(|limit| self.last_heard.elapsed() > limit)
+    }
+
+    async fn tick(&mut self) {
+        match &mut self.ticker {
+            Some(ticker) => {
+                ticker.tick().await;
+            }
+            None => std::future::pending().await,
         }
     }
-    let content_type = match codec {
-        CodecFormat::Json => "application/connect+json",
-        _ => "application/connect+proto",
-    };
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    if let Some(deadline) = deadline {
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        headers.insert(
-            HeaderName::from_static("connect-timeout-ms"),
-            HeaderValue::from(remaining.min(9_999_999_999) as u64),
-        );
-    }
-    extensions.insert(WebSocketRpc);
-    extensions.insert(dispatch);
-    let mut request = Request::new(());
-    *request.method_mut() = Method::POST;
-    *request.uri_mut() = procedure
-        .parse()
-        .map_err(|_| protocol_error("the procedure path is not a valid URI path"))?;
-    *request.headers_mut() = headers;
-    *request.extensions_mut() = extensions;
-    Ok(request)
 }
 
 /// Handshake headers that describe the connection, not the RPC (§7.1). The
@@ -850,6 +959,16 @@ fn is_connection_header(name: &str) -> bool {
             | "transfer-encoding"
     ) || name.starts_with("sec-websocket-")
         || name.starts_with("connect-")
+}
+
+/// The first response header under a `connect-` name that the handler set,
+/// which a server must not send (§7.4). The service sets the encoding ones.
+fn handler_connect_header(headers: &http::HeaderMap) -> Option<&HeaderName> {
+    headers.keys().find(|name| {
+        name.as_str().starts_with("connect-")
+            && **name != crate::protocol::hdr::CONNECT_ACCEPT_ENCODING
+            && **name != crate::protocol::hdr::CONNECT_CONTENT_ENCODING
+    })
 }
 
 /// Response headers that describe the HTTP framing rather than metadata.
@@ -868,20 +987,6 @@ fn skip_response_header(name: &HeaderName) -> bool {
         )
 }
 
-/// Queue `item` for the handler. Returns it back when the queue is full, so
-/// the caller holds it and stops reading until there is room. A handler
-/// that dropped its request stream gets nothing more.
-fn offer(tx: Option<&mpsc::Sender<RequestItem>>, item: Bytes) -> Option<Bytes> {
-    match tx?.try_send(Ok(item)) {
-        Err(mpsc::error::TrySendError::Full(Ok(item))) => Some(item),
-        _ => None,
-    }
-}
-
-async fn reserve(tx: Option<&mpsc::Sender<RequestItem>>) -> Option<mpsc::OwnedPermit<RequestItem>> {
-    tx?.clone().reserve_owned().await.ok()
-}
-
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -894,15 +999,6 @@ async fn wait_shutdown(shutdown: Option<&mut watch::Receiver<bool>>) {
     match shutdown {
         Some(shutdown) => {
             let _ = shutdown.wait_for(|fired| *fired).await;
-        }
-        None => std::future::pending().await,
-    }
-}
-
-async fn tick(interval: Option<&mut tokio::time::Interval>) {
-    match interval {
-        Some(interval) => {
-            interval.tick().await;
         }
         None => std::future::pending().await,
     }
@@ -937,9 +1033,12 @@ impl std::fmt::Display for Canceled {
 
 impl std::error::Error for Canceled {}
 
-/// The synthesized request's body: the client's messages as envelopes.
+/// The synthesized request's body: the client's messages as envelopes. It
+/// fails, rather than ends, if the connection ends before the client's `C`.
 struct RequestBody {
-    rx: mpsc::Receiver<RequestItem>,
+    rx: mpsc::Receiver<Bytes>,
+    client_ended: Arc<AtomicBool>,
+    canceled: bool,
 }
 
 impl Body for RequestBody {
@@ -950,8 +1049,14 @@ impl Body for RequestBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Canceled>>> {
-        self.rx
-            .poll_recv(cx)
-            .map(|item| item.map(|item| item.map(Frame::data)))
+        if self.canceled {
+            return Poll::Ready(None);
+        }
+        let item = ready!(self.rx.poll_recv(cx));
+        if item.is_none() && !self.client_ended.load(Ordering::Acquire) {
+            self.canceled = true;
+            return Poll::Ready(Some(Err(Canceled)));
+        }
+        Poll::Ready(item.map(|item| Ok(Frame::data(item))))
     }
 }

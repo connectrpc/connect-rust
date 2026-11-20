@@ -188,7 +188,23 @@ async fn path_prefix_splits_the_transports() {
 }
 
 #[tokio::test]
-async fn unknown_procedure_is_unimplemented_in_band() {
+async fn a_plaintext_transport_refuses_a_tls_url_before_dialing() {
+    // Nothing listens on port 1, so a dial would fail as unavailable.
+    let config = ClientConfig::new("https://127.0.0.1:1/".parse().unwrap());
+    let err = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &config,
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
+}
+
+#[tokio::test]
+async fn unknown_procedure_is_unimplemented() {
     let (addr, _) = serve(WebSocketConfig::new()).await;
     let err = call_unary::<_, _, StringValueView<'static>>(
         &WebSocketTransport::plaintext(),
@@ -262,7 +278,7 @@ async fn an_undecodable_response_is_a_protocol_error() {
     )
     .await
     .unwrap_err();
-    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
     assert_eq!(close_code(close_rx).await, 3102);
 
     let (addr, close_rx) = scripted(script()).await;
@@ -275,7 +291,7 @@ async fn an_undecodable_response_is_a_protocol_error() {
     )
     .await
     .unwrap_err();
-    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
     assert_eq!(close_code(close_rx).await, 3102);
 }
 
