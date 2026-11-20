@@ -30,10 +30,11 @@
 //! A WebSocket handshake cannot carry a request body, and a browser cannot
 //! set headers on it, so the client sends its request headers in an opening
 //! metadata message. The server reads that message before the RPC is
-//! dispatched. A key in it replaces the handshake header of the same name;
-//! handshake headers it does not mention are kept. A client may not set
-//! reserved names (`Cookie`, `Host`, `Origin`, `Sec-*`, `Proxy-*`, the
-//! protocol's own headers, and the
+//! dispatched. The RPC's headers are the handshake's, less the connection
+//! headers (`Connection`, `Upgrade`, `Sec-WebSocket-*`, `Connect-*`), plus
+//! that message's; a key that repeats a handshake header fails the RPC. A
+//! client may not set reserved names (`Cookie`, `Host`, `Origin`, `Sec-*`,
+//! `Proxy-*`, the protocol's own headers, and the
 //! [infrastructure list](WebSocketConfig::with_infrastructure_headers)); one
 //! that does has its RPC failed. HTTP middleware in front of the service runs
 //! once, on the handshake, and never sees that message, so authenticate RPCs
@@ -60,24 +61,28 @@
 //! message, and closes with:
 //!
 //! - 1000 after a normal end, an error from the handler, or an RPC refused
-//!   in-band (a bad `connect-timeout-ms`, an unsupported codec, a deadline);
-//! - 1002 after a protocol error by the client, 1003 after a body in the
-//!   wrong frame type, 1007 after a text message that is not UTF-8, and 1009
-//!   after an oversized message;
+//!   in-band (a bad or zero `connect-timeout-ms`, a deadline);
+//! - 1001 when the server shuts down;
+//! - 1002 after a protocol error by the client, including a request message
+//!   that does not decode, and 1009 after an oversized message;
 //! - 1011 after a failure inside the server (a handler panic or a malformed
 //!   response from the service), and, with no `S`, for a client that
 //!   stopped answering Pings.
 //!
-//! The `S` reports a client's protocol mistake as `invalid_argument`, and an
-//! oversized message as `resource_exhausted`.
+//! The `S` reports a client's protocol mistake as `internal`, and an
+//! oversized message as `resource_exhausted`. A text message that is not
+//! UTF-8 closes the connection with 1007 and no `S`.
 //!
-//! The client transport closes with 1000, or with 3102 on any failure,
-//! since a browser cannot send the 10xx codes. When the server broke the
-//! protocol, the Close reason says how and the RPC fails with `internal`
-//! (`resource_exhausted` for an oversized message, which a streaming RPC
-//! reports as the cause of an `internal` error; see `WebSocketBody`);
-//! for a failure on the client's side the reason is only "client error".
-//! A connection that ends without `S` fails the RPC with `unavailable`.
+//! The client transport closes with 1000 when the RPC completes or the
+//! caller gives up on it. When the server broke the protocol, it closes with
+//! 3102, since a browser cannot send 1002, and the Close reason says how;
+//! the RPC fails with `internal`. A response message that does not decode
+//! counts, for unary and client-streaming RPCs. The client closes with 1007
+//! after a text message that is not UTF-8, and 1009 after an oversized message,
+//! which fails the RPC with `resource_exhausted`. A local failure closes
+//! with 3102 and the reason "client error". A connection that ends without
+//! `S` fails the RPC with `unavailable`, or `internal` after 1007 and
+//! `resource_exhausted` after 1009.
 //!
 //! # What is not supported
 //!
@@ -86,7 +91,7 @@
 //! - WebSocket over HTTP/2 (RFC 8441 extended CONNECT) is refused; the
 //!   handshake must be HTTP/1.1.
 //! - Without the `json` feature only `connectrpc.1+proto` is served; a
-//!   `connectrpc.1+json` client gets `unimplemented`.
+//!   handshake that offers only `connectrpc.1+json` gets `400`.
 //! - The client transport is not built for `wasm32`. In a browser, use the
 //!   browser's own `WebSocket` through a JavaScript Connect client.
 //!
@@ -100,6 +105,8 @@ mod wire;
 
 #[cfg(all(feature = "client", not(target_arch = "wasm32")))]
 mod client;
+#[cfg(all(feature = "client", not(target_arch = "wasm32")))]
+pub(crate) use client::DecodeReport;
 #[cfg(all(feature = "client", not(target_arch = "wasm32")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub use client::{DEFAULT_HANDSHAKE_TIMEOUT, WebSocketBody, WebSocketTransport};
@@ -202,15 +209,13 @@ impl WebSocketConfig {
     ///
     /// With a prefix, `/{prefix}/{service}/{method}` accepts only upgrades
     /// (anything else gets `426 Upgrade Required`), and the bare procedure
-    /// paths accept only plain HTTP (an upgrade there gets `400`). Clients
-    /// must be configured with the same prefix. Leading and trailing `/` are
-    /// ignored, so `"ws"`, `"/ws"` and `"/ws/"` are the same prefix; an empty
-    /// prefix turns the split off.
+    /// paths accept only plain HTTP (an upgrade there gets `400`). WebSocket
+    /// clients include the prefix in their base URL, such as
+    /// `https://host/ws`. Leading and trailing `/` are ignored, so `"ws"`,
+    /// `"/ws"` and `"/ws/"` are the same prefix; an empty prefix turns the
+    /// split off.
     ///
-    /// The prefix is matched at the start of the path this service sees. A
-    /// client puts it after its base URI's path, so a client whose base URI
-    /// is `https://host/api` reaches `/api/ws/{service}/{method}`, which
-    /// matches only if something in front of the service strips `/api`.
+    /// The prefix is matched at the start of the path this service sees.
     #[must_use]
     pub fn with_path_prefix(mut self, prefix: impl AsRef<str>) -> Self {
         let trimmed = prefix.as_ref().trim_matches('/');

@@ -146,8 +146,8 @@ async fn bidi_is_full_duplex() {
 async fn path_prefix_splits_the_transports() {
     let (addr, _) = serve(WebSocketConfig::new().with_path_prefix("ws")).await;
     let ok = call_unary::<_, _, StringValueView<'static>>(
-        &WebSocketTransport::plaintext().with_path_prefix("/ws/"),
-        &client_config(addr),
+        &WebSocketTransport::plaintext(),
+        &ClientConfig::new(format!("http://{addr}/ws/").parse().unwrap()),
         spec("/test.v1.EchoService/Echo", StreamType::Unary),
         StringValue::from("p"),
         CallOptions::default(),
@@ -202,6 +202,129 @@ async fn unknown_procedure_is_unimplemented_in_band() {
     assert_eq!(err.code, ErrorCode::Unimplemented);
 }
 
+/// A server that answers one call with `messages`, then reports the Close
+/// frame the client sends.
+async fn scripted(
+    messages: Vec<tokio_tungstenite::tungstenite::Message>,
+) -> (
+    SocketAddr,
+    tokio::sync::oneshot::Receiver<Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>>,
+) {
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut ws = accept_proto(&listener).await;
+        for message in messages {
+            let _ = ws.send(message).await;
+        }
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Close(frame) = message {
+                let _ = close_tx.send(frame);
+                break;
+            }
+        }
+    });
+    (addr, close_rx)
+}
+
+async fn close_code(
+    close_rx: tokio::sync::oneshot::Receiver<
+        Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    >,
+) -> u16 {
+    let frame = tokio::time::timeout(Duration::from_secs(10), close_rx)
+        .await
+        .expect("the client never closed")
+        .unwrap()
+        .expect("a Close frame with a code");
+    u16::from(frame.code)
+}
+
+#[tokio::test]
+async fn an_undecodable_response_is_a_protocol_error() {
+    use tokio_tungstenite::tungstenite::Message;
+    let script = || {
+        vec![
+            Message::Text("M[]".into()),
+            Message::Binary(bytes::Bytes::from_static(b"B\xff")),
+            Message::Text("S{}".into()),
+        ]
+    };
+    let (addr, close_rx) = scripted(script()).await;
+    let err = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    assert_eq!(close_code(close_rx).await, 3102);
+
+    let (addr, close_rx) = scripted(script()).await;
+    let err = call_client_stream::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Join", StreamType::ClientStream),
+        futures::stream::iter([StringValue::from("x")]),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    assert_eq!(close_code(close_rx).await, 3102);
+}
+
+#[tokio::test]
+async fn a_unary_response_needs_exactly_one_message() {
+    use tokio_tungstenite::tungstenite::Message;
+    let body = || Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x"));
+    let (addr, close_rx) = scripted(vec![
+        Message::Text("M[]".into()),
+        body(),
+        body(),
+        Message::Text("S{}".into()),
+    ])
+    .await;
+    let err = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unimplemented, "{err}");
+    assert_eq!(close_code(close_rx).await, 1000);
+}
+
+#[tokio::test]
+async fn a_decoded_response_closes_normally() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (addr, close_rx) = scripted(vec![
+        Message::Text("M[]".into()),
+        Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x")),
+        Message::Text("S{}".into()),
+    ])
+    .await;
+    let ok = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.into_owned().value, "x");
+    assert_eq!(close_code(close_rx).await, 1000);
+}
+
 #[tokio::test]
 async fn client_reports_a_server_that_closes_without_s() {
     // A server that accepts the upgrade and hangs up straight away.
@@ -235,7 +358,7 @@ async fn client_closes_with_3102_and_a_reason_on_a_malformed_end_stream() {
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut ws = accept_proto(&listener).await;
-        let _ = ws.send(Message::Text("M{}".into())).await;
+        let _ = ws.send(Message::Text("M[]".into())).await;
         let _ = ws.send(Message::Text("Snot json".into())).await;
         while let Some(Ok(message)) = ws.next().await {
             if let Message::Close(frame) = message {
@@ -330,7 +453,7 @@ async fn an_oversized_response_is_resource_exhausted() {
             Err(err) => break err,
         }
     };
-    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    assert_eq!(err.code, ErrorCode::ResourceExhausted, "{err}");
     let cause = std::error::Error::source(&err)
         .and_then(|source| source.downcast_ref::<crate::ConnectError>())
         .expect("the transport's error as the source");
@@ -395,7 +518,7 @@ async fn client_reports_an_early_s_while_still_sending() {
     tokio::spawn(async move {
         let mut ws = accept_proto(&listener).await;
         let _ = ws.next().await;
-        ws.send(Message::Text("M{}".into())).await.unwrap();
+        ws.send(Message::Text("M[]".into())).await.unwrap();
         ws.send(Message::Text(
             r#"S{"error":{"code":"permission_denied","message":"no"}}"#.into(),
         ))

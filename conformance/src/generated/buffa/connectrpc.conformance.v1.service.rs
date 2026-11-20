@@ -6207,8 +6207,8 @@ pub struct RawWebSocketResponse {
     /// If not empty, the server sends no Close frame of its own after the
     /// messages. It waits instead for the client to close the connection, and
     /// reports an error if the client's Close frame does not carry one of these
-    /// codes, or carries 3102 without a reason. A connection the client ends
-    /// without a Close frame is treated as code 1006.
+    /// codes. A connection the client ends without a Close frame is treated as
+    /// code 1006.
     ///
     /// Field 4: `expected_client_close_codes`
     #[serde(

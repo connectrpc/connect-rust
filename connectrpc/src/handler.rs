@@ -32,7 +32,7 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::codec::CodecFormat;
-use crate::codec::decode_json;
+use crate::codec::decode_peer_json;
 use crate::codec::{JsonDeserialize, JsonSerialize};
 use crate::error::ConnectError;
 use crate::response::{
@@ -46,13 +46,14 @@ use crate::response::{
 /// limit to raise. Every other variant is a malformed request, where naming
 /// a limit would misdirect. `DecodeError` is `#[non_exhaustive]`, hence the
 /// catch-all arm.
-fn decode_request_error(e: &buffa::DecodeError) -> ConnectError {
+fn decode_request_error(e: buffa::DecodeError) -> ConnectError {
     match e {
         buffa::DecodeError::ElementMemoryLimitExceeded => ConnectError::invalid_argument(format!(
             "failed to decode proto request: {e}; if this peer is trusted, \
              raise the limit with Limits::with_element_memory_limit"
         )),
-        _ => ConnectError::invalid_argument(format!("failed to decode proto request: {e}")),
+        _ => ConnectError::invalid_argument(format!("failed to decode proto request: {e}"))
+            .decode_failure(e),
     }
 }
 
@@ -68,8 +69,8 @@ where
     match format {
         CodecFormat::Proto => options
             .decode_from_slice(&request[..])
-            .map_err(|e| decode_request_error(&e)),
-        CodecFormat::Json => decode_json(&request[..]),
+            .map_err(decode_request_error),
+        CodecFormat::Json => decode_peer_json(&request[..]),
     }
 }
 
@@ -691,7 +692,7 @@ where
     ReqView::Owned: Message + JsonDeserialize,
 {
     let body = request_proto_bytes::<ReqView::Owned>(request, format)?;
-    OwnedView::<ReqView>::decode_with_options(body, options).map_err(|e| decode_request_error(&e))
+    OwnedView::<ReqView>::decode_with_options(body, options).map_err(decode_request_error)
 }
 
 /// Normalize a request body to protobuf wire bytes.
@@ -716,7 +717,7 @@ where
     match format {
         CodecFormat::Proto => Ok(request),
         CodecFormat::Json => {
-            let owned: Req = decode_json(&request[..])?;
+            let owned: Req = decode_peer_json(&request[..])?;
             Ok(Bytes::from(owned.encode_to_vec()))
         }
     }
@@ -745,9 +746,7 @@ pub fn decode_borrowed_request_view<'a, ReqView>(
 where
     ReqView: MessageView<'a>,
 {
-    options
-        .decode_view(body)
-        .map_err(|e| decode_request_error(&e))
+    options.decode_view(body).map_err(decode_request_error)
 }
 
 /// Trait for unary RPC handlers using zero-copy request views.

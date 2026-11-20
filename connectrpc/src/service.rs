@@ -724,18 +724,53 @@ pub(crate) fn end_stream_error_json(err: &ConnectError) -> Bytes {
     EndStreamResponse::error(err, err.trailers()).to_json()
 }
 
-/// Whether a request was synthesized by a WebSocket session, whose unary
-/// methods use streaming framing.
 #[cfg(feature = "websocket")]
-fn is_websocket_dispatch(extensions: &http::Extensions) -> bool {
-    extensions
-        .get::<crate::websocket::server::WebSocketDispatch>()
-        .is_some()
+use crate::websocket::server::WebSocketDispatch;
+/// Without the `websocket` feature no request comes from a WebSocket session.
+#[cfg(not(feature = "websocket"))]
+type WebSocketDispatch = Infallible;
+
+/// The WebSocket session that synthesized this request, if one did. Its
+/// unary methods use streaming framing.
+fn websocket_dispatch(extensions: &http::Extensions) -> Option<WebSocketDispatch> {
+    #[cfg(feature = "websocket")]
+    return extensions.get::<WebSocketDispatch>().cloned();
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = extensions;
+        None
+    }
 }
 
-#[cfg(not(feature = "websocket"))]
-fn is_websocket_dispatch(_: &http::Extensions) -> bool {
-    false
+/// Tell the WebSocket session behind `dispatch`, if any, about an error that
+/// ends its RPC, since one reporting an undecodable request is a protocol
+/// error there.
+fn note_ending_error(dispatch: Option<&WebSocketDispatch>, err: &ConnectError) {
+    #[cfg(feature = "websocket")]
+    if let Some(dispatch) = dispatch {
+        dispatch.note(err);
+    }
+    #[cfg(not(feature = "websocket"))]
+    if let Some(never) = dispatch {
+        let _ = err;
+        match *never {}
+    }
+}
+
+/// `stream`, telling the WebSocket session behind `dispatch` about an error
+/// that ends it.
+fn watch_ending_error(
+    stream: crate::EncodedStream,
+    dispatch: Option<WebSocketDispatch>,
+) -> crate::EncodedStream {
+    let Some(dispatch) = dispatch else {
+        return stream;
+    };
+    Box::pin(stream.inspect(move |item| {
+        if let Err(err) = item {
+            note_ending_error(Some(&dispatch), err);
+        }
+    }))
 }
 
 /// Response headers that may never be carried from a propagated error
@@ -1653,7 +1688,7 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         #[cfg(feature = "websocket")]
         if let Some(config) = &self.websocket
-            && !is_websocket_dispatch(req.extensions())
+            && websocket_dispatch(req.extensions()).is_none()
         {
             use crate::websocket::server::{Route, accept, route};
             let response = match route(config, &req) {
@@ -2564,7 +2599,8 @@ where
     // from there into the handler context), the body is read or streamed below.
     let (parts, body) = req.into_parts();
     let extensions = parts.extensions;
-    let via_websocket = is_websocket_dispatch(&extensions);
+    let websocket = websocket_dispatch(&extensions);
+    let via_websocket = websocket.is_some();
     let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
@@ -2757,7 +2793,10 @@ where
             );
             match with_request_deadline(deadline, fut).await {
                 Ok(result) => result,
-                Err(e) => return streaming_error_response(&e, protocol, codec_format),
+                Err(e) => {
+                    note_ending_error(websocket.as_ref(), &e);
+                    return streaming_error_response(&e, protocol, codec_format);
+                }
             }
         }
         StreamingDispatchKind::Unary => {
@@ -2775,7 +2814,10 @@ where
                 Ok(r) => r.map_body(|body| -> crate::EncodedStream {
                     Box::pin(futures::stream::once(async move { Ok(body) }))
                 }),
-                Err(e) => return streaming_error_response(&e, protocol, codec_format),
+                Err(e) => {
+                    note_ending_error(websocket.as_ref(), &e);
+                    return streaming_error_response(&e, protocol, codec_format);
+                }
             }
         }
     };
@@ -2806,7 +2848,8 @@ where
     // stream starts; the wrapper arms a `tokio::time::sleep` from this so
     // the deadline does not shift relative to request arrival.
     let remaining = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-    let resp_body = deadline_policy.enforce_on_response_stream(resp.body, remaining);
+    let resp_body = deadline_policy
+        .enforce_on_response_stream(watch_ending_error(resp.body, websocket), remaining);
     let body = StreamingResponseBody::new(
         resp_body,
         resp.trailers,
@@ -2858,6 +2901,7 @@ where
     let deadline = metadata
         .timeout
         .and_then(|t| std::time::Instant::now().checked_add(t));
+    let websocket = websocket_dispatch(&extensions);
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -2901,6 +2945,7 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
+            note_ending_error(websocket.as_ref(), &e);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -3275,6 +3320,7 @@ where
     let deadline = metadata
         .timeout
         .and_then(|t| std::time::Instant::now().checked_add(t));
+    let websocket = websocket_dispatch(&extensions);
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -3319,6 +3365,7 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
+            note_ending_error(websocket.as_ref(), &e);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -3349,7 +3396,8 @@ where
     // stream starts; the wrapper arms a `tokio::time::sleep` from this so
     // the deadline does not shift relative to request arrival.
     let remaining = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-    let resp_body = deadline_policy.enforce_on_response_stream(resp.body, remaining);
+    let resp_body = deadline_policy
+        .enforce_on_response_stream(watch_ending_error(resp.body, websocket), remaining);
     let body = StreamingResponseBody::new(
         resp_body,
         resp.trailers,

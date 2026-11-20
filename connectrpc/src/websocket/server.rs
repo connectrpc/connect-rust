@@ -14,8 +14,8 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -54,13 +54,29 @@ use crate::service::{ConnectRpcBody, ConnectRpcService, DRAIN_TIMEOUT, end_strea
 /// the message size limit, so this stays small.
 const REQUEST_QUEUE: usize = 1;
 
-/// The close code for a server that is shutting down.
-const GOING_AWAY: u16 = 1001;
-
 /// Request extension marking a synthesized request whose unary method may be
-/// served with streaming framing.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WebSocketDispatch;
+/// served with streaming framing. The service reports through it whether the
+/// RPC ended because a request message did not decode, which on a WebSocket
+/// is a protocol error (§6.1) rather than the handler's `invalid_argument`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WebSocketDispatch {
+    undecodable: Arc<OnceLock<String>>,
+}
+
+impl WebSocketDispatch {
+    /// Record `err` if it reports a request message that did not decode.
+    pub(crate) fn note(&self, err: &ConnectError) {
+        if err.is_decode_failure() {
+            let _ = self
+                .undecodable
+                .set(err.message.clone().unwrap_or_default());
+        }
+    }
+
+    fn undecodable(&self) -> Option<&str> {
+        self.undecodable.get().map(String::as_str)
+    }
+}
 
 /// Connection extension the built-in server attaches so that upgraded
 /// sessions, which outlive their connection's task, still end on graceful
@@ -135,13 +151,13 @@ pub(crate) fn is_upgrade(headers: &http::HeaderMap) -> bool {
 }
 
 /// Route a request by its upgrade headers and the configured path prefix
-/// (§4.2, §4.2.1). Without a prefix, an upgrade that offers no Connect
-/// subprotocol is someone else's WebSocket and stays on the HTTP path.
+/// (§4.2). Without a prefix, every path serves both bindings; with one,
+/// paths under it serve only WebSocket and the rest only HTTP.
 pub(crate) fn route<B>(config: &WebSocketConfig, req: &Request<B>) -> Route {
     let upgrade = is_upgrade(req.headers());
     let path = req.uri().path();
     let Some(prefix) = config.path_prefix.as_deref() else {
-        return if upgrade && wire::offers_connect_subprotocol(req.headers()) {
+        return if upgrade {
             Route::Upgrade(path.to_owned())
         } else {
             Route::Http
@@ -223,17 +239,20 @@ where
         return reject(StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key");
     };
     let accept_key = derive_accept_key(key.as_bytes());
-    let offered: Vec<&str> = parts
-        .headers
-        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    let Some(codec) = wire::codec_for_subprotocol(&offered.join(",")) else {
+    let Some((codec, token)) = wire::negotiate_subprotocol(&parts.headers) else {
         return reject(
             StatusCode::BAD_REQUEST,
-            "Sec-WebSocket-Protocol must offer exactly one of connectrpc.1+proto or connectrpc.1+json",
+            if cfg!(feature = "json") {
+                "Sec-WebSocket-Protocol offers no supported codec; \
+                 this server supports connectrpc.1+proto and connectrpc.1+json"
+            } else {
+                "Sec-WebSocket-Protocol offers no supported codec; \
+                 this server supports connectrpc.1+proto"
+            },
         );
+    };
+    let Ok(token) = HeaderValue::from_str(&token) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid Sec-WebSocket-Protocol");
     };
     if !config.origin_allowed(&parts.headers) {
         return reject(
@@ -281,10 +300,7 @@ where
     if let Ok(value) = HeaderValue::from_str(&accept_key) {
         headers.insert(header::SEC_WEBSOCKET_ACCEPT, value);
     }
-    headers.insert(
-        header::SEC_WEBSOCKET_PROTOCOL,
-        HeaderValue::from_static(wire::subprotocol_token(codec)),
-    );
+    headers.insert(header::SEC_WEBSOCKET_PROTOCOL, token);
     response
 }
 
@@ -305,6 +321,8 @@ enum End {
     Finished,
     /// End the RPC with this error and close code.
     Fail(ConnectError, u16),
+    /// Close with this code and reason, sending no `S`.
+    Abort(u16, String),
     /// The connection ended before `S`: the client canceled.
     Canceled,
     /// The client stopped answering; hang up with 1011.
@@ -313,7 +331,12 @@ enum End {
 
 impl From<WireError> for End {
     fn from(err: WireError) -> Self {
-        End::Fail(err.error, err.fault.close_code(Side::Server))
+        let code = err.fault.close_code(Side::Server);
+        match err.fault {
+            // The peer cannot be trusted to read a text message (§6.1).
+            Fault::Encoding => End::Abort(code, err.error.message.unwrap_or_default()),
+            Fault::Protocol | Fault::TooLarge => End::Fail(err.error, code),
+        }
     }
 }
 
@@ -355,6 +378,7 @@ async fn run_session<D: Dispatcher>(
         stream,
         outbound: Outbound::default(),
         codec: handshake.codec,
+        dispatch: WebSocketDispatch::default(),
         sent_metadata: false,
         sent_end: false,
         max_message_size: limits.max_message_size(),
@@ -379,6 +403,7 @@ struct Session {
     stream: SplitStream<Socket>,
     outbound: Outbound,
     codec: CodecFormat,
+    dispatch: WebSocketDispatch,
     sent_metadata: bool,
     /// `S` is queued, so nothing may follow it but the close.
     sent_end: bool,
@@ -417,19 +442,15 @@ impl Session {
     ) -> End {
         let config = Arc::clone(&handshake.config);
         let client_timeout = match handshake.timeout {
+            Ok(Some(Duration::ZERO)) => {
+                return End::Fail(
+                    ConnectError::deadline_exceeded("the client's deadline was zero"),
+                    close_code::NORMAL,
+                );
+            }
             Ok(timeout) => timeout,
             Err(err) => return End::Fail(err, close_code::NORMAL),
         };
-        #[cfg(not(feature = "json"))]
-        if self.codec == CodecFormat::Json {
-            return End::Fail(
-                ConnectError::unimplemented(format!(
-                    "codec json is not supported; this server supports {}",
-                    wire::SUBPROTOCOL_PROTO
-                )),
-                close_code::NORMAL,
-            );
-        }
         let limit = [client_timeout, config.max_timeout]
             .into_iter()
             .flatten()
@@ -489,7 +510,7 @@ impl Session {
                 () = wait_shutdown(shutdown.as_mut()) => {
                     return End::Fail(
                         ConnectError::unavailable("the server is shutting down"),
-                        GOING_AWAY,
+                        close_code::GOING_AWAY,
                     );
                 }
                 written = std::future::poll_fn(|cx| self.outbound.poll_write(&mut self.sink, cx)),
@@ -538,6 +559,7 @@ impl Session {
                             &procedure,
                             headers,
                             extensions,
+                            self.dispatch.clone(),
                             &message.payload,
                             &config,
                             self.codec,
@@ -632,6 +654,9 @@ impl Session {
             ));
         }
         if envelope.is_end_stream() {
+            if let Some(message) = self.dispatch.undecodable() {
+                return Err(WireError::protocol(message).into());
+            }
             let message = wire::encode(Marker::ServerEnd, &envelope.data, false)
                 .map_err(|err| End::Fail(err, close_code::INTERNAL_ERROR))?;
             self.outbound.push(message);
@@ -640,7 +665,7 @@ impl Session {
             out.body = None;
             return Ok(());
         }
-        let message = wire::encode_body(Marker::Body, &envelope.data, self.codec)
+        let message = wire::encode_body(&envelope.data, self.codec)
             .map_err(|err| End::Fail(err, close_code::INTERNAL_ERROR))?;
         self.outbound.push(message);
         Ok(())
@@ -649,12 +674,10 @@ impl Session {
     fn read_error(&self, err: WsError) -> End {
         match err {
             WsError::Capacity(_) => End::from(WireError::new(
-                Side::Server,
                 Fault::TooLarge,
                 format!("message exceeds the {} byte limit", self.max_message_size),
             )),
             WsError::Utf8(_) => End::from(WireError::new(
-                Side::Server,
                 Fault::Encoding,
                 "a text message is not valid UTF-8",
             )),
@@ -670,7 +693,7 @@ impl Session {
     /// since a client that stopped reading can stall them forever.
     async fn finish(&mut self, end: End) {
         let end = match end {
-            End::Fail(..) if self.sent_end => End::Finished,
+            End::Fail(..) | End::Abort(..) if self.sent_end => End::Finished,
             end => end,
         };
         let close = match end {
@@ -680,10 +703,11 @@ impl Session {
                 close_code::INTERNAL_ERROR,
                 "the client stopped responding",
             )),
+            End::Abort(code, reason) => Some(wire::close_frame(code, &reason)),
             End::Fail(err, code) => {
                 if !self.sent_metadata {
                     self.outbound
-                        .push(wire::encode_json(Marker::Metadata, b"{}"));
+                        .push(wire::encode_json(Marker::Metadata, b"[]"));
                 }
                 self.outbound.push(wire::encode_json(
                     Marker::ServerEnd,
@@ -724,18 +748,16 @@ fn receive(inbound: &mut Inbound, message: wire::WireMessage) -> Result<(), End>
         _ if inbound.client_done => {
             Err(protocol_error("a message after the Client-End-Stream ('C') message").into())
         }
-        Marker::Body | Marker::ClientEnd => {
-            let is_end = message.marker == Marker::ClientEnd;
-            if !is_end || !message.payload.is_empty() {
-                let item = wire::envelope(flags::DATA, &message.payload)
-                    .map_err(|err| End::Fail(err, close_code::MESSAGE_TOO_BIG))?;
-                inbound.pending = offer(inbound.tx.as_ref(), item);
-            }
-            if is_end {
-                inbound.client_done = true;
-                if inbound.pending.is_none() {
-                    inbound.tx = None;
-                }
+        Marker::Body => {
+            let item = wire::envelope(flags::DATA, &message.payload)
+                .map_err(|err| End::Fail(err, close_code::MESSAGE_TOO_BIG))?;
+            inbound.pending = offer(inbound.tx.as_ref(), item);
+            Ok(())
+        }
+        Marker::ClientEnd => {
+            inbound.client_done = true;
+            if inbound.pending.is_none() {
+                inbound.tx = None;
             }
             Ok(())
         }
@@ -744,42 +766,47 @@ fn receive(inbound: &mut Inbound, message: wire::WireMessage) -> Result<(), End>
 }
 
 fn protocol_error(message: &str) -> WireError {
-    WireError::new(Side::Server, Fault::Protocol, message)
+    WireError::protocol(message)
 }
 
-/// Build the request the service dispatches: the handshake's headers under
-/// the client's metadata, with the protocol's own headers replaced.
+/// Build the request the service dispatches, whose headers are the RPC's
+/// effective headers (§7.1, §7.3): the handshake's, less the ones that
+/// describe the connection, plus the client's metadata.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     procedure: &str,
     mut headers: http::HeaderMap,
     mut extensions: http::Extensions,
+    dispatch: WebSocketDispatch,
     metadata: &[u8],
     config: &WebSocketConfig,
     codec: CodecFormat,
     deadline: Option<Instant>,
 ) -> Result<Request<()>, WireError> {
-    for name in [
-        "connection",
-        "upgrade",
-        "connect-protocol-version",
-        "connect-timeout-ms",
-        "connect-content-encoding",
-        "connect-accept-encoding",
-        "content-encoding",
-        "content-type",
-        "content-length",
-        "transfer-encoding",
-    ] {
-        headers.remove(name);
-    }
-    for (name, values) in decode_metadata(metadata, Side::Server)? {
+    let metadata = decode_metadata(metadata)?;
+    for (name, _) in &metadata {
         if is_reserved_request_key(name.as_str(), &config.infrastructure_headers) {
             return Err(protocol_error(&format!(
                 "metadata key {:?} is reserved and may not be set by a client",
                 name.as_str()
             )));
         }
-        headers.remove(&name);
+        if headers.contains_key(name) {
+            return Err(protocol_error(&format!(
+                "metadata key {:?} is also a handshake header",
+                name.as_str()
+            )));
+        }
+    }
+    let connection_headers: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| is_connection_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in connection_headers {
+        headers.remove(name);
+    }
+    for (name, values) in metadata {
         for value in values {
             headers.append(name.clone(), value);
         }
@@ -799,7 +826,7 @@ fn build_request(
         );
     }
     extensions.insert(WebSocketRpc);
-    extensions.insert(WebSocketDispatch);
+    extensions.insert(dispatch);
     let mut request = Request::new(());
     *request.method_mut() = Method::POST;
     *request.uri_mut() = procedure
@@ -808,6 +835,21 @@ fn build_request(
     *request.headers_mut() = headers;
     *request.extensions_mut() = extensions;
     Ok(request)
+}
+
+/// Handshake headers that describe the connection, not the RPC (§7.1). The
+/// `content-` ones would describe a handshake body, and the RPC has its own.
+fn is_connection_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "upgrade"
+            | "content-type"
+            | "content-encoding"
+            | "content-length"
+            | "transfer-encoding"
+    ) || name.starts_with("sec-websocket-")
+        || name.starts_with("connect-")
 }
 
 /// Response headers that describe the HTTP framing rather than metadata.

@@ -190,14 +190,22 @@ async fn raw_connect(
     token: &str,
     origin: Option<&str>,
 ) -> Result<Raw, WsError> {
+    let origin = origin.map(|origin| ("origin", origin));
+    raw_connect_with(addr, path, token, origin.as_slice()).await
+}
+
+async fn raw_connect_with(
+    addr: SocketAddr,
+    path: &str,
+    token: &str,
+    headers: &[(&'static str, &str)],
+) -> Result<Raw, WsError> {
     let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
     request
         .headers_mut()
         .insert("sec-websocket-protocol", token.parse().unwrap());
-    if let Some(origin) = origin {
-        request
-            .headers_mut()
-            .insert("origin", origin.parse().unwrap());
+    for (name, value) in headers {
+        request.headers_mut().insert(*name, value.parse().unwrap());
     }
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     tokio_tungstenite::client_async(request, tcp)
@@ -241,7 +249,7 @@ async fn worked_exchange_under_json() {
     let mut ws = raw_connect(addr, "/test.v1.EchoService/Echo", "connectrpc.1+json", None)
         .await
         .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     ws.send(text(r#"B"7""#)).await.unwrap();
     ws.send(text("C")).await.unwrap();
     let (messages, code) = read_all(&mut ws).await;
@@ -250,9 +258,12 @@ async fn worked_exchange_under_json() {
     let Message::Text(m) = &messages[0] else {
         panic!()
     };
-    let m: serde_json::Value = serde_json::from_str(m.as_str().strip_prefix('M').unwrap()).unwrap();
-    assert_eq!(m["x-head"], serde_json::json!(["h"]));
-    assert!(m.get("content-type").is_none());
+    let m: Vec<Vec<String>> = serde_json::from_str(m.as_str().strip_prefix('M').unwrap()).unwrap();
+    assert!(
+        m.contains(&vec!["x-head".to_owned(), "h".to_owned()]),
+        "{m:?}"
+    );
+    assert!(m.iter().all(|entry| entry[0] != "content-type"), "{m:?}");
     assert_eq!(messages[1], text(r#"B"ws::7""#));
     assert_eq!(
         end_stream(&messages[2]),
@@ -271,14 +282,12 @@ async fn worked_exchange_under_proto_mixes_frame_types() {
     )
     .await
     .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     // StringValue{value: "7"} is field 1, length 1.
     ws.send(Message::Binary(Bytes::from_static(b"B\x0a\x017")))
         .await
         .unwrap();
-    ws.send(Message::Binary(Bytes::from_static(b"C")))
-        .await
-        .unwrap();
+    ws.send(text("C")).await.unwrap();
     let (messages, code) = read_all(&mut ws).await;
     assert_eq!(code, Some(1000));
     assert!(matches!(&messages[0], Message::Text(_)));
@@ -289,11 +298,22 @@ async fn worked_exchange_under_proto_mixes_frame_types() {
     assert!(matches!(&messages[2], Message::Text(_)));
 }
 
-/// Send `messages` and expect the server to end the RPC with `code` and
-/// close with `close`.
+/// Send `messages` to `Chat` and expect the server to end the RPC with
+/// `code` and close with `close`.
 async fn expect_fault(token: &str, messages: Vec<Message>, code: &str, close: u16) {
+    expect_fault_at("Chat", token, &[], messages, code, close).await;
+}
+
+async fn expect_fault_at(
+    method: &str,
+    token: &str,
+    headers: &[(&'static str, &str)],
+    messages: Vec<Message>,
+    code: &str,
+    close: u16,
+) {
     let (addr, _) = serve(WebSocketConfig::new().with_keep_alive(None)).await;
-    let mut ws = raw_connect(addr, "/test.v1.EchoService/Chat", token, None)
+    let mut ws = raw_connect_with(addr, &format!("/{SVC}/{method}"), token, headers)
         .await
         .unwrap();
     for message in messages {
@@ -315,89 +335,110 @@ async fn expect_fault(token: &str, messages: Vec<Message>, code: &str, close: u1
 async fn protocol_errors_end_the_stream() {
     let json = "connectrpc.1+json";
     let proto = "connectrpc.1+proto";
-    // The first message must be M.
-    expect_fault(json, vec![text(r#"B"x""#)], "invalid_argument", 1002).await;
-    // Unknown marker.
-    expect_fault(
-        json,
-        vec![text("M{}"), text("X{}")],
-        "invalid_argument",
-        1002,
-    )
-    .await;
-    // S from a client.
-    expect_fault(
-        json,
-        vec![text("M{}"), text("S{}")],
-        "invalid_argument",
-        1002,
-    )
-    .await;
-    // A second M.
-    expect_fault(
-        json,
-        vec![text("M{}"), text("M{}")],
-        "invalid_argument",
-        1002,
-    )
-    .await;
-    // A body in the wrong frame type.
-    expect_fault(
-        proto,
-        vec![text("M{}"), text(r#"B"x""#)],
-        "invalid_argument",
-        1003,
-    )
-    .await;
-    // A message after C.
-    expect_fault(
-        json,
-        vec![text("M{}"), text("C"), text(r#"B"x""#)],
-        "invalid_argument",
-        1002,
-    )
-    .await;
-    // A reserved metadata key.
-    expect_fault(
-        json,
-        vec![text(r#"M{"cookie":["a=b"]}"#)],
-        "invalid_argument",
-        1002,
-    )
-    .await;
-    expect_fault(
-        json,
-        vec![text(r#"M{"x-forwarded-for":["1.2.3.4"]}"#)],
-        "invalid_argument",
-        1002,
-    )
-    .await;
+    let cases: &[(&str, Vec<Message>)] = &[
+        (json, vec![text(r#"B"x""#)]),
+        (json, vec![text("M[]"), text("X{}")]),
+        (json, vec![text("M[]"), text("S{}")]),
+        (json, vec![text("M[]"), text("M[]")]),
+        (proto, vec![text("M[]"), text(r#"B"x""#)]),
+        (json, vec![text("M[]"), text("C"), text(r#"B"x""#)]),
+        (json, vec![text("M[]"), text("Cx")]),
+        (json, vec![text(r#"M{"a":["1"]}"#)]),
+        (json, vec![text(r#"M[["cookie","a=b"]]"#)]),
+        (json, vec![text(r#"M[["x-forwarded-for","1.2.3.4"]]"#)]),
+        (json, vec![text(r#"M[["connect-anything","1"]]"#)]),
+        (json, vec![text(r#"M[["a","1"],["a","2"]]"#)]),
+        (json, vec![text(r#"M[["A","1"]]"#)]),
+        (json, vec![text(r#"M[["a"]]"#)]),
+    ];
+    for (token, messages) in cases {
+        expect_fault(token, messages.clone(), "internal", 1002).await;
+    }
     // A reason longer than a Close frame carries is cut, not dropped.
-    let long_key = format!(r#"M{{"x-forwarded-{}":["a"]}}"#, "é".repeat(100));
-    expect_fault(json, vec![text(&long_key)], "invalid_argument", 1002).await;
-    // Duplicate keys that fold together.
-    expect_fault(
-        json,
-        vec![text(r#"M{"a":["1"],"A":["2"]}"#)],
-        "invalid_argument",
+    let long_key = format!(r#"M[["x-forwarded-{}","a"]]"#, "e".repeat(200));
+    expect_fault(json, vec![text(&long_key)], "internal", 1002).await;
+}
+
+#[tokio::test]
+async fn metadata_may_not_repeat_a_handshake_header() {
+    expect_fault_at(
+        "Echo",
+        "connectrpc.1+json",
+        &[("acme-tenant", "hs")],
+        vec![text(r#"M[["acme-tenant","m"]]"#)],
+        "internal",
         1002,
     )
     .await;
 }
 
 #[tokio::test]
-async fn invalid_utf8_closes_with_1007() {
+async fn effective_headers_join_handshake_and_metadata() {
+    let (addr, _) = serve(WebSocketConfig::new()).await;
+    let mut ws = raw_connect_with(
+        addr,
+        "/test.v1.EchoService/Echo",
+        "connectrpc.1+json",
+        &[("acme-tenant", "hs")],
+    )
+    .await
+    .unwrap();
+    ws.send(text(r#"M[["x-other","1"]]"#)).await.unwrap();
+    ws.send(text(r#"B"v""#)).await.unwrap();
+    ws.send(text("C")).await.unwrap();
+    let (received, code) = read_all(&mut ws).await;
+    assert_eq!(received[1], text(r#"B"ws:hs:v""#));
+    assert_eq!(code, Some(1000));
+}
+
+#[tokio::test]
+async fn an_undecodable_request_is_a_protocol_error() {
+    for method in ["Echo", "Count", "Join", "Chat"] {
+        expect_fault_at(
+            method,
+            "connectrpc.1+json",
+            &[],
+            vec![text("M[]"), text("B5"), text("C")],
+            "internal",
+            1002,
+        )
+        .await;
+        expect_fault_at(
+            method,
+            "connectrpc.1+proto",
+            &[],
+            vec![
+                text("M[]"),
+                Message::Binary(Bytes::from_static(b"B\xff")),
+                text("C"),
+            ],
+            "internal",
+            1002,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn invalid_utf8_closes_with_1007_and_no_s() {
     use tokio_tungstenite::tungstenite::protocol::frame::Frame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
+    let (addr, _) = serve(WebSocketConfig::new().with_keep_alive(None)).await;
+    let mut ws = raw_connect(addr, "/test.v1.EchoService/Chat", "connectrpc.1+json", None)
+        .await
+        .unwrap();
     let invalid = Frame::message(&b"B\xff\xfe"[..], OpCode::Data(Data::Text), true);
-    expect_fault(
-        "connectrpc.1+json",
-        vec![text("M{}"), Message::Frame(invalid)],
-        "invalid_argument",
-        1007,
-    )
-    .await;
+    ws.send(text("M[]")).await.unwrap();
+    ws.send(Message::Frame(invalid)).await.unwrap();
+    let (received, code) = read_all(&mut ws).await;
+    assert!(
+        !received
+            .iter()
+            .any(|m| matches!(m, Message::Text(t) if t.as_str().starts_with('S'))),
+        "{received:?}"
+    );
+    assert_eq!(code, Some(1007));
 }
 
 #[tokio::test]
@@ -412,7 +453,7 @@ async fn oversized_message_is_resource_exhausted() {
     let mut ws = raw_connect(addr, "/test.v1.EchoService/Chat", "connectrpc.1+json", None)
         .await
         .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     ws.send(text(&format!("B\"{}\"", "x".repeat(64))))
         .await
         .unwrap();
@@ -441,12 +482,33 @@ async fn invalid_timeout_is_reported_in_band() {
     .unwrap();
     let (received, code) = read_all(&mut ws).await;
     assert_eq!(received.len(), 2, "{received:?}");
-    assert_eq!(received[0], text("M{}"));
+    assert_eq!(received[0], text("M[]"));
     assert_eq!(
         end_stream(&received[1])["error"]["code"],
         "invalid_argument"
     );
     assert_eq!(code, Some(1000));
+}
+
+#[tokio::test]
+async fn zero_timeout_is_deadline_exceeded_without_dispatch() {
+    let (addr, hang_dropped) = serve(WebSocketConfig::new()).await;
+    let mut ws = raw_connect(
+        addr,
+        "/test.v1.EchoService/Hang?connect-timeout-ms=0",
+        "connectrpc.1+json",
+        None,
+    )
+    .await
+    .unwrap();
+    let (received, code) = read_all(&mut ws).await;
+    assert_eq!(received[0], text("M[]"));
+    assert_eq!(
+        end_stream(&received[1])["error"]["code"],
+        "deadline_exceeded"
+    );
+    assert_eq!(code, Some(1000));
+    assert!(!hang_dropped.load(Ordering::SeqCst), "the handler ran");
 }
 
 #[tokio::test]
@@ -460,7 +522,7 @@ async fn deadline_bounds_the_whole_rpc() {
     )
     .await
     .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     let (received, code) = read_all(&mut ws).await;
     assert_eq!(
         end_stream(received.last().unwrap())["error"]["code"],
@@ -476,7 +538,7 @@ async fn closing_before_s_cancels_the_handler() {
     let mut ws = raw_connect(addr, "/test.v1.EchoService/Hang", "connectrpc.1+json", None)
         .await
         .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!hang_dropped.load(Ordering::SeqCst));
     ws.close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
@@ -510,11 +572,10 @@ async fn handshake_failures_are_http_statuses() {
     .await
     .unwrap_err();
     assert_eq!(status(err), 400);
-    // Without a prefix, someone else's WebSocket stays on the HTTP path.
     let err = raw_connect(addr, "/test.v1.EchoService/Echo", "chat", None)
         .await
         .unwrap_err();
-    assert_ne!(status(err), 400);
+    assert_eq!(status(err), 400);
     let err = raw_connect(
         addr,
         "/test.v1.EchoService/Echo",
@@ -538,6 +599,26 @@ async fn handshake_failures_are_http_statuses() {
 }
 
 #[tokio::test]
+async fn the_first_supported_token_is_echoed() {
+    let (addr, _) = serve(WebSocketConfig::new()).await;
+    let mut request = format!("ws://{addr}/test.v1.EchoService/Echo")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        "connectrpc.1+cbor, connectrpc.1+proto, connectrpc.1+json"
+            .parse()
+            .unwrap(),
+    );
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (_, response) = tokio_tungstenite::client_async(request, tcp).await.unwrap();
+    assert_eq!(
+        response.headers()["sec-websocket-protocol"],
+        "connectrpc.1+proto"
+    );
+}
+
+#[tokio::test]
 async fn keep_alive_hangs_up_on_a_silent_client() {
     let config = WebSocketConfig::new()
         .with_keep_alive(Some(Duration::from_millis(20)))
@@ -548,7 +629,7 @@ async fn keep_alive_hangs_up_on_a_silent_client() {
     let mut alive = raw_connect(addr, "/test.v1.EchoService/Chat", "connectrpc.1+json", None)
         .await
         .unwrap();
-    alive.send(text("M{}")).await.unwrap();
+    alive.send(text("M[]")).await.unwrap();
     let mut pings = 0;
     let quiet = tokio::time::timeout(Duration::from_millis(300), async {
         while let Some(Ok(message)) = alive.next().await {
@@ -568,7 +649,7 @@ async fn keep_alive_hangs_up_on_a_silent_client() {
     let mut silent = raw_connect(addr, "/test.v1.EchoService/Hang", "connectrpc.1+json", None)
         .await
         .unwrap();
-    silent.send(text("M{}")).await.unwrap();
+    silent.send(text("M[]")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (_, code) = read_all(&mut silent).await;
     assert_eq!(code, Some(1011));
@@ -588,7 +669,7 @@ async fn handler_dropping_its_request_stream_does_not_stall_the_session() {
     let mut ws = raw_connect(addr, "/test.v1.EchoService/Echo", "connectrpc.1+json", None)
         .await
         .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     for _ in 0..32 {
         if ws
             .send(text(&format!("B\"{}\"", "x".repeat(40))))
@@ -611,7 +692,7 @@ async fn opening_timeout_bounds_a_silent_client() {
         .await
         .unwrap();
     let (received, code) = read_all(&mut ws).await;
-    assert_eq!(received[0], text("M{}"));
+    assert_eq!(received[0], text("M[]"));
     assert_eq!(
         end_stream(&received[1])["error"]["code"],
         "deadline_exceeded"
@@ -633,7 +714,7 @@ async fn graceful_shutdown_ends_open_sessions() {
     let mut ws = raw_connect(addr, "/test.v1.EchoService/Hang", "connectrpc.1+json", None)
         .await
         .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     stop_tx.send(()).unwrap();
     let (received, code) = read_all(&mut ws).await;
@@ -662,7 +743,7 @@ async fn path_prefix_routes_by_url() {
     )
     .await
     .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     ws.send(text(r#"B"p""#)).await.unwrap();
     ws.send(text("C")).await.unwrap();
     let (received, code) = read_all(&mut ws).await;
@@ -690,7 +771,7 @@ async fn handler_panic_is_reported_in_band() {
     )
     .await
     .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     ws.send(text(r#"B"x""#)).await.unwrap();
     ws.send(text("C")).await.unwrap();
     let (received, code) = read_all(&mut ws).await;
@@ -712,7 +793,7 @@ async fn a_client_that_stops_reading_still_meets_its_deadline() {
     )
     .await
     .unwrap();
-    ws.send(text("M{}")).await.unwrap();
+    ws.send(text("M[]")).await.unwrap();
     ws.send(text(r#"B"x""#)).await.unwrap();
     ws.send(text("C")).await.unwrap();
     // Never read: the server's writes stall once the socket buffers fill.

@@ -1879,8 +1879,11 @@ fn deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
 /// its `Display` text goes in `message`, the typed error is retained for
 /// `downcast_ref`. Unlike [`map_transport_send_error`], a `ConnectError`
 /// found in the read error is not surfaced verbatim — the read failure is
-/// always reported as this client's, with that error as its cause. That
-/// holds for the `deadline_exceeded` arm too — the deadline only explains
+/// reported as this client's, with that error as its cause. Before the
+/// deadline its code is kept, though, since the transport that classified
+/// the failure knows its protocol's rule for it: a WebSocket that closes
+/// before the end of the stream is `unavailable`. That holds for the
+/// `deadline_exceeded` arm too — the deadline only explains
 /// *why* the stream died, and the error that reported it (a reset, a closed
 /// connection) is still the most specific fact available. The deadline
 /// errors that stay source-less are those [`with_deadline`] synthesises
@@ -1899,7 +1902,8 @@ fn classify_body_read_error(
     if deadline_elapsed(deadline) {
         ConnectError::deadline_exceeded(format!("{context} after the deadline elapsed: {error}"))
     } else {
-        ConnectError::internal(format!("{context}: {error}"))
+        let code = find_connect_error_in_chain(&*error).map_or(ErrorCode::Internal, |e| e.code);
+        ConnectError::new(code, format!("{context}: {error}"))
     }
     .with_source(error)
 }
@@ -2439,7 +2443,7 @@ fn map_response_decompression_error(mut e: ConnectError) -> ConnectError {
 
 /// Parse a Connect protocol unary response.
 async fn parse_connect_unary_response<B, RespView>(
-    response: Response<B>,
+    mut response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
     deadline: Option<std::time::Instant>,
@@ -2509,14 +2513,7 @@ where
             None => body,
         };
 
-        if let Ok(error) = serde_json::from_slice::<ConnectErrorResponse>(&body) {
-            let code = error
-                .code
-                .as_deref()
-                .and_then(|s| s.parse::<ErrorCode>().ok())
-                .unwrap_or_else(|| http_status_to_error_code(status));
-            let mut err = ConnectError::new(code, error.message.unwrap_or_default());
-            err.details = error.details;
+        if let Some(mut err) = connect_error_from_body(status, &body) {
             err.set_response_headers(headers);
             err.set_trailers(trailers);
             return Err(err);
@@ -2569,6 +2566,7 @@ where
     // every error out of it carries that response's metadata.
     let attach = with_response_metadata(&resp_headers, &resp_trailers);
 
+    let decode_report = take_decode_report(response.extensions_mut());
     let body = collect_body_bounded(response.into_body(), max_message_size, deadline)
         .await
         .map_err(&attach)?;
@@ -2595,8 +2593,9 @@ where
     }
 
     let message =
-        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options())
-            .map_err(&attach)?;
+        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options());
+    report_decode(decode_report, &message);
+    let message = message.map_err(&attach)?;
     drop(attach);
 
     Ok(UnaryResponse {
@@ -4623,7 +4622,7 @@ where
 
 /// Parse a Connect protocol client-streaming response.
 async fn parse_connect_client_stream_response<B, RespView>(
-    response: Response<B>,
+    mut response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
     deadline: Option<std::time::Instant>,
@@ -4709,6 +4708,7 @@ where
     let body_limit = max_msg_size
         .saturating_add(2 * crate::envelope::HEADER_SIZE)
         .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
+    let decode_report = take_decode_report(response.extensions_mut());
     let body = collect_body_bounded(response.into_body(), body_limit, deadline)
         .await
         .map_err(with_response_metadata(
@@ -4725,8 +4725,9 @@ where
     )?;
     // The trailers are parsed by now, so a decode failure reports them too.
     let message =
-        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options())
-            .map_err(with_response_metadata(&resp_headers, &trailers))?;
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options());
+    report_decode(decode_report, &message);
+    let message = message.map_err(with_response_metadata(&resp_headers, &trailers))?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -4916,6 +4917,51 @@ pub(crate) fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> Co
     );
     connect_error.details = err.details;
     connect_error
+}
+
+/// The Connect error a failed response's `body` holds, if it holds one. A
+/// missing or unknown code is inferred from `status`.
+pub(crate) fn connect_error_from_body(
+    status: http::StatusCode,
+    body: &[u8],
+) -> Option<ConnectError> {
+    let error = serde_json::from_slice::<ConnectErrorResponse>(body).ok()?;
+    let code = error
+        .code
+        .as_deref()
+        .and_then(|s| s.parse::<ErrorCode>().ok())
+        .unwrap_or_else(|| http_status_to_error_code(status));
+    let mut err = ConnectError::new(code, error.message.unwrap_or_default());
+    err.details = error.details;
+    Some(err)
+}
+
+#[cfg(all(feature = "websocket", feature = "client", not(target_arch = "wasm32")))]
+use crate::websocket::DecodeReport;
+/// Only the WebSocket transport asks to hear about undecodable responses.
+#[cfg(not(all(feature = "websocket", feature = "client", not(target_arch = "wasm32"))))]
+type DecodeReport = std::convert::Infallible;
+
+/// Take the hook a WebSocket transport attached to learn whether its
+/// response message decoded.
+fn take_decode_report(extensions: &mut http::Extensions) -> Option<DecodeReport> {
+    extensions.remove::<DecodeReport>()
+}
+
+/// Tell the transport behind `report`, if any, that a response message did
+/// not decode. A resource limit of this client's own is not the peer's fault.
+fn report_decode<T>(report: Option<DecodeReport>, result: &Result<T, ConnectError>) {
+    #[cfg(all(feature = "websocket", feature = "client", not(target_arch = "wasm32")))]
+    if let (Some(report), Err(err)) = (report, result)
+        && err.code == ErrorCode::Internal
+    {
+        report.fail(err);
+    }
+    #[cfg(not(all(feature = "websocket", feature = "client", not(target_arch = "wasm32"))))]
+    if let Some(never) = report {
+        let _ = result;
+        match never {}
+    }
 }
 
 /// Error response structure from ConnectRPC.
@@ -8083,6 +8129,32 @@ mod tests {
                     .unwrap())
             })
         }
+    }
+
+    #[test]
+    fn body_read_error_keeps_a_transport_classified_code() {
+        let err = classify_body_read_error(
+            "failed to read response body",
+            ConnectError::unavailable("closed before the end"),
+            None,
+        );
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .starts_with("failed to read response body"),
+            "{err:?}"
+        );
+        let source = std::error::Error::source(&err).expect("the read error stays the source");
+        assert!(source.downcast_ref::<ConnectError>().is_some());
+
+        let err = classify_body_read_error(
+            "failed to read response body",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            None,
+        );
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
     }
 
     /// The typed cause a body-read failure must surface: the same

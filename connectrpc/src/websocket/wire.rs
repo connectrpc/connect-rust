@@ -2,15 +2,13 @@
 //! the client transport: message markers, the Leading-Metadata JSON object,
 //! the names a client may not set, and the close codes.
 
-use std::collections::VecDeque;
-use std::fmt;
+use std::collections::{HashSet, VecDeque};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
-use serde::de::{Deserializer, MapAccess, Visitor};
 use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Utf8Bytes};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -46,26 +44,28 @@ pub(crate) enum Side {
     Client,
 }
 
-/// What kind of framing mistake a peer made. It selects the close code.
+/// What kind of mistake a peer made. It selects the close code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fault {
+    /// A protocol error (§5): reported in `S` by a server.
     Protocol,
-    FrameType,
+    /// A text message that is not UTF-8 (§6.1): the connection fails with
+    /// 1007 and no `S`.
     Encoding,
+    /// A message over the size limit (§12.1).
     TooLarge,
 }
 
 impl Fault {
-    /// The close code the reading side sends for this fault. A server picks
-    /// the most specific 10xx code; a client, which in a browser cannot send
-    /// 10xx codes, always sends 3102 (§13).
+    /// The close code the reading side sends for this fault (§13). Only a
+    /// protocol error differs by side: a client sends 3102, since a browser
+    /// cannot send 1002.
     pub(crate) fn close_code(self, side: Side) -> u16 {
-        match (side, self) {
-            (Side::Client, _) => close_code::CLIENT_ERROR,
-            (Side::Server, Self::Protocol) => close_code::PROTOCOL_ERROR,
-            (Side::Server, Self::FrameType) => close_code::UNSUPPORTED_DATA,
-            (Side::Server, Self::Encoding) => close_code::INVALID_PAYLOAD,
-            (Side::Server, Self::TooLarge) => close_code::MESSAGE_TOO_BIG,
+        match (self, side) {
+            (Self::Protocol, Side::Server) => close_code::PROTOCOL_ERROR,
+            (Self::Protocol, Side::Client) => close_code::CLIENT_ERROR,
+            (Self::Encoding, _) => close_code::INVALID_PAYLOAD,
+            (Self::TooLarge, _) => close_code::MESSAGE_TOO_BIG,
         }
     }
 }
@@ -78,26 +78,29 @@ pub(crate) struct WireError {
 }
 
 impl WireError {
-    /// A fault found by `side`. A server reports the client's mistake as
-    /// `invalid_argument`; a client reports the server's as `internal`,
-    /// matching how Connect clients treat a malformed HTTP response.
-    pub(crate) fn new(side: Side, fault: Fault, message: impl Into<String>) -> Self {
-        let code = match (fault, side) {
-            (Fault::TooLarge, _) => ErrorCode::ResourceExhausted,
-            (_, Side::Server) => ErrorCode::InvalidArgument,
-            (_, Side::Client) => ErrorCode::Internal,
+    /// A fault found by either side. Both report a peer's protocol error as
+    /// `internal` (§5), and an oversized message as `resource_exhausted`.
+    pub(crate) fn new(fault: Fault, message: impl Into<String>) -> Self {
+        let code = match fault {
+            Fault::TooLarge => ErrorCode::ResourceExhausted,
+            Fault::Protocol | Fault::Encoding => ErrorCode::Internal,
         };
         Self {
             fault,
             error: ConnectError::new(code, message),
         }
     }
+
+    /// A protocol error described by `message`.
+    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+        Self::new(Fault::Protocol, message)
+    }
 }
 
 pub(crate) mod close_code {
     pub(crate) const NORMAL: u16 = 1000;
+    pub(crate) const GOING_AWAY: u16 = 1001;
     pub(crate) const PROTOCOL_ERROR: u16 = 1002;
-    pub(crate) const UNSUPPORTED_DATA: u16 = 1003;
     pub(crate) const INVALID_PAYLOAD: u16 = 1007;
     pub(crate) const MESSAGE_TOO_BIG: u16 = 1009;
     pub(crate) const INTERNAL_ERROR: u16 = 1011;
@@ -133,7 +136,8 @@ pub(crate) struct WireMessage {
 ///
 /// Every rule of the spec's §5 and §6.1 that can be checked without
 /// connection state is checked here: the marker, the direction, the frame
-/// type for the marker and codec, and the empty payloads that are not JSON.
+/// type for the marker and codec, and the payloads a marker must or must
+/// not have.
 pub(crate) fn classify(
     message: Message,
     side: Side,
@@ -144,67 +148,56 @@ pub(crate) fn classify(
         Message::Binary(data) => (data, true),
         _ => return Ok(None),
     };
-    let protocol_error = |message: String| WireError::new(side, Fault::Protocol, message);
     let Some(&first) = data.first() else {
-        return Err(protocol_error("empty message has no marker".into()));
+        return Err(WireError::protocol("empty message has no marker"));
     };
-    if first >= 0x80 {
-        return Err(protocol_error(format!(
-            "marker byte 0x{first:02x} sets the reserved high bit"
-        )));
-    }
     let marker = match (first, side) {
         (b'B', _) => Marker::Body,
         (b'M', _) => Marker::Metadata,
         (b'S', Side::Client) => Marker::ServerEnd,
         (b'C', Side::Server) => Marker::ClientEnd,
         (b'S' | b'C', _) => {
-            return Err(protocol_error(format!(
+            return Err(WireError::protocol(format!(
                 "marker '{}' is not valid in this direction",
                 first as char
             )));
         }
         _ => {
-            return Err(protocol_error(format!("unknown marker 0x{first:02x}")));
+            return Err(WireError::protocol(format!("unknown marker 0x{first:02x}")));
         }
     };
     let payload = data.slice(1..);
-    let codec_binary = codec == CodecFormat::Proto;
+    let want_binary = marker == Marker::Body && codec == CodecFormat::Proto;
+    if binary != want_binary {
+        return Err(WireError::protocol(format!(
+            "'{}' message arrived in a {} frame; expected a {} frame",
+            first as char,
+            frame_type(binary),
+            frame_type(want_binary),
+        )));
+    }
     match marker {
-        Marker::Metadata | Marker::ServerEnd => {
-            if binary {
-                return Err(protocol_error(format!(
-                    "'{}' message must be a text frame",
-                    first as char
-                )));
-            }
-            if payload.is_empty() {
-                return Err(protocol_error(format!(
-                    "'{}' message has no JSON payload",
-                    first as char
-                )));
-            }
+        Marker::Metadata | Marker::ServerEnd if payload.is_empty() => {
+            return Err(WireError::protocol(format!(
+                "'{}' message has no JSON payload",
+                first as char
+            )));
         }
-        Marker::Body | Marker::ClientEnd => {
-            if binary != codec_binary {
-                return Err(WireError::new(
-                    side,
-                    Fault::FrameType,
-                    format!(
-                        "'{}' message arrived as a {} frame, but the negotiated codec is {codec}",
-                        first as char,
-                        if binary { "binary" } else { "text" },
-                    ),
-                ));
-            }
-            if marker == Marker::Body && !binary && payload.is_empty() {
-                return Err(protocol_error(
-                    "text 'B' message has no payload; an empty JSON message is {}".into(),
-                ));
-            }
+        Marker::ClientEnd if !payload.is_empty() => {
+            return Err(WireError::protocol("'C' message carries a payload"));
         }
+        Marker::Body if !binary && payload.is_empty() => {
+            return Err(WireError::protocol(
+                "text 'B' message has no payload; an empty JSON message is {}",
+            ));
+        }
+        _ => {}
     }
     Ok(Some(WireMessage { marker, payload }))
+}
+
+fn frame_type(binary: bool) -> &'static str {
+    if binary { "binary" } else { "text" }
 }
 
 /// Build the message for `marker` with `payload`: a text frame for JSON, a
@@ -230,13 +223,9 @@ pub(crate) fn encode(
         .map_err(|_| ConnectError::internal("a JSON message is not valid UTF-8"))
 }
 
-/// A body (or final `C` body) message under `codec`.
-pub(crate) fn encode_body(
-    marker: Marker,
-    payload: &[u8],
-    codec: CodecFormat,
-) -> Result<Message, ConnectError> {
-    encode(marker, payload, codec == CodecFormat::Proto)
+/// A `B` message under `codec`.
+pub(crate) fn encode_body(payload: &[u8], codec: CodecFormat) -> Result<Message, ConnectError> {
+    encode(Marker::Body, payload, codec == CodecFormat::Proto)
 }
 
 /// A JSON message (`M` or `S`) built from JSON this crate serialized, which
@@ -328,85 +317,99 @@ pub(crate) fn envelope(flag: u8, payload: &[u8]) -> Result<Bytes, ConnectError> 
 // ============================================================================
 
 /// Decode a Leading-Metadata payload into header entries, enforcing §7.3.1:
-/// an object of string arrays, valid field names and values, no two keys
-/// that fold to the same name, and valid base64 under a `-bin` key.
+/// an array of entries, each a key and at least one value, keys that are
+/// lower-case field names and appear once, and values of visible ASCII,
+/// space and tab, trimmed of surrounding whitespace.
 ///
-/// An entry with no values is returned too, since it still replaces what
-/// the handshake carried for that key.
+/// A `-bin` value is not checked for base64 here: the spec leaves that
+/// to the application that decodes it.
+/// The most values a Leading-Metadata message may carry. It keeps a peer's
+/// metadata well inside a `HeaderMap`'s capacity, past which it panics.
+pub(crate) const MAX_METADATA_VALUES: usize = 1024;
+
 pub(crate) fn decode_metadata(
     payload: &[u8],
-    side: Side,
 ) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, WireError> {
-    let fault = |message: String| WireError::new(side, Fault::Protocol, message);
-    let mut deserializer = serde_json::Deserializer::from_slice(payload);
-    let raw = deserializer
-        .deserialize_map(EntriesVisitor)
-        .and_then(|raw| deserializer.end().map(|()| raw))
-        .map_err(|e| fault(format!("invalid metadata message: {e}")))?;
-
+    let raw: Vec<Vec<String>> = serde_json::from_slice(payload).map_err(|e| {
+        WireError::protocol(format!("metadata is not an array of string arrays: {e}"))
+    })?;
+    let total: usize = raw.iter().map(|entry| entry.len().saturating_sub(1)).sum();
+    if total > MAX_METADATA_VALUES {
+        return Err(WireError::new(
+            Fault::TooLarge,
+            format!("metadata has {total} values; at most {MAX_METADATA_VALUES} are allowed"),
+        ));
+    }
     let mut entries: Vec<(HeaderName, Vec<HeaderValue>)> = Vec::with_capacity(raw.len());
-    for (key, values) in raw {
-        let name = HeaderName::from_bytes(key.as_bytes())
-            .map_err(|_| fault(format!("invalid metadata key {key:?}")))?;
-        if entries.iter().any(|(seen, _)| *seen == name) {
-            return Err(fault(format!(
-                "metadata key {key:?} appears more than once"
+    let mut seen = HashSet::with_capacity(raw.len());
+    for entry in raw {
+        let mut parts = entry.into_iter();
+        let Some(key) = parts.next() else {
+            return Err(WireError::protocol("metadata entry is empty"));
+        };
+        if key.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(WireError::protocol(format!(
+                "metadata key {key:?} is not lower-case"
             )));
         }
-        let binary = name.as_str().ends_with("-bin");
-        let mut header_values = Vec::with_capacity(values.len());
-        for value in values {
-            if binary && crate::error::detail_b64::decode_lenient(&value).is_err() {
-                return Err(fault(format!(
-                    "metadata value for {key:?} is not valid base64"
-                )));
-            }
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| fault(format!("invalid metadata value for {key:?}")))?;
-            header_values.push(value);
+        let name = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|_| WireError::protocol(format!("invalid metadata key {key:?}")))?;
+        if !seen.insert(name.clone()) {
+            return Err(WireError::protocol(format!(
+                "metadata key {key:?} appears in more than one entry"
+            )));
         }
-        entries.push((name, header_values));
+        let values = parts
+            .map(|value| {
+                metadata_value(&value).ok_or_else(|| {
+                    WireError::protocol(format!("invalid metadata value for {key:?}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.is_empty() {
+            return Err(WireError::protocol(format!(
+                "metadata key {key:?} has no values"
+            )));
+        }
+        entries.push((name, values));
     }
     Ok(entries)
 }
 
-/// Encode `headers` as a Leading-Metadata (or `EndStreamResponse.metadata`)
-/// object, skipping names `skip` rejects and values that are not text.
-pub(crate) fn encode_metadata(headers: &HeaderMap, skip: impl Fn(&HeaderName) -> bool) -> Bytes {
-    let mut object = serde_json::Map::new();
-    for name in headers.keys() {
-        if skip(name) {
-            continue;
-        }
-        let values: Vec<serde_json::Value> = headers
-            .get_all(name)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .map(|value| serde_json::Value::String(value.to_owned()))
-            .collect();
-        object.insert(name.as_str().to_owned(), serde_json::Value::Array(values));
+/// A metadata value: visible ASCII, space and tab only, with surrounding
+/// space and tab removed.
+fn metadata_value(value: &str) -> Option<HeaderValue> {
+    let valid = value
+        .bytes()
+        .all(|b| b == b'\t' || (b' '..=b'~').contains(&b));
+    if !valid {
+        return None;
     }
-    Bytes::from(serde_json::Value::Object(object).to_string())
+    HeaderValue::from_str(value.trim_matches([' ', '\t'])).ok()
 }
 
-/// Collects a JSON object's entries in order, keeping duplicate keys so they
-/// can be rejected instead of silently overwritten.
-struct EntriesVisitor;
-
-impl<'de> Visitor<'de> for EntriesVisitor {
-    type Value = Vec<(String, Vec<String>)>;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an object whose values are arrays of strings")
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
-        while let Some(entry) = map.next_entry::<String, Vec<String>>()? {
-            entries.push(entry);
+/// Encode `headers` as a Leading-Metadata array, leaving out names `skip`
+/// rejects, the `connect-` names no peer may send (§7.3.2), and values that
+/// are not text.
+pub(crate) fn encode_metadata(headers: &HeaderMap, skip: impl Fn(&HeaderName) -> bool) -> Bytes {
+    let mut entries = Vec::new();
+    for name in headers.keys() {
+        if skip(name) || name.as_str().starts_with("connect-") {
+            continue;
         }
-        Ok(entries)
+        let mut entry = vec![serde_json::Value::String(name.as_str().to_owned())];
+        entry.extend(
+            headers
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .map(|value| serde_json::Value::String(value.to_owned())),
+        );
+        if entry.len() > 1 {
+            entries.push(serde_json::Value::Array(entry));
+        }
     }
+    Bytes::from(serde_json::Value::Array(entries).to_string())
 }
 
 // ============================================================================
@@ -445,22 +448,11 @@ const FORBIDDEN_REQUEST_HEADERS: &[&str] = &[
     "x-method-override",
 ];
 
-/// Names the protocol itself controls, which neither side carries as
-/// metadata.
-const PROTOCOL_HEADERS: &[&str] = &[
-    "connect-protocol-version",
-    "connect-timeout-ms",
-    "content-type",
-    "content-encoding",
-    "connect-content-encoding",
-    "connect-accept-encoding",
-];
-
 /// Whether a client may not set `name` in its Leading-Metadata message.
 /// `name` is already lower-case, as `HeaderName` always is.
 pub(crate) fn is_reserved_request_key<S: AsRef<str>>(name: &str, infrastructure: &[S]) -> bool {
     FORBIDDEN_REQUEST_HEADERS.contains(&name)
-        || PROTOCOL_HEADERS.contains(&name)
+        || is_protocol_header(name)
         || name.starts_with("proxy-")
         || name.starts_with("sec-")
         || infrastructure
@@ -468,10 +460,11 @@ pub(crate) fn is_reserved_request_key<S: AsRef<str>>(name: &str, infrastructure:
             .any(|pattern| matches_pattern(name, pattern.as_ref()))
 }
 
-/// Whether a name is one the protocol controls, so a client leaves it out
-/// of the metadata it sends and a server out of the metadata it echoes.
+/// Whether a name is one the protocol controls (§7.3.2), so a client leaves
+/// it out of the metadata it sends and a server out of the metadata it
+/// echoes.
 pub(crate) fn is_protocol_header(name: &str) -> bool {
-    PROTOCOL_HEADERS.contains(&name) || name == "accept-encoding"
+    name.starts_with("connect-") || matches!(name, "content-type" | "content-encoding")
 }
 
 /// Match a lower-case name against a deny-list entry, where a trailing `*`
@@ -497,6 +490,7 @@ pub(crate) const SUBPROTOCOL_JSON: &str = "connectrpc.1+json";
 /// The query parameter that carries a client's deadline.
 pub(crate) const TIMEOUT_PARAM: &str = "connect-timeout-ms";
 
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub(crate) fn subprotocol_token(codec: CodecFormat) -> &'static str {
     match codec {
         CodecFormat::Json => SUBPROTOCOL_JSON,
@@ -504,32 +498,23 @@ pub(crate) fn subprotocol_token(codec: CodecFormat) -> &'static str {
     }
 }
 
-/// Whether the offered subprotocols name this protocol at all, any version or
-/// codec. Without a prefix, only such an upgrade is Connect over WebSocket;
-/// any other is left to the HTTP path (§4.2).
-pub(crate) fn offers_connect_subprotocol(headers: &HeaderMap) -> bool {
+/// Select the codec for a handshake (§4.3): the first offered token whose
+/// codec this server supports, skipping any it does not recognize. Returns
+/// the codec and the token exactly as offered, which the server echoes.
+pub(crate) fn negotiate_subprotocol(headers: &HeaderMap) -> Option<(CodecFormat, String)> {
     headers
         .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
-        .any(|token| {
-            let token = token.trim();
-            token.len() >= 10 && token[..10].eq_ignore_ascii_case("connectrpc")
-        })
+        .map(str::trim)
+        .find_map(|token| Some((supported_codec(token)?, token.to_owned())))
 }
 
-/// Map an offered subprotocol header to its codec. A header offering more
-/// than one token, or any token but the two Connect ones, is `None`.
-pub(crate) fn codec_for_subprotocol(header: &str) -> Option<CodecFormat> {
-    let mut tokens = header.split(',').map(str::trim).filter(|t| !t.is_empty());
-    let token = tokens.next()?;
-    if tokens.next().is_some() {
-        return None;
-    }
+fn supported_codec(token: &str) -> Option<CodecFormat> {
     if token.eq_ignore_ascii_case(SUBPROTOCOL_PROTO) {
         Some(CodecFormat::Proto)
-    } else if token.eq_ignore_ascii_case(SUBPROTOCOL_JSON) {
+    } else if cfg!(feature = "json") && token.eq_ignore_ascii_case(SUBPROTOCOL_JSON) {
         Some(CodecFormat::Json)
     } else {
         None
@@ -549,7 +534,8 @@ pub(crate) fn header_has_token(headers: &HeaderMap, name: &HeaderName, token: &s
 
 /// Parse the `connect-timeout-ms` query parameter (§11). Absent is `Ok(None)`;
 /// anything but one to ten decimal digits, or a repeated parameter, is
-/// `invalid_argument`.
+/// `invalid_argument`. Zero is valid; the caller fails it as
+/// `deadline_exceeded` without dispatching.
 pub(crate) fn parse_timeout_param(query: Option<&str>) -> Result<Option<Duration>, ConnectError> {
     let mut found = None;
     for pair in query.unwrap_or("").split('&') {
@@ -599,16 +585,15 @@ mod tests {
 
     #[test]
     fn classify_accepts_each_marker_in_its_direction() {
-        let m = classify(text("M{}"), Side::Server, CodecFormat::Json)
+        let m = classify(text("M[]"), Side::Server, CodecFormat::Json)
             .unwrap()
             .unwrap();
         assert_eq!(m.marker, Marker::Metadata);
-        assert_eq!(&m.payload[..], b"{}");
-        let c = classify(binary(b"C"), Side::Server, CodecFormat::Proto)
+        assert_eq!(&m.payload[..], b"[]");
+        let c = classify(text("C"), Side::Server, CodecFormat::Proto)
             .unwrap()
             .unwrap();
         assert_eq!(c.marker, Marker::ClientEnd);
-        assert!(c.payload.is_empty());
         let s = classify(text("S{}"), Side::Client, CodecFormat::Proto)
             .unwrap()
             .unwrap();
@@ -634,15 +619,20 @@ mod tests {
     fn classify_rejects_markers_from_the_wrong_direction() {
         let err = classify(text("S{}"), Side::Server, CodecFormat::Json).unwrap_err();
         assert_eq!(err.fault, Fault::Protocol);
-        assert_eq!(err.error.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.error.code, ErrorCode::Internal);
         let err = classify(text("C"), Side::Client, CodecFormat::Json).unwrap_err();
         assert_eq!(err.fault, Fault::Protocol);
-        assert_eq!(err.error.code, ErrorCode::Internal);
     }
 
     #[test]
-    fn classify_rejects_unknown_reserved_and_missing_markers() {
-        for message in [text("X{}"), binary(b"\x80abc"), binary(b""), text("")] {
+    fn classify_rejects_unknown_and_missing_markers() {
+        for message in [
+            text("X{}"),
+            text("é{}"),
+            binary(b"\x80abc"),
+            binary(b""),
+            text(""),
+        ] {
             let err = classify(message, Side::Server, CodecFormat::Proto).unwrap_err();
             assert_eq!(err.fault, Fault::Protocol);
         }
@@ -650,53 +640,57 @@ mod tests {
 
     #[test]
     fn classify_checks_the_frame_type() {
-        let err = classify(text("B{}"), Side::Server, CodecFormat::Proto).unwrap_err();
-        assert_eq!(err.fault, Fault::FrameType);
-        let err = classify(binary(b"B\x08\x01"), Side::Server, CodecFormat::Json).unwrap_err();
-        assert_eq!(err.fault, Fault::FrameType);
-        let err = classify(binary(b"M{}"), Side::Server, CodecFormat::Proto).unwrap_err();
-        assert_eq!(err.fault, Fault::Protocol);
-        let err = classify(text("C"), Side::Server, CodecFormat::Proto).unwrap_err();
-        assert_eq!(err.fault, Fault::FrameType);
+        for (message, codec, expected) in [
+            (text("B{}"), CodecFormat::Proto, "expected a binary frame"),
+            (
+                binary(b"B\x08\x01"),
+                CodecFormat::Json,
+                "expected a text frame",
+            ),
+            (binary(b"M[]"), CodecFormat::Proto, "expected a text frame"),
+            (binary(b"C"), CodecFormat::Proto, "expected a text frame"),
+        ] {
+            let err = classify(message, Side::Server, codec).unwrap_err();
+            assert_eq!(err.fault, Fault::Protocol);
+            let message = err.error.message.unwrap_or_default();
+            assert!(message.contains(expected), "{message}");
+        }
     }
 
     #[test]
-    fn classify_rejects_empty_json_payloads() {
-        for message in [text("B"), text("M"), text("S")] {
-            let side = Side::Client;
+    fn classify_checks_payload_presence() {
+        for (message, side) in [
+            (text("B"), Side::Client),
+            (text("M"), Side::Client),
+            (text("S"), Side::Client),
+            (text("C{}"), Side::Server),
+        ] {
             let err = classify(message, side, CodecFormat::Json).unwrap_err();
             assert_eq!(err.fault, Fault::Protocol);
         }
-        // A bare `C` carries no payload and is valid in either codec.
         assert!(classify(text("C"), Side::Server, CodecFormat::Json).is_ok());
     }
 
     #[test]
     fn encode_picks_the_frame_type() {
         assert!(matches!(
-            encode_body(Marker::Body, b"\x08\x01", CodecFormat::Proto),
+            encode_body(b"\x08\x01", CodecFormat::Proto),
             Ok(Message::Binary(_))
         ));
-        let Ok(Message::Text(text)) = encode_body(Marker::Body, b"{}", CodecFormat::Json) else {
+        let Ok(Message::Text(text)) = encode_body(b"{}", CodecFormat::Json) else {
             panic!("expected text");
         };
         assert_eq!(text.as_str(), "B{}");
-        assert!(encode_body(Marker::Body, b"\xff", CodecFormat::Json).is_err());
+        assert!(encode_body(b"\xff", CodecFormat::Json).is_err());
     }
 
     #[test]
-    fn close_codes_follow_the_side() {
+    fn close_codes_follow_the_fault() {
         assert_eq!(Fault::Protocol.close_code(Side::Server), 1002);
-        assert_eq!(Fault::FrameType.close_code(Side::Server), 1003);
-        assert_eq!(Fault::Encoding.close_code(Side::Server), 1007);
-        assert_eq!(Fault::TooLarge.close_code(Side::Server), 1009);
-        for fault in [
-            Fault::Protocol,
-            Fault::FrameType,
-            Fault::Encoding,
-            Fault::TooLarge,
-        ] {
-            assert_eq!(fault.close_code(Side::Client), 3102);
+        assert_eq!(Fault::Protocol.close_code(Side::Client), 3102);
+        for side in [Side::Server, Side::Client] {
+            assert_eq!(Fault::Encoding.close_code(side), 1007);
+            assert_eq!(Fault::TooLarge.close_code(side), 1009);
         }
     }
 
@@ -721,36 +715,59 @@ mod tests {
     }
 
     #[test]
-    fn decode_metadata_accepts_valid_objects() {
+    fn decode_metadata_accepts_valid_arrays() {
         let entries = decode_metadata(
-            br#"{"Acme-Tenant":["t-42"],"empty":[],"x-bin":["AAEC","AAECAw=="]}"#,
-            Side::Server,
+            br#"[["acme-tenant","t-42"],["empty",""],["x-bin","!!!","AAECAw=="],["pad"," \ta\tb\t "]]"#,
         )
         .unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].0, "acme-tenant");
         assert_eq!(entries[0].1, vec![HeaderValue::from_static("t-42")]);
-        assert!(entries[1].1.is_empty());
+        assert_eq!(entries[1].1, vec![HeaderValue::from_static("")]);
+        // A -bin value is left for the application to decode.
         assert_eq!(entries[2].1.len(), 2);
+        assert_eq!(entries[3].1, vec![HeaderValue::from_static("a\tb")]);
+        assert!(decode_metadata(b"[]").unwrap().is_empty());
     }
 
     #[test]
-    fn decode_metadata_rejects_malformed_objects() {
+    fn decode_metadata_caps_the_value_count() {
+        let entry = |i: usize| format!(r#"["k{i}","v"]"#);
+        let at_cap: Vec<String> = (0..MAX_METADATA_VALUES).map(entry).collect();
+        let payload = format!("[{}]", at_cap.join(","));
+        assert_eq!(
+            decode_metadata(payload.as_bytes()).unwrap().len(),
+            MAX_METADATA_VALUES
+        );
+        let over: Vec<String> = (0..=MAX_METADATA_VALUES).map(entry).collect();
+        let payload = format!("[{}]", over.join(","));
+        let err = decode_metadata(payload.as_bytes()).unwrap_err();
+        assert_eq!(err.fault, Fault::TooLarge);
+        assert_eq!(err.error.code, ErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn decode_metadata_rejects_malformed_arrays() {
         let cases: &[&[u8]] = &[
             b"",
-            b"[]",
-            br#"{"a":"bare"}"#,
-            br#"{"a":[1]}"#,
-            br#"{"a":["x"],"A":["y"]}"#,
-            br#"{"a":["x"],"a":["y"]}"#,
-            br#"{"bad key":["x"]}"#,
-            br#"{"a":["line\nbreak"]}"#,
-            br#"{"a":["nul\u0000"]}"#,
-            br#"{"a-bin":["not base64!"]}"#,
-            br#"{} trailing"#,
+            b"{}",
+            b"null",
+            br#"{"a":["x"]}"#,
+            br#"["a"]"#,
+            br#"[[]]"#,
+            br#"[["a"]]"#,
+            br#"[["a",1]]"#,
+            br#"[["a",["x"]]]"#,
+            br#"[["A","x"]]"#,
+            br#"[["a","x"],["a","y"]]"#,
+            br#"[["bad key","x"]]"#,
+            br#"[["a","line\nbreak"]]"#,
+            br#"[["a","nul\u0000"]]"#,
+            br#"[["a","caf\u00e9"]]"#,
+            br#"[] trailing"#,
         ];
         for case in cases {
-            let err = decode_metadata(case, Side::Server).unwrap_err();
+            let err = decode_metadata(case).unwrap_err();
             assert_eq!(
                 err.fault,
                 Fault::Protocol,
@@ -766,9 +783,12 @@ mod tests {
         headers.append("x-a", HeaderValue::from_static("1"));
         headers.append("x-a", HeaderValue::from_static("2"));
         headers.append("content-type", HeaderValue::from_static("application/json"));
+        headers.append("connect-x", HeaderValue::from_static("1"));
+        headers.append("x-opaque", HeaderValue::from_bytes(b"\xff").unwrap());
         let json = encode_metadata(&headers, |name| is_protocol_header(name.as_str()));
         let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert_eq!(value, serde_json::json!({"x-a": ["1", "2"]}));
+        assert_eq!(value, serde_json::json!([["x-a", "1", "2"]]));
+        assert_eq!(&encode_metadata(&HeaderMap::new(), |_| false)[..], b"[]");
     }
 
     #[test]
@@ -787,7 +807,9 @@ mod tests {
             "x-forwarded-for",
             "x-real-ip",
             "connect-timeout-ms",
+            "connect-anything",
             "content-type",
+            "content-encoding",
         ] {
             assert!(is_reserved_request_key(name, &infra), "{name}");
         }
@@ -798,21 +820,43 @@ mod tests {
     }
 
     #[test]
-    fn subprotocol_requires_exactly_one_connect_token() {
+    fn subprotocol_selects_the_first_supported_token() {
+        let offer = |tokens: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for token in tokens {
+                headers.append(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_str(token).unwrap(),
+                );
+            }
+            negotiate_subprotocol(&headers)
+        };
         assert_eq!(
-            codec_for_subprotocol("connectrpc.1+proto"),
+            offer(&["connectrpc.1+proto"]),
+            Some((CodecFormat::Proto, "connectrpc.1+proto".to_owned()))
+        );
+        assert_eq!(
+            offer(&["connectrpc.1+thrift", "connectrpc.1+proto"]),
+            Some((CodecFormat::Proto, "connectrpc.1+proto".to_owned()))
+        );
+        #[cfg(feature = "json")]
+        {
+            assert_eq!(
+                offer(&["connectrpc.2+json, ConnectRPC.1+JSON"]),
+                Some((CodecFormat::Json, "ConnectRPC.1+JSON".to_owned()))
+            );
+            assert_eq!(
+                offer(&["connectrpc.1+json, connectrpc.1+proto"]).map(|(codec, _)| codec),
+                Some(CodecFormat::Json)
+            );
+        }
+        #[cfg(not(feature = "json"))]
+        assert_eq!(
+            offer(&["connectrpc.1+json, connectrpc.1+proto"]).map(|(codec, _)| codec),
             Some(CodecFormat::Proto)
         );
-        assert_eq!(
-            codec_for_subprotocol(" ConnectRPC.1+JSON "),
-            Some(CodecFormat::Json)
-        );
-        assert_eq!(codec_for_subprotocol("connectrpc.1+thrift"), None);
-        assert_eq!(
-            codec_for_subprotocol("connectrpc.1+proto, connectrpc.1+json"),
-            None
-        );
-        assert_eq!(codec_for_subprotocol(""), None);
+        assert_eq!(offer(&["connectrpc.1+thrift"]), None);
+        assert_eq!(offer(&[]), None);
     }
 
     #[test]

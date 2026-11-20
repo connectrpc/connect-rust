@@ -1773,13 +1773,13 @@ let via_websocket = ctx.extensions().get::<WebSocketRpc>().is_some();
 
 Things that differ from HTTP:
 
-- **Request headers arrive in the first message.** A browser cannot set headers on a WebSocket handshake, so the client sends its request metadata as an opening message, which the server reads before dispatching. The handshake's headers are merged underneath it. HTTP middleware runs once, on the handshake, and never sees that message — authenticate RPCs in an interceptor or the handler, not in middleware. Clients may not set reserved names (`Cookie`, `Host`, `Sec-*`, `Forwarded`, `X-Forwarded-*`, ...); change the infrastructure part of that list with `WebSocketConfig::with_infrastructure_headers`.
+- **Request headers arrive in the first message.** A browser cannot set headers on a WebSocket handshake, so the client sends its request metadata as an opening message, which the server reads before dispatching. The RPC sees the handshake's headers, less `Connection`, `Upgrade`, `Sec-WebSocket-*` and `Connect-*`, plus that message's; a key that repeats a handshake header fails the RPC. HTTP middleware runs once, on the handshake, and never sees that message — authenticate RPCs in an interceptor or the handler, not in middleware. Clients may not set reserved names (`Cookie`, `Host`, `Sec-*`, `Forwarded`, `X-Forwarded-*`, ...); change the infrastructure part of that list with `WebSocketConfig::with_infrastructure_headers`.
 - **Origins are checked.** A browser attaches cookies to the handshake and does no CORS preflight, so by default only same-host origins (the `Origin` host and port against the `Host` header) are accepted, with `403` otherwise. Behind a proxy that rewrites `Host`, list the public origin with `with_allowed_origins`, or replace the rule with `with_origin_check`.
 - **Every RPC has a deadline.** The client's `connect-timeout-ms` travels as a query parameter; the server caps it at `with_max_timeout` (one hour by default), and gives the client `with_opening_timeout` (30 seconds) to send its opening message, so a client that upgrades and goes quiet cannot hold a connection.
 - **Graceful shutdown.** The built-in `Server` ends open WebSocket RPCs with `unavailable` when it shuts down, and waits for them to close.
 - **Keep-alive.** The server pings every 30 seconds (`with_keep_alive`) and closes a connection that has been silent for `with_keep_alive_timeout`.
 - **No compression.** `permessage-deflate` is not negotiated and there is no message-level compression.
-- **Path prefix.** Some load balancers need WebSocket traffic on its own URL space. `with_path_prefix("ws")` serves WebSocket only under `/ws/{service}/{method}` and plain HTTP only at the bare paths. Configure the client with the same prefix; it goes after the client's base path.
+- **Path prefix.** Some load balancers need WebSocket traffic on its own URL space. `with_path_prefix("ws")` serves WebSocket only under `/ws/{service}/{method}` and plain HTTP only at the bare paths. WebSocket clients put the prefix in their base URL (`http://host/ws`).
 
 On the client, `WebSocketTransport` (with the `client` feature; `client-tls` for `wss://`) is a `ClientTransport` for generated clients. Point the `ClientConfig` at the server's `http://` or `https://` address and it switches to `ws://` or `wss://`:
 
@@ -1790,6 +1790,8 @@ let transport = WebSocketTransport::plaintext(); // or ::with_tls(tls_config)
 let config = ClientConfig::new("http://localhost:8080".parse()?);
 let client = ChatServiceClient::new(transport, config);
 ```
+
+For a server with a WebSocket path prefix, put the prefix in this client's base URL (`http://localhost:8080/ws`) and keep the bare URL for any `HttpClient`, since the prefixed paths refuse plain HTTP.
 
 It carries every RPC kind, unary included, each on its own connection, so use it where WebSocket buys something — usually bidi streaming — and an `HttpClient` for the rest. It rejects request headers that servers refuse in request metadata (`Cookie`, `Host`, `X-Forwarded-*`, ...) with `invalid_argument` before dialing, and undoes any request compression set on the `ClientConfig`.
 

@@ -19,6 +19,7 @@ use http::{HeaderMap, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame};
 use http_body_util::BodyExt;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -65,6 +66,12 @@ const RESPONSE_QUEUE: usize = 2;
 /// let mut stream = client.chat().await?; // full-duplex bidi
 /// ```
 ///
+/// A server that serves WebSocket under its own path, with
+/// [`WebSocketConfig::with_path_prefix`](super::WebSocketConfig::with_path_prefix),
+/// is reached by putting that path in the base URI
+/// (`http://localhost:8080/ws`). An HTTP client for the same server keeps
+/// the bare base URI, since the prefixed paths refuse plain HTTP.
+///
 /// Every RPC kind is supported, unary included, and a bidi stream is full
 /// duplex. Messages are always sent uncompressed, since this binding has no
 /// message compression: a request compression set on the [`ClientConfig`] is
@@ -93,7 +100,6 @@ pub struct WebSocketTransport {
 
 #[derive(Clone)]
 struct Options {
-    path_prefix: Option<String>,
     max_message_size: usize,
     handshake_timeout: Option<Duration>,
     #[cfg(feature = "client-tls")]
@@ -104,7 +110,6 @@ impl std::fmt::Debug for WebSocketTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("WebSocketTransport");
         debug
-            .field("path_prefix", &self.options.path_prefix)
             .field("max_message_size", &self.options.max_message_size)
             .field("handshake_timeout", &self.options.handshake_timeout);
         #[cfg(feature = "client-tls")]
@@ -119,7 +124,6 @@ impl WebSocketTransport {
     pub fn plaintext() -> Self {
         Self {
             options: Arc::new(Options {
-                path_prefix: None,
                 max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
                 handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
                 #[cfg(feature = "client-tls")]
@@ -140,17 +144,6 @@ impl WebSocketTransport {
         let mut transport = Self::plaintext();
         transport.options_mut().tls = Some(Arc::new(config));
         transport
-    }
-
-    /// Put `prefix` between the base URI's path and the procedure, to match
-    /// a server configured with
-    /// [`WebSocketConfig::with_path_prefix`](super::WebSocketConfig::with_path_prefix).
-    /// Leading and trailing `/` are ignored.
-    #[must_use]
-    pub fn with_path_prefix(mut self, prefix: impl AsRef<str>) -> Self {
-        let trimmed = prefix.as_ref().trim_matches('/');
-        self.options_mut().path_prefix = (!trimmed.is_empty()).then(|| format!("/{trimmed}"));
-        self
     }
 
     /// The largest message the server may send, in bytes. A larger one
@@ -196,11 +189,9 @@ impl ClientTransport for WebSocketTransport {
 ///
 /// A unary RPC reports such a failure from the transport's `send`, so its
 /// code reaches the caller as is. A streaming RPC reports it while reading
-/// this body, and the client call path reports every body read failure as
-/// `internal` (or `deadline_exceeded` past the deadline), keeping this
-/// body's [`ConnectError`] as its [source](std::error::Error::source). An
-/// oversized response message is `resource_exhausted` on a unary RPC and
-/// `internal`, caused by `resource_exhausted`, on a streaming one.
+/// this body; the client call path keeps its code (or reports
+/// `deadline_exceeded` past the deadline) and keeps this body's
+/// [`ConnectError`] as its [source](std::error::Error::source).
 pub struct WebSocketBody {
     inner: BodyInner,
 }
@@ -281,11 +272,7 @@ async fn start(
         .get("connect-timeout-ms")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let uri = websocket_uri(
-        &parts.uri,
-        options.path_prefix.as_deref(),
-        timeout.as_deref(),
-    )?;
+    let uri = websocket_uri(&parts.uri, timeout.as_deref())?;
     if let Some(name) = parts.headers.keys().find(|name| {
         !skip_request_header(name)
             && is_reserved_request_key(name.as_str(), DEFAULT_INFRASTRUCTURE_HEADERS)
@@ -322,14 +309,9 @@ async fn start(
     })
 }
 
-/// The handshake URI (§4.2): `ws`/`wss` for `http`/`https`, the prefix
-/// between the base path and the procedure, and the deadline as a query
-/// parameter.
-fn websocket_uri(
-    uri: &Uri,
-    prefix: Option<&str>,
-    timeout: Option<&str>,
-) -> Result<Uri, ConnectError> {
+/// The handshake URI (§4.2): `ws`/`wss` for `http`/`https`, and the
+/// deadline as a query parameter.
+fn websocket_uri(uri: &Uri, timeout: Option<&str>) -> Result<Uri, ConnectError> {
     let scheme = match uri.scheme_str() {
         Some("http" | "ws") => "ws",
         Some("https" | "wss") => "wss",
@@ -343,17 +325,6 @@ fn websocket_uri(
         .authority()
         .ok_or_else(|| ConnectError::invalid_argument("request URI has no authority"))?;
     let path = uri.path();
-    let path = match prefix {
-        Some(prefix) => {
-            // The procedure is always the last two segments.
-            let mut segments = path.rsplitn(3, '/');
-            let method = segments.next().unwrap_or_default();
-            let service = segments.next().unwrap_or_default();
-            let base = segments.next().unwrap_or_default();
-            format!("{base}{prefix}/{service}/{method}")
-        }
-        None => path.to_owned(),
-    };
     let mut target = format!("{scheme}://{authority}{path}");
     if let Some(timeout) = timeout {
         target.push('?');
@@ -367,12 +338,19 @@ fn websocket_uri(
 }
 
 /// Request headers the protocol carries some other way, or that describe
-/// the HTTP request rather than the RPC.
+/// the HTTP request rather than the RPC. This binding has no message
+/// compression, so `accept-encoding` has nothing to negotiate.
 fn skip_request_header(name: &HeaderName) -> bool {
     is_protocol_header(name.as_str())
         || matches!(
             name.as_str(),
-            "content-length" | "transfer-encoding" | "connection" | "te" | "host" | "upgrade"
+            "accept-encoding"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "te"
+                | "host"
+                | "upgrade"
         )
 }
 
@@ -413,19 +391,21 @@ async fn connect(options: &Options, uri: Uri, codec: CodecFormat) -> Result<Sock
     let config = FrameConfig::default()
         .max_message_size(Some(max))
         .max_frame_size(Some(max));
+    // tungstenite fails the handshake, before the socket opens, when the
+    // server echoes no subprotocol or one that was not offered (§4.3).
     let (mut ws, response) = tokio_tungstenite::client_async_with_config(request, io, Some(config))
         .await
         .map_err(handshake_error)?;
     // Compression is never offered, so any negotiated extension is the
     // server imposing one, which this binding forbids without
     // no_context_takeover in both directions (§10).
-    if response
-        .headers()
-        .contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
-    {
-        let message = "the server negotiated a WebSocket extension that was not offered";
+    if let Some(extensions) = response.headers().get(header::SEC_WEBSOCKET_EXTENSIONS) {
+        let message = format!(
+            "the server negotiated the WebSocket extension {:?}, which was not offered",
+            String::from_utf8_lossy(extensions.as_bytes())
+        );
         let _ = ws
-            .close(Some(wire::close_frame(close_code::CLIENT_ERROR, message)))
+            .close(Some(wire::close_frame(close_code::CLIENT_ERROR, &message)))
             .await;
         return Err(ConnectError::internal(message));
     }
@@ -466,19 +446,23 @@ fn no_tls() -> ConnectError {
     )
 }
 
-/// Map a failed handshake to the error the RPC reports. A rejected upgrade
-/// is mapped from its HTTP status as Connect maps any HTTP status.
+/// Map a failed handshake to the error the RPC reports (§4.5). A rejected
+/// upgrade reports the Connect error in its body, or else is mapped from its
+/// HTTP status as Connect maps any HTTP status.
 fn handshake_error(err: WsError) -> ConnectError {
     match err {
         WsError::Http(response) => {
             let status = response.status();
-            let detail = response
-                .body()
-                .as_deref()
-                .map(String::from_utf8_lossy)
-                .map(|body| body.trim().to_owned())
-                .filter(|body| !body.is_empty())
-                .unwrap_or_else(|| status.to_string());
+            let body = response.body().as_deref().unwrap_or_default();
+            if let Some(err) = crate::client::connect_error_from_body(status, body) {
+                return err;
+            }
+            let detail = String::from_utf8_lossy(body).trim().to_owned();
+            let detail = if detail.is_empty() {
+                status.to_string()
+            } else {
+                detail
+            };
             ConnectError::new(
                 crate::client::http_status_to_error_code(status),
                 format!(
@@ -489,6 +473,9 @@ fn handshake_error(err: WsError) -> ConnectError {
         }
         WsError::Io(err) => {
             ConnectError::unavailable_from_transport(err, "WebSocket handshake failed")
+        }
+        WsError::Protocol(ProtocolError::SecWebSocketSubProtocolError(err)) => {
+            ConnectError::internal(format!("WebSocket subprotocol negotiation failed: {err}"))
         }
         other => ConnectError::unavailable(format!("WebSocket handshake failed: {other}")),
     }
@@ -505,15 +492,36 @@ enum End {
     /// the connection is already gone).
     Fail(ConnectError, Option<u16>),
     /// The server broke the protocol: fail the RPC with this error and close
-    /// with 3102, telling the server why.
-    Fault(ConnectError),
+    /// with this code, telling the server why.
+    Fault(ConnectError, u16),
     /// The caller dropped the call.
     Abandoned,
 }
 
 impl From<WireError> for End {
     fn from(err: WireError) -> Self {
-        End::Fault(err.error)
+        End::Fault(err.error, err.fault.close_code(Side::Client))
+    }
+}
+
+/// Response extension through which the call path reports a response message
+/// it could not decode, which is a protocol error (§6.1) the session explains
+/// in its Close frame.
+#[derive(Clone)]
+pub(crate) struct DecodeReport(Arc<std::sync::Mutex<Option<oneshot::Sender<String>>>>);
+
+impl DecodeReport {
+    fn new() -> (Self, oneshot::Receiver<String>) {
+        let (tx, rx) = oneshot::channel();
+        (Self(Arc::new(std::sync::Mutex::new(Some(tx)))), rx)
+    }
+
+    /// Report that the response message did not decode, with `err`.
+    pub(crate) fn fail(&self, err: &ConnectError) {
+        let sender = self.0.lock().ok().and_then(|mut sender| sender.take());
+        if let Some(sender) = sender {
+            let _ = sender.send(err.message.clone().unwrap_or_default());
+        }
     }
 }
 
@@ -532,6 +540,8 @@ struct Delivery {
     /// A response envelope waiting for room in the caller's queue. While one
     /// waits, the connection is not read.
     pending: Option<Bytes>,
+    /// Whether the call path could decode the response.
+    verdict: Option<oneshot::Receiver<String>>,
 }
 
 /// Request-side state: the caller's body, cut into messages one at a time.
@@ -547,6 +557,8 @@ struct Outgoing {
 struct Received {
     headers: Option<HeaderMap>,
     unary_message: Option<Bytes>,
+    /// A unary response carried more than one message.
+    extra_message: bool,
 }
 
 impl Session {
@@ -555,6 +567,7 @@ impl Session {
             head: Some(head),
             body: None,
             pending: None,
+            verdict: None,
         };
         let end = self.drive(&call, metadata, body, &mut delivery).await;
         self.finish(end, delivery).await;
@@ -689,7 +702,7 @@ impl Session {
         } else {
             envelope.data
         };
-        let message = wire::encode_body(Marker::Body, &payload, call.codec).map_err(internal)?;
+        let message = wire::encode_body(&payload, call.codec).map_err(internal)?;
         self.outbound.push(message);
         Ok(())
     }
@@ -708,19 +721,17 @@ impl Session {
                     .decompress_with_limit(encoding, payload, usize::MAX)
                     .map_err(internal)?;
             }
-            let message =
-                wire::encode_body(Marker::Body, &payload, call.codec).map_err(internal)?;
+            let message = wire::encode_body(&payload, call.codec).map_err(internal)?;
             self.outbound.push(message);
         }
-        let end = wire::encode_body(Marker::ClientEnd, &[], call.codec).map_err(internal)?;
-        self.outbound.push(end);
+        self.outbound
+            .push(wire::encode_json(Marker::ClientEnd, b""));
         Ok(())
     }
 
     fn read_error(&self, err: WsError) -> End {
         match err {
             WsError::Capacity(_) => End::from(WireError::new(
-                Side::Client,
                 Fault::TooLarge,
                 format!(
                     "response message exceeds the {} byte limit",
@@ -728,7 +739,6 @@ impl Session {
                 ),
             )),
             WsError::Utf8(_) => End::from(WireError::new(
-                Side::Client,
                 Fault::Encoding,
                 "a text message is not valid UTF-8",
             )),
@@ -756,14 +766,14 @@ impl Session {
         // Only a fault the server caused is explained to it; a local
         // failure's message may hold the caller's own data.
         let (error, close) = match end {
-            End::Finished => (None, Some((close_code::NORMAL, String::new()))),
+            End::Finished => (None, Some(verdict(&mut delivery).await)),
             End::Fail(err, close) => (
                 Some(err),
                 close.map(|code| (code, "client error".to_owned())),
             ),
-            End::Fault(err) => {
+            End::Fault(err, code) => {
                 let reason = err.message.clone().unwrap_or_default();
-                (Some(err), Some((close_code::CLIENT_ERROR, reason)))
+                (Some(err), Some((code, reason)))
             }
             End::Abandoned => (None, Some((close_code::NORMAL, String::new()))),
         };
@@ -787,6 +797,29 @@ impl Session {
     }
 }
 
+/// The close for an RPC whose `S` arrived: 1000, unless the call path could
+/// not decode the response message, which is a protocol error (§6.1).
+async fn verdict(delivery: &mut Delivery) -> (u16, String) {
+    let normal = (close_code::NORMAL, String::new());
+    let Some(mut verdict) = delivery.verdict.take() else {
+        return normal;
+    };
+    let reason = match verdict.try_recv() {
+        Ok(reason) => Some(reason),
+        Err(TryRecvError::Closed) => None,
+        Err(TryRecvError::Empty) => {
+            // A client-stream caller decodes only once its body has ended.
+            let _ =
+                tokio::time::timeout(crate::service::DRAIN_TIMEOUT, deliver(delivery, None)).await;
+            tokio::time::timeout(crate::service::DRAIN_TIMEOUT, verdict)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }
+    };
+    reason.map_or(normal, |reason| (close_code::CLIENT_ERROR, reason))
+}
+
 /// Hand the caller what is still queued, then the error, if any: through
 /// the head while the caller still awaits it, through the body after. The
 /// connection is closed by now, so this waits for as long as the caller
@@ -798,13 +831,16 @@ async fn deliver(delivery: &mut Delivery, error: Option<ConnectError>) {
         }
         return;
     }
-    let Some(body) = delivery.body.take() else {
+    let Some(body) = delivery.body.as_ref() else {
         return;
     };
-    let pending = delivery.pending.take();
+    // Cancel-safe: `verdict` bounds this, and an item not yet sent stays
+    // queued for the unbounded call in `finish`.
+    let pending = &mut delivery.pending;
     let send_all = async {
-        if let Some(item) = pending {
-            body.send(Ok(item)).await.ok()?;
+        if pending.is_some() {
+            let permit = body.reserve().await.ok()?;
+            permit.send(Ok(pending.take()?));
         }
         if let Some(error) = error {
             body.send(Err(error)).await.ok()?;
@@ -815,6 +851,7 @@ async fn deliver(delivery: &mut Delivery, error: Option<ConnectError>) {
         _ = send_all => {}
         () = body.closed() => {}
     }
+    delivery.body = None;
 }
 
 /// Take one message from the server. `Ok(true)` once `S` has been handed on.
@@ -834,7 +871,10 @@ fn receive(
         let headers = metadata_headers(&message.payload)?;
         if !call.unary {
             let (tx, rx) = mpsc::channel(RESPONSE_QUEUE);
-            let response = streaming_head(&headers, call.codec, rx);
+            let mut response = streaming_head(&headers, call.codec, rx);
+            let (report, verdict) = DecodeReport::new();
+            response.extensions_mut().insert(report);
+            delivery.verdict = Some(verdict);
             let delivered = delivery
                 .head
                 .take()
@@ -851,9 +891,10 @@ fn receive(
         Marker::Metadata => Err(protocol_error("a second Leading-Metadata ('M') message").into()),
         Marker::Body if call.unary => {
             if received.unary_message.is_some() {
-                return Err(protocol_error("a unary response with more than one message").into());
+                received.extra_message = true;
+            } else {
+                received.unary_message = Some(message.payload);
             }
-            received.unary_message = Some(message.payload);
             Ok(false)
         }
         Marker::Body => {
@@ -869,12 +910,23 @@ fn receive(
                         error,
                     }
                 })?;
-            let response = unary_response(
-                headers.clone(),
-                end,
-                received.unary_message.take(),
-                call.codec,
-            );
+            let mut response = if received.extra_message && end.error.is_none() {
+                Err(ConnectError::unimplemented(
+                    "the server sent more than one message for a unary RPC",
+                ))
+            } else {
+                unary_response(
+                    headers.clone(),
+                    end,
+                    received.unary_message.take(),
+                    call.codec,
+                )
+            };
+            if let Ok(response) = &mut response {
+                let (report, verdict) = DecodeReport::new();
+                response.extensions_mut().insert(report);
+                delivery.verdict = Some(verdict);
+            }
             if let Some(head) = delivery.head.take() {
                 let _ = head.send(response);
             }
@@ -896,7 +948,7 @@ fn receive(
 }
 
 fn protocol_error(message: &str) -> WireError {
-    WireError::new(Side::Client, Fault::Protocol, message)
+    WireError::protocol(message)
 }
 
 fn internal(err: ConnectError) -> End {
@@ -904,8 +956,14 @@ fn internal(err: ConnectError) -> End {
 }
 
 /// The connection ended without the server's `S` (§13.1), which always
-/// fails the RPC, whatever the close code.
+/// fails the RPC: `internal` for invalid data (1007), `resource_exhausted`
+/// for an oversized message (1009), and `unavailable` otherwise.
 fn connection_lost(frame: Option<CloseFrame>) -> End {
+    let code = match frame.as_ref().map(|frame| u16::from(frame.code)) {
+        Some(close_code::INVALID_PAYLOAD) => ErrorCode::Internal,
+        Some(close_code::MESSAGE_TOO_BIG) => ErrorCode::ResourceExhausted,
+        _ => ErrorCode::Unavailable,
+    };
     let message = match frame {
         Some(frame) if frame.reason.is_empty() => format!(
             "the WebSocket closed with code {} before the end of the response",
@@ -918,12 +976,12 @@ fn connection_lost(frame: Option<CloseFrame>) -> End {
         ),
         None => "the WebSocket connection ended before the end of the response".to_owned(),
     };
-    End::Fail(ConnectError::unavailable(message), None)
+    End::Fail(ConnectError::new(code, message), None)
 }
 
 fn metadata_headers(payload: &[u8]) -> Result<HeaderMap, WireError> {
     let mut headers = HeaderMap::new();
-    for (name, values) in decode_metadata(payload, Side::Client)? {
+    for (name, values) in decode_metadata(payload)? {
         for value in values {
             headers.append(name.clone(), value);
         }
@@ -1024,23 +1082,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn websocket_uri_maps_scheme_prefix_and_timeout() {
+    fn websocket_uri_maps_scheme_and_timeout() {
         let uri: Uri = "http://localhost:8080/api/pkg.Svc/Method".parse().unwrap();
         assert_eq!(
-            websocket_uri(&uri, None, None).unwrap(),
+            websocket_uri(&uri, None).unwrap(),
             "ws://localhost:8080/api/pkg.Svc/Method"
         );
         assert_eq!(
-            websocket_uri(&uri, Some("/ws"), Some("1500")).unwrap(),
-            "ws://localhost:8080/api/ws/pkg.Svc/Method?connect-timeout-ms=1500"
+            websocket_uri(&uri, Some("1500")).unwrap(),
+            "ws://localhost:8080/api/pkg.Svc/Method?connect-timeout-ms=1500"
         );
         let uri: Uri = "https://example.com/pkg.Svc/Method".parse().unwrap();
         assert_eq!(
-            websocket_uri(&uri, Some("/ws"), None).unwrap(),
-            "wss://example.com/ws/pkg.Svc/Method"
+            websocket_uri(&uri, None).unwrap(),
+            "wss://example.com/pkg.Svc/Method"
         );
         let uri: Uri = "ftp://example.com/pkg.Svc/Method".parse().unwrap();
-        assert!(websocket_uri(&uri, None, None).is_err());
+        assert!(websocket_uri(&uri, None).is_err());
+    }
+
+    #[test]
+    fn connection_lost_maps_the_close_code() {
+        let lost = |code: u16| match connection_lost(Some(wire::close_frame(code, ""))) {
+            End::Fail(err, None) => err.code,
+            _ => panic!("connection_lost must fail the RPC without closing"),
+        };
+        assert_eq!(lost(close_code::INVALID_PAYLOAD), ErrorCode::Internal);
+        assert_eq!(
+            lost(close_code::MESSAGE_TOO_BIG),
+            ErrorCode::ResourceExhausted
+        );
+        for code in [1000, 1001, 1002, 1011] {
+            assert_eq!(lost(code), ErrorCode::Unavailable, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn verdict_closes_with_the_decode_failure() {
+        let (report, rx) = DecodeReport::new();
+        let mut delivery = Delivery {
+            head: None,
+            body: None,
+            pending: None,
+            verdict: Some(rx),
+        };
+        report.fail(&ConnectError::internal("bad bytes"));
+        assert_eq!(
+            verdict(&mut delivery).await,
+            (close_code::CLIENT_ERROR, "bad bytes".to_owned())
+        );
+
+        let (report, rx) = DecodeReport::new();
+        delivery.verdict = Some(rx);
+        drop(report);
+        assert_eq!(
+            verdict(&mut delivery).await,
+            (close_code::NORMAL, String::new())
+        );
+
+        delivery.verdict = None;
+        assert_eq!(
+            verdict(&mut delivery).await,
+            (close_code::NORMAL, String::new())
+        );
+
+        // A caller that decodes only after the body ends reports late.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (report, verdict_rx) = DecodeReport::new();
+        delivery.body = Some(tx);
+        delivery.pending = Some(Bytes::from_static(b"end"));
+        delivery.verdict = Some(verdict_rx);
+        let caller = tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+            report.fail(&ConnectError::internal("late"));
+        });
+        assert_eq!(
+            verdict(&mut delivery).await,
+            (close_code::CLIENT_ERROR, "late".to_owned())
+        );
+        caller.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verdict_timeout_keeps_the_undelivered_item() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(Ok(Bytes::from_static(b"queued"))).unwrap();
+        let (_report, verdict_rx) = DecodeReport::new();
+        let mut delivery = Delivery {
+            head: None,
+            body: Some(tx),
+            pending: Some(Bytes::from_static(b"end")),
+            verdict: Some(verdict_rx),
+        };
+        assert_eq!(
+            verdict(&mut delivery).await,
+            (close_code::NORMAL, String::new())
+        );
+        assert!(delivery.body.is_some());
+        assert_eq!(delivery.pending.as_deref(), Some(&b"end"[..]));
     }
 
     #[test]

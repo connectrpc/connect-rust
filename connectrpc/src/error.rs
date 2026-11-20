@@ -620,6 +620,43 @@ impl std::error::Error for ConnectError {
     }
 }
 
+/// The cause of a `ConnectError` reporting a message that failed to decode.
+/// Connect over WebSocket ends such an RPC as a protocol error, so the
+/// session needs to tell it apart from a handler's own `invalid_argument`.
+#[derive(Debug)]
+struct UndecodableMessage(Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for UndecodableMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for UndecodableMessage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+impl ConnectError {
+    /// Mark this error as reporting a message that failed to decode, with
+    /// `cause` as the decoder's error.
+    pub(crate) fn decode_failure(
+        self,
+        cause: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        self.with_source(UndecodableMessage(cause.into()))
+    }
+
+    /// Whether this error reports a message that failed to decode.
+    #[cfg(feature = "websocket")]
+    pub(crate) fn is_decode_failure(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.is::<UndecodableMessage>())
+    }
+}
+
 impl From<std::io::Error> for ConnectError {
     fn from(err: std::io::Error) -> Self {
         Self::internal(err.to_string()).with_source(err)
