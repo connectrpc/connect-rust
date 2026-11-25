@@ -3504,7 +3504,7 @@ fn grpc_percent_encode(message: &str) -> String {
 }
 
 /// Build an error response with ConnectRpcBody body type.
-pub(crate) fn error_response_either(err: ConnectError) -> Response<ConnectRpcBody> {
+fn error_response_either(err: ConnectError) -> Response<ConnectRpcBody> {
     error_response(err).map(ConnectRpcBody::Full)
 }
 

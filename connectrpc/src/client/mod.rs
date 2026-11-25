@@ -5001,10 +5001,6 @@ struct ConnectErrorResponse {
     details: Vec<ErrorDetail>,
 }
 
-/// Maps an HTTP status code to a Connect error code per the Connect protocol spec.
-///
-/// Only specific HTTP status codes have defined mappings. All other codes map to
-/// `Unknown` per the specification.
 /// Build the error for a gRPC response body that could not be parsed.
 ///
 /// On a non-2xx the HTTP status is the more useful report — it is the code that
@@ -5032,6 +5028,10 @@ fn body_parse_error(
     err
 }
 
+/// Maps an HTTP status code to a Connect error code per the Connect protocol spec.
+///
+/// Only specific HTTP status codes have defined mappings. All other codes map to
+/// `Unknown` per the specification.
 pub(crate) fn http_status_to_error_code(status: http::StatusCode) -> ErrorCode {
     match status.as_u16() {
         400 => ErrorCode::Internal,
@@ -5080,12 +5080,28 @@ fn format_timeout(timeout: Duration, protocol: Protocol) -> String {
 /// e.g. because the compression policy's size threshold was not met). For
 /// gRPC/gRPC-Web this is ignored — `grpc-encoding` is a capability
 /// declaration and the per-message envelope flag signals actual compression.
+/// Attach the codecs that compress the request, so a transport that must
+/// undo the compression (WebSocket has none of its own) can.
+fn with_compression_registry(
+    builder: http::request::Builder,
+    config: &ClientConfig,
+) -> http::request::Builder {
+    #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+    if config.request_compression.is_some() {
+        return builder.extension(config.compression.clone());
+    }
+    #[cfg(not(all(feature = "websocket", not(target_arch = "wasm32"))))]
+    let _ = config;
+    builder
+}
+
 fn add_unary_request_headers(
     mut builder: http::request::Builder,
     config: &ClientConfig,
     timeout: Option<Duration>,
     applied_content_encoding: Option<&str>,
 ) -> http::request::Builder {
+    builder = with_compression_registry(builder, config);
     builder = builder.header(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static(unary_request_content_type(config)),
@@ -5141,6 +5157,7 @@ fn add_streaming_request_headers(
     config: &ClientConfig,
     timeout: Option<Duration>,
 ) -> http::request::Builder {
+    builder = with_compression_registry(builder, config);
     builder = builder.header(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static(streaming_request_content_type(config)),

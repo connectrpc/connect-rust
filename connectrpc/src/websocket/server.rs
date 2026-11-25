@@ -47,23 +47,18 @@ use crate::codec::CodecFormat;
 use crate::dispatcher::Dispatcher;
 use crate::envelope::{EnvelopeAssembler, flags};
 use crate::error::ConnectError;
-use crate::service::{
-    ConnectRpcBody, ConnectRpcService, DRAIN_TIMEOUT, end_stream_error_json, error_response_either,
-};
+use crate::service::{ConnectRpcBody, ConnectRpcService, DRAIN_TIMEOUT, end_stream_error_json};
 
-/// How many request messages may wait for the handler, beyond the one the
-/// session holds, before it stops reading the connection. Each can be up to
-/// the message size limit, so this stays small.
+/// Request messages that may wait for the handler beyond the one the session
+/// holds; each can be as large as the size limit, so this stays small.
 const REQUEST_QUEUE: usize = 1;
 
 /// About how many response bytes are queued before they are written and
 /// flushed together.
 const WRITE_BATCH: usize = 64 * 1024;
 
-/// Request extension marking a synthesized request whose unary method may be
-/// served with streaming framing. The service reports through it whether the
-/// RPC ended because a request message did not decode, which on a WebSocket
-/// is a protocol error (§6.1): still `invalid_argument`, but closed with 1002.
+/// Marks a request a session synthesized, whose unary methods use streaming
+/// framing, and carries back a request message that did not decode (§6.1).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WebSocketDispatch {
     undecodable: Arc<OnceLock<String>>,
@@ -99,11 +94,8 @@ impl WebSocketDispatch {
     }
 }
 
-/// Connection extension the built-in server attaches so that upgraded
-/// sessions, which outlive their connection's task, still end on graceful
-/// shutdown and hold it open until they have. Only a [`SessionGuard`]
-/// counts, so a handler that keeps a copy of its request's extensions does
-/// not hold shutdown open.
+/// Connection extension that lets graceful shutdown end upgraded sessions,
+/// which outlive their connection's task, and wait for them.
 #[derive(Clone)]
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) struct SessionTracker(Arc<TrackerInner>);
@@ -146,10 +138,16 @@ impl SessionTracker {
 /// One live session, counted until dropped.
 struct SessionGuard(SessionTracker);
 
+impl SessionGuard {
+    fn tracker(&self) -> &TrackerInner {
+        &self.0.0
+    }
+}
+
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        if self.0.0.live.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.0.idle.notify_waiters();
+        if self.tracker().live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.tracker().idle.notify_waiters();
         }
     }
 }
@@ -281,16 +279,6 @@ where
             "cross-origin WebSocket handshake refused",
         );
     }
-    if service
-        .dispatcher()
-        .lookup(procedure.trim_start_matches('/'))
-        .is_none()
-    {
-        return error_response_either(
-            ConnectError::unimplemented(format!("method not found: {procedure}"))
-                .with_http_status(StatusCode::NOT_FOUND),
-        );
-    }
     let Some(on_upgrade) = parts.extensions.remove::<OnUpgrade>() else {
         if parts.version == http::Version::HTTP_11 {
             tracing::error!(
@@ -312,9 +300,21 @@ where
         .extensions
         .remove::<SessionTracker>()
         .map(|tracker| tracker.guard());
+    // A browser can read an `S` but not a refused handshake (§4.5).
+    let timeout = if service
+        .dispatcher()
+        .lookup(procedure.strip_prefix('/').unwrap_or(&procedure))
+        .is_none()
+    {
+        Err(ConnectError::unimplemented(format!(
+            "method not found: {procedure}"
+        )))
+    } else {
+        wire::parse_timeout_param(parts.uri.query())
+    };
     let handshake = Handshake {
         accepted_at: Instant::now(),
-        timeout: wire::parse_timeout_param(parts.uri.query()),
+        timeout,
         codec,
         procedure,
         headers: parts.headers,
@@ -338,6 +338,7 @@ where
 /// What the session keeps from the handshake.
 struct Handshake {
     accepted_at: Instant,
+    /// The client's timeout, or why the RPC is refused in-band (§4.5).
     timeout: Result<Option<Duration>, ConnectError>,
     codec: CodecFormat,
     procedure: String,
@@ -386,7 +387,10 @@ async fn run_session<D: Dispatcher>(
             return;
         }
     };
-    let path = handshake.procedure.trim_start_matches('/');
+    let path = handshake
+        .procedure
+        .strip_prefix('/')
+        .unwrap_or(&handshake.procedure);
     let limits = service
         .dispatcher()
         .lookup(path)
@@ -408,7 +412,7 @@ async fn run_session<D: Dispatcher>(
         read_failed: false,
         max_message_size: limits.max_message_size(),
     };
-    let shutdown = guard.as_ref().map(|guard| guard.0.0.shutdown.clone());
+    let shutdown = guard.as_ref().map(|guard| guard.tracker().shutdown.clone());
     let procedure = handshake.procedure.clone();
     let driven = AssertUnwindSafe(session.drive(service, handshake, shutdown))
         .catch_unwind()
@@ -473,7 +477,7 @@ impl Session {
     async fn drive<D: Dispatcher>(
         &mut self,
         service: ConnectRpcService<D>,
-        mut handshake: Handshake,
+        handshake: Handshake,
         mut shutdown: Option<watch::Receiver<bool>>,
     ) -> End {
         let (deadline, opening_deadline) = match handshake.deadlines() {
@@ -543,29 +547,15 @@ impl Session {
                 }
                 message = self.stream.next(), if inbound.pending.is_none() => {
                     keep_alive.heard();
-                    let message = match message {
-                        Some(Ok(Message::Close(_))) | None => return End::Canceled,
-                        Some(Ok(message)) => message,
-                        Some(Err(err)) => {
-                            self.read_failed = true;
-                            return self.read_error(err);
-                        }
-                    };
-                    if out.ended {
-                        continue;
-                    }
-                    let message = match wire::classify(message, Side::Server, self.codec) {
-                        Ok(Some(message)) => message,
-                        Ok(None) => continue,
-                        Err(err) => return err.into(),
-                    };
-                    let result = match pending_handshake.take() {
-                        Some(handshake) => self
-                            .open(&service, handshake, message, &mut inbound, deadline)
-                            .map(|response| out.response = Some(response)),
-                        None => receive(&mut inbound, message),
-                    };
-                    if let Err(end) = result {
+                    let read = self.on_message(
+                        message,
+                        &service,
+                        &mut pending_handshake,
+                        &mut inbound,
+                        &mut out,
+                        deadline,
+                    );
+                    if let Err(end) = read {
                         return end;
                     }
                     if out.response.is_some() && opening {
@@ -599,6 +589,40 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Take what the client sent: the opening `M` dispatches the RPC, and
+    /// later messages feed its request stream.
+    fn on_message<D: Dispatcher>(
+        &mut self,
+        message: Option<Result<Message, WsError>>,
+        service: &ConnectRpcService<D>,
+        handshake: &mut Option<Handshake>,
+        inbound: &mut Inbound,
+        out: &mut Outflow,
+        deadline: Option<Instant>,
+    ) -> Result<(), End> {
+        let message = match message {
+            Some(Ok(Message::Close(_))) | None => return Err(End::Canceled),
+            Some(Ok(message)) => message,
+            Some(Err(err)) => {
+                self.read_failed = true;
+                return Err(self.read_error(err));
+            }
+        };
+        if out.ended {
+            return Ok(());
+        }
+        let Some(message) = wire::classify(message, Side::Server, self.codec)? else {
+            return Ok(());
+        };
+        match handshake.take() {
+            Some(handshake) => {
+                out.response = Some(self.open(service, handshake, message, inbound, deadline)?);
+            }
+            None => receive(inbound, message)?,
+        }
+        Ok(())
     }
 
     /// Dispatch the RPC once its opening `M` arrives.
@@ -689,6 +713,8 @@ impl Session {
             if !out.leftover.is_empty() || out.ended {
                 return Ok(());
             }
+            // A no-op waker is enough: the loop polls the body again whenever
+            // this finds nothing ready.
             match out
                 .body
                 .as_mut()
@@ -789,14 +815,28 @@ impl Session {
                 ))
             }
         };
+        tracing::debug!(
+            close_code = close.as_ref().map(|frame| u16::from(frame.code)),
+            "WebSocket session ended"
+        );
         let closing = close.is_some();
-        if let Some(frame) = close {
-            self.outbound.push(Message::Close(Some(frame)));
+        match close {
+            Some(frame) => self.outbound.push(Message::Close(Some(frame))),
+            // The peer is gone or closed; only tungstenite's Close reply,
+            // which the write's flush sends, is still owed.
+            None => self.outbound.clear(),
         }
         let written =
             tokio::time::timeout(DRAIN_TIMEOUT, self.outbound.write(&mut self.sink)).await;
+        // After a Close that could not be written there is nothing to protect.
         if matches!(written, Ok(Ok(()))) || !closing {
-            wire::drain(self.sink, self.stream, self.read_failed).await;
+            wire::drain(
+                self.sink,
+                self.stream,
+                self.read_failed,
+                self.max_message_size,
+            )
+            .await;
         }
     }
 }
@@ -831,8 +871,8 @@ fn receive(inbound: &mut Inbound, message: wire::WireMessage) -> Result<(), End>
 impl Handshake {
     /// The RPC's deadline (§11.1), and the earlier one by which the opening
     /// `M` must arrive. A timeout the RPC cannot run under is the error.
-    fn deadlines(&mut self) -> Result<(Option<Instant>, Option<Instant>), ConnectError> {
-        let client_timeout = match std::mem::replace(&mut self.timeout, Ok(None))? {
+    fn deadlines(&self) -> Result<(Option<Instant>, Option<Instant>), ConnectError> {
+        let client_timeout = match self.timeout.clone()? {
             Some(Duration::ZERO) => {
                 return Err(ConnectError::deadline_exceeded(
                     "the client's deadline was zero",
@@ -905,7 +945,7 @@ impl Handshake {
                 .as_millis();
             headers.insert(
                 HeaderName::from_static(wire::TIMEOUT_PARAM),
-                HeaderValue::from(remaining.min(9_999_999_999) as u64),
+                HeaderValue::from(remaining.min(wire::MAX_TIMEOUT_MILLIS.into()) as u64),
             );
         }
         extensions.insert(WebSocketRpc);

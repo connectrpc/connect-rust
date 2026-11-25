@@ -6,6 +6,7 @@ use std::time::Duration;
 use buffa_types::google::protobuf::__buffa::view::StringValueView;
 use buffa_types::google::protobuf::StringValue;
 use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{raw_http_status, serve};
 use crate::ErrorCode;
@@ -221,12 +222,11 @@ async fn unknown_procedure_is_unimplemented() {
 /// A server that answers one call with `messages`, then reports the Close
 /// frame the client sends.
 async fn scripted(
-    messages: Vec<tokio_tungstenite::tungstenite::Message>,
+    messages: Vec<Message>,
 ) -> (
     SocketAddr,
     tokio::sync::oneshot::Receiver<Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>>,
 ) {
-    use tokio_tungstenite::tungstenite::Message;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
@@ -245,6 +245,33 @@ async fn scripted(
     (addr, close_rx)
 }
 
+/// A unary `Echo` call with "x" to the server at `addr`.
+async fn echo(
+    addr: SocketAddr,
+) -> Result<
+    crate::client::UnaryResponse<buffa::view::OwnedView<StringValueView<'static>>>,
+    crate::ConnectError,
+> {
+    call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+}
+
+/// A complete response: `M`, the binary message `body` (its marker
+/// included), and an empty `S`.
+fn reply(body: &'static [u8]) -> Vec<Message> {
+    vec![
+        Message::Text("M[]".into()),
+        Message::Binary(bytes::Bytes::from_static(body)),
+        Message::Text("S{}".into()),
+    ]
+}
+
 async fn close_code(
     close_rx: tokio::sync::oneshot::Receiver<
         Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
@@ -260,28 +287,12 @@ async fn close_code(
 
 #[tokio::test]
 async fn an_undecodable_response_is_a_protocol_error() {
-    use tokio_tungstenite::tungstenite::Message;
-    let script = || {
-        vec![
-            Message::Text("M[]".into()),
-            Message::Binary(bytes::Bytes::from_static(b"B\xff")),
-            Message::Text("S{}".into()),
-        ]
-    };
-    let (addr, close_rx) = scripted(script()).await;
-    let err = call_unary::<_, _, StringValueView<'static>>(
-        &WebSocketTransport::plaintext(),
-        &client_config(addr),
-        spec("/test.v1.EchoService/Echo", StreamType::Unary),
-        StringValue::from("x"),
-        CallOptions::default(),
-    )
-    .await
-    .unwrap_err();
+    let (addr, close_rx) = scripted(reply(b"B\xff")).await;
+    let err = echo(addr).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
     assert_eq!(close_code(close_rx).await, 3102);
 
-    let (addr, close_rx) = scripted(script()).await;
+    let (addr, close_rx) = scripted(reply(b"B\xff")).await;
     let err = call_client_stream::<_, _, StringValueView<'static>>(
         &WebSocketTransport::plaintext(),
         &client_config(addr),
@@ -297,7 +308,6 @@ async fn an_undecodable_response_is_a_protocol_error() {
 
 #[tokio::test]
 async fn a_unary_response_needs_exactly_one_message() {
-    use tokio_tungstenite::tungstenite::Message;
     let body = || Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x"));
     let (addr, close_rx) = scripted(vec![
         Message::Text("M[]".into()),
@@ -306,37 +316,15 @@ async fn a_unary_response_needs_exactly_one_message() {
         Message::Text("S{}".into()),
     ])
     .await;
-    let err = call_unary::<_, _, StringValueView<'static>>(
-        &WebSocketTransport::plaintext(),
-        &client_config(addr),
-        spec("/test.v1.EchoService/Echo", StreamType::Unary),
-        StringValue::from("x"),
-        CallOptions::default(),
-    )
-    .await
-    .unwrap_err();
+    let err = echo(addr).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unimplemented, "{err}");
     assert_eq!(close_code(close_rx).await, 1000);
 }
 
 #[tokio::test]
 async fn a_decoded_response_closes_normally() {
-    use tokio_tungstenite::tungstenite::Message;
-    let (addr, close_rx) = scripted(vec![
-        Message::Text("M[]".into()),
-        Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x")),
-        Message::Text("S{}".into()),
-    ])
-    .await;
-    let ok = call_unary::<_, _, StringValueView<'static>>(
-        &WebSocketTransport::plaintext(),
-        &client_config(addr),
-        spec("/test.v1.EchoService/Echo", StreamType::Unary),
-        StringValue::from("x"),
-        CallOptions::default(),
-    )
-    .await
-    .unwrap();
+    let (addr, close_rx) = scripted(reply(b"B\x0a\x01x")).await;
+    let ok = echo(addr).await.unwrap();
     assert_eq!(ok.into_owned().value, "x");
     assert_eq!(close_code(close_rx).await, 1000);
 }
@@ -351,22 +339,12 @@ async fn client_reports_a_server_that_closes_without_s() {
         let _ = ws.next().await;
         let _ = ws.close(None).await;
     });
-    let err = call_unary::<_, _, StringValueView<'static>>(
-        &WebSocketTransport::plaintext(),
-        &client_config(addr),
-        spec("/test.v1.EchoService/Echo", StreamType::Unary),
-        StringValue::from("x"),
-        CallOptions::default(),
-    )
-    .await
-    .unwrap_err();
+    let err = echo(addr).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
 }
 
 #[tokio::test]
 async fn client_closes_with_3102_and_a_reason_on_a_malformed_end_stream() {
-    use tokio_tungstenite::tungstenite::Message;
-
     // A server that answers a unary call with an S that is not JSON, then
     // reports the client's Close frame.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -383,15 +361,7 @@ async fn client_closes_with_3102_and_a_reason_on_a_malformed_end_stream() {
             }
         }
     });
-    let err = call_unary::<_, _, StringValueView<'static>>(
-        &WebSocketTransport::plaintext(),
-        &client_config(addr),
-        spec("/test.v1.EchoService/Echo", StreamType::Unary),
-        StringValue::from("x"),
-        CallOptions::default(),
-    )
-    .await
-    .unwrap_err();
+    let err = echo(addr).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Internal, "{err}");
     let frame = close_rx.await.unwrap().expect("a Close frame with a code");
     assert_eq!(u16::from(frame.code), 3102);
@@ -401,7 +371,6 @@ async fn client_closes_with_3102_and_a_reason_on_a_malformed_end_stream() {
 #[tokio::test]
 async fn a_local_failure_is_not_explained_to_the_server() {
     use http_body_util::BodyExt;
-    use tokio_tungstenite::tungstenite::Message;
 
     use crate::client::ClientTransport;
 
@@ -526,7 +495,6 @@ async fn client_rejects_reserved_headers_before_dialing() {
 
 #[tokio::test]
 async fn client_reports_an_early_s_while_still_sending() {
-    use tokio_tungstenite::tungstenite::Message;
     // A server that rejects the RPC as soon as it opens, then discards what
     // the client is still sending until it closes.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -573,7 +541,6 @@ async fn server_stream(
 
 #[tokio::test]
 async fn an_undecodable_streamed_message_closes_at_once() {
-    use tokio_tungstenite::tungstenite::Message;
     // Without S only the decode failure can end the RPC; with S right behind
     // the bad message, the session must not close normally first.
     let script = |end: bool| {
@@ -612,13 +579,7 @@ async fn an_undecodable_streamed_message_closes_at_once() {
 
 #[tokio::test]
 async fn a_finished_stream_closes_while_the_caller_holds_it() {
-    use tokio_tungstenite::tungstenite::Message;
-    let (addr, close_rx) = scripted(vec![
-        Message::Text("M[]".into()),
-        Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x")),
-        Message::Text("S{}".into()),
-    ])
-    .await;
+    let (addr, close_rx) = scripted(reply(b"B\x0a\x01x")).await;
     let mut stream = server_stream(addr).await;
     assert!(stream.message().await.unwrap().is_some());
     assert!(stream.message().await.unwrap().is_none());
@@ -629,4 +590,155 @@ async fn a_finished_stream_closes_while_the_caller_holds_it() {
         .unwrap();
     assert_eq!(u16::from(frame.code), 1000);
     drop(stream);
+}
+
+#[tokio::test]
+async fn a_server_protocol_violation_fails_with_3102() {
+    let marker = |text: &'static str| Message::Text(text.into());
+    let scripts = [
+        vec![marker("Xunknown")],
+        vec![Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x"))],
+        vec![marker("M[]"), marker("M[]")],
+        vec![marker("M[]"), marker("C")],
+        vec![Message::Binary(bytes::Bytes::from_static(b"M[]"))],
+    ];
+    for script in scripts {
+        let (addr, close_rx) = scripted(script.clone()).await;
+        let err = echo(addr).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal, "{script:?}: {err}");
+        assert_eq!(close_code(close_rx).await, 3102, "{script:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_client_answers_a_server_that_closes_first() {
+    let (addr, close_rx) = scripted(vec![
+        Message::Text("M[]".into()),
+        Message::Close(Some(wire_close(1001))),
+    ])
+    .await;
+    let err = echo(addr).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+    assert_eq!(close_code(close_rx).await, 1001);
+}
+
+fn wire_close(code: u16) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+        code: code.into(),
+        reason: "".into(),
+    }
+}
+
+#[tokio::test]
+async fn the_client_enforces_its_own_deadline() {
+    // The server answers `M` and then nothing, so only the client's timer ends it.
+    let (addr, close_rx) = scripted(vec![Message::Text("M[]".into())]).await;
+    let mut stream = call_server_stream::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Count", StreamType::ServerStream),
+        StringValue::from("x"),
+        CallOptions::default().with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    let err = stream.message().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::DeadlineExceeded, "{err}");
+    let frame = tokio::time::timeout(Duration::from_secs(2), close_rx)
+        .await
+        .expect("closed at the deadline while the caller holds the stream")
+        .unwrap()
+        .unwrap();
+    assert_eq!(u16::from(frame.code), 1000);
+    drop(stream);
+}
+
+#[tokio::test]
+async fn the_error_does_not_wait_for_the_close_to_finish() {
+    // A server that breaks the protocol, then neither reads nor closes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut ws = accept_proto(&listener).await;
+        ws.send(Message::Text("Xbad".into())).await.unwrap();
+        std::future::pending::<()>().await;
+        drop(ws);
+    });
+    let err = tokio::time::timeout(Duration::from_secs(2), echo(addr))
+        .await
+        .expect("the error arrives before the drain window ends")
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+}
+
+#[tokio::test]
+async fn a_server_that_picks_no_subprotocol_is_refused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let _ws = tokio_tungstenite::accept_async(tcp).await;
+    });
+    let err = echo(addr).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+}
+
+#[tokio::test]
+async fn a_header_value_that_is_not_text_is_refused_before_dialing() {
+    // Nothing listens here; the call must fail before it tries.
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let value = http::HeaderValue::from_bytes(b"caf\xe9").unwrap();
+    let options =
+        CallOptions::default().with_headers([(http::HeaderName::from_static("x-name"), value)]);
+    let err = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        options,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
+}
+
+/// A codec only the caller's registry knows: it reverses the bytes.
+struct Reverse;
+
+impl crate::CompressionProvider for Reverse {
+    fn name(&self) -> &'static str {
+        "reverse"
+    }
+
+    fn compress(&self, data: &[u8]) -> Result<bytes::Bytes, crate::ConnectError> {
+        Ok(data.iter().rev().copied().collect::<Vec<_>>().into())
+    }
+
+    fn decompressor<'a>(
+        &self,
+        data: &'a [u8],
+    ) -> Result<Box<dyn std::io::Read + 'a>, crate::ConnectError> {
+        let reversed: Vec<u8> = data.iter().rev().copied().collect();
+        Ok(Box::new(std::io::Cursor::new(reversed)))
+    }
+}
+
+#[tokio::test]
+async fn a_custom_request_codec_is_undone_with_the_callers_registry() {
+    let (addr, _) = serve(WebSocketConfig::new()).await;
+    let config = client_config(addr)
+        .with_compression(crate::CompressionRegistry::default().register(Reverse))
+        .with_compression_policy(crate::CompressionPolicy::default().with_min_size(0))
+        .compress_requests("reverse");
+    let text = "a request long enough to compress";
+    let response = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &config,
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from(text),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(response.into_owned().value.ends_with(text));
 }

@@ -1536,7 +1536,7 @@ impl Server {
         };
         tracing::info!("ConnectRPC server listening on {scheme}://{addr}");
 
-        let connection = connection_for(&self.service, self.connection);
+        let connection = connection_for(&self.service, &self.accept, self.connection);
         serve_with_listener(
             listener,
             self.service,
@@ -1964,7 +1964,7 @@ impl BoundServer {
         D: Dispatcher,
         F: Future<Output = ()> + Send + 'static,
     {
-        let connection = connection_for(&service, self.connection);
+        let connection = connection_for(&service, &self.accept, self.connection);
         serve_with_listener(
             self.listener,
             service,
@@ -1981,16 +1981,34 @@ impl BoundServer {
 /// The connection settings for serving `service`: a service that speaks
 /// Connect over WebSocket must not invite browsers to use HTTP/2 WebSockets,
 /// which it refuses.
-#[cfg_attr(not(feature = "websocket"), allow(unused_variables))]
+#[cfg_attr(
+    not(all(feature = "websocket", feature = "server-tls")),
+    allow(unused_variables)
+)]
 fn connection_for<D: Dispatcher>(
     service: &ConnectRpcService<D>,
+    accept: &AcceptConfig,
     config: ConnectionConfig,
 ) -> ConnectionConfig {
     #[cfg(feature = "websocket")]
     if service.websocket_config().is_some() {
+        #[cfg(feature = "server-tls")]
+        if accept.tls.as_deref().is_some_and(refuses_http1) {
+            tracing::warn!(
+                "the TLS configuration's ALPN list leaves out http/1.1, so no client \
+                 can open a Connect-over-WebSocket RPC"
+            );
+        }
         return config.with_http2_extended_connect(false);
     }
     config
+}
+
+/// Whether a TLS configuration negotiates ALPN without offering HTTP/1.1,
+/// the only HTTP version a WebSocket handshake here can use.
+#[cfg(all(feature = "websocket", feature = "server-tls"))]
+fn refuses_http1(tls: &rustls::ServerConfig) -> bool {
+    !tls.alpn_protocols.is_empty() && !tls.alpn_protocols.iter().any(|p| p == b"http/1.1")
 }
 
 /// Per-connection max-age settings, after jitter.
@@ -7005,5 +7023,19 @@ mod tests {
         // The exact DER bytes the client presented.
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].as_ref(), expected_client_der.as_ref());
+    }
+
+    #[cfg(all(feature = "websocket", feature = "server-tls"))]
+    #[test]
+    fn a_tls_config_without_http1_refuses_websocket_handshakes() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        assert!(!refuses_http1(&tls));
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        assert!(refuses_http1(&tls));
+        tls.alpn_protocols.push(b"http/1.1".to_vec());
+        assert!(!refuses_http1(&tls));
     }
 }

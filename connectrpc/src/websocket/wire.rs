@@ -47,7 +47,10 @@ impl Marker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     Server,
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "client", not(target_arch = "wasm32"))),
+        allow(dead_code)
+    )]
     Client,
 }
 
@@ -113,6 +116,7 @@ impl WireError {
     }
 }
 
+/// The WebSocket close codes the protocol uses (§13).
 pub(crate) mod close_code {
     pub(crate) const NORMAL: u16 = 1000;
     pub(crate) const GOING_AWAY: u16 = 1001;
@@ -120,7 +124,8 @@ pub(crate) mod close_code {
     pub(crate) const INVALID_PAYLOAD: u16 = 1007;
     pub(crate) const MESSAGE_TOO_BIG: u16 = 1009;
     pub(crate) const INTERNAL_ERROR: u16 = 1011;
-    /// The only error code a client sends (§13).
+    /// What a client sends for a protocol or local error, since a browser
+    /// can send only 1000 and 3000–4999 (§13).
     pub(crate) const CLIENT_ERROR: u16 = 3102;
 }
 
@@ -239,8 +244,8 @@ pub(crate) fn encode_body(payload: &[u8], codec: CodecFormat) -> Result<Message,
     encode(Marker::Body, payload, codec == CodecFormat::Proto)
 }
 
-/// A JSON message (`M` or `S`) built from JSON this crate serialized, which
-/// is always UTF-8, so the lossy conversion never changes it.
+/// A JSON message (`M` or `S`). Callers pass JSON that `serde_json`
+/// produced, which is UTF-8, so the lossy conversion never replaces anything.
 pub(crate) fn encode_json(marker: Marker, payload: &[u8]) -> Message {
     let mut text = String::with_capacity(payload.len() + 1);
     text.push(marker.byte() as char);
@@ -260,7 +265,10 @@ pub(crate) struct Outbound {
 
 impl Outbound {
     /// Whether nothing is queued, so the caller may produce more.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "client", not(target_arch = "wasm32"))),
+        allow(dead_code)
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -281,7 +289,6 @@ impl Outbound {
     }
 
     /// Drop what has not been handed to the sink yet.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
         self.queued_bytes = 0;
@@ -328,7 +335,7 @@ pub(crate) fn frame_config(max_message_size: usize) -> FrameConfig {
 
 /// Queue `item` for the peer's side of the RPC. Returns it back when the
 /// queue is full, so the caller holds it and stops reading until there is
-/// room. A receiver that has gone gets nothing more.
+/// room; `None` both when it was queued and when the receiver has gone.
 pub(crate) fn offer<T>(tx: Option<&mpsc::Sender<T>>, item: T) -> Option<T> {
     match tx?.try_send(item) {
         Err(mpsc::error::TrySendError::Full(item)) => Some(item),
@@ -336,6 +343,7 @@ pub(crate) fn offer<T>(tx: Option<&mpsc::Sender<T>>, item: T) -> Option<T> {
     }
 }
 
+/// Wait for room in the queue; `None` once there is no queue or receiver.
 pub(crate) async fn reserve<T>(tx: Option<&mpsc::Sender<T>>) -> Option<mpsc::OwnedPermit<T>> {
     tx?.clone().reserve_owned().await.ok()
 }
@@ -377,21 +385,28 @@ pub(crate) fn without_connect_metadata(json: Bytes) -> Bytes {
     serde_json::to_vec(&value).map_or(json, Bytes::from)
 }
 
-/// Read and discard until the peer closes or the drain window passes, so
-/// that a TCP reset over unread data cannot destroy what was sent (§13.2),
-/// and so that tungstenite answers the peer's Close. After a read error
-/// tungstenite reads nothing more, so the raw connection is drained instead.
+/// Read and discard until the peer closes, `byte_limit` bytes have been
+/// read or the drain window passes, so that a TCP reset over unread data
+/// cannot destroy what was sent (§13.2), and so that tungstenite answers the
+/// peer's Close. The byte limit keeps the bytes read past an oversized
+/// message within a bounded margin (§12). After a read error tungstenite
+/// reads nothing more, so the raw connection is drained instead.
 pub(crate) async fn drain<T>(
     sink: SplitSink<WebSocketStream<T>, Message>,
     mut stream: SplitStream<WebSocketStream<T>>,
     mut read_failed: bool,
+    byte_limit: usize,
 ) where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut left = byte_limit;
     let _ = tokio::time::timeout(crate::service::DRAIN_TIMEOUT, async {
         while !read_failed {
             match stream.next().await {
-                Some(Ok(_)) => {}
+                Some(Ok(message)) => match left.checked_sub(message.len()) {
+                    Some(rest) => left = rest,
+                    None => return,
+                },
                 Some(Err(_)) => read_failed = true,
                 None => return,
             }
@@ -400,7 +415,13 @@ pub(crate) async fn drain<T>(
             return;
         };
         let mut buf = [0; 8192];
-        while matches!(ws.get_mut().read(&mut buf).await, Ok(n) if n > 0) {}
+        while left > 0 {
+            let want = left.min(buf.len());
+            match ws.get_mut().read(&mut buf[..want]).await {
+                Ok(n) if n > 0 => left -= n,
+                _ => return,
+            }
+        }
     })
     .await;
 }
@@ -443,12 +464,12 @@ const MAX_METADATA_ITEMS: usize = 3 * MAX_METADATA_VALUES;
 pub(crate) fn decode_metadata(
     payload: &[u8],
 ) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, WireError> {
-    let budget = Cell::new(MAX_METADATA_ITEMS);
+    let budget = Budget::new(MAX_METADATA_ITEMS);
     let mut parser = serde_json::Deserializer::from_slice(payload);
     let raw = serde::de::DeserializeSeed::deserialize(Entries(&budget), &mut parser)
         .and_then(|raw| parser.end().map(|()| raw))
         .map_err(|e| {
-            if budget.get() == 0 {
+            if budget.exceeded.get() {
                 return WireError::new(
                     Fault::TooLarge,
                     format!("metadata has more than {MAX_METADATA_VALUES} values"),
@@ -511,22 +532,38 @@ pub(crate) fn append_metadata(
     }
 }
 
+/// How many more entries and strings a metadata parse may take, and whether
+/// it tried to take more, which tells a cap apart from a syntax error.
+struct Budget {
+    left: Cell<usize>,
+    exceeded: Cell<bool>,
+}
+
+impl Budget {
+    fn new(items: usize) -> Self {
+        Self {
+            left: Cell::new(items),
+            exceeded: Cell::new(false),
+        }
+    }
+
+    fn charge<E: serde::de::Error>(&self) -> Result<(), E> {
+        let Some(left) = self.left.get().checked_sub(1) else {
+            self.exceeded.set(true);
+            return Err(E::custom("too many items"));
+        };
+        self.left.set(left);
+        Ok(())
+    }
+}
+
 /// Parses the metadata array, failing once it has taken more entries and
 /// strings than the budget allows, so that a peer cannot make it allocate
 /// many times the payload's size.
-struct Entries<'a>(&'a Cell<usize>);
+struct Entries<'a>(&'a Budget);
 
 /// One entry's strings, charged to the same budget.
-struct Strings<'a>(&'a Cell<usize>);
-
-fn charge<E: serde::de::Error>(budget: &Cell<usize>) -> Result<(), E> {
-    let left = budget
-        .get()
-        .checked_sub(1)
-        .ok_or_else(|| E::custom("too many items"))?;
-    budget.set(left);
-    Ok(())
-}
+struct Strings<'a>(&'a Budget);
 
 impl<'de> serde::de::DeserializeSeed<'de> for Entries<'_> {
     type Value = Vec<Vec<String>>;
@@ -546,7 +583,7 @@ impl<'de> serde::de::Visitor<'de> for Entries<'_> {
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut entries = Vec::new();
         while let Some(entry) = seq.next_element_seed(Strings(self.0))? {
-            charge(self.0)?;
+            self.0.charge()?;
             entries.push(entry);
         }
         Ok(entries)
@@ -571,7 +608,7 @@ impl<'de> serde::de::Visitor<'de> for Strings<'_> {
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut strings = Vec::new();
         while let Some(string) = seq.next_element::<String>()? {
-            charge(self.0)?;
+            self.0.charge()?;
             strings.push(string);
         }
         Ok(strings)
@@ -592,19 +629,28 @@ fn metadata_value(value: &str) -> Option<HeaderValue> {
 
 /// Encode `headers` as a Leading-Metadata array, leaving out names `skip`
 /// rejects, the `connect-` names no peer may send (§7.3.2), and values that
-/// are not text.
+/// are not text. Values are trimmed, and `-bin` ones unpadded (§7.3.1).
 pub(crate) fn encode_metadata(headers: &HeaderMap, skip: impl Fn(&HeaderName) -> bool) -> Bytes {
     let mut entries = Vec::new();
     for name in headers.keys() {
         if skip(name) || name.as_str().starts_with("connect-") {
             continue;
         }
+        let binary = name.as_str().ends_with("-bin");
         let mut entry = vec![serde_json::Value::String(name.as_str().to_owned())];
         entry.extend(
             headers
                 .get_all(name)
                 .iter()
                 .filter_map(|value| value.to_str().ok())
+                .map(|value| value.trim_matches([' ', '\t']))
+                .map(|value| {
+                    if binary {
+                        value.trim_end_matches('=')
+                    } else {
+                        value
+                    }
+                })
                 .map(|value| serde_json::Value::String(value.to_owned())),
         );
         if entry.len() > 1 {
@@ -673,9 +719,10 @@ pub(crate) fn is_protocol_header(name: &str) -> bool {
 /// matches any suffix.
 fn matches_pattern(name: &str, pattern: &str) -> bool {
     match pattern.strip_suffix('*') {
-        Some(prefix) => {
-            name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
-        }
+        Some(prefix) => name
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes())),
         None => name.eq_ignore_ascii_case(pattern),
     }
 }
@@ -692,11 +739,17 @@ pub(crate) const SUBPROTOCOL_JSON: &str = "connectrpc.1+json";
 /// The query parameter that carries a client's deadline.
 pub(crate) const TIMEOUT_PARAM: &str = "connect-timeout-ms";
 
-#[cfg_attr(not(feature = "client"), allow(dead_code))]
+/// The longest deadline the parameter can carry: ten decimal digits (§11).
+pub(crate) const MAX_TIMEOUT_MILLIS: u64 = 9_999_999_999;
+
+#[cfg_attr(
+    not(all(feature = "client", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 pub(crate) fn subprotocol_token(codec: CodecFormat) -> &'static str {
     match codec {
         CodecFormat::Json => SUBPROTOCOL_JSON,
-        _ => SUBPROTOCOL_PROTO,
+        CodecFormat::Proto => SUBPROTOCOL_PROTO,
     }
 }
 
@@ -750,7 +803,11 @@ pub(crate) fn parse_timeout_param(query: Option<&str>) -> Result<Option<Duration
                 "{TIMEOUT_PARAM} appears more than once"
             )));
         }
-        if value.is_empty() || value.len() > 10 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        let max_digits = MAX_TIMEOUT_MILLIS.ilog10() as usize + 1;
+        if value.is_empty()
+            || value.len() > max_digits
+            || !value.bytes().all(|b| b.is_ascii_digit())
+        {
             return Err(ConnectError::invalid_argument(format!(
                 "invalid {TIMEOUT_PARAM} value {value:?}: want 1 to 10 decimal digits"
             )));
@@ -1117,6 +1174,144 @@ mod tests {
             let err = parse_timeout_param(Some(bad)).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{bad}");
         }
+    }
+
+    #[test]
+    fn decode_metadata_rejects_more_malformed_values() {
+        let cases: &[&[u8]] = &[
+            br#"[["","x"]]"#,
+            br#"[["a",null]]"#,
+            br#"[["a","\ud800"]]"#,
+            br#"[["a","del\u007f"]]"#,
+        ];
+        for case in cases {
+            let err = decode_metadata(case).unwrap_err();
+            let case = String::from_utf8_lossy(case);
+            assert_eq!(err.fault, Fault::Protocol, "{case}");
+        }
+    }
+
+    #[test]
+    fn decode_metadata_reports_syntax_after_a_spent_budget_as_protocol() {
+        // Exactly the budget, then garbage: a syntax error, not a cap.
+        let entries = vec![r#"["k","v"]"#; MAX_METADATA_VALUES].join(",");
+        let payload = format!("[{entries}] trailing");
+        let err = decode_metadata(payload.as_bytes()).unwrap_err();
+        assert_eq!(err.fault, Fault::Protocol);
+    }
+
+    #[test]
+    fn encode_metadata_trims_values_and_unpads_binary_ones() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-a", HeaderValue::from_static(" v\t"));
+        headers.append("x-bin", HeaderValue::from_static("AAECAw=="));
+        let json = encode_metadata(&headers, |_| false);
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([["x-a", "v"], ["x-bin", "AAECAw"]])
+        );
+    }
+
+    #[test]
+    fn a_connect_end_stream_key_fails_the_rpc() {
+        let error = |key: &str| {
+            Bytes::from(format!(
+                r#"{{"error":{{"code":"internal","message":"{key}"}}}}"#
+            ))
+        };
+        let failed =
+            fail_connect_metadata(br#"{"metadata":{"connect-x":["1"],"x-ok":["1"]}}"#, error)
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&failed).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "metadata": {"x-ok": ["1"]},
+                "error": {"code": "internal", "message": "connect-x"},
+            })
+        );
+        // `connect-` only in a message, no metadata, or not JSON: unchanged.
+        for json in [
+            &br#"{"error":{"code":"internal","message":"\"connect-x"}}"#[..],
+            br#"{"metadata":{}}"#,
+            br#"not json "connect-"#,
+        ] {
+            assert!(fail_connect_metadata(json, error).is_none());
+        }
+    }
+
+    #[test]
+    fn frame_config_allows_the_marker_past_the_limit() {
+        let config = frame_config(10);
+        assert_eq!(config.max_message_size, Some(11));
+        assert_eq!(config.max_frame_size, Some(11));
+        assert_eq!(frame_config(usize::MAX).max_message_size, Some(usize::MAX));
+    }
+
+    #[test]
+    fn header_tokens_are_comma_separated_and_case_blind() {
+        let name = http::header::CONNECTION;
+        let mut headers = HeaderMap::new();
+        headers.append(&name, HeaderValue::from_static("keep-alive, Upgrade"));
+        assert!(header_has_token(&headers, &name, "upgrade"));
+        assert!(!header_has_token(&headers, &name, "close"));
+        headers.insert(&name, HeaderValue::from_bytes(b"up\xffgrade").unwrap());
+        assert!(!header_has_token(&headers, &name, "upgrade"));
+    }
+
+    #[test]
+    fn deny_patterns_never_cut_inside_a_character() {
+        assert!(matches_pattern("x-forwarded-for", "x-forwarded-*"));
+        assert!(matches_pattern("X-Real-IP", "x-real-ip"));
+        assert!(!matches_pattern("é", "x*"));
+        assert!(!matches_pattern("x", "xy*"));
+    }
+
+    #[test]
+    fn outbound_counts_queued_bytes() {
+        let mut outbound = Outbound::default();
+        outbound.push(text("Mab"));
+        outbound.push(binary(b"B\x01"));
+        assert_eq!(outbound.queued_bytes(), 5);
+        outbound.clear();
+        assert_eq!(outbound.queued_bytes(), 0);
+        assert!(outbound.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_stops_at_its_byte_limit() {
+        use tokio::io::AsyncWriteExt;
+        let (local, mut peer) = tokio::io::duplex(1024);
+        let ws = WebSocketStream::from_raw_socket(
+            local,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (sink, stream) = ws.split();
+        // The peer sends more than the limit and never closes.
+        peer.write_all(&[0; 64]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), drain(sink, stream, true, 16))
+            .await
+            .expect("drain stops at its byte limit, not the time limit");
+        drop(peer);
+    }
+
+    #[test]
+    fn timeout_param_edge_cases() {
+        assert_eq!(
+            parse_timeout_param(Some("connect-timeout-ms=0000000001")).unwrap(),
+            Some(Duration::from_millis(1))
+        );
+        assert!(parse_timeout_param(Some("connect-timeout-ms")).is_err());
+    }
+
+    #[test]
+    fn same_host_needs_a_bare_authority() {
+        assert!(is_same_host("https://example.com/path", "example.com"));
+        assert!(!is_same_host("https://user@example.com", "example.com"));
+        assert!(!is_same_host("https://example.com?q", "example.com"));
     }
 
     #[test]

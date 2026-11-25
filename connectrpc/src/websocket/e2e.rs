@@ -721,6 +721,19 @@ async fn invalid_timeout_is_reported_in_band() {
 }
 
 #[tokio::test]
+async fn an_unknown_procedure_is_reported_in_band() {
+    let (addr, _) = serve(WebSocketConfig::new()).await;
+    let mut ws = raw_connect(addr, "/test.v1.EchoService/Nope", "connectrpc.1+json", None)
+        .await
+        .unwrap();
+    let (received, code) = read_all(&mut ws).await;
+    assert_eq!(received.len(), 2, "{received:?}");
+    assert_eq!(received[0], text("M[]"));
+    assert_eq!(end_stream(&received[1])["error"]["code"], "unimplemented");
+    assert_eq!(code, Some(1000));
+}
+
+#[tokio::test]
 async fn zero_timeout_is_deadline_exceeded_without_dispatch() {
     let (addr, hang_dropped) = serve(WebSocketConfig::new()).await;
     let mut ws = raw_connect(
@@ -852,10 +865,6 @@ async fn handshake_failures_are_http_statuses() {
     .await
     .unwrap_err();
     assert_eq!(status(err), 403);
-    let err = raw_connect(addr, "/test.v1.EchoService/Nope", "connectrpc.1+json", None)
-        .await
-        .unwrap_err();
-    assert_eq!(status(err), 404);
     let same_origin = format!("https://{addr}");
     assert!(
         raw_connect(

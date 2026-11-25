@@ -12,8 +12,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
 use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame};
@@ -79,8 +79,13 @@ const RESPONSE_QUEUE: usize = 2;
 ///
 /// Request headers go to the server in the opening metadata message. Names a
 /// server rejects there by default (`Cookie`, `Host`, `Sec-*`, `Forwarded`,
-/// `X-Forwarded-*`, ...) fail the call with `invalid_argument` before
-/// dialing.
+/// `X-Forwarded-*`, ...) and values that are not text fail the call with
+/// `invalid_argument` before dialing. A name a server adds to its own deny
+/// list fails the RPC when the server reads it.
+///
+/// A caller that stops reading a stream for longer than the server's
+/// keep-alive timeout loses the RPC: an unread connection stops answering
+/// the server's Pings.
 ///
 /// Native targets only; in a browser, use the browser's `WebSocket` through
 /// a JavaScript Connect client.
@@ -234,6 +239,33 @@ struct Call {
     /// Request compression to undo: `content-encoding` for unary, the
     /// `connect-content-encoding` of compressed envelopes for streaming.
     encoding: Option<String>,
+    /// The caller's codecs, which compressed the request.
+    compression: CompressionRegistry,
+    /// When the client's own timer expires (§11.1).
+    deadline: Option<tokio::time::Instant>,
+}
+
+/// Refuse headers the opening metadata message cannot carry: names servers
+/// reject there by default, and values that are not text.
+fn check_request_headers(headers: &HeaderMap) -> Result<(), ConnectError> {
+    for (name, value) in headers
+        .iter()
+        .filter(|(name, _)| !skip_request_header(name))
+    {
+        if is_reserved_request_key(name.as_str(), DEFAULT_INFRASTRUCTURE_HEADERS) {
+            return Err(ConnectError::invalid_argument(format!(
+                "header {:?} cannot be sent over WebSocket; servers reject it in request metadata by default",
+                name.as_str()
+            )));
+        }
+        if value.to_str().is_err() {
+            return Err(ConnectError::invalid_argument(format!(
+                "header {:?} has a value that is not text, which WebSocket metadata cannot carry",
+                name.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn start(
@@ -256,6 +288,11 @@ async fn start(
     } else {
         "content-encoding"
     };
+    let timeout = parts
+        .headers
+        .get(wire::TIMEOUT_PARAM)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let call = Call {
         codec: detected.codec_format,
         unary: !detected.is_streaming,
@@ -265,22 +302,20 @@ async fn start(
             .and_then(|v| v.to_str().ok())
             .filter(|v| *v != "identity")
             .map(str::to_owned),
+        compression: parts
+            .extensions
+            .get::<CompressionRegistry>()
+            .cloned()
+            .unwrap_or_default(),
+        deadline: timeout
+            .as_deref()
+            .and_then(|millis| millis.parse().ok())
+            .and_then(|millis| {
+                tokio::time::Instant::now().checked_add(Duration::from_millis(millis))
+            }),
     };
-    let timeout = parts
-        .headers
-        .get("connect-timeout-ms")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
     let uri = websocket_uri(&parts.uri, timeout.as_deref())?;
-    if let Some(name) = parts.headers.keys().find(|name| {
-        !skip_request_header(name)
-            && is_reserved_request_key(name.as_str(), DEFAULT_INFRASTRUCTURE_HEADERS)
-    }) {
-        return Err(ConnectError::invalid_argument(format!(
-            "header {:?} cannot be sent over WebSocket; servers reject it in request metadata by default",
-            name.as_str()
-        )));
-    }
+    check_request_headers(&parts.headers)?;
     let metadata = encode_metadata(&parts.headers, skip_request_header);
 
     let connecting = connect(&options, uri, call.codec);
@@ -458,6 +493,9 @@ fn no_tls() -> ConnectError {
 /// Map a failed handshake to the error the RPC reports (§4.5). A rejected
 /// upgrade reports the Connect error in its body, or else is mapped from its
 /// HTTP status as Connect maps any HTTP status.
+/// The most bytes of a refused handshake's body that an error quotes.
+const MAX_HANDSHAKE_DETAIL: usize = 512;
+
 fn handshake_error(err: WsError) -> ConnectError {
     match err {
         WsError::Http(response) => {
@@ -466,7 +504,9 @@ fn handshake_error(err: WsError) -> ConnectError {
             if let Some(err) = crate::client::connect_error_from_body(status, body) {
                 return err;
             }
-            let detail = String::from_utf8_lossy(body).trim().to_owned();
+            // A proxy's error page can be long; the start says what it is.
+            let shown = &body[..body.len().min(MAX_HANDSHAKE_DETAIL)];
+            let detail = String::from_utf8_lossy(shown).trim().to_owned();
             let detail = if detail.is_empty() {
                 status.to_string()
             } else {
@@ -596,7 +636,6 @@ impl Session {
     ) -> End {
         self.outbound
             .push(wire::encode_json(Marker::Metadata, &metadata));
-        let compression = CompressionRegistry::default();
         let mut request = Outgoing {
             body: Some(body),
             leftover: Bytes::new(),
@@ -604,12 +643,15 @@ impl Session {
             unary: BytesMut::new(),
         };
         let mut received = Received::default();
+        let mut expiry = std::pin::pin!(tokio::time::sleep_until(
+            call.deadline.unwrap_or_else(tokio::time::Instant::now)
+        ));
         // After a failed write the server may still have sent `S` before it
         // closed, so keep reading until the stream ends.
         let mut write_failed = false;
 
         loop {
-            if let Err(end) = self.pump_request(call, &compression, &mut request) {
+            if let Err(end) = self.pump_request(call, &mut request) {
                 return end;
             }
             let can_read_request =
@@ -628,6 +670,12 @@ impl Session {
                 }
                 () = caller_gone(delivery.head.as_mut(), delivery.body.as_ref()) => {
                     return End::Abandoned;
+                }
+                () = &mut expiry, if call.deadline.is_some() => {
+                    return End::Fail(
+                        ConnectError::deadline_exceeded("the RPC deadline expired"),
+                        Some(close_code::NORMAL),
+                    );
                 }
                 written = std::future::poll_fn(|cx| self.outbound.poll_write(&mut self.sink, cx)),
                     if !write_failed && self.outbound.is_busy() =>
@@ -648,65 +696,78 @@ impl Session {
                     }
                 }
                 message = self.stream.next(), if delivery.pending.is_none() => {
-                    let message = match message {
-                        Some(Ok(Message::Close(frame))) => return connection_lost(frame),
-                        Some(Ok(message)) => message,
-                        Some(Err(err)) => {
-                            self.read_failed = true;
-                            return self.read_error(err);
-                        }
-                        None => return connection_lost(None),
-                    };
-                    let message = match wire::classify(message, Side::Client, self.codec) {
-                        Ok(Some(message)) => message,
-                        Ok(None) => continue,
-                        Err(err) => return err.into(),
-                    };
-                    match receive(call, &mut received, delivery, message) {
+                    match self.on_message(call, &mut received, delivery, message) {
                         Ok(false) => {}
                         Ok(true) => return End::Finished,
                         Err(end) => return end,
                     }
                 }
                 frame = next_frame(&mut request.body), if can_read_request => {
-                    match frame {
-                        None => {
-                            request.body = None;
-                            if request.assembler.has_partial() {
-                                return internal(ConnectError::internal(
-                                    "the request body ended inside a message",
-                                ));
-                            }
-                            if let Err(end) = self.end_request(call, &compression, &mut request.unary) {
-                                return end;
-                            }
-                        }
-                        Some(Err(err)) => {
-                            return End::Fail(err, Some(close_code::CLIENT_ERROR));
-                        }
-                        Some(Ok(frame)) => {
-                            if let Ok(data) = frame.into_data() {
-                                if call.unary {
-                                    request.unary.extend_from_slice(&data);
-                                } else {
-                                    request.leftover = data;
-                                }
-                            }
-                        }
+                    if let Err(end) = self.on_request_frame(call, &mut request, frame) {
+                        return end;
                     }
                 }
             }
         }
     }
 
-    /// Queue at most one request message from the caller's body, so that a
-    /// stalled write stops the caller rather than buffering its stream.
-    fn pump_request(
+    /// Take what the server sent. `Ok(true)` once its `S` has been handed on.
+    fn on_message(
         &mut self,
         call: &Call,
-        compression: &CompressionRegistry,
+        received: &mut Received,
+        delivery: &mut Delivery,
+        message: Option<Result<Message, WsError>>,
+    ) -> Result<bool, End> {
+        let message = match message {
+            Some(Ok(Message::Close(frame))) => return Err(connection_lost(frame)),
+            Some(Ok(message)) => message,
+            Some(Err(err)) => {
+                self.read_failed = true;
+                return Err(self.read_error(err));
+            }
+            None => return Err(connection_lost(None)),
+        };
+        match wire::classify(message, Side::Client, self.codec)? {
+            Some(message) => receive(call, received, delivery, message),
+            None => Ok(false),
+        }
+    }
+
+    /// Take the next frame of the caller's request body.
+    fn on_request_frame(
+        &mut self,
+        call: &Call,
         request: &mut Outgoing,
+        frame: Option<Result<Frame<Bytes>, ConnectError>>,
     ) -> Result<(), End> {
+        match frame {
+            None => {
+                request.body = None;
+                if request.assembler.has_partial() {
+                    return Err(internal(ConnectError::internal(
+                        "the request body ended inside a message",
+                    )));
+                }
+                self.end_request(call, &mut request.unary)
+            }
+            Some(Err(err)) => Err(End::Fail(err, Some(close_code::CLIENT_ERROR))),
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    if call.unary {
+                        request.unary.extend_from_slice(&data);
+                    } else {
+                        request.leftover = data;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Queue at most one request message from the caller's body, so that a
+    /// stalled write stops the caller rather than buffering its stream.
+    fn pump_request(&mut self, call: &Call, request: &mut Outgoing) -> Result<(), End> {
         if !self.outbound.is_empty() || request.leftover.is_empty() {
             return Ok(());
         }
@@ -723,7 +784,7 @@ impl Session {
                     "compressed request message without connect-content-encoding",
                 ))
             })?;
-            compression
+            call.compression
                 .decompress_with_limit(encoding, envelope.data, usize::MAX)
                 .map_err(internal)?
         } else {
@@ -735,16 +796,12 @@ impl Session {
     }
 
     /// The request body ended: queue the unary message, then `C`.
-    fn end_request(
-        &mut self,
-        call: &Call,
-        compression: &CompressionRegistry,
-        unary: &mut BytesMut,
-    ) -> Result<(), End> {
+    fn end_request(&mut self, call: &Call, unary: &mut BytesMut) -> Result<(), End> {
         if call.unary {
             let mut payload = std::mem::take(unary).freeze();
             if let Some(encoding) = &call.encoding {
-                payload = compression
+                payload = call
+                    .compression
                     .decompress_with_limit(encoding, payload, usize::MAX)
                     .map_err(internal)?;
             }
@@ -793,44 +850,62 @@ impl Session {
         // Only a fault the server caused is explained to it; a local
         // failure's message may hold the caller's own data.
         let (error, close) = match end {
-            End::Finished => (None, Some(verdict(&mut delivery).await)),
-            End::Fail(err, close) => (
-                Some(err),
-                close.map(|code| (code, "client error".to_owned())),
-            ),
+            End::Finished => (None, Some(close_after_end(&mut delivery).await)),
+            End::Fail(err, close) => {
+                let reason = if close == Some(close_code::NORMAL) {
+                    ""
+                } else {
+                    "client error"
+                };
+                (Some(err), close.map(|code| (code, reason.to_owned())))
+            }
             End::Fault(err, code) => {
                 let reason = err.message.clone().unwrap_or_default();
                 (Some(err), Some((code, reason)))
             }
-            End::Undecodable(reason) => (None, Some((close_code::CLIENT_ERROR, reason))),
+            End::Undecodable(reason) => {
+                // The caller has its error and will read nothing more.
+                delivery.body = None;
+                (None, Some((close_code::CLIENT_ERROR, reason)))
+            }
             End::Abandoned => (None, Some((close_code::NORMAL, String::new()))),
         };
-        // The socket is released before the outcome is delivered.
-        if let Some((code, reason)) = close {
-            let Self {
-                mut sink,
-                stream,
-                mut outbound,
-                read_failed,
-                ..
-            } = self;
-            outbound.push(Message::Close(Some(wire::close_frame(code, &reason))));
-            let written =
-                tokio::time::timeout(crate::service::DRAIN_TIMEOUT, outbound.write(&mut sink))
-                    .await;
-            if matches!(written, Ok(Ok(()))) {
-                wire::drain(sink, stream, read_failed).await;
-            }
-        } else {
-            drop(self);
+        tracing::debug!(
+            close_code = close.as_ref().map(|(code, _)| *code),
+            "WebSocket RPC ended"
+        );
+        // The caller hears the outcome while the connection closes.
+        tokio::join!(self.close(close), deliver(&mut delivery, error));
+    }
+
+    /// Send `close` and linger for the server's, bounded in time and bytes.
+    /// With none, the server closed first, and only tungstenite's reply to
+    /// its Close, which a flush sends, is still owed.
+    async fn close(self, close: Option<(u16, String)>) {
+        let Self {
+            mut sink,
+            stream,
+            mut outbound,
+            read_failed,
+            max_message_size,
+            ..
+        } = self;
+        let Some((code, reason)) = close else {
+            let _ = tokio::time::timeout(crate::service::DRAIN_TIMEOUT, sink.flush()).await;
+            return;
+        };
+        outbound.push(Message::Close(Some(wire::close_frame(code, &reason))));
+        let written =
+            tokio::time::timeout(crate::service::DRAIN_TIMEOUT, outbound.write(&mut sink)).await;
+        if matches!(written, Ok(Ok(()))) {
+            wire::drain(sink, stream, read_failed, max_message_size).await;
         }
-        deliver(&mut delivery, error).await;
     }
 }
 
 /// The close for an RPC whose `S` arrived: 1000, unless the call path could
 /// not decode the response message, which is a protocol error (§6.1).
-async fn verdict(delivery: &mut Delivery) -> (u16, String) {
+async fn close_after_end(delivery: &mut Delivery) -> (u16, String) {
     let normal = (close_code::NORMAL, String::new());
     let Some(mut verdict) = delivery.verdict.take() else {
         return normal;
@@ -1053,10 +1128,7 @@ fn unary_response(
             .with_trailers(trailers));
     }
     let message = message.ok_or_else(|| {
-        ConnectError::new(
-            ErrorCode::Unimplemented,
-            "the server ended a unary RPC without a response message",
-        )
+        ConnectError::unimplemented("the server ended a unary RPC without a response message")
     })?;
     let mut response = Response::new(WebSocketBody {
         inner: BodyInner::Full(Some(message)),
@@ -1144,7 +1216,7 @@ mod tests {
         };
         report.fail(&ConnectError::internal("bad bytes"));
         assert_eq!(
-            verdict(&mut delivery).await,
+            close_after_end(&mut delivery).await,
             (close_code::CLIENT_ERROR, "bad bytes".to_owned())
         );
 
@@ -1152,13 +1224,13 @@ mod tests {
         delivery.verdict = Some(rx);
         drop(report);
         assert_eq!(
-            verdict(&mut delivery).await,
+            close_after_end(&mut delivery).await,
             (close_code::NORMAL, String::new())
         );
 
         delivery.verdict = None;
         assert_eq!(
-            verdict(&mut delivery).await,
+            close_after_end(&mut delivery).await,
             (close_code::NORMAL, String::new())
         );
 
@@ -1173,7 +1245,7 @@ mod tests {
             report.fail(&ConnectError::internal("late"));
         });
         assert_eq!(
-            verdict(&mut delivery).await,
+            close_after_end(&mut delivery).await,
             (close_code::CLIENT_ERROR, "late".to_owned())
         );
         caller.await.unwrap();
@@ -1191,7 +1263,7 @@ mod tests {
             verdict: Some(verdict_rx),
         };
         assert_eq!(
-            verdict(&mut delivery).await,
+            close_after_end(&mut delivery).await,
             (close_code::NORMAL, String::new())
         );
         assert!(delivery.body.is_some());
