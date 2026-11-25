@@ -19,6 +19,7 @@ use connectrpc::Router;
 use connectrpc::error::ErrorDetail;
 use connectrpc::rustls;
 use connectrpc::server::Server;
+use connectrpc::websocket::WebSocketConfig;
 use connectrpc::{
     RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream, StreamMessage,
 };
@@ -998,7 +999,7 @@ async fn main() -> Result<()> {
         request.use_tls
     );
 
-    let _protocol = request
+    let protocol = request
         .protocol
         .as_known()
         .unwrap_or(Protocol::PROTOCOL_UNSPECIFIED);
@@ -1099,7 +1100,10 @@ async fn main() -> Result<()> {
     };
 
     // Serve requests using our custom hyper-based server
-    let connect_service = ConnectRpcService::new(router).with_limits(limits);
+    let mut connect_service = ConnectRpcService::new(router).with_limits(limits);
+    if protocol == Protocol::PROTOCOL_CONNECT_WEBSOCKET {
+        connect_service = connect_service.with_websocket(WebSocketConfig::new());
+    }
     bound
         .serve_with_service(connect_service)
         .await

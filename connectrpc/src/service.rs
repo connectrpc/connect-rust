@@ -717,6 +717,62 @@ impl EndStreamResponse {
     }
 }
 
+/// The JSON `EndStreamResponse` that ends a stream with `err`, the same
+/// payload a Connect streaming response carries in its END_STREAM envelope.
+#[cfg(feature = "websocket")]
+pub(crate) fn end_stream_error_json(err: &ConnectError) -> Bytes {
+    EndStreamResponse::error(err, err.trailers()).to_json()
+}
+
+#[cfg(feature = "websocket")]
+use crate::websocket::server::WebSocketDispatch;
+/// Without the `websocket` feature no request comes from a WebSocket session.
+#[cfg(not(feature = "websocket"))]
+type WebSocketDispatch = Infallible;
+
+/// The WebSocket session that synthesized this request, if one did. Its
+/// unary methods use streaming framing.
+pub(crate) fn websocket_dispatch(extensions: &http::Extensions) -> Option<WebSocketDispatch> {
+    #[cfg(feature = "websocket")]
+    return extensions.get::<WebSocketDispatch>().cloned();
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = extensions;
+        None
+    }
+}
+
+/// Tell the WebSocket session behind `dispatch`, if any, about an error from
+/// the service or handler; it acts only on one reporting an undecodable
+/// request, which is a protocol error there.
+pub(crate) fn note_error(dispatch: Option<&WebSocketDispatch>, err: &ConnectError) {
+    #[cfg(feature = "websocket")]
+    if let Some(dispatch) = dispatch {
+        dispatch.note(err);
+    }
+    #[cfg(not(feature = "websocket"))]
+    if let Some(never) = dispatch {
+        let _ = err;
+        match *never {}
+    }
+}
+
+/// `stream`, telling the WebSocket session behind `dispatch` about an error
+/// that ends it.
+fn watch_ending_error(
+    stream: crate::EncodedStream,
+    dispatch: Option<WebSocketDispatch>,
+) -> crate::EncodedStream {
+    let Some(dispatch) = dispatch else {
+        return stream;
+    };
+    Box::pin(stream.inspect(move |item| {
+        if let Err(err) = item {
+            note_error(Some(&dispatch), err);
+        }
+    }))
+}
+
 /// Response headers that may never be carried from a propagated error
 /// onto this response. Three classes, none of which describe the response
 /// being built.
@@ -1360,6 +1416,8 @@ pub struct ConnectRpcService<D = Router> {
     /// Interceptor chain, outermost first. One pointer to clone per
     /// request regardless of chain length.
     interceptors: InterceptorChain,
+    #[cfg(feature = "websocket")]
+    websocket: Option<Arc<crate::websocket::WebSocketConfig>>,
 }
 
 // Manual Clone impl because `#[derive(Clone)]` would add a `D: Clone` bound,
@@ -1373,6 +1431,8 @@ impl<D> Clone for ConnectRpcService<D> {
             compression_policy: self.compression_policy,
             deadline_policy: self.deadline_policy.clone(),
             interceptors: self.interceptors.clone(),
+            #[cfg(feature = "websocket")]
+            websocket: self.websocket.clone(),
         }
     }
 }
@@ -1397,6 +1457,8 @@ impl<D: Dispatcher> ConnectRpcService<D> {
             compression_policy: CompressionPolicy::default(),
             deadline_policy: DeadlinePolicy::new(),
             interceptors: InterceptorChain::default(),
+            #[cfg(feature = "websocket")]
+            websocket: None,
         }
     }
 
@@ -1495,6 +1557,26 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     pub fn with_interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
+    }
+
+    /// Accept Connect over WebSocket on every registered procedure, in
+    /// addition to Connect, gRPC and gRPC-Web over HTTP.
+    ///
+    /// A request carrying `Connection: Upgrade` and `Upgrade: websocket` is
+    /// a WebSocket handshake; anything else is served as before. See the
+    /// [`websocket`](crate::websocket) module for the protocol, the
+    /// server requirements, and where authentication belongs.
+    #[cfg(feature = "websocket")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    #[must_use]
+    pub fn with_websocket(mut self, config: crate::websocket::WebSocketConfig) -> Self {
+        self.websocket = Some(Arc::new(config));
+        self
+    }
+
+    #[cfg(all(feature = "websocket", feature = "server"))]
+    pub(crate) fn websocket_config(&self) -> Option<&crate::websocket::WebSocketConfig> {
+        self.websocket.as_deref()
     }
 
     /// Get the current limits configuration.
@@ -1604,6 +1686,29 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
+        #[cfg(feature = "websocket")]
+        if let Some(config) = &self.websocket
+            && websocket_dispatch(req.extensions()).is_none()
+        {
+            use crate::websocket::server::{Route, accept, route};
+            let response = match route(config, &req) {
+                Route::Http => None,
+                Route::Respond(response) => Some(*response),
+                Route::Upgrade(procedure) => {
+                    let config = Arc::clone(config);
+                    return Box::pin(std::future::ready(Ok(accept(
+                        self.clone(),
+                        config,
+                        req,
+                        procedure,
+                    ))));
+                }
+            };
+            if let Some(response) = response {
+                return Box::pin(std::future::ready(Ok(response)));
+            }
+        }
+
         let dispatcher = Arc::clone(&self.dispatcher);
         let limits = self.limits;
         let compression = Arc::clone(&self.compression);
@@ -2494,6 +2599,8 @@ where
     // from there into the handler context), the body is read or streamed below.
     let (parts, body) = req.into_parts();
     let extensions = parts.extensions;
+    let websocket = websocket_dispatch(&extensions);
+    let via_websocket = websocket.is_some();
     let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
@@ -2587,6 +2694,8 @@ where
         Some(MethodKind::Unary) => match protocol {
             // gRPC sends unary RPCs with streaming framing, so fall through.
             Protocol::Grpc | Protocol::GrpcWeb => StreamingDispatchKind::Unary,
+            // So does Connect over WebSocket, which has no unary framing.
+            Protocol::Connect if via_websocket => StreamingDispatchKind::Unary,
             Protocol::Connect => {
                 let err =
                     ConnectError::invalid_argument("streaming content type used for unary method");
@@ -2684,7 +2793,10 @@ where
             );
             match with_request_deadline(deadline, fut).await {
                 Ok(result) => result,
-                Err(e) => return streaming_error_response(&e, protocol, codec_format),
+                Err(e) => {
+                    note_error(websocket.as_ref(), &e);
+                    return streaming_error_response(&e, protocol, codec_format);
+                }
             }
         }
         StreamingDispatchKind::Unary => {
@@ -2702,7 +2814,10 @@ where
                 Ok(r) => r.map_body(|body| -> crate::EncodedStream {
                     Box::pin(futures::stream::once(async move { Ok(body) }))
                 }),
-                Err(e) => return streaming_error_response(&e, protocol, codec_format),
+                Err(e) => {
+                    note_error(websocket.as_ref(), &e);
+                    return streaming_error_response(&e, protocol, codec_format);
+                }
             }
         }
     };
@@ -2733,7 +2848,8 @@ where
     // stream starts; the wrapper arms a `tokio::time::sleep` from this so
     // the deadline does not shift relative to request arrival.
     let remaining = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-    let resp_body = deadline_policy.enforce_on_response_stream(resp.body, remaining);
+    let resp_body = deadline_policy
+        .enforce_on_response_stream(watch_ending_error(resp.body, websocket), remaining);
     let body = StreamingResponseBody::new(
         resp_body,
         resp.trailers,
@@ -2785,6 +2901,7 @@ where
     let deadline = metadata
         .timeout
         .and_then(|t| std::time::Instant::now().checked_add(t));
+    let websocket = websocket_dispatch(&extensions);
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -2828,6 +2945,7 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
+            note_error(websocket.as_ref(), &e);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -3202,6 +3320,7 @@ where
     let deadline = metadata
         .timeout
         .and_then(|t| std::time::Instant::now().checked_add(t));
+    let websocket = websocket_dispatch(&extensions);
     let ctx = RequestContext::new(metadata.headers)
         .with_deadline(deadline)
         .with_extensions(extensions)
@@ -3246,6 +3365,7 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
+            note_error(websocket.as_ref(), &e);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -3276,7 +3396,8 @@ where
     // stream starts; the wrapper arms a `tokio::time::sleep` from this so
     // the deadline does not shift relative to request arrival.
     let remaining = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-    let resp_body = deadline_policy.enforce_on_response_stream(resp.body, remaining);
+    let resp_body = deadline_policy
+        .enforce_on_response_stream(watch_ending_error(resp.body, websocket), remaining);
     let body = StreamingResponseBody::new(
         resp_body,
         resp.trailers,

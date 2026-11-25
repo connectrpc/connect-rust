@@ -904,6 +904,16 @@ pub struct TestCaseView<'a> {
         'a,
         ::buffa::EnumValue<super::super::Code>,
     >,
+    /// When expected_response indicates that an error with a message is expected, in
+    /// some cases, the actual error message returned may be flexible. In that case,
+    /// this field provides other acceptable error messages, in addition to the one
+    /// indicated in the expected_response. As long as the actual error's message
+    /// equals any of these, the error is considered conformant, and the test case
+    /// can pass. This field may only be used when expected_response has an error
+    /// with a message.
+    ///
+    /// Field 5: `other_allowed_error_messages`
+    pub other_allowed_error_messages: ::buffa::RepeatedView<'a, &'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for TestCaseView<'a> {
@@ -1028,6 +1038,17 @@ impl<'a> ::buffa::MessageView<'a> for TestCaseView<'a> {
                     );
                 }
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.other_allowed_error_messages.push(__elem);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -1074,6 +1095,11 @@ impl<'a> ::buffa::MessageView<'a> for TestCaseView<'a> {
                 None => ::buffa::MessageField::none(),
             },
             other_allowed_error_codes: self.other_allowed_error_codes.to_vec(),
+            other_allowed_error_messages: self
+                .other_allowed_error_messages
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1116,6 +1142,9 @@ impl<'a> ::buffa::ViewEncode<'a> for TestCaseView<'a> {
                 .map(|v| ::buffa::types::int32_encoded_len(v.to_i32()) as u64)
                 .sum::<u64>();
             size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
+        }
+        for v in &self.other_allowed_error_messages {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
@@ -1163,6 +1192,9 @@ impl<'a> ::buffa::ViewEncode<'a> for TestCaseView<'a> {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
             }
         }
+        for v in &self.other_allowed_error_messages {
+            ::buffa::types::put_string_field(5u32, v, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -1203,6 +1235,13 @@ impl<'__a> ::serde::Serialize for TestCaseView<'__a> {
                 .serialize_entry(
                     "otherAllowedErrorCodes",
                     &::buffa::json_helpers::EnumSeqJson(&self.other_allowed_error_codes),
+                )?;
+        }
+        if !self.other_allowed_error_messages.is_empty() {
+            __map
+                .serialize_entry(
+                    "otherAllowedErrorMessages",
+                    &*self.other_allowed_error_messages,
                 )?;
         }
         __map.end()
@@ -1375,6 +1414,19 @@ impl TestCaseOwnedView {
         &self,
     ) -> &::buffa::RepeatedView<'_, ::buffa::EnumValue<super::super::Code>> {
         &self.0.reborrow().other_allowed_error_codes
+    }
+    /// When expected_response indicates that an error with a message is expected, in
+    /// some cases, the actual error message returned may be flexible. In that case,
+    /// this field provides other acceptable error messages, in addition to the one
+    /// indicated in the expected_response. As long as the actual error's message
+    /// equals any of these, the error is considered conformant, and the test case
+    /// can pass. This field may only be used when expected_response has an error
+    /// with a message.
+    ///
+    /// Field 5: `other_allowed_error_messages`
+    #[must_use]
+    pub fn other_allowed_error_messages(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().other_allowed_error_messages
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<TestCaseView<'static>>>

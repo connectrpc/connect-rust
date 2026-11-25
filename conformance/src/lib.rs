@@ -70,6 +70,11 @@ pub fn init_type_registry() {
     register!(registry, ClientStreamRequest);
     register!(registry, BidiStreamRequest);
     register!(registry, IdempotentUnaryRequest);
+    register!(registry, UnaryResponse);
+    register!(registry, ServerStreamResponse);
+    register!(registry, ClientStreamResponse);
+    register!(registry, BidiStreamResponse);
+    register!(registry, IdempotentUnaryResponse);
     register!(registry, ConformancePayload);
     register!(registry, conformance_payload::RequestInfo);
     register!(registry, self::Error);

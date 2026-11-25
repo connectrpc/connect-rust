@@ -237,6 +237,27 @@ pub struct ClientCompatRequest {
         RawHTTPRequest,
         ::buffa::Inline<RawHTTPRequest>,
     >,
+    /// The following field is only used by the reference client. If
+    /// you are implementing a client under test, you may ignore it
+    /// or respond with an error if the client receives a request where
+    /// it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_request. When
+    /// present, it defines the handshake and the WebSocket messages that will be
+    /// sent instead of the ones the client would otherwise produce. The above
+    /// group of fields must still be provided and valid so that the reference
+    /// client knows how it should try to interpret the server's response.
+    ///
+    /// Field 21: `raw_websocket_request`
+    #[serde(
+        rename = "rawWebsocketRequest",
+        alias = "raw_websocket_request",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub raw_websocket_request: ::buffa::MessageField<
+        RawWebSocketRequest,
+        ::buffa::Inline<RawWebSocketRequest>,
+    >,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -264,6 +285,7 @@ impl ::core::fmt::Debug for ClientCompatRequest {
             .field("request_delay_ms", &self.request_delay_ms)
             .field("cancel", &self.cancel)
             .field("raw_request", &self.raw_request)
+            .field("raw_websocket_request", &self.raw_websocket_request)
             .finish()
     }
 }
@@ -430,6 +452,14 @@ impl ::buffa::Message for ClientCompatRequest {
                 += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        if self.raw_websocket_request.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.raw_websocket_request.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -539,6 +569,14 @@ impl ::buffa::Message for ClientCompatRequest {
                 buf,
             );
             self.raw_request.write_to(__cache, buf);
+        }
+        if self.raw_websocket_request.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                21u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.raw_websocket_request.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -733,6 +771,17 @@ impl ::buffa::Message for ClientCompatRequest {
                     ctx,
                 )?;
             }
+            21u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.raw_websocket_request.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -761,6 +810,7 @@ impl ::buffa::Message for ClientCompatRequest {
         self.request_delay_ms = 0u32;
         self.cancel = ::buffa::MessageField::none();
         self.raw_request = ::buffa::MessageField::none();
+        self.raw_websocket_request = ::buffa::MessageField::none();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1557,6 +1607,21 @@ pub struct ClientResponseResult {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub feedback: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
+    /// The following field is only set by the reference client, and only for
+    /// the PROTOCOL_CONNECT_WEBSOCKET protocol. It is the status code in the
+    /// server's WebSocket Close frame. A connection that ended without a Close
+    /// frame is reported as 1006, as RFC 6455 section 7.1.5 prescribes.
+    /// If you are implementing a client-under-test, you should ignore this field
+    /// and leave it unset.
+    ///
+    /// Field 8: `websocket_close_code`
+    #[serde(
+        rename = "websocketCloseCode",
+        alias = "websocket_close_code",
+        with = "::buffa::json_helpers::opt_int32",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub websocket_close_code: ::core::option::Option<i32>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1571,6 +1636,7 @@ impl ::core::fmt::Debug for ClientResponseResult {
             .field("num_unsent_requests", &self.num_unsent_requests)
             .field("http_status_code", &self.http_status_code)
             .field("feedback", &self.feedback)
+            .field("websocket_close_code", &self.websocket_close_code)
             .finish()
     }
 }
@@ -1587,6 +1653,13 @@ impl ClientResponseResult {
     ///Sets [`Self::http_status_code`] to `Some(value)`, consuming and returning `self`.
     pub fn with_http_status_code(mut self, value: i32) -> Self {
         self.http_status_code = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::websocket_close_code`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_websocket_close_code(mut self, value: i32) -> Self {
+        self.websocket_close_code = Some(value);
         self
     }
 }
@@ -1653,6 +1726,9 @@ impl ::buffa::Message for ClientResponseResult {
         for v in &self.feedback {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
+        if let Some(v) = self.websocket_close_code {
+            size += 1u64 + ::buffa::types::int32_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1703,6 +1779,9 @@ impl ::buffa::Message for ClientResponseResult {
         }
         for v in &self.feedback {
             ::buffa::types::put_string_field(7u32, v, buf);
+        }
+        if let Some(v) = self.websocket_close_code {
+            ::buffa::types::put_int32_field(8u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1791,6 +1870,15 @@ impl ::buffa::Message for ClientResponseResult {
                 )?;
                 self.feedback.push(__elem);
             }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.websocket_close_code = ::core::option::Option::Some(
+                    ::buffa::types::decode_int32(buf)?,
+                );
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1806,6 +1894,7 @@ impl ::buffa::Message for ClientResponseResult {
         self.num_unsent_requests = 0i32;
         self.http_status_code = ::core::option::Option::None;
         self.feedback.clear();
+        self.websocket_close_code = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
 }

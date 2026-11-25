@@ -1050,6 +1050,24 @@ pub struct TestCase {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec"
     )]
     pub other_allowed_error_codes: ::buffa::alloc::vec::Vec<::buffa::EnumValue<Code>>,
+    /// When expected_response indicates that an error with a message is expected, in
+    /// some cases, the actual error message returned may be flexible. In that case,
+    /// this field provides other acceptable error messages, in addition to the one
+    /// indicated in the expected_response. As long as the actual error's message
+    /// equals any of these, the error is considered conformant, and the test case
+    /// can pass. This field may only be used when expected_response has an error
+    /// with a message.
+    ///
+    /// Field 5: `other_allowed_error_messages`
+    #[serde(
+        rename = "otherAllowedErrorMessages",
+        alias = "other_allowed_error_messages",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub other_allowed_error_messages: ::buffa::alloc::vec::Vec<
+        ::buffa::alloc::string::String,
+    >,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1061,6 +1079,7 @@ impl ::core::fmt::Debug for TestCase {
             .field("expand_requests", &self.expand_requests)
             .field("expected_response", &self.expected_response)
             .field("other_allowed_error_codes", &self.other_allowed_error_codes)
+            .field("other_allowed_error_messages", &self.other_allowed_error_messages)
             .finish()
     }
 }
@@ -1123,6 +1142,9 @@ impl ::buffa::Message for TestCase {
                 .sum::<u64>();
             size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
         }
+        for v in &self.other_allowed_error_messages {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1167,6 +1189,9 @@ impl ::buffa::Message for TestCase {
             for v in &self.other_allowed_error_codes {
                 ::buffa::types::encode_int32(v.to_i32(), buf);
             }
+        }
+        for v in &self.other_allowed_error_messages {
+            ::buffa::types::put_string_field(5u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1253,6 +1278,17 @@ impl ::buffa::Message for TestCase {
                     );
                 }
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.other_allowed_error_messages.push(__elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1265,6 +1301,7 @@ impl ::buffa::Message for TestCase {
         self.expand_requests.clear();
         self.expected_response = ::buffa::MessageField::none();
         self.other_allowed_error_codes.clear();
+        self.other_allowed_error_messages.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

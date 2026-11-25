@@ -32,7 +32,7 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::codec::CodecFormat;
-use crate::codec::decode_json;
+use crate::codec::decode_peer_json;
 use crate::codec::{JsonDeserialize, JsonSerialize};
 use crate::error::ConnectError;
 use crate::response::{
@@ -46,13 +46,14 @@ use crate::response::{
 /// limit to raise. Every other variant is a malformed request, where naming
 /// a limit would misdirect. `DecodeError` is `#[non_exhaustive]`, hence the
 /// catch-all arm.
-fn decode_request_error(e: &buffa::DecodeError) -> ConnectError {
+fn decode_request_error(e: buffa::DecodeError) -> ConnectError {
     match e {
         buffa::DecodeError::ElementMemoryLimitExceeded => ConnectError::invalid_argument(format!(
             "failed to decode proto request: {e}; if this peer is trusted, \
              raise the limit with Limits::with_element_memory_limit"
         )),
-        _ => ConnectError::invalid_argument(format!("failed to decode proto request: {e}")),
+        _ => ConnectError::invalid_argument(format!("failed to decode proto request: {e}"))
+            .decode_failure(e),
     }
 }
 
@@ -68,8 +69,8 @@ where
     match format {
         CodecFormat::Proto => options
             .decode_from_slice(&request[..])
-            .map_err(|e| decode_request_error(&e)),
-        CodecFormat::Json => decode_json(&request[..]),
+            .map_err(decode_request_error),
+        CodecFormat::Json => decode_peer_json(&request[..]),
     }
 }
 
@@ -526,16 +527,9 @@ where
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
     ) -> BoxFuture<'static, Result<EncodedResponse, ConnectError>> {
-        use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            // The stream outlives this frame, so it owns its limits rather
-            // than borrowing them from `ctx`, which is moved into the call.
-            let options = ctx.decode_options().clone();
-            let request_stream: ServiceStream<Req> =
-                Box::pin(requests.map(move |result| {
-                    result.and_then(|raw| decode_request(&raw, format, &options))
-                }));
+            let request_stream = decode_request_owned_stream::<Req>(requests, format, &ctx);
             handler
                 .call(ctx, request_stream)
                 .await?
@@ -655,16 +649,9 @@ where
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
     ) -> StreamingHandlerResult {
-        use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            // The stream outlives this frame, so it owns its limits rather
-            // than borrowing them from `ctx`, which is moved into the call.
-            let options = ctx.decode_options().clone();
-            let request_stream: ServiceStream<Req> =
-                Box::pin(requests.map(move |result| {
-                    result.and_then(|raw| decode_request(&raw, format, &options))
-                }));
+            let request_stream = decode_request_owned_stream::<Req>(requests, format, &ctx);
             let resp = handler.call(ctx, request_stream).await?;
             Ok(resp.map_body(|s| encode_body_stream(s, format)))
         })
@@ -691,7 +678,61 @@ where
     ReqView::Owned: Message + JsonDeserialize,
 {
     let body = request_proto_bytes::<ReqView::Owned>(request, format)?;
-    OwnedView::<ReqView>::decode_with_options(body, options).map_err(|e| decode_request_error(&e))
+    OwnedView::<ReqView>::decode_with_options(body, options).map_err(decode_request_error)
+}
+
+/// Decode each message of a request stream with `decode`. One that fails to
+/// decode is reported to the WebSocket session behind `ctx`, if any, which
+/// then ends the RPC as a protocol error (§6.1) whatever the handler does.
+fn decode_stream_with<T, F>(
+    requests: BoxStream<Result<Bytes, ConnectError>>,
+    ctx: &RequestContext,
+    mut decode: F,
+) -> ServiceStream<T>
+where
+    T: Send + 'static,
+    F: FnMut(Bytes, &buffa::DecodeOptions) -> Result<T, ConnectError> + Send + 'static,
+{
+    use futures::StreamExt as _;
+    // The stream outlives the caller's frame, so it owns its limits rather
+    // than borrowing them from `ctx`, which is moved into the handler call.
+    let options = ctx.decode_options().clone();
+    let dispatch = crate::service::websocket_dispatch(ctx.extensions());
+    // An interceptor upstream may have decoded the message and failed too.
+    Box::pin(requests.map(move |result| {
+        result
+            .and_then(|raw| decode(raw, &options))
+            .inspect_err(|err| crate::service::note_error(dispatch.as_ref(), err))
+    }))
+}
+
+/// [`decode_stream_with`] into owned request messages.
+fn decode_request_owned_stream<Req>(
+    requests: BoxStream<Result<Bytes, ConnectError>>,
+    format: CodecFormat,
+    ctx: &RequestContext,
+) -> ServiceStream<Req>
+where
+    Req: Message + JsonDeserialize + Send + 'static,
+{
+    decode_stream_with(requests, ctx, move |raw, options| {
+        decode_request(&raw, format, options)
+    })
+}
+
+/// [`decode_stream_with`] into request views.
+pub(crate) fn decode_request_view_stream<ReqView>(
+    requests: BoxStream<Result<Bytes, ConnectError>>,
+    format: CodecFormat,
+    ctx: &RequestContext,
+) -> ServiceStream<OwnedView<ReqView>>
+where
+    ReqView: MessageView<'static> + Send + 'static,
+    ReqView::Owned: Message + JsonDeserialize,
+{
+    decode_stream_with(requests, ctx, move |raw, options| {
+        decode_request_view::<ReqView>(raw, format, options)
+    })
 }
 
 /// Normalize a request body to protobuf wire bytes.
@@ -716,7 +757,7 @@ where
     match format {
         CodecFormat::Proto => Ok(request),
         CodecFormat::Json => {
-            let owned: Req = decode_json(&request[..])?;
+            let owned: Req = decode_peer_json(&request[..])?;
             Ok(Bytes::from(owned.encode_to_vec()))
         }
     }
@@ -745,9 +786,7 @@ pub fn decode_borrowed_request_view<'a, ReqView>(
 where
     ReqView: MessageView<'a>,
 {
-    options
-        .decode_view(body)
-        .map_err(|e| decode_request_error(&e))
+    options.decode_view(body).map_err(decode_request_error)
 }
 
 /// Trait for unary RPC handlers using zero-copy request views.
@@ -1079,16 +1118,9 @@ where
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
     ) -> BoxFuture<'static, Result<EncodedResponse, ConnectError>> {
-        use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            // The stream outlives this frame, so it owns its limits rather
-            // than borrowing them from `ctx`, which is moved into the call.
-            let options = ctx.decode_options().clone();
-            let request_stream: ServiceStream<OwnedView<ReqView>> =
-                Box::pin(requests.map(move |result| {
-                    result.and_then(|raw| decode_request_view::<ReqView>(raw, format, &options))
-                }));
+            let request_stream = decode_request_view_stream::<ReqView>(requests, format, &ctx);
             handler.call(ctx, request_stream, format).await
         })
     }
@@ -1202,16 +1234,9 @@ where
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
     ) -> StreamingHandlerResult {
-        use futures::StreamExt as _;
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            // The stream outlives this frame, so it owns its limits rather
-            // than borrowing them from `ctx`, which is moved into the call.
-            let options = ctx.decode_options().clone();
-            let request_stream: ServiceStream<OwnedView<ReqView>> =
-                Box::pin(requests.map(move |result| {
-                    result.and_then(|raw| decode_request_view::<ReqView>(raw, format, &options))
-                }));
+            let request_stream = decode_request_view_stream::<ReqView>(requests, format, &ctx);
             let resp = handler.call(ctx, request_stream).await?;
             Ok(resp.map_body(|s| encode_body_stream(s, format)))
         })

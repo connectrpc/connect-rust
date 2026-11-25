@@ -1879,12 +1879,17 @@ fn deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
 /// its `Display` text goes in `message`, the typed error is retained for
 /// `downcast_ref`. Unlike [`map_transport_send_error`], a `ConnectError`
 /// found in the read error is not surfaced verbatim — the read failure is
-/// always reported as this client's, with that error as its cause. That
-/// holds for the `deadline_exceeded` arm too — the deadline only explains
+/// reported as this client's, with that error as its cause. That holds for
+/// the `deadline_exceeded` arm too — the deadline only explains
 /// *why* the stream died, and the error that reported it (a reset, a closed
 /// connection) is still the most specific fact available. The deadline
 /// errors that stay source-less are those [`with_deadline`] synthesises
 /// when the local timer fires first; there is nothing to attach.
+///
+/// Before the deadline, the code of a `ConnectError` in the read error is
+/// kept, since the transport that classified the failure knows its
+/// protocol's rule for it: a WebSocket that closes before the end of the
+/// stream is `unavailable`.
 ///
 /// The bound is `Into<Box<dyn Error>>` rather than `Error` so that bodies
 /// whose error type is already the boxed form (`http_body_util::Limited`,
@@ -1899,7 +1904,8 @@ fn classify_body_read_error(
     if deadline_elapsed(deadline) {
         ConnectError::deadline_exceeded(format!("{context} after the deadline elapsed: {error}"))
     } else {
-        ConnectError::internal(format!("{context}: {error}"))
+        let code = find_connect_error_in_chain(&*error).map_or(ErrorCode::Internal, |e| e.code);
+        ConnectError::new(code, format!("{context}: {error}"))
     }
     .with_source(error)
 }
@@ -2439,7 +2445,7 @@ fn map_response_decompression_error(mut e: ConnectError) -> ConnectError {
 
 /// Parse a Connect protocol unary response.
 async fn parse_connect_unary_response<B, RespView>(
-    response: Response<B>,
+    mut response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
     deadline: Option<std::time::Instant>,
@@ -2509,14 +2515,7 @@ where
             None => body,
         };
 
-        if let Ok(error) = serde_json::from_slice::<ConnectErrorResponse>(&body) {
-            let code = error
-                .code
-                .as_deref()
-                .and_then(|s| s.parse::<ErrorCode>().ok())
-                .unwrap_or_else(|| http_status_to_error_code(status));
-            let mut err = ConnectError::new(code, error.message.unwrap_or_default());
-            err.details = error.details;
+        if let Some(mut err) = connect_error_from_body(status, &body) {
             err.set_response_headers(headers);
             err.set_trailers(trailers);
             return Err(err);
@@ -2569,6 +2568,7 @@ where
     // every error out of it carries that response's metadata.
     let attach = with_response_metadata(&resp_headers, &resp_trailers);
 
+    let decode_report = take_decode_report(response.extensions_mut());
     let body = collect_body_bounded(response.into_body(), max_message_size, deadline)
         .await
         .map_err(&attach)?;
@@ -2594,9 +2594,11 @@ where
         )));
     }
 
-    let message =
-        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options())
-            .map_err(&attach)?;
+    let message = report_decode(
+        decode_report.as_ref(),
+        decode_response_view::<RespView>(body, config.codec_format, &options.decode_options()),
+    );
+    let message = message.map_err(&attach)?;
     drop(attach);
 
     Ok(UnaryResponse {
@@ -3142,6 +3144,8 @@ pub struct ServerStream<B, RespView> {
     /// Trailers-Only response (empty body; status rides the headers)
     /// from a stream that produced data and was then cut off.
     saw_body_data: bool,
+    /// Where an undecodable message is reported, for a WebSocket response.
+    decode_report: Option<DecodeReport>,
     _phantom: PhantomData<RespView>,
 }
 
@@ -3228,6 +3232,11 @@ where
     /// carrying `grpc-status: 0` in the headers (empty body) is a clean
     /// end.
     ///
+    /// A response message that fails to decode is `internal`, or
+    /// `invalid_argument` over a `WebSocketTransport`, as Connect over
+    /// WebSocket requires; either way the server sent it. A message over
+    /// the element memory limit is `resource_exhausted` on every transport.
+    ///
     /// Whatever the cause, the returned error carries the response
     /// metadata: [`ConnectError::response_headers()`] always, and
     /// [`ConnectError::trailers()`] whenever termination metadata arrived.
@@ -3253,6 +3262,9 @@ where
             // recording why" is unrepresentable.
             Err(mut end) => {
                 debug_assert!(self.end.is_none(), "terminal record written twice");
+                // Nothing more can fail to decode, so a WebSocket transport
+                // may close now rather than wait to hear.
+                self.decode_report = None;
                 end.attach_metadata(&self.headers);
                 self.end.get_or_insert(end).replay()
             }
@@ -3321,8 +3333,10 @@ where
 
             // Data envelope — decompress (also bounded by `max_message_size`) and decode.
             let data = self.decompress_envelope(envelope)?;
-            let msg =
-                decode_response_view::<RespView>(data, self.codec_format, &self.decode_options())?;
+            let msg = report_decode(
+                self.decode_report.as_ref(),
+                decode_response_view::<RespView>(data, self.codec_format, &self.decode_options()),
+            )?;
             return Ok(msg);
         }
     }
@@ -3619,7 +3633,7 @@ where
 /// need to capture config by value (like `BidiStream`, which outlives the
 /// borrow) can share the same code path.
 async fn make_server_stream<B, RespView>(
-    response: Response<B>,
+    mut response: Response<B>,
     protocol: Protocol,
     compression: &CompressionRegistry,
     codec_format: CodecFormat,
@@ -3711,6 +3725,7 @@ where
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
 
+    let decode_report = take_decode_report(response.extensions_mut());
     Ok(ServerStream {
         element_memory_limit,
         headers: response_headers,
@@ -3725,6 +3740,7 @@ where
         deadline,
         end: None,
         saw_body_data: false,
+        decode_report,
         _phantom: PhantomData,
     })
 }
@@ -4623,7 +4639,7 @@ where
 
 /// Parse a Connect protocol client-streaming response.
 async fn parse_connect_client_stream_response<B, RespView>(
-    response: Response<B>,
+    mut response: Response<B>,
     config: &ClientConfig,
     options: &CallOptions,
     deadline: Option<std::time::Instant>,
@@ -4709,6 +4725,7 @@ where
     let body_limit = max_msg_size
         .saturating_add(2 * crate::envelope::HEADER_SIZE)
         .saturating_add(RESPONSE_BUFFER_TRAILER_SLACK);
+    let decode_report = take_decode_report(response.extensions_mut());
     let body = collect_body_bounded(response.into_body(), body_limit, deadline)
         .await
         .map_err(with_response_metadata(
@@ -4724,9 +4741,11 @@ where
         &resp_headers,
     )?;
     // The trailers are parsed by now, so a decode failure reports them too.
-    let message =
-        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options())
-            .map_err(with_response_metadata(&resp_headers, &trailers))?;
+    let message = report_decode(
+        decode_report.as_ref(),
+        decode_response_view::<RespView>(data, config.codec_format, &options.decode_options()),
+    );
+    let message = message.map_err(with_response_metadata(&resp_headers, &trailers))?;
 
     Ok(UnaryResponse {
         headers: resp_headers,
@@ -4877,14 +4896,14 @@ fn scan_connect_client_stream_envelopes(
 
 /// EndStreamResponse as received by the client.
 #[derive(serde::Deserialize)]
-struct ClientEndStreamResponse {
-    error: Option<ClientEndStreamError>,
-    metadata: Option<HashMap<String, Vec<String>>>,
+pub(crate) struct ClientEndStreamResponse {
+    pub(crate) error: Option<ClientEndStreamError>,
+    pub(crate) metadata: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Error in the EndStreamResponse.
 #[derive(serde::Deserialize)]
-struct ClientEndStreamError {
+pub(crate) struct ClientEndStreamError {
     code: Option<String>,
     message: Option<String>,
     #[serde(default)]
@@ -4894,7 +4913,9 @@ struct ClientEndStreamError {
 /// Parse the body of a Connect END_STREAM envelope. A malformed body is a
 /// wire-protocol violation, so it surfaces as `Internal` (matching connect-go)
 /// rather than being silently treated as a clean close.
-fn parse_connect_end_stream(data: &[u8]) -> Result<ClientEndStreamResponse, ConnectError> {
+pub(crate) fn parse_connect_end_stream(
+    data: &[u8],
+) -> Result<ClientEndStreamResponse, ConnectError> {
     serde_json::from_slice(data).map_err(|e| {
         ConnectError::internal(format!(
             "protocol error: malformed Connect END_STREAM JSON: {e}"
@@ -4904,7 +4925,7 @@ fn parse_connect_end_stream(data: &[u8]) -> Result<ClientEndStreamResponse, Conn
 
 /// Convert the `error` member of a Connect END_STREAM body into the
 /// caller-facing [`ConnectError`], with `Unknown` as the fallback code.
-fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> ConnectError {
+pub(crate) fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> ConnectError {
     let mut connect_error = ConnectError::new(
         err.code
             .as_deref()
@@ -4914,6 +4935,59 @@ fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> ConnectError 
     );
     connect_error.details = err.details;
     connect_error
+}
+
+/// The Connect error a failed response's `body` holds, if it holds one. A
+/// missing or unknown code is inferred from `status`.
+pub(crate) fn connect_error_from_body(
+    status: http::StatusCode,
+    body: &[u8],
+) -> Option<ConnectError> {
+    let error = serde_json::from_slice::<ConnectErrorResponse>(body).ok()?;
+    let code = error
+        .code
+        .as_deref()
+        .and_then(|s| s.parse::<ErrorCode>().ok())
+        .unwrap_or_else(|| http_status_to_error_code(status));
+    let mut err = ConnectError::new(code, error.message.unwrap_or_default());
+    err.details = error.details;
+    Some(err)
+}
+
+#[cfg(all(feature = "websocket", feature = "client", not(target_arch = "wasm32")))]
+use crate::websocket::DecodeReport;
+/// Only the WebSocket transport asks to hear about undecodable responses.
+#[cfg(not(all(feature = "websocket", feature = "client", not(target_arch = "wasm32"))))]
+type DecodeReport = std::convert::Infallible;
+
+/// Take the hook a WebSocket transport attached to learn whether its
+/// response message decoded.
+fn take_decode_report(extensions: &mut http::Extensions) -> Option<DecodeReport> {
+    extensions.remove::<DecodeReport>()
+}
+
+/// Tell the transport behind `report`, if any, that a response message did
+/// not decode. A resource limit of this client's own is not the peer's fault.
+/// Over WebSocket the RPC then fails with `invalid_argument` (§6.1).
+fn report_decode<T>(
+    report: Option<&DecodeReport>,
+    result: Result<T, ConnectError>,
+) -> Result<T, ConnectError> {
+    #[cfg(all(feature = "websocket", feature = "client", not(target_arch = "wasm32")))]
+    if let Some(report) = report {
+        return result.map_err(|mut err| {
+            if err.code == ErrorCode::Internal {
+                report.fail(&err);
+                err.code = ErrorCode::InvalidArgument;
+            }
+            err
+        });
+    }
+    #[cfg(not(all(feature = "websocket", feature = "client", not(target_arch = "wasm32"))))]
+    if let Some(never) = report {
+        match *never {}
+    }
+    result
 }
 
 /// Error response structure from ConnectRPC.
@@ -4927,10 +5001,6 @@ struct ConnectErrorResponse {
     details: Vec<ErrorDetail>,
 }
 
-/// Maps an HTTP status code to a Connect error code per the Connect protocol spec.
-///
-/// Only specific HTTP status codes have defined mappings. All other codes map to
-/// `Unknown` per the specification.
 /// Build the error for a gRPC response body that could not be parsed.
 ///
 /// On a non-2xx the HTTP status is the more useful report — it is the code that
@@ -4958,7 +5028,11 @@ fn body_parse_error(
     err
 }
 
-fn http_status_to_error_code(status: http::StatusCode) -> ErrorCode {
+/// Maps an HTTP status code to a Connect error code per the Connect protocol spec.
+///
+/// Only specific HTTP status codes have defined mappings. All other codes map to
+/// `Unknown` per the specification.
+pub(crate) fn http_status_to_error_code(status: http::StatusCode) -> ErrorCode {
     match status.as_u16() {
         400 => ErrorCode::Internal,
         401 => ErrorCode::Unauthenticated,
@@ -5006,12 +5080,28 @@ fn format_timeout(timeout: Duration, protocol: Protocol) -> String {
 /// e.g. because the compression policy's size threshold was not met). For
 /// gRPC/gRPC-Web this is ignored — `grpc-encoding` is a capability
 /// declaration and the per-message envelope flag signals actual compression.
+/// Attach the codecs that compress the request, so a transport that must
+/// undo the compression (WebSocket has none of its own) can.
+fn with_compression_registry(
+    builder: http::request::Builder,
+    config: &ClientConfig,
+) -> http::request::Builder {
+    #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+    if config.request_compression.is_some() {
+        return builder.extension(config.compression.clone());
+    }
+    #[cfg(not(all(feature = "websocket", not(target_arch = "wasm32"))))]
+    let _ = config;
+    builder
+}
+
 fn add_unary_request_headers(
     mut builder: http::request::Builder,
     config: &ClientConfig,
     timeout: Option<Duration>,
     applied_content_encoding: Option<&str>,
 ) -> http::request::Builder {
+    builder = with_compression_registry(builder, config);
     builder = builder.header(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static(unary_request_content_type(config)),
@@ -5067,6 +5157,7 @@ fn add_streaming_request_headers(
     config: &ClientConfig,
     timeout: Option<Duration>,
 ) -> http::request::Builder {
+    builder = with_compression_registry(builder, config);
     builder = builder.header(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static(streaming_request_content_type(config)),
@@ -5349,7 +5440,10 @@ fn parse_grpc_web_trailer_payload(
 /// hostile server could send tens of thousands of distinct keys in a few
 /// hundred KB of JSON and crash the RPC task. Use the fallible `try_append`
 /// and stop at the ceiling instead.
-fn append_metadata_capped(trailers: &mut http::HeaderMap, metadata: HashMap<String, Vec<String>>) {
+pub(crate) fn append_metadata_capped(
+    trailers: &mut http::HeaderMap,
+    metadata: HashMap<String, Vec<String>>,
+) {
     'outer: for (name, values) in metadata {
         for value in values {
             if let (Ok(name), Ok(value)) = (
@@ -6916,6 +7010,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -6963,6 +7058,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         }
     }
@@ -7161,6 +7257,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7213,6 +7310,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7268,6 +7366,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7337,6 +7436,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7404,6 +7504,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7473,6 +7574,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7534,6 +7636,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7625,6 +7728,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7684,6 +7788,7 @@ mod tests {
             deadline: Some(std::time::Instant::now() + Duration::from_secs(5)),
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7713,6 +7818,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7760,6 +7866,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7801,6 +7908,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7839,6 +7947,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7905,6 +8014,7 @@ mod tests {
             deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7961,6 +8071,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -8078,6 +8189,32 @@ mod tests {
                     .unwrap())
             })
         }
+    }
+
+    #[test]
+    fn body_read_error_keeps_a_transport_classified_code() {
+        let err = classify_body_read_error(
+            "failed to read response body",
+            ConnectError::unavailable("closed before the end"),
+            None,
+        );
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+        assert!(
+            err.message
+                .as_deref()
+                .unwrap()
+                .starts_with("failed to read response body"),
+            "{err:?}"
+        );
+        let source = std::error::Error::source(&err).expect("the read error stays the source");
+        assert!(source.downcast_ref::<ConnectError>().is_some());
+
+        let err = classify_body_read_error(
+            "failed to read response body",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            None,
+        );
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
     }
 
     /// The typed cause a body-read failure must surface: the same

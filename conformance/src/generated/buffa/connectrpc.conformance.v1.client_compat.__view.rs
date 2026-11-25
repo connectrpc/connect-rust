@@ -140,6 +140,21 @@ pub struct ClientCompatRequestView<'a> {
     pub raw_request: ::buffa::MessageFieldView<
         super::super::__buffa::view::RawHTTPRequestView<'a>,
     >,
+    /// The following field is only used by the reference client. If
+    /// you are implementing a client under test, you may ignore it
+    /// or respond with an error if the client receives a request where
+    /// it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_request. When
+    /// present, it defines the handshake and the WebSocket messages that will be
+    /// sent instead of the ones the client would otherwise produce. The above
+    /// group of fields must still be provided and valid so that the reference
+    /// client knows how it should try to interpret the server's response.
+    ///
+    /// Field 21: `raw_websocket_request`
+    pub raw_websocket_request: ::buffa::MessageFieldView<
+        super::super::__buffa::view::RawWebSocketRequestView<'a>,
+    >,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ClientCompatRequestView<'a> {
@@ -350,6 +365,27 @@ impl<'a> ::buffa::MessageView<'a> for ClientCompatRequestView<'a> {
                     }
                 }
             }
+            21u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.raw_websocket_request.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.raw_websocket_request = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::RawWebSocketRequestView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
             15u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -464,6 +500,15 @@ impl<'a> ::buffa::MessageView<'a> for ClientCompatRequestView<'a> {
                     ::buffa::MessageField::<
                         super::super::RawHTTPRequest,
                         ::buffa::Inline<super::super::RawHTTPRequest>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
+            raw_websocket_request: match self.raw_websocket_request.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::RawWebSocketRequest,
+                        ::buffa::Inline<super::super::RawWebSocketRequest>,
                     >::some(v.to_owned_from_source(__buffa_src)?)
                 }
                 None => ::buffa::MessageField::none(),
@@ -586,6 +631,14 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientCompatRequestView<'a> {
                 += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        if self.raw_websocket_request.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.raw_websocket_request.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -697,6 +750,14 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientCompatRequestView<'a> {
             );
             self.raw_request.write_to(__cache, buf);
         }
+        if self.raw_websocket_request.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                21u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.raw_websocket_request.write_to(__cache, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -796,6 +857,14 @@ impl<'__a> ::serde::Serialize for ClientCompatRequestView<'__a> {
         {
             if let ::core::option::Option::Some(__v) = self.raw_request.as_option() {
                 __map.serialize_entry("rawRequest", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self
+                .raw_websocket_request
+                .as_option()
+            {
+                __map.serialize_entry("rawWebsocketRequest", __v)?;
             }
         }
         __map.end()
@@ -1090,6 +1159,26 @@ impl ClientCompatRequestOwnedView {
         super::super::__buffa::view::RawHTTPRequestView<'_>,
     > {
         &self.0.reborrow().raw_request
+    }
+    /// The following field is only used by the reference client. If
+    /// you are implementing a client under test, you may ignore it
+    /// or respond with an error if the client receives a request where
+    /// it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_request. When
+    /// present, it defines the handshake and the WebSocket messages that will be
+    /// sent instead of the ones the client would otherwise produce. The above
+    /// group of fields must still be provided and valid so that the reference
+    /// client knows how it should try to interpret the server's response.
+    ///
+    /// Field 21: `raw_websocket_request`
+    #[must_use]
+    pub fn raw_websocket_request(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::RawWebSocketRequestView<'_>,
+    > {
+        &self.0.reborrow().raw_websocket_request
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ClientCompatRequestView<'static>>>
@@ -2011,6 +2100,15 @@ pub struct ClientResponseResultView<'a> {
     ///
     /// Field 7: `feedback`
     pub feedback: ::buffa::RepeatedView<'a, &'a str>,
+    /// The following field is only set by the reference client, and only for
+    /// the PROTOCOL_CONNECT_WEBSOCKET protocol. It is the status code in the
+    /// server's WebSocket Close frame. A connection that ended without a Close
+    /// frame is reported as 1006, as RFC 6455 section 7.1.5 prescribes.
+    /// If you are implementing a client-under-test, you should ignore this field
+    /// and leave it unset.
+    ///
+    /// Field 8: `websocket_close_code`
+    pub websocket_close_code: ::core::option::Option<i32>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ClientResponseResultView<'a> {
@@ -2077,6 +2175,15 @@ impl<'a> ::buffa::MessageView<'a> for ClientResponseResultView<'a> {
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 view.http_status_code = Some(::buffa::types::decode_int32(&mut cur)?);
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.websocket_close_code = Some(
+                    ::buffa::types::decode_int32(&mut cur)?,
+                );
             }
             1u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -2200,6 +2307,7 @@ impl<'a> ::buffa::MessageView<'a> for ClientResponseResultView<'a> {
             num_unsent_requests: self.num_unsent_requests,
             http_status_code: self.http_status_code,
             feedback: self.feedback.iter().map(|s| s.to_string()).collect(),
+            websocket_close_code: self.websocket_close_code,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -2254,6 +2362,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientResponseResultView<'a> {
         for v in &self.feedback {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
+        if let Some(v) = self.websocket_close_code {
+            size += 1u64 + ::buffa::types::int32_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2306,6 +2417,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ClientResponseResultView<'a> {
         for v in &self.feedback {
             ::buffa::types::put_string_field(7u32, v, buf);
         }
+        if let Some(v) = self.websocket_close_code {
+            ::buffa::types::put_int32_field(8u32, v, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -2357,6 +2471,13 @@ impl<'__a> ::serde::Serialize for ClientResponseResultView<'__a> {
         }
         if !self.feedback.is_empty() {
             __map.serialize_entry("feedback", &*self.feedback)?;
+        }
+        if let ::core::option::Option::Some(__v) = self.websocket_close_code {
+            __map
+                .serialize_entry(
+                    "websocketCloseCode",
+                    &::buffa::json_helpers::ProtoJson(&__v),
+                )?;
         }
         __map.end()
     }
@@ -2526,6 +2647,18 @@ impl ClientResponseResultOwnedView {
     #[must_use]
     pub fn feedback(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().feedback
+    }
+    /// The following field is only set by the reference client, and only for
+    /// the PROTOCOL_CONNECT_WEBSOCKET protocol. It is the status code in the
+    /// server's WebSocket Close frame. A connection that ended without a Close
+    /// frame is reported as 1006, as RFC 6455 section 7.1.5 prescribes.
+    /// If you are implementing a client-under-test, you should ignore this field
+    /// and leave it unset.
+    ///
+    /// Field 8: `websocket_close_code`
+    #[must_use]
+    pub fn websocket_close_code(&self) -> ::core::option::Option<i32> {
+        self.0.reborrow().websocket_close_code
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ClientResponseResultView<'static>>>

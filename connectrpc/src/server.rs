@@ -566,6 +566,7 @@ pub struct ConnectionConfig {
     max_connection_age_grace: Duration,
     max_connection_idle: Option<Duration>,
     max_requests_per_connection: Option<NonZeroU64>,
+    http2_extended_connect: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -584,6 +585,7 @@ impl Default for ConnectionConfig {
             max_connection_age_grace: DEFAULT_MAX_CONNECTION_AGE_GRACE,
             max_connection_idle: None,
             max_requests_per_connection: None,
+            http2_extended_connect: true,
         }
     }
 }
@@ -661,6 +663,22 @@ impl ConnectionConfig {
     #[must_use]
     pub fn with_http2_adaptive_window(mut self, enabled: bool) -> Self {
         self.http2_adaptive_window = enabled;
+        self
+    }
+
+    /// Advertise HTTP/2 extended CONNECT (RFC 8441, default: enabled), which
+    /// lets clients open WebSockets over HTTP/2.
+    ///
+    /// Connect over WebSocket refuses HTTP/2 WebSockets, and a browser that
+    /// sees the setting on an HTTP/2 connection uses it instead of falling
+    /// back to HTTP/1.1. [`Server`] turns it off for a service with
+    /// [`ConnectRpcService::with_websocket`]; turn it off yourself when
+    /// serving such a service through `connectrpc::axum::serve` or
+    /// [`serve_connection`] over TLS. Leave it on for an axum app with its
+    /// own HTTP/2 WebSocket routes.
+    #[must_use]
+    pub fn with_http2_extended_connect(mut self, enabled: bool) -> Self {
+        self.http2_extended_connect = enabled;
         self
     }
 
@@ -1010,6 +1028,12 @@ impl ConnectionConfig {
         self.http2_max_header_list_size
     }
 
+    /// Whether HTTP/2 extended CONNECT is advertised.
+    #[must_use]
+    pub fn http2_extended_connect(&self) -> bool {
+        self.http2_extended_connect
+    }
+
     /// The maximum connection age (before jitter), or `None` if disabled.
     #[must_use]
     pub fn max_connection_age(&self) -> Option<Duration> {
@@ -1292,6 +1316,21 @@ impl Server {
         self
     }
 
+    /// Accept Connect over WebSocket on every registered procedure.
+    ///
+    /// Delegates to [`ConnectRpcService::with_websocket`]. The server's
+    /// HTTP/1.1 connections support the upgrade, so nothing else is needed;
+    /// a server restricted to HTTP/2 cannot accept the handshake. The server
+    /// stops advertising HTTP/2 WebSockets, overriding
+    /// [`ConnectionConfig::with_http2_extended_connect`].
+    #[cfg(feature = "websocket")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    #[must_use]
+    pub fn with_websocket(mut self, config: crate::websocket::WebSocketConfig) -> Self {
+        self.service = self.service.with_websocket(config);
+        self
+    }
+
     /// Set a maximum age for each accepted HTTP connection (±10% jitter, then
     /// GOAWAY and a grace period). Shorthand for
     /// [`ConnectionConfig::with_max_connection_age`].
@@ -1497,11 +1536,12 @@ impl Server {
         };
         tracing::info!("ConnectRPC server listening on {scheme}://{addr}");
 
+        let connection = connection_for(&self.service, &self.accept, self.connection);
         serve_with_listener(
             listener,
             self.service,
             self.accept,
-            self.connection,
+            connection,
             self.connection_extensions,
             None,
         )
@@ -1924,17 +1964,51 @@ impl BoundServer {
         D: Dispatcher,
         F: Future<Output = ()> + Send + 'static,
     {
+        let connection = connection_for(&service, &self.accept, self.connection);
         serve_with_listener(
             self.listener,
             service,
             self.accept,
-            self.connection,
+            connection,
             self.connection_extensions,
             Some(Box::pin(signal)),
         )
         .await?;
         Ok(())
     }
+}
+
+/// The connection settings for serving `service`: a service that speaks
+/// Connect over WebSocket must not invite browsers to use HTTP/2 WebSockets,
+/// which it refuses.
+#[cfg_attr(
+    not(all(feature = "websocket", feature = "server-tls")),
+    allow(unused_variables)
+)]
+fn connection_for<D: Dispatcher>(
+    service: &ConnectRpcService<D>,
+    accept: &AcceptConfig,
+    config: ConnectionConfig,
+) -> ConnectionConfig {
+    #[cfg(feature = "websocket")]
+    if service.websocket_config().is_some() {
+        #[cfg(feature = "server-tls")]
+        if accept.tls.as_deref().is_some_and(refuses_http1) {
+            tracing::warn!(
+                "the TLS configuration's ALPN list leaves out http/1.1, so no client \
+                 can open a Connect-over-WebSocket RPC"
+            );
+        }
+        return config.with_http2_extended_connect(false);
+    }
+    config
+}
+
+/// Whether a TLS configuration negotiates ALPN without offering HTTP/1.1,
+/// the only HTTP version a WebSocket handshake here can use.
+#[cfg(all(feature = "websocket", feature = "server-tls"))]
+fn refuses_http1(tls: &rustls::ServerConfig) -> bool {
+    !tls.alpn_protocols.is_empty() && !tls.alpn_protocols.iter().any(|p| p == b"http/1.1")
 }
 
 /// Per-connection max-age settings, after jitter.
@@ -2260,7 +2334,9 @@ fn configure_http2(builder: &mut AutoBuilder<TokioExecutor>, config: &Connection
     // axum app moved onto `connectrpc::axum::serve` loses its HTTP/2 WebSocket
     // routes. A service that does not handle it answers such a request like
     // any other.
-    http2.enable_connect_protocol();
+    if config.http2_extended_connect {
+        http2.enable_connect_protocol();
+    }
     // Keepalive is opt-in: when no interval is set, leave hyper's default
     // (disabled) untouched. When enabled, a timer must be installed — hyper's
     // HTTP/2 keepalive requires one and panics the connection task without it.
@@ -2788,6 +2864,8 @@ where
     // connection that registers after the signal still observes it.
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
+    #[cfg(feature = "websocket")]
+    let sessions = crate::websocket::server::SessionTracker::new(global_shutdown_rx.clone());
 
     loop {
         let (stream, remote_addr) = tokio::select! {
@@ -2841,6 +2919,8 @@ where
         let config = config.clone();
         let connection_extensions = connection_extensions.clone();
         let global_shutdown = global_shutdown_future(global_shutdown_rx.clone());
+        #[cfg(feature = "websocket")]
+        let sessions = sessions.clone();
 
         #[cfg(feature = "server-tls")]
         let tls_acceptor = tls_acceptor.clone();
@@ -2861,6 +2941,8 @@ where
                         // for every request on this connection).
                         let (_, conn) = tls_stream.get_ref();
                         let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
+                        #[cfg(feature = "websocket")]
+                        peer.extensions_mut().insert(sessions.clone());
                         peer.peer_certs = conn
                             .peer_certificates()
                             .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect());
@@ -2890,6 +2972,8 @@ where
 
             // Plain TCP (no TLS or TLS not configured)
             let mut peer = ConnectionInfo::new().with_peer_addr(remote_addr);
+            #[cfg(feature = "websocket")]
+            peer.extensions_mut().insert(sessions.clone());
             if let Some(f) = &connection_extensions
                 && f.apply(&mut peer).is_err()
             {
@@ -2901,12 +2985,15 @@ where
 
     // Drop the listener (refuse new conns), then signal & drain existing ones.
     drop(listener);
-    // Errors only if every connection already finished (no receivers left),
-    // in which case there is nothing to drain.
+    // Errors only when nothing holds a receiver, so there is nothing to drain.
     let _ = global_shutdown_tx.send(true);
     while let Some(result) = connections.join_next().await {
         log_connection_task_result(result);
     }
+    // Upgraded WebSocket sessions outlive their connection tasks; each one
+    // ends its RPC when it sees the shutdown signal.
+    #[cfg(feature = "websocket")]
+    sessions.wait_idle().await;
     tracing::info!("All connections drained; shutdown complete");
 
     Ok(())
@@ -4103,6 +4190,21 @@ mod tests {
         let serve = tokio::spawn(bound.serve(Router::new()));
         let advertised = read_advertised_setting(addr, SETTINGS_ENABLE_CONNECT_PROTOCOL_ID).await;
         assert_eq!(advertised, Some(1));
+        serve.abort();
+    }
+
+    /// A service that speaks Connect over WebSocket refuses HTTP/2
+    /// WebSockets, so the server must not invite browsers to use them.
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn extended_connect_is_not_advertised_with_websocket() {
+        let bound = Server::bind("127.0.0.1:0").await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let service = ConnectRpcService::new(Router::new())
+            .with_websocket(crate::websocket::WebSocketConfig::new());
+        let serve = tokio::spawn(bound.serve_with_service(service));
+        let advertised = read_advertised_setting(addr, SETTINGS_ENABLE_CONNECT_PROTOCOL_ID).await;
+        assert_eq!(advertised, None);
         serve.abort();
     }
 
@@ -6921,5 +7023,19 @@ mod tests {
         // The exact DER bytes the client presented.
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].as_ref(), expected_client_der.as_ref());
+    }
+
+    #[cfg(all(feature = "websocket", feature = "server-tls"))]
+    #[test]
+    fn a_tls_config_without_http1_refuses_websocket_handshakes() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        assert!(!refuses_http1(&tls));
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        assert!(refuses_http1(&tls));
+        tls.alpn_protocols.push(b"http/1.1".to_vec());
+        assert!(!refuses_http1(&tls));
     }
 }

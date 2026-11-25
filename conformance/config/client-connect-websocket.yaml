@@ -1,0 +1,30 @@
+# Client conformance test configuration for Connect over WebSocket
+#
+# Connect over WebSocket is opt-in and needs HTTP/1.1, since the handshake is
+# an HTTP/1.1 upgrade. It is tested only with identity compression, because
+# WebSocket compresses at its own layer, and it carries every stream type,
+# full-duplex bidi included.
+
+features:
+    versions:
+        - HTTP_VERSION_1
+    protocols:
+        - PROTOCOL_CONNECT_WEBSOCKET
+    codecs:
+        - CODEC_PROTO
+        - CODEC_JSON
+    compressions:
+        - COMPRESSION_IDENTITY
+    stream_types:
+        - STREAM_TYPE_UNARY
+        - STREAM_TYPE_SERVER_STREAM
+        - STREAM_TYPE_CLIENT_STREAM
+        - STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM
+        - STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM
+    supports_h2c: false
+    supports_tls: true
+    supports_tls_client_certs: true
+    supports_trailers: true
+    supports_connect_get: false
+    supports_message_receive_limit: true
+    supports_half_duplex_bidi_over_http1: true

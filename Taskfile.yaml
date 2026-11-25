@@ -314,6 +314,28 @@ tasks:
           --conf "{{.ROOT_DIR}}/conformance/config/connect-tls.yaml" \
           -- "{{.SERVER_BIN}}"
 
+  conformance:test-connect-websocket:
+    desc: Run server conformance tests for Connect over WebSocket (needs a runner that supports PROTOCOL_CONNECT_WEBSOCKET; set CONFORMANCE_BIN)
+    deps: [conformance:download, conformance:build]
+    cmds:
+      - |
+        echo "Running Connect-over-WebSocket server conformance tests..."
+        echo ""
+        RUST_LOG=warn "{{.CONFORMANCE_BIN}}" --mode server \
+          --conf "{{.ROOT_DIR}}/conformance/config/connect-websocket.yaml" \
+          -- "{{.SERVER_BIN}}"
+
+  conformance:test-client-connect-websocket:
+    desc: Run client conformance tests for Connect over WebSocket (needs a runner that supports PROTOCOL_CONNECT_WEBSOCKET; set CONFORMANCE_BIN)
+    deps: [conformance:download, conformance:build]
+    cmds:
+      - |
+        echo "Running Connect-over-WebSocket client conformance tests..."
+        echo ""
+        RUST_LOG=warn "{{.CONFORMANCE_BIN}}" --mode client \
+          --conf "{{.ROOT_DIR}}/conformance/config/client-connect-websocket.yaml" \
+          -- "{{.CLIENT_BIN}}"
+
   conformance:test-client-connect-only:
     desc: Run client conformance tests for Connect protocol (unary)
     deps: [conformance:download, conformance:build]

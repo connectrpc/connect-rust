@@ -33,6 +33,16 @@ pub struct UnaryResponseDefinitionView<'a> {
     pub raw_response: ::buffa::MessageFieldView<
         super::super::__buffa::view::RawHTTPResponseView<'a>,
     >,
+    /// This field is only used by the reference server. If you are implementing a
+    /// server under test, you can ignore this field or respond with an error if the
+    /// server receives a request where it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_response.
+    ///
+    /// Field 7: `raw_websocket_response`
+    pub raw_websocket_response: ::buffa::MessageFieldView<
+        super::super::__buffa::view::RawWebSocketResponseView<'a>,
+    >,
     pub response: ::core::option::Option<
         super::super::__buffa::view::oneof::unary_response_definition::Response<'a>,
     >,
@@ -89,6 +99,27 @@ impl<'a> ::buffa::MessageView<'a> for UnaryResponseDefinitionView<'a> {
                     None => {
                         view.raw_response = ::buffa::MessageFieldView::set(
                             <super::super::__buffa::view::RawHTTPResponseView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.raw_websocket_response.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.raw_websocket_response = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::RawWebSocketResponseView as ::buffa::MessageView>::decode_view_ctx(
                                 sub,
                                 __sub_ctx,
                             )?,
@@ -222,6 +253,15 @@ impl<'a> ::buffa::MessageView<'a> for UnaryResponseDefinitionView<'a> {
                 }
                 None => ::buffa::MessageField::none(),
             },
+            raw_websocket_response: match self.raw_websocket_response.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::RawWebSocketResponse,
+                        ::buffa::Inline<super::super::RawWebSocketResponse>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
             response: match self.response.as_ref() {
                 ::core::option::Option::Some(v) => {
                     ::core::option::Option::Some(
@@ -306,6 +346,14 @@ impl<'a> ::buffa::ViewEncode<'a> for UnaryResponseDefinitionView<'a> {
                 += 1u64
                     + ::buffa::types::uint32_encoded_len(self.response_delay_ms) as u64;
         }
+        if self.raw_websocket_response.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.raw_websocket_response.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -363,6 +411,14 @@ impl<'a> ::buffa::ViewEncode<'a> for UnaryResponseDefinitionView<'a> {
         if self.response_delay_ms != 0u32 {
             ::buffa::types::put_uint32_field(6u32, self.response_delay_ms, buf);
         }
+        if self.raw_websocket_response.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                7u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.raw_websocket_response.write_to(__cache, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -400,6 +456,14 @@ impl<'__a> ::serde::Serialize for UnaryResponseDefinitionView<'__a> {
         {
             if let ::core::option::Option::Some(__v) = self.raw_response.as_option() {
                 __map.serialize_entry("rawResponse", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self
+                .raw_websocket_response
+                .as_option()
+            {
+                __map.serialize_entry("rawWebsocketResponse", __v)?;
             }
         }
         if let ::core::option::Option::Some(ref __ov) = self.response {
@@ -555,6 +619,21 @@ impl UnaryResponseDefinitionOwnedView {
     > {
         &self.0.reborrow().raw_response
     }
+    /// This field is only used by the reference server. If you are implementing a
+    /// server under test, you can ignore this field or respond with an error if the
+    /// server receives a request where it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_response.
+    ///
+    /// Field 7: `raw_websocket_response`
+    #[must_use]
+    pub fn raw_websocket_response(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::RawWebSocketResponseView<'_>,
+    > {
+        &self.0.reborrow().raw_websocket_response
+    }
     /// Oneof `response`.
     #[must_use]
     pub fn response(
@@ -639,6 +718,16 @@ pub struct StreamResponseDefinitionView<'a> {
     pub raw_response: ::buffa::MessageFieldView<
         super::super::__buffa::view::RawHTTPResponseView<'a>,
     >,
+    /// This field is only used by the reference server. If you are implementing a
+    /// server under test, you can ignore this field or respond with an error if the
+    /// server receives a request where it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_response.
+    ///
+    /// Field 7: `raw_websocket_response`
+    pub raw_websocket_response: ::buffa::MessageFieldView<
+        super::super::__buffa::view::RawWebSocketResponseView<'a>,
+    >,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for StreamResponseDefinitionView<'a> {
@@ -713,6 +802,27 @@ impl<'a> ::buffa::MessageView<'a> for StreamResponseDefinitionView<'a> {
                     None => {
                         view.raw_response = ::buffa::MessageFieldView::set(
                             <super::super::__buffa::view::RawHTTPResponseView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.raw_websocket_response.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.raw_websocket_response = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::RawWebSocketResponseView as ::buffa::MessageView>::decode_view_ctx(
                                 sub,
                                 __sub_ctx,
                             )?,
@@ -825,6 +935,15 @@ impl<'a> ::buffa::MessageView<'a> for StreamResponseDefinitionView<'a> {
                 }
                 None => ::buffa::MessageField::none(),
             },
+            raw_websocket_response: match self.raw_websocket_response.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::RawWebSocketResponse,
+                        ::buffa::Inline<super::super::RawWebSocketResponse>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -871,6 +990,14 @@ impl<'a> ::buffa::ViewEncode<'a> for StreamResponseDefinitionView<'a> {
         if self.raw_response.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.raw_response.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.raw_websocket_response.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.raw_websocket_response.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -925,6 +1052,14 @@ impl<'a> ::buffa::ViewEncode<'a> for StreamResponseDefinitionView<'a> {
             );
             self.raw_response.write_to(__cache, buf);
         }
+        if self.raw_websocket_response.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                7u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.raw_websocket_response.write_to(__cache, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -974,6 +1109,14 @@ impl<'__a> ::serde::Serialize for StreamResponseDefinitionView<'__a> {
         {
             if let ::core::option::Option::Some(__v) = self.raw_response.as_option() {
                 __map.serialize_entry("rawResponse", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self
+                .raw_websocket_response
+                .as_option()
+            {
+                __map.serialize_entry("rawWebsocketResponse", __v)?;
             }
         }
         __map.end()
@@ -1130,6 +1273,21 @@ impl StreamResponseDefinitionOwnedView {
         super::super::__buffa::view::RawHTTPResponseView<'_>,
     > {
         &self.0.reborrow().raw_response
+    }
+    /// This field is only used by the reference server. If you are implementing a
+    /// server under test, you can ignore this field or respond with an error if the
+    /// server receives a request where it is set.
+    ///
+    /// It is the PROTOCOL_CONNECT_WEBSOCKET counterpart of raw_response.
+    ///
+    /// Field 7: `raw_websocket_response`
+    #[must_use]
+    pub fn raw_websocket_response(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::RawWebSocketResponseView<'_>,
+    > {
+        &self.0.reborrow().raw_websocket_response
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<StreamResponseDefinitionView<'static>>>
@@ -9162,6 +9320,1312 @@ impl ::buffa::HasMessageView for super::super::RawHTTPResponse {
     type ViewHandle = RawHTTPResponseOwnedView;
 }
 impl ::serde::Serialize for RawHTTPResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// RawWebSocketRequest models the client side of a Connect-over-WebSocket
+/// connection. This can be used to craft handshakes and message sequences
+/// with odd properties (including certain kinds of malformed ones) to test
+/// edge cases in servers.
+///
+/// Unlike the messages of a normal RPC, none of these are generated
+/// automatically: a test that wants the stream to open with a Leading-Metadata
+/// message must include one in messages.
+#[derive(Clone, Debug, Default)]
+pub struct RawWebSocketRequestView<'a> {
+    /// The path of the handshake URI. If empty, the path of the procedure named
+    /// by the request's service and method is used.
+    ///
+    /// Field 1: `path`
+    pub path: &'a str,
+    /// Query parameters to add to the handshake URI.
+    ///
+    /// Field 2: `query_params`
+    pub query_params: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::HeaderView<'a>,
+    >,
+    /// Headers to add to the handshake request.
+    ///
+    /// Field 3: `headers`
+    pub headers: ::buffa::RepeatedView<'a, super::super::__buffa::view::HeaderView<'a>>,
+    /// The tokens offered in the Sec-WebSocket-Protocol header. If empty, the
+    /// single token that selects the request's codec is offered.
+    ///
+    /// Field 4: `subprotocols`
+    pub subprotocols: ::buffa::RepeatedView<'a, &'a str>,
+    /// If true, offer the permessage-deflate extension without the
+    /// no_context_takeover parameters. If false, compression is not offered.
+    ///
+    /// Field 5: `offer_context_takeover`
+    pub offer_context_takeover: bool,
+    /// The messages to send once the connection is open, in order. The client
+    /// then reads the server's response until the connection ends.
+    ///
+    /// Field 6: `messages`
+    pub messages: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::WebSocketMessageView<'a>,
+    >,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for RawWebSocketRequestView<'a> {
+    type Owned = super::super::RawWebSocketRequest;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.path = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.offer_context_takeover = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<super::super::__buffa::view::HeaderView>(),
+                )?;
+                view.query_params
+                    .push(
+                        <super::super::__buffa::view::HeaderView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<super::super::__buffa::view::HeaderView>(),
+                )?;
+                view.headers
+                    .push(
+                        <super::super::__buffa::view::HeaderView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.subprotocols.push(__elem);
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<
+                        super::super::__buffa::view::WebSocketMessageView,
+                    >(),
+                )?;
+                view.messages
+                    .push(
+                        <super::super::__buffa::view::WebSocketMessageView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::RawWebSocketRequest,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::RawWebSocketRequest,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::RawWebSocketRequest {
+            path: self.path.to_string(),
+            query_params: self
+                .query_params
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            headers: self
+                .headers
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            subprotocols: self.subprotocols.iter().map(|s| s.to_string()).collect(),
+            offer_context_takeover: self.offer_context_takeover,
+            messages: self
+                .messages
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for RawWebSocketRequestView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.path.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.path) as u64;
+        }
+        for v in &self.query_params {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        for v in &self.headers {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        for v in &self.subprotocols {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
+        if self.offer_context_takeover {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        for v in &self.messages {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.path.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.path, buf);
+        }
+        for v in &self.query_params {
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        for v in &self.headers {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        for v in &self.subprotocols {
+            ::buffa::types::put_string_field(4u32, v, buf);
+        }
+        if self.offer_context_takeover {
+            ::buffa::types::put_bool_field(5u32, self.offer_context_takeover, buf);
+        }
+        for v in &self.messages {
+            ::buffa::types::put_len_delimited_header(
+                6u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for RawWebSocketRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.path) {
+            __map.serialize_entry("path", self.path)?;
+        }
+        if !self.query_params.is_empty() {
+            __map.serialize_entry("queryParams", &*self.query_params)?;
+        }
+        if !self.headers.is_empty() {
+            __map.serialize_entry("headers", &*self.headers)?;
+        }
+        if !self.subprotocols.is_empty() {
+            __map.serialize_entry("subprotocols", &*self.subprotocols)?;
+        }
+        if self.offer_context_takeover {
+            __map.serialize_entry("offerContextTakeover", &self.offer_context_takeover)?;
+        }
+        if !self.messages.is_empty() {
+            __map.serialize_entry("messages", &*self.messages)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for RawWebSocketRequestView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "RawWebSocketRequest";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.RawWebSocketRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.RawWebSocketRequest";
+}
+::buffa::impl_default_view_instance!(RawWebSocketRequestView);
+::buffa::impl_view_reborrow!(RawWebSocketRequestView);
+/** Self-contained, `'static` owned view of a `RawWebSocketRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`RawWebSocketRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`RawWebSocketRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct RawWebSocketRequestOwnedView(
+    ::buffa::OwnedView<RawWebSocketRequestView<'static>>,
+);
+impl RawWebSocketRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            RawWebSocketRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            RawWebSocketRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::RawWebSocketRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            RawWebSocketRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`RawWebSocketRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &RawWebSocketRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::RawWebSocketRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The path of the handshake URI. If empty, the path of the procedure named
+    /// by the request's service and method is used.
+    ///
+    /// Field 1: `path`
+    #[must_use]
+    pub fn path(&self) -> &'_ str {
+        self.0.reborrow().path
+    }
+    /// Query parameters to add to the handshake URI.
+    ///
+    /// Field 2: `query_params`
+    #[must_use]
+    pub fn query_params(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::HeaderView<'_>> {
+        &self.0.reborrow().query_params
+    }
+    /// Headers to add to the handshake request.
+    ///
+    /// Field 3: `headers`
+    #[must_use]
+    pub fn headers(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::HeaderView<'_>> {
+        &self.0.reborrow().headers
+    }
+    /// The tokens offered in the Sec-WebSocket-Protocol header. If empty, the
+    /// single token that selects the request's codec is offered.
+    ///
+    /// Field 4: `subprotocols`
+    #[must_use]
+    pub fn subprotocols(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().subprotocols
+    }
+    /// If true, offer the permessage-deflate extension without the
+    /// no_context_takeover parameters. If false, compression is not offered.
+    ///
+    /// Field 5: `offer_context_takeover`
+    #[must_use]
+    pub fn offer_context_takeover(&self) -> bool {
+        self.0.reborrow().offer_context_takeover
+    }
+    /// The messages to send once the connection is open, in order. The client
+    /// then reads the server's response until the connection ends.
+    ///
+    /// Field 6: `messages`
+    #[must_use]
+    pub fn messages(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::WebSocketMessageView<'_>,
+    > {
+        &self.0.reborrow().messages
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<RawWebSocketRequestView<'static>>>
+for RawWebSocketRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<RawWebSocketRequestView<'static>>) -> Self {
+        RawWebSocketRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<RawWebSocketRequestOwnedView>
+for ::buffa::OwnedView<RawWebSocketRequestView<'static>> {
+    fn from(wrapper: RawWebSocketRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<RawWebSocketRequestView<'static>>>
+for RawWebSocketRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<RawWebSocketRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::RawWebSocketRequest {
+    type View<'a> = RawWebSocketRequestView<'a>;
+    type ViewHandle = RawWebSocketRequestOwnedView;
+}
+impl ::serde::Serialize for RawWebSocketRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// RawWebSocketResponse models the server side of a Connect-over-WebSocket
+/// connection, after the handshake has completed and the reference server has
+/// read the client's request stream. This can be used to craft message
+/// sequences with odd properties (including certain kinds of malformed ones)
+/// to test edge cases in clients.
+///
+/// None of the server's messages are generated automatically: a test that
+/// wants the response to open with a Leading-Metadata message must include one
+/// in messages.
+#[derive(Clone, Debug, Default)]
+pub struct RawWebSocketResponseView<'a> {
+    /// The messages to send, in order.
+    ///
+    /// Field 1: `messages`
+    pub messages: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::WebSocketMessageView<'a>,
+    >,
+    /// The status code to send in the server's Close frame after the messages.
+    /// If zero, 1000 (normal closure) is sent. Ignored if omit_close or
+    /// expected_client_close_codes is set.
+    ///
+    /// Field 2: `close_code`
+    pub close_code: u32,
+    /// If true, the server ends the connection without sending a Close frame.
+    ///
+    /// Field 3: `omit_close`
+    pub omit_close: bool,
+    /// If not empty, the server sends no Close frame of its own after the
+    /// messages. It waits instead for the client to close the connection, and
+    /// reports an error if the client's Close frame does not carry one of these
+    /// codes. A connection the client ends without a Close frame is treated as
+    /// code 1006.
+    ///
+    /// Field 4: `expected_client_close_codes`
+    pub expected_client_close_codes: ::buffa::RepeatedView<'a, u32>,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for RawWebSocketResponseView<'a> {
+    type Owned = super::super::RawWebSocketResponse;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.close_code = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.omit_close = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<
+                        super::super::__buffa::view::WebSocketMessageView,
+                    >(),
+                )?;
+                view.messages
+                    .push(
+                        <super::super::__buffa::view::WebSocketMessageView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            4u32 => {
+                if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
+                    let payload = ::buffa::types::borrow_bytes(&mut cur)?;
+                    ::buffa::types::extend_packed_uint32(
+                        payload,
+                        view.expected_client_close_codes.as_mut_vec(),
+                        ::buffa::encoding::count_varints(payload),
+                    )?;
+                } else if tag.wire_type() == ::buffa::encoding::WireType::Varint {
+                    view.expected_client_close_codes
+                        .push(::buffa::types::decode_uint32(&mut cur)?);
+                } else {
+                    return Err(
+                        ::buffa::encoding::wire_type_mismatch(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        ),
+                    );
+                }
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::RawWebSocketResponse,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::RawWebSocketResponse,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::RawWebSocketResponse {
+            messages: self
+                .messages
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            close_code: self.close_code,
+            omit_close: self.omit_close,
+            expected_client_close_codes: self.expected_client_close_codes.to_vec(),
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for RawWebSocketResponseView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        for v in &self.messages {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.close_code != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.close_code) as u64;
+        }
+        if self.omit_close {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if !self.expected_client_close_codes.is_empty() {
+            let payload: u64 = self
+                .expected_client_close_codes
+                .iter()
+                .map(|&v| ::buffa::types::uint32_encoded_len(v) as u64)
+                .sum::<u64>();
+            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        for v in &self.messages {
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.close_code != 0u32 {
+            ::buffa::types::put_uint32_field(2u32, self.close_code, buf);
+        }
+        if self.omit_close {
+            ::buffa::types::put_bool_field(3u32, self.omit_close, buf);
+        }
+        if !self.expected_client_close_codes.is_empty() {
+            let payload: u64 = self
+                .expected_client_close_codes
+                .iter()
+                .map(|&v| ::buffa::types::uint32_encoded_len(v) as u64)
+                .sum::<u64>();
+            ::buffa::types::put_len_delimited_header(4u32, payload, buf);
+            for &v in &self.expected_client_close_codes {
+                ::buffa::types::encode_uint32(v, buf);
+            }
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for RawWebSocketResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !self.messages.is_empty() {
+            __map.serialize_entry("messages", &*self.messages)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.close_code) {
+            __map
+                .serialize_entry(
+                    "closeCode",
+                    &::buffa::json_helpers::ProtoJson(&self.close_code),
+                )?;
+        }
+        if self.omit_close {
+            __map.serialize_entry("omitClose", &self.omit_close)?;
+        }
+        if !self.expected_client_close_codes.is_empty() {
+            __map
+                .serialize_entry(
+                    "expectedClientCloseCodes",
+                    &::buffa::json_helpers::RepeatedJson(
+                        &self.expected_client_close_codes,
+                    ),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for RawWebSocketResponseView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "RawWebSocketResponse";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.RawWebSocketResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.RawWebSocketResponse";
+}
+::buffa::impl_default_view_instance!(RawWebSocketResponseView);
+::buffa::impl_view_reborrow!(RawWebSocketResponseView);
+/** Self-contained, `'static` owned view of a `RawWebSocketResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`RawWebSocketResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`RawWebSocketResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct RawWebSocketResponseOwnedView(
+    ::buffa::OwnedView<RawWebSocketResponseView<'static>>,
+);
+impl RawWebSocketResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            RawWebSocketResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            RawWebSocketResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::RawWebSocketResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            RawWebSocketResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`RawWebSocketResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &RawWebSocketResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::RawWebSocketResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The messages to send, in order.
+    ///
+    /// Field 1: `messages`
+    #[must_use]
+    pub fn messages(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::WebSocketMessageView<'_>,
+    > {
+        &self.0.reborrow().messages
+    }
+    /// The status code to send in the server's Close frame after the messages.
+    /// If zero, 1000 (normal closure) is sent. Ignored if omit_close or
+    /// expected_client_close_codes is set.
+    ///
+    /// Field 2: `close_code`
+    #[must_use]
+    pub fn close_code(&self) -> u32 {
+        self.0.reborrow().close_code
+    }
+    /// If true, the server ends the connection without sending a Close frame.
+    ///
+    /// Field 3: `omit_close`
+    #[must_use]
+    pub fn omit_close(&self) -> bool {
+        self.0.reborrow().omit_close
+    }
+    /// If not empty, the server sends no Close frame of its own after the
+    /// messages. It waits instead for the client to close the connection, and
+    /// reports an error if the client's Close frame does not carry one of these
+    /// codes. A connection the client ends without a Close frame is treated as
+    /// code 1006.
+    ///
+    /// Field 4: `expected_client_close_codes`
+    #[must_use]
+    pub fn expected_client_close_codes(&self) -> &::buffa::RepeatedView<'_, u32> {
+        &self.0.reborrow().expected_client_close_codes
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<RawWebSocketResponseView<'static>>>
+for RawWebSocketResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<RawWebSocketResponseView<'static>>) -> Self {
+        RawWebSocketResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<RawWebSocketResponseOwnedView>
+for ::buffa::OwnedView<RawWebSocketResponseView<'static>> {
+    fn from(wrapper: RawWebSocketResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<RawWebSocketResponseView<'static>>>
+for RawWebSocketResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<RawWebSocketResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::RawWebSocketResponse {
+    type View<'a> = RawWebSocketResponseView<'a>;
+    type ViewHandle = RawWebSocketResponseOwnedView;
+}
+impl ::serde::Serialize for RawWebSocketResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// WebSocketMessage is one complete WebSocket message, sent in a single frame.
+#[derive(Clone, Debug, Default)]
+pub struct WebSocketMessageView<'a> {
+    /// The frame type of the message.
+    ///
+    /// Field 1: `type`
+    pub r#type: ::buffa::EnumValue<super::super::WebSocketMessageType>,
+    /// Written verbatim before contents. It is typically a single Connect-over-
+    /// WebSocket marker: "B", "M", "S", or "C". If empty, only contents is sent.
+    ///
+    /// Field 2: `marker`
+    pub marker: &'a str,
+    /// The payload that follows the marker. If absent, the message is the marker
+    /// alone.
+    ///
+    /// Field 3: `contents`
+    pub contents: ::buffa::MessageFieldView<
+        super::super::__buffa::view::MessageContentsView<'a>,
+    >,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for WebSocketMessageView<'a> {
+    type Owned = super::super::WebSocketMessage;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.r#type = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(&mut cur)?,
+                );
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.marker = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.contents.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.contents = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::MessageContentsView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::WebSocketMessage, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::WebSocketMessage, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::WebSocketMessage {
+            r#type: self.r#type,
+            marker: self.marker.to_string(),
+            contents: match self.contents.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::MessageContents,
+                        ::buffa::Inline<super::super::MessageContents>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for WebSocketMessageView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        {
+            let val = self.r#type.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        if !self.marker.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.marker) as u64;
+        }
+        if self.contents.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.contents.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        {
+            let val = self.r#type.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(1u32, val, buf);
+            }
+        }
+        if !self.marker.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.marker, buf);
+        }
+        if self.contents.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.contents.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for WebSocketMessageView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.r#type) {
+            __map.serialize_entry("type", &self.r#type)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.marker) {
+            __map.serialize_entry("marker", self.marker)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.contents.as_option() {
+                __map.serialize_entry("contents", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for WebSocketMessageView<'a> {
+    const PACKAGE: &'static str = "connectrpc.conformance.v1";
+    const NAME: &'static str = "WebSocketMessage";
+    const FULL_NAME: &'static str = "connectrpc.conformance.v1.WebSocketMessage";
+    const TYPE_URL: &'static str = "type.googleapis.com/connectrpc.conformance.v1.WebSocketMessage";
+}
+::buffa::impl_default_view_instance!(WebSocketMessageView);
+::buffa::impl_view_reborrow!(WebSocketMessageView);
+/** Self-contained, `'static` owned view of a `WebSocketMessage` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`WebSocketMessageView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`WebSocketMessageView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct WebSocketMessageOwnedView(::buffa::OwnedView<WebSocketMessageView<'static>>);
+impl WebSocketMessageOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            WebSocketMessageOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            WebSocketMessageOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::WebSocketMessage,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            WebSocketMessageOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`WebSocketMessageView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &WebSocketMessageView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::WebSocketMessage {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The frame type of the message.
+    ///
+    /// Field 1: `type`
+    #[must_use]
+    pub fn r#type(&self) -> ::buffa::EnumValue<super::super::WebSocketMessageType> {
+        self.0.reborrow().r#type
+    }
+    /// Written verbatim before contents. It is typically a single Connect-over-
+    /// WebSocket marker: "B", "M", "S", or "C". If empty, only contents is sent.
+    ///
+    /// Field 2: `marker`
+    #[must_use]
+    pub fn marker(&self) -> &'_ str {
+        self.0.reborrow().marker
+    }
+    /// The payload that follows the marker. If absent, the message is the marker
+    /// alone.
+    ///
+    /// Field 3: `contents`
+    #[must_use]
+    pub fn contents(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::MessageContentsView<'_>,
+    > {
+        &self.0.reborrow().contents
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<WebSocketMessageView<'static>>>
+for WebSocketMessageOwnedView {
+    fn from(inner: ::buffa::OwnedView<WebSocketMessageView<'static>>) -> Self {
+        WebSocketMessageOwnedView(inner)
+    }
+}
+impl ::core::convert::From<WebSocketMessageOwnedView>
+for ::buffa::OwnedView<WebSocketMessageView<'static>> {
+    fn from(wrapper: WebSocketMessageOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<WebSocketMessageView<'static>>>
+for WebSocketMessageOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<WebSocketMessageView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::WebSocketMessage {
+    type View<'a> = WebSocketMessageView<'a>;
+    type ViewHandle = WebSocketMessageOwnedView;
+}
+impl ::serde::Serialize for WebSocketMessageOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,

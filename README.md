@@ -330,10 +330,11 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 | `server-tls` | No      | TLS for the built-in server (`Server::with_tls`) |
 | `tls`        | No      | Convenience: enables both `server-tls` + `client-tls` |
 | `axum`       | No      | Axum integration (`Router::into_axum_service`); the `connectrpc::axum` module also needs `server`, and `serve_tls` needs `server-tls` |
+| `websocket`  | No      | Connect over WebSocket: `ConnectRpcService::with_websocket` (and `Server::with_websocket` with `server`), and with `client` on native targets the `WebSocketTransport`; `wss://` also needs `client-tls`. See [docs/guide.md#connect-over-websocket](docs/guide.md#connect-over-websocket) |
 
 ### wasm32
 
-The core crate compiles for `wasm32-unknown-unknown`. Generated clients are generic over `ClientTransport`, so they work on wasm with a custom transport (e.g. `web-sys::fetch`). The `client`/`server`/`tls` features require platform networking and `zstd` requires native C compilation. See [`examples/wasm-client`](examples/wasm-client) for a complete Fetch-based transport.
+The core crate compiles for `wasm32-unknown-unknown`. Generated clients are generic over `ClientTransport`, so they work on wasm with a custom transport (e.g. `web-sys::fetch`). The `client`/`server`/`tls`/`websocket` features require platform networking and `zstd` requires native C compilation. See [`examples/wasm-client`](examples/wasm-client) for a complete Fetch-based transport.
 
 ```toml
 [dependencies]

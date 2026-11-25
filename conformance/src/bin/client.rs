@@ -20,6 +20,7 @@ use connectrpc::client::{
 };
 use connectrpc::error::{ConnectError, ErrorCode};
 use connectrpc::rustls;
+use connectrpc::websocket::{WebSocketBody, WebSocketTransport};
 use connectrpc::{
     CodecFormat, CompressionRegistry, Spec, SpecOrigin,
     compression::{GzipProvider, ZstdProvider},
@@ -45,6 +46,7 @@ use connectrpc_conformance::{
     CONFORMANCE_SERVICE_IDEMPOTENT_UNARY_SPEC, CONFORMANCE_SERVICE_SERVER_STREAM_SPEC,
     CONFORMANCE_SERVICE_UNARY_SPEC, CONFORMANCE_SERVICE_UNIMPLEMENTED_SPEC,
 };
+use http_body_util::Either;
 use hyper::Request;
 use hyper::Response;
 use hyper_util::rt::TokioIo;
@@ -69,12 +71,15 @@ struct ConformanceTransport {
     /// Client's certificate + key (PEM) for mTLS. None = no client auth.
     client_creds: Option<(Vec<u8>, Vec<u8>)>,
     http_version: HTTPVersion,
+    /// Set for PROTOCOL_CONNECT_WEBSOCKET, which carries every RPC over the
+    /// library's own WebSocket transport instead.
+    websocket: Option<WebSocketTransport>,
 }
 
 impl ConformanceTransport {
     /// Build a transport from the conformance request's connection fields.
     /// Centralizes the TLS / mTLS credential extraction.
-    fn from_request(req: &ClientCompatRequest, http_version: HTTPVersion) -> Self {
+    fn from_request(req: &ClientCompatRequest, http_version: HTTPVersion) -> Result<Self> {
         let use_tls = !req.server_tls_cert.is_empty();
         let client_creds = req.client_tls_creds.as_option().and_then(|creds| {
             if creds.cert.is_empty() || creds.key.is_empty() {
@@ -83,7 +88,25 @@ impl ConformanceTransport {
                 Some((creds.cert.clone(), creds.key.clone()))
             }
         });
-        Self {
+        let websocket = if req.protocol.as_known() == Some(Protocol::PROTOCOL_CONNECT_WEBSOCKET) {
+            let mut transport = if use_tls {
+                let config = build_tls_client_config(
+                    &req.server_tls_cert,
+                    client_creds.as_ref(),
+                    HTTPVersion::HTTP_VERSION_1,
+                )?;
+                WebSocketTransport::with_tls(Arc::new(config))
+            } else {
+                WebSocketTransport::plaintext()
+            };
+            if req.message_receive_limit > 0 {
+                transport = transport.with_max_message_size(req.message_receive_limit as usize);
+            }
+            Some(transport)
+        } else {
+            None
+        };
+        Ok(Self {
             host: req.host.clone(),
             port: req.port as u16,
             tls_cert: if use_tls {
@@ -93,18 +116,23 @@ impl ConformanceTransport {
             },
             client_creds,
             http_version,
-        }
+            websocket,
+        })
     }
 }
 
 impl ClientTransport for ConformanceTransport {
-    type ResponseBody = hyper::body::Incoming;
-    type Error = ConformanceTransportError;
+    type ResponseBody = Either<hyper::body::Incoming, WebSocketBody>;
+    type Error = ConnectError;
 
     fn send(
         &self,
         request: Request<ClientBody>,
     ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+        if let Some(websocket) = &self.websocket {
+            let sent = websocket.send(request);
+            return Box::pin(async move { sent.await.map(|response| response.map(Either::Right)) });
+        }
         let host = self.host.clone();
         let port = self.port;
         let tls_cert = self.tls_cert.clone();
@@ -130,12 +158,12 @@ impl ClientTransport for ConformanceTransport {
             let (mut parts, body) = request.into_parts();
             parts.uri = path
                 .parse()
-                .map_err(|e| ConformanceTransportError(format!("invalid path: {e}")))?;
+                .map_err(|e| ConnectError::unavailable(format!("invalid path: {e}")))?;
             parts.headers.insert(
                 http::header::HOST,
                 host_header
                     .parse()
-                    .map_err(|e| ConformanceTransportError(format!("invalid host header: {e}")))?,
+                    .map_err(|e| ConnectError::unavailable(format!("invalid host header: {e}")))?,
             );
             let request = Request::from_parts(parts, body);
 
@@ -143,44 +171,34 @@ impl ClientTransport for ConformanceTransport {
             let addr = format!("{host}:{port}");
             let tcp_stream = TcpStream::connect(&addr)
                 .await
-                .map_err(|e| ConformanceTransportError(format!("TCP connect failed: {e}")))?;
+                .map_err(|e| ConnectError::unavailable(format!("TCP connect failed: {e}")))?;
 
             if let Some(cert) = &tls_cert {
                 let tls_config = build_tls_client_config(cert, client_creds.as_ref(), http_version)
-                    .map_err(|e| ConformanceTransportError(format!("TLS config error: {e}")))?;
+                    .map_err(|e| ConnectError::unavailable(format!("TLS config error: {e}")))?;
                 let connector = TlsConnector::from(Arc::new(tls_config));
                 let server_name = rustls_pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|e| ConformanceTransportError(format!("invalid server name: {e}")))?
+                    .map_err(|e| ConnectError::unavailable(format!("invalid server name: {e}")))?
                     .to_owned();
                 let tls_stream = connector
                     .connect(server_name, tcp_stream)
                     .await
-                    .map_err(|e| ConformanceTransportError(format!("TLS handshake failed: {e}")))?;
+                    .map_err(|e| ConnectError::unavailable(format!("TLS handshake failed: {e}")))?;
                 let io = TokioIo::new(tls_stream);
                 send_request(io, request, http_version)
                     .await
-                    .map_err(|e| ConformanceTransportError(format!("send failed: {e}")))
+                    .map(|response| response.map(Either::Left))
+                    .map_err(|e| ConnectError::unavailable(format!("send failed: {e}")))
             } else {
                 let io = TokioIo::new(tcp_stream);
                 send_request(io, request, http_version)
                     .await
-                    .map_err(|e| ConformanceTransportError(format!("send failed: {e}")))
+                    .map(|response| response.map(Either::Left))
+                    .map_err(|e| ConnectError::unavailable(format!("send failed: {e}")))
             }
         })
     }
 }
-
-/// Error type for ConformanceTransport.
-#[derive(Debug, Clone)]
-struct ConformanceTransportError(String);
-
-impl std::fmt::Display for ConformanceTransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ConformanceTransportError {}
 
 // ============================================================================
 // Main + execute_request (unchanged structure)
@@ -243,9 +261,9 @@ async fn execute_request(req: &ClientCompatRequest) -> ExecResult {
         .as_known()
         .unwrap_or(Protocol::PROTOCOL_UNSPECIFIED);
     let wire_protocol = match protocol {
-        Protocol::PROTOCOL_CONNECT | Protocol::PROTOCOL_UNSPECIFIED => {
-            connectrpc::Protocol::Connect
-        }
+        Protocol::PROTOCOL_CONNECT
+        | Protocol::PROTOCOL_UNSPECIFIED
+        | Protocol::PROTOCOL_CONNECT_WEBSOCKET => connectrpc::Protocol::Connect,
         Protocol::PROTOCOL_GRPC => connectrpc::Protocol::Grpc,
         Protocol::PROTOCOL_GRPC_WEB => connectrpc::Protocol::GrpcWeb,
     };
@@ -335,8 +353,8 @@ async fn execute_request(req: &ClientCompatRequest) -> ExecResult {
     };
 
     // Raw requests are reference-client only
-    if req.raw_request.is_set() {
-        return ExecResult::Error("raw_request not supported".to_string());
+    if req.raw_request.is_set() || req.raw_websocket_request.is_set() {
+        return ExecResult::Error("raw requests are not supported".to_string());
     }
 
     // Extract cancel timing info
@@ -493,7 +511,7 @@ async fn do_unary_call(
 
     let method = req.method.as_deref().unwrap_or("Unary");
 
-    let transport = ConformanceTransport::from_request(req, http_version);
+    let transport = ConformanceTransport::from_request(req, http_version)?;
 
     // Build client config. For unary, always accept all supported encodings
     // for response decompression (matches reference clients — they
@@ -718,7 +736,7 @@ async fn do_server_stream_call(
 ) -> Result<ClientResponseResult> {
     let use_tls = !req.server_tls_cert.is_empty();
 
-    let transport = ConformanceTransport::from_request(req, http_version);
+    let transport = ConformanceTransport::from_request(req, http_version)?;
 
     // Build client config. For streaming, only register the requested
     // encoding (the "unexpected-compressed-message" conformance tests
@@ -1019,7 +1037,7 @@ async fn do_client_stream_call(
 ) -> Result<ClientResponseResult> {
     let use_tls = !req.server_tls_cert.is_empty();
 
-    let transport = ConformanceTransport::from_request(req, http_version);
+    let transport = ConformanceTransport::from_request(req, http_version)?;
 
     // Build client config (streaming — only requested encoding).
     let registry = registry_for_compression(compression);
@@ -1183,7 +1201,7 @@ async fn do_bidi_stream_call(
 
     let use_tls = !req.server_tls_cert.is_empty();
 
-    let transport = ConformanceTransport::from_request(req, http_version);
+    let transport = ConformanceTransport::from_request(req, http_version)?;
 
     // Build client config (streaming — only requested encoding).
     let registry = registry_for_compression(compression);

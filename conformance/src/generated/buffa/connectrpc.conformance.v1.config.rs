@@ -163,10 +163,22 @@ pub enum Protocol {
     PROTOCOL_UNSPECIFIED = 0i32,
     PROTOCOL_CONNECT = 1i32,
     PROTOCOL_GRPC = 2i32,
+    PROTOCOL_GRPC_WEB = 3i32,
+    /// The Connect protocol carried over a WebSocket connection, as described
+    /// by the Connect-over-WebSocket specification. The handshake is always an
+    /// HTTP/1.1 request, so this protocol is only tested with HTTP_VERSION_1. All
+    /// stream types, including full-duplex bidi streams, work over it.
+    ///
+    /// Messages are compressed by the WebSocket layer (permessage-deflate), not
+    /// by Connect, so this protocol is only tested with COMPRESSION_IDENTITY.
+    ///
+    /// An implementation opts into this protocol by listing it in the features
+    /// of its configuration. It is never included by default.
+    ///
     /// TODO: Support add'l protocols:
     /// PROTOCOL_GRPC_WEB_TEXT = 4;
     /// PROTOCOL_REST_TRANSCODING = 5;
-    PROTOCOL_GRPC_WEB = 3i32,
+    PROTOCOL_CONNECT_WEBSOCKET = 6i32,
 }
 impl Protocol {
     ///Idiomatic alias for [`Self::PROTOCOL_UNSPECIFIED`]; `Debug` prints the variant name.
@@ -181,6 +193,9 @@ impl Protocol {
     ///Idiomatic alias for [`Self::PROTOCOL_GRPC_WEB`]; `Debug` prints the variant name.
     #[allow(non_upper_case_globals)]
     pub const GrpcWeb: Self = Self::PROTOCOL_GRPC_WEB;
+    ///Idiomatic alias for [`Self::PROTOCOL_CONNECT_WEBSOCKET`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const ConnectWebsocket: Self = Self::PROTOCOL_CONNECT_WEBSOCKET;
 }
 impl ::core::default::Default for Protocol {
     fn default() -> Self {
@@ -280,6 +295,7 @@ impl ::buffa::Enumeration for Protocol {
             1i32 => ::core::option::Option::Some(Self::PROTOCOL_CONNECT),
             2i32 => ::core::option::Option::Some(Self::PROTOCOL_GRPC),
             3i32 => ::core::option::Option::Some(Self::PROTOCOL_GRPC_WEB),
+            6i32 => ::core::option::Option::Some(Self::PROTOCOL_CONNECT_WEBSOCKET),
             _ => ::core::option::Option::None,
         }
     }
@@ -292,6 +308,7 @@ impl ::buffa::Enumeration for Protocol {
             Self::PROTOCOL_CONNECT => "PROTOCOL_CONNECT",
             Self::PROTOCOL_GRPC => "PROTOCOL_GRPC",
             Self::PROTOCOL_GRPC_WEB => "PROTOCOL_GRPC_WEB",
+            Self::PROTOCOL_CONNECT_WEBSOCKET => "PROTOCOL_CONNECT_WEBSOCKET",
         }
     }
     fn from_proto_name(name: &str) -> ::core::option::Option<Self> {
@@ -302,6 +319,9 @@ impl ::buffa::Enumeration for Protocol {
             "PROTOCOL_CONNECT" => ::core::option::Option::Some(Self::PROTOCOL_CONNECT),
             "PROTOCOL_GRPC" => ::core::option::Option::Some(Self::PROTOCOL_GRPC),
             "PROTOCOL_GRPC_WEB" => ::core::option::Option::Some(Self::PROTOCOL_GRPC_WEB),
+            "PROTOCOL_CONNECT_WEBSOCKET" => {
+                ::core::option::Option::Some(Self::PROTOCOL_CONNECT_WEBSOCKET)
+            }
             _ => ::core::option::Option::None,
         }
     }
@@ -311,6 +331,7 @@ impl ::buffa::Enumeration for Protocol {
             Self::PROTOCOL_CONNECT,
             Self::PROTOCOL_GRPC,
             Self::PROTOCOL_GRPC_WEB,
+            Self::PROTOCOL_CONNECT_WEBSOCKET,
         ]
     }
 }

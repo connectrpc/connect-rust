@@ -169,6 +169,7 @@
 //! | `server` | ✗ | Standalone hyper-based server |
 //! | `server-tls` | ✗ | TLS for the built-in server |
 //! | `tls` | ✗ | Convenience: `server-tls` + `client-tls` |
+//! | `websocket` | ✗ | Connect over WebSocket: [`ConnectRpcService::with_websocket`], and with `client` (native targets) the `WebSocketTransport`; `wss://` also needs `client-tls` |
 //! | `axum` | ✗ | Axum integration (`Router::into_axum_service`); the `connectrpc::axum` module also needs `server`, and `serve_tls` needs `server-tls` |
 
 #![deny(unsafe_code)]
@@ -241,6 +242,11 @@ pub mod server;
 #[cfg(all(feature = "axum", feature = "server"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server"))))]
 pub mod axum;
+
+// Optional: Connect over WebSocket
+#[cfg(feature = "websocket")]
+#[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+pub mod websocket;
 
 // ============================================================================
 // Primary exports - Tower-first API

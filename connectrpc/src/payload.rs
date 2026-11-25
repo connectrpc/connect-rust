@@ -29,8 +29,8 @@ use buffa::view::{MessageView, OwnedView};
 use bytes::Bytes;
 
 use crate::codec::{
-    CodecFormat, JsonDeserialize, JsonSerialize, decode_json, decode_proto_with_options,
-    encode_json, encode_proto,
+    CodecFormat, JsonDeserialize, JsonSerialize, decode_peer_json, decode_peer_proto, encode_json,
+    encode_proto,
 };
 use crate::error::ConnectError;
 
@@ -305,8 +305,8 @@ impl Payload {
         // the other caller gets the wrong-type error below.
         if self.decoded.get().is_none() {
             let m: M = match self.format {
-                CodecFormat::Proto => decode_proto_with_options(&self.bytes, &self.decode_options)?,
-                CodecFormat::Json => decode_json(&self.bytes)?,
+                CodecFormat::Proto => decode_peer_proto(&self.bytes, &self.decode_options)?,
+                CodecFormat::Json => decode_peer_json(&self.bytes)?,
             };
             let _ = self.decoded.set(Box::new(m));
         }
@@ -388,8 +388,8 @@ impl Payload {
             });
         }
         match self.format {
-            CodecFormat::Proto => decode_proto_with_options(&self.bytes, &self.decode_options),
-            CodecFormat::Json => decode_json(&self.bytes),
+            CodecFormat::Proto => decode_peer_proto(&self.bytes, &self.decode_options),
+            CodecFormat::Json => decode_peer_json(&self.bytes),
         }
     }
 
@@ -450,7 +450,10 @@ impl Payload {
             ));
         }
         OwnedView::decode_with_options(self.bytes.clone(), &self.decode_options).map_err(|e| {
-            ConnectError::invalid_argument(format!("failed to decode payload as view: {e}"))
+            crate::codec::mark_peer_decode_error(
+                ConnectError::invalid_argument(format!("failed to decode payload as view: {e}")),
+                e,
+            )
         })
     }
 
@@ -648,7 +651,7 @@ mod tests {
         });
         // encoded() re-encodes in the original (JSON) format.
         let encoded = p.encoded().unwrap();
-        let rt: StringValue = decode_json(&encoded).unwrap();
+        let rt: StringValue = crate::codec::decode_json(&encoded).unwrap();
         assert_eq!(rt.value, "after");
     }
 
@@ -704,7 +707,7 @@ mod tests {
     #[test]
     fn from_message_encodes_in_requested_format() {
         let p = Payload::from_message(StringValue::from("j"), CodecFormat::Json);
-        let rt: StringValue = decode_json(&p.encoded().unwrap()).unwrap();
+        let rt: StringValue = crate::codec::decode_json(&p.encoded().unwrap()).unwrap();
         assert_eq!(rt.value, "j");
     }
 
@@ -715,7 +718,7 @@ mod tests {
     fn encoded_as_transcodes_a_message_payload() {
         let p = Payload::from_message(StringValue::from("x"), CodecFormat::Proto);
         let json = p.encoded_as(CodecFormat::Json).unwrap();
-        let rt: StringValue = decode_json(&json).unwrap();
+        let rt: StringValue = crate::codec::decode_json(&json).unwrap();
         assert_eq!(rt.value, "x");
         // Same-format requests still hit the memo.
         let a = p.encoded_as(CodecFormat::Proto).unwrap();

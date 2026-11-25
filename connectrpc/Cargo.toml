@@ -77,6 +77,9 @@ tracing = { workspace = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 
+# Optional: Connect-over-WebSocket
+tokio-tungstenite = { workspace = true, optional = true }
+
 # Optional: Axum integration
 axum = { workspace = true, optional = true }
 
@@ -162,6 +165,17 @@ client-tls = [
 
 # Convenience meta-feature: enable both server and client TLS
 tls = ["server-tls", "client-tls"]
+
+# Connect-over-WebSocket. Serving it needs only this feature (the upgrade
+# comes from whatever hyper-based server hosts the service); the client
+# transport additionally needs `client`, and `wss://` needs `client-tls`.
+websocket = [
+    "dep:tokio-tungstenite",
+    "dep:hyper",
+    "dep:hyper-util",
+    "hyper-util/tokio",
+    "tokio/net",
+]
 
 # Framework integrations
 axum = ["dep:axum"]

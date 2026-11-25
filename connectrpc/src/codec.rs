@@ -112,7 +112,31 @@ pub fn decode_proto_with_options<M: Message>(
 ) -> Result<M, ConnectError> {
     options
         .decode_from_slice(data)
-        .map_err(|e| ConnectError::invalid_argument(format!("failed to decode proto: {e}")))
+        .map_err(|e| proto_decode_error(&e))
+}
+
+fn proto_decode_error(e: &buffa::DecodeError) -> ConnectError {
+    ConnectError::invalid_argument(format!("failed to decode proto: {e}"))
+}
+
+/// [`decode_proto_with_options`] for a message a peer sent, whose failure a
+/// WebSocket session reports as a protocol error.
+pub(crate) fn decode_peer_proto<M: Message>(
+    data: &[u8],
+    options: &buffa::DecodeOptions,
+) -> Result<M, ConnectError> {
+    options
+        .decode_from_slice(data)
+        .map_err(|e| mark_peer_decode_error(proto_decode_error(&e), e))
+}
+
+/// Mark `err` as a peer's undecodable message, unless `cause` is this end's
+/// own element-memory limit, which the operator can raise.
+pub(crate) fn mark_peer_decode_error(err: ConnectError, cause: buffa::DecodeError) -> ConnectError {
+    match cause {
+        buffa::DecodeError::ElementMemoryLimitExceeded => err,
+        cause => err.decode_failure(cause),
+    }
 }
 
 /// Message shared by the JSON codec entry points when the `json` feature is
@@ -151,8 +175,19 @@ pub fn encode_json<M>(_message: &M) -> Result<Bytes, ConnectError> {
 /// requiring `M: serde::de::DeserializeOwned`.
 #[cfg(feature = "json")]
 pub fn decode_json<M: DeserializeOwned>(data: &[u8]) -> Result<M, ConnectError> {
-    serde_json::from_slice(data)
-        .map_err(|e| ConnectError::invalid_argument(format!("failed to decode JSON: {e}")))
+    serde_json::from_slice(data).map_err(|e| json_decode_error(&e))
+}
+
+#[cfg(feature = "json")]
+fn json_decode_error(e: &serde_json::Error) -> ConnectError {
+    ConnectError::invalid_argument(format!("failed to decode JSON: {e}"))
+}
+
+/// [`decode_json`] for a message a peer sent, whose failure a WebSocket
+/// session reports as a protocol error.
+#[cfg(feature = "json")]
+pub(crate) fn decode_peer_json<M: DeserializeOwned>(data: &[u8]) -> Result<M, ConnectError> {
+    serde_json::from_slice(data).map_err(|e| json_decode_error(&e).decode_failure(e))
 }
 
 /// Decode JSON bytes into a message — proto-only build: always `Unimplemented`.
@@ -160,6 +195,9 @@ pub fn decode_json<M: DeserializeOwned>(data: &[u8]) -> Result<M, ConnectError> 
 pub fn decode_json<M>(_data: &[u8]) -> Result<M, ConnectError> {
     Err(ConnectError::unimplemented(JSON_FEATURE_DISABLED))
 }
+
+#[cfg(not(feature = "json"))]
+pub(crate) use decode_json as decode_peer_json;
 
 /// Codec for binary protobuf encoding.
 #[derive(Debug, Clone, Copy, Default)]
@@ -312,6 +350,22 @@ impl CodecFormat {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn peer_decode_errors_are_marked_except_this_ends_limit() {
+        use super::*;
+        let err = || ConnectError::invalid_argument("bad");
+        let limit = mark_peer_decode_error(err(), buffa::DecodeError::ElementMemoryLimitExceeded);
+        assert!(!limit.is_decode_failure());
+        let malformed = mark_peer_decode_error(err(), buffa::DecodeError::UnexpectedEof);
+        assert!(malformed.is_decode_failure());
+        let decoded: Result<buffa_types::google::protobuf::StringValue, _> =
+            decode_peer_proto(b"\xff", &buffa::DecodeOptions::new());
+        assert!(decoded.unwrap_err().is_decode_failure());
+        let decoded: Result<buffa_types::google::protobuf::StringValue, _> = decode_proto(b"\xff");
+        assert!(!decoded.unwrap_err().is_decode_failure());
+    }
+
     /// With the `json` feature disabled, the message-type markers must be
     /// empty bounds: a type with no serde derives — as emitted by the codegen
     /// `no_json` option — still satisfies them. This is exactly what lets

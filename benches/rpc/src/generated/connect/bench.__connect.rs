@@ -777,9 +777,9 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
             "ClientStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 ::std::boxed::Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
-                    >(requests, format, ctx.decode_options().clone());
+                    >(requests, format, &ctx);
                     svc.client_stream(ctx, req_stream)
                         .await?
                         .encode::<crate::proto::bench::v1::BenchResponse>(format)
@@ -804,9 +804,9 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
             "BidiStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 ::std::boxed::Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
-                    >(requests, format, ctx.decode_options().clone());
+                    >(requests, format, &ctx);
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
                     ::std::result::Result::Ok(
                         resp

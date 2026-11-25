@@ -2209,7 +2209,7 @@ fn generate_service_server(
         let stream_decode = {
             let input_fqn = m.input_type.as_deref().unwrap_or("");
             let input_owned = resolver.rust_type(input_fqn, package)?;
-            quote! { ::connectrpc::dispatcher::codegen::decode_message_request_stream::<#input_owned>(requests, format, ctx.decode_options().clone()) }
+            quote! { ::connectrpc::dispatcher::codegen::decode_request_stream::<#input_owned>(requests, format, &ctx) }
         };
 
         if cs && ss {

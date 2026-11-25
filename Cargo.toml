@@ -92,6 +92,10 @@ tokio-rustls = "0.26"
 # runtime because it can't auto-detect which one to use.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12"] }
 
+# WebSocket framing for the Connect-over-WebSocket binding. Only the
+# `handshake` feature: connectrpc does its own TCP/TLS dialing.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
 # Framework integration
 axum = { version = "0.8", default-features = false, features = ["http2"] }
 

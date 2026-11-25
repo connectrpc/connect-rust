@@ -71,6 +71,9 @@ pub mod __buffa {
         reg.register_json_any(super::__STREAM_CONTENTS_JSON_ANY);
         reg.register_json_any(super::stream_contents::__STREAM_ITEM_JSON_ANY);
         reg.register_json_any(super::__RAW_HTTP_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__RAW_WEB_SOCKET_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__RAW_WEB_SOCKET_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__WEB_SOCKET_MESSAGE_JSON_ANY);
         reg.register_json_any(super::__CLIENT_COMPAT_REQUEST_JSON_ANY);
         reg.register_json_any(super::client_compat_request::__CANCEL_JSON_ANY);
         reg.register_json_any(super::__CLIENT_COMPAT_RESPONSE_JSON_ANY);
@@ -184,6 +187,18 @@ pub use self::__buffa::view::StreamContentsOwnedView;
 pub use self::__buffa::view::RawHTTPResponseView;
 #[doc(inline)]
 pub use self::__buffa::view::RawHTTPResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::RawWebSocketRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::RawWebSocketRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::RawWebSocketResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::RawWebSocketResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::WebSocketMessageView;
+#[doc(inline)]
+pub use self::__buffa::view::WebSocketMessageOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ClientCompatRequestView;
 #[doc(inline)]
