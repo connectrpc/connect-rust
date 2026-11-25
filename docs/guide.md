@@ -1794,7 +1794,7 @@ let client = ChatServiceClient::new(transport, config);
 
 For a server with a WebSocket path prefix, put the prefix in this client's base URL (`http://localhost:8080/ws`) and keep the bare URL for any `HttpClient`, since the prefixed paths refuse plain HTTP.
 
-It carries every RPC kind, unary included, each on its own connection, so use it where WebSocket buys something — usually bidi streaming — and an `HttpClient` for the rest. It rejects request headers that servers refuse in request metadata (`Cookie`, `Host`, `X-Forwarded-*`, ...) with `invalid_argument` before dialing, and undoes any request compression set on the `ClientConfig`.
+It carries every RPC kind, unary included, each on its own connection, so use it where WebSocket buys something — usually bidi streaming — and an `HttpClient` for the rest. It rejects request headers that servers refuse in request metadata (`Cookie`, `Host`, `X-Forwarded-*`, ...) with `invalid_argument` before dialing, and undoes any request compression set on the `ClientConfig`. A response message that fails to decode is `invalid_argument` over WebSocket, where it is `internal` over HTTP, as the WebSocket protocol requires; the server sent the bad message either way, so treat it like `internal` when deciding whether the caller is at fault.
 
 ## Health checking
 

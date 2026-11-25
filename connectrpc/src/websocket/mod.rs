@@ -82,8 +82,12 @@
 //! caller gives up on it. When the server broke the protocol, it closes with
 //! 3102, since a browser cannot send 1002, and the Close reason says how;
 //! the RPC fails with `internal`. A response message that does not decode
-//! counts, for unary and client-streaming RPCs, but fails the RPC with
-//! `invalid_argument`. The client closes with 1007
+//! counts too, but fails the RPC with `invalid_argument`, and the Close
+//! reason is the decoder's message. A unary or client-streaming RPC closes
+//! after the server's `S`; a stream closes as soon as the caller's
+//! `message()` fails to decode, so no message after it arrives. A message
+//! over the caller's element memory limit is `resource_exhausted` and is not
+//! a protocol error. The client closes with 1007
 //! after a text message that is not UTF-8, and 1009 after an oversized message,
 //! which fails the RPC with `resource_exhausted`. A local failure closes
 //! with 3102 and the reason "client error". A connection that ends without

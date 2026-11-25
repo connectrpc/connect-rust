@@ -13,7 +13,7 @@ use crate::client::{
     CallOptions, ClientConfig, call_bidi_stream, call_client_stream, call_server_stream, call_unary,
 };
 use crate::spec::{Spec, StreamType};
-use crate::websocket::{WebSocketConfig, WebSocketTransport};
+use crate::websocket::{WebSocketBody, WebSocketConfig, WebSocketTransport};
 
 fn client_config(addr: SocketAddr) -> ClientConfig {
     ClientConfig::new(format!("http://{addr}").parse().unwrap())
@@ -554,4 +554,79 @@ async fn client_reports_an_early_s_while_still_sending() {
     .await
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::PermissionDenied, "{err}");
+}
+
+/// A server-streaming call to `Count` on the server at `addr`.
+async fn server_stream(
+    addr: SocketAddr,
+) -> crate::client::ServerStream<WebSocketBody, StringValueView<'static>> {
+    call_server_stream::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Count", StreamType::ServerStream),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_undecodable_streamed_message_closes_at_once() {
+    use tokio_tungstenite::tungstenite::Message;
+    // Without S only the decode failure can end the RPC; with S right behind
+    // the bad message, the session must not close normally first.
+    let script = |end: bool| {
+        let mut script = vec![
+            Message::Text("M[]".into()),
+            Message::Binary(bytes::Bytes::from_static(b"B\xff")),
+        ];
+        if end {
+            script.push(Message::Text("S{}".into()));
+        }
+        script
+    };
+    for end in [false, true] {
+        let (addr, close_rx) = scripted(script(end)).await;
+        let mut stream = server_stream(addr).await;
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
+        // A caller that drops the stream on the error still sends 3102.
+        drop(stream);
+        assert_eq!(close_code(close_rx).await, 3102);
+    }
+
+    let (addr, close_rx) = scripted(script(false)).await;
+    let mut stream = call_bidi_stream::<_, StringValue, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Chat", StreamType::BidiStream),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap();
+    let err = stream.message().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
+    assert_eq!(close_code(close_rx).await, 3102);
+}
+
+#[tokio::test]
+async fn a_finished_stream_closes_while_the_caller_holds_it() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (addr, close_rx) = scripted(vec![
+        Message::Text("M[]".into()),
+        Message::Binary(bytes::Bytes::from_static(b"B\x0a\x01x")),
+        Message::Text("S{}".into()),
+    ])
+    .await;
+    let mut stream = server_stream(addr).await;
+    assert!(stream.message().await.unwrap().is_some());
+    assert!(stream.message().await.unwrap().is_none());
+    let frame = tokio::time::timeout(Duration::from_secs(1), close_rx)
+        .await
+        .expect("closed before the drain timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(u16::from(frame.code), 1000);
+    drop(stream);
 }

@@ -2595,7 +2595,7 @@ where
     }
 
     let message = report_decode(
-        decode_report,
+        decode_report.as_ref(),
         decode_response_view::<RespView>(body, config.codec_format, &options.decode_options()),
     );
     let message = message.map_err(&attach)?;
@@ -3144,6 +3144,8 @@ pub struct ServerStream<B, RespView> {
     /// Trailers-Only response (empty body; status rides the headers)
     /// from a stream that produced data and was then cut off.
     saw_body_data: bool,
+    /// Where an undecodable message is reported, for a WebSocket response.
+    decode_report: Option<DecodeReport>,
     _phantom: PhantomData<RespView>,
 }
 
@@ -3230,6 +3232,11 @@ where
     /// carrying `grpc-status: 0` in the headers (empty body) is a clean
     /// end.
     ///
+    /// A response message that fails to decode is `internal`, or
+    /// `invalid_argument` over a `WebSocketTransport`, as Connect over
+    /// WebSocket requires; either way the server sent it. A message over
+    /// the element memory limit is `resource_exhausted` on every transport.
+    ///
     /// Whatever the cause, the returned error carries the response
     /// metadata: [`ConnectError::response_headers()`] always, and
     /// [`ConnectError::trailers()`] whenever termination metadata arrived.
@@ -3255,6 +3262,9 @@ where
             // recording why" is unrepresentable.
             Err(mut end) => {
                 debug_assert!(self.end.is_none(), "terminal record written twice");
+                // Nothing more can fail to decode, so a WebSocket transport
+                // may close now rather than wait to hear.
+                self.decode_report = None;
                 end.attach_metadata(&self.headers);
                 self.end.get_or_insert(end).replay()
             }
@@ -3323,8 +3333,10 @@ where
 
             // Data envelope — decompress (also bounded by `max_message_size`) and decode.
             let data = self.decompress_envelope(envelope)?;
-            let msg =
-                decode_response_view::<RespView>(data, self.codec_format, &self.decode_options())?;
+            let msg = report_decode(
+                self.decode_report.as_ref(),
+                decode_response_view::<RespView>(data, self.codec_format, &self.decode_options()),
+            )?;
             return Ok(msg);
         }
     }
@@ -3621,7 +3633,7 @@ where
 /// need to capture config by value (like `BidiStream`, which outlives the
 /// borrow) can share the same code path.
 async fn make_server_stream<B, RespView>(
-    response: Response<B>,
+    mut response: Response<B>,
     protocol: Protocol,
     compression: &CompressionRegistry,
     codec_format: CodecFormat,
@@ -3713,6 +3725,7 @@ where
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
 
+    let decode_report = take_decode_report(response.extensions_mut());
     Ok(ServerStream {
         element_memory_limit,
         headers: response_headers,
@@ -3727,6 +3740,7 @@ where
         deadline,
         end: None,
         saw_body_data: false,
+        decode_report,
         _phantom: PhantomData,
     })
 }
@@ -4728,7 +4742,7 @@ where
     )?;
     // The trailers are parsed by now, so a decode failure reports them too.
     let message = report_decode(
-        decode_report,
+        decode_report.as_ref(),
         decode_response_view::<RespView>(data, config.codec_format, &options.decode_options()),
     );
     let message = message.map_err(with_response_metadata(&resp_headers, &trailers))?;
@@ -4956,7 +4970,7 @@ fn take_decode_report(extensions: &mut http::Extensions) -> Option<DecodeReport>
 /// not decode. A resource limit of this client's own is not the peer's fault.
 /// Over WebSocket the RPC then fails with `invalid_argument` (§6.1).
 fn report_decode<T>(
-    report: Option<DecodeReport>,
+    report: Option<&DecodeReport>,
     result: Result<T, ConnectError>,
 ) -> Result<T, ConnectError> {
     #[cfg(all(feature = "websocket", feature = "client", not(target_arch = "wasm32")))]
@@ -4971,7 +4985,7 @@ fn report_decode<T>(
     }
     #[cfg(not(all(feature = "websocket", feature = "client", not(target_arch = "wasm32"))))]
     if let Some(never) = report {
-        match never {}
+        match *never {}
     }
     result
 }
@@ -6979,6 +6993,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7026,6 +7041,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         }
     }
@@ -7224,6 +7240,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7276,6 +7293,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7331,6 +7349,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7400,6 +7419,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7467,6 +7487,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7536,6 +7557,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7597,6 +7619,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7688,6 +7711,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7747,6 +7771,7 @@ mod tests {
             deadline: Some(std::time::Instant::now() + Duration::from_secs(5)),
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7776,6 +7801,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7823,6 +7849,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7864,6 +7891,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7902,6 +7930,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -7968,6 +7997,7 @@ mod tests {
             deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 
@@ -8024,6 +8054,7 @@ mod tests {
             deadline: None,
             end: None,
             saw_body_data: false,
+            decode_report: None,
             _phantom: PhantomData,
         };
 

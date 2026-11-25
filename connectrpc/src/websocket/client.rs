@@ -503,6 +503,9 @@ enum End {
     /// The server broke the protocol: fail the RPC with this error and close
     /// with this code, telling the server why.
     Fault(ConnectError, u16),
+    /// The caller, which has the error already, could not decode a streamed
+    /// message: close with [`close_code::CLIENT_ERROR`] and this reason (§6.1).
+    Undecodable(String),
     /// The caller dropped the call.
     Abandoned,
 }
@@ -613,6 +616,16 @@ impl Session {
                 !write_failed && self.outbound.is_empty() && request.leftover.is_empty();
             tokio::select! {
                 biased;
+                // Ahead of `caller_gone`: a caller that drops the stream on
+                // the error still has the server told why.
+                reason = async { delivery.verdict.as_mut()?.await.ok() },
+                    if delivery.verdict.is_some() =>
+                {
+                    delivery.verdict = None;
+                    if let Some(reason) = reason {
+                        return End::Undecodable(reason);
+                    }
+                }
                 () = caller_gone(delivery.head.as_mut(), delivery.body.as_ref()) => {
                     return End::Abandoned;
                 }
@@ -789,6 +802,7 @@ impl Session {
                 let reason = err.message.clone().unwrap_or_default();
                 (Some(err), Some((code, reason)))
             }
+            End::Undecodable(reason) => (None, Some((close_code::CLIENT_ERROR, reason))),
             End::Abandoned => (None, Some((close_code::NORMAL, String::new()))),
         };
         // The socket is released before the outcome is delivered.
