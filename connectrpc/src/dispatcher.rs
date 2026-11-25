@@ -435,15 +435,13 @@ pub mod codegen {
     }
 
     /// Map a stream of raw request bytes into typed
-    /// [`StreamMessage`](crate::StreamMessage) items.
+    /// [`StreamMessage`](crate::StreamMessage) items, without reporting
+    /// decode failures to a WebSocket session.
     ///
-    /// Used by generated `call_client_streaming` and `call_bidi_streaming`
-    /// arms; the per-item decode is the same normalize-then-decode used on
-    /// the unary paths.
-    ///
-    /// Takes the limits by value because the returned stream outlives the
-    /// caller's frame; generated arms pass `ctx.decode_options().clone()`
-    /// before `ctx` is moved into the handler call.
+    /// Used by `call_client_streaming` and `call_bidi_streaming` arms that
+    /// older code generators emitted. Unlike [`decode_request_stream`], it
+    /// cannot tell a WebSocket session that a message did not decode, so a
+    /// handler that swallows that error ends the RPC normally.
     pub fn decode_message_request_stream<M>(
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
@@ -459,6 +457,29 @@ pub mod codegen {
             })
             .map(crate::StreamMessage::from_owned_view)
         }))
+    }
+
+    /// Map a stream of raw request bytes into typed
+    /// [`StreamMessage`](crate::StreamMessage) items, reporting decode
+    /// failures to the WebSocket session behind `ctx`, if any.
+    ///
+    /// Used by generated `call_client_streaming` and `call_bidi_streaming`
+    /// arms, before `ctx` is moved into the handler call. A message that
+    /// fails to decode ends a WebSocket RPC as a protocol error, whatever the
+    /// handler does with the error.
+    pub fn decode_request_stream<M>(
+        requests: BoxStream<Result<Bytes, ConnectError>>,
+        format: CodecFormat,
+        ctx: &crate::RequestContext,
+    ) -> crate::ServiceStream<crate::StreamMessage<M>>
+    where
+        M: crate::HasMessageView + JsonDeserialize + 'static,
+        M::View<'static>: 'static,
+    {
+        Box::pin(
+            crate::handler::decode_request_view_stream::<M::View<'static>>(requests, format, ctx)
+                .map(|r| r.map(crate::StreamMessage::from_owned_view)),
+        )
     }
 }
 

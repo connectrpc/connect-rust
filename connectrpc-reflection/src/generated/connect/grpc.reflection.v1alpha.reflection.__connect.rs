@@ -313,9 +313,9 @@ impl<T: ServerReflection> ::connectrpc::Dispatcher for ServerReflectionServer<T>
             "ServerReflectionInfo" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 ::std::boxed::Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_request_stream::<
                         crate::proto::grpc::reflection::v1alpha::ServerReflectionRequest,
-                    >(requests, format, ctx.decode_options().clone());
+                    >(requests, format, &ctx);
                     let resp = svc.server_reflection_info(ctx, req_stream).await?;
                     ::std::result::Result::Ok(
                         resp

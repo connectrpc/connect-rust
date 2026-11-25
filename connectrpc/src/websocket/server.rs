@@ -67,20 +67,35 @@ const WRITE_BATCH: usize = 64 * 1024;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WebSocketDispatch {
     undecodable: Arc<OnceLock<String>>,
+    recorded: Arc<Notify>,
 }
 
 impl WebSocketDispatch {
     /// Record `err` if it reports a request message that did not decode.
     pub(crate) fn note(&self, err: &ConnectError) {
-        if err.is_decode_failure() {
-            let _ = self
+        if err.is_decode_failure()
+            && self
                 .undecodable
-                .set(err.message.clone().unwrap_or_default());
+                .set(err.message.clone().unwrap_or_default())
+                .is_ok()
+        {
+            self.recorded.notify_one();
         }
     }
 
     fn undecodable(&self) -> Option<&str> {
         self.undecodable.get().map(String::as_str)
+    }
+
+    /// The message of the first request message that did not decode, once
+    /// one has, whatever the handler then does with the error.
+    async fn wait_undecodable(&self) -> &str {
+        loop {
+            if let Some(message) = self.undecodable() {
+                return message;
+            }
+            self.recorded.notified().await;
+        }
     }
 }
 
@@ -469,6 +484,7 @@ impl Session {
         let mut opening = opening_deadline.is_some();
         let mut keep_alive = KeepAlive::new(&handshake.config);
         let mut pending_handshake = Some(handshake);
+        let dispatch = self.dispatch.clone();
         let mut inbound = Inbound::default();
         let mut out = Outflow {
             response: None,
@@ -501,6 +517,9 @@ impl Session {
                         ConnectError::unavailable("the server is shutting down"),
                         close_code::GOING_AWAY,
                     );
+                }
+                message = dispatch.wait_undecodable() => {
+                    return WireError::undecodable(message).into();
                 }
                 written = std::future::poll_fn(|cx| self.outbound.poll_write(&mut self.sink, cx)),
                     if self.outbound.is_busy() =>
@@ -1058,5 +1077,36 @@ impl Body for RequestBody {
             return Poll::Ready(Some(Err(Canceled)));
         }
         Poll::Ready(item.map(|item| Ok(Frame::data(item))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buffa_types::google::protobuf::StringValue;
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    use super::WebSocketDispatch;
+    use crate::{CodecFormat, ConnectError, RequestContext};
+
+    #[tokio::test]
+    async fn generated_stream_decoding_reports_an_undecodable_message() {
+        let dispatch = WebSocketDispatch::default();
+        let mut extensions = http::Extensions::new();
+        extensions.insert(dispatch.clone());
+        let ctx = RequestContext::new(http::HeaderMap::new()).with_extensions(extensions);
+        let requests = futures::stream::iter([
+            Ok::<_, ConnectError>(Bytes::from_static(b"\x0a\x01a")),
+            Ok(Bytes::from_static(b"\xff")),
+        ]);
+        let decoded = crate::dispatcher::codegen::decode_request_stream::<StringValue>(
+            Box::pin(requests),
+            CodecFormat::Proto,
+            &ctx,
+        );
+        let results: Vec<_> = decoded.collect().await;
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert!(dispatch.undecodable().is_some());
     }
 }

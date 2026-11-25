@@ -567,9 +567,9 @@ impl<T: ElizaService> ::connectrpc::Dispatcher for ElizaServiceServer<T> {
             "Converse" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 ::std::boxed::Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_request_stream::<
                         crate::proto::connectrpc::eliza::v1::ConverseRequest,
-                    >(requests, format, ctx.decode_options().clone());
+                    >(requests, format, &ctx);
                     let resp = svc.converse(ctx, req_stream).await?;
                     ::std::result::Result::Ok(
                         resp

@@ -732,7 +732,7 @@ type WebSocketDispatch = Infallible;
 
 /// The WebSocket session that synthesized this request, if one did. Its
 /// unary methods use streaming framing.
-fn websocket_dispatch(extensions: &http::Extensions) -> Option<WebSocketDispatch> {
+pub(crate) fn websocket_dispatch(extensions: &http::Extensions) -> Option<WebSocketDispatch> {
     #[cfg(feature = "websocket")]
     return extensions.get::<WebSocketDispatch>().cloned();
     #[cfg(not(feature = "websocket"))]
@@ -742,10 +742,10 @@ fn websocket_dispatch(extensions: &http::Extensions) -> Option<WebSocketDispatch
     }
 }
 
-/// Tell the WebSocket session behind `dispatch`, if any, about an error that
-/// ends its RPC, since one reporting an undecodable request is a protocol
-/// error there.
-fn note_ending_error(dispatch: Option<&WebSocketDispatch>, err: &ConnectError) {
+/// Tell the WebSocket session behind `dispatch`, if any, about an error from
+/// the service or handler; it acts only on one reporting an undecodable
+/// request, which is a protocol error there.
+pub(crate) fn note_error(dispatch: Option<&WebSocketDispatch>, err: &ConnectError) {
     #[cfg(feature = "websocket")]
     if let Some(dispatch) = dispatch {
         dispatch.note(err);
@@ -768,7 +768,7 @@ fn watch_ending_error(
     };
     Box::pin(stream.inspect(move |item| {
         if let Err(err) = item {
-            note_ending_error(Some(&dispatch), err);
+            note_error(Some(&dispatch), err);
         }
     }))
 }
@@ -2794,7 +2794,7 @@ where
             match with_request_deadline(deadline, fut).await {
                 Ok(result) => result,
                 Err(e) => {
-                    note_ending_error(websocket.as_ref(), &e);
+                    note_error(websocket.as_ref(), &e);
                     return streaming_error_response(&e, protocol, codec_format);
                 }
             }
@@ -2815,7 +2815,7 @@ where
                     Box::pin(futures::stream::once(async move { Ok(body) }))
                 }),
                 Err(e) => {
-                    note_ending_error(websocket.as_ref(), &e);
+                    note_error(websocket.as_ref(), &e);
                     return streaming_error_response(&e, protocol, codec_format);
                 }
             }
@@ -2945,7 +2945,7 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
-            note_ending_error(websocket.as_ref(), &e);
+            note_error(websocket.as_ref(), &e);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };
@@ -3365,7 +3365,7 @@ where
     let resp = match handler_result {
         Ok(result) => result,
         Err(e) => {
-            note_ending_error(websocket.as_ref(), &e);
+            note_error(websocket.as_ref(), &e);
             return streaming_error_response(&e, protocol, codec_format);
         }
     };

@@ -111,6 +111,28 @@ fn router(hang_dropped: Flag) -> Router {
                 },
             ),
         )
+        .route_client_stream(
+            SVC,
+            "Lenient",
+            client_streaming_handler_fn(
+                |_ctx: RequestContext, requests: crate::ServiceStream<StringValue>| async move {
+                    let kept = requests.filter_map(|req| async { req.ok() }).count().await;
+                    Response::ok(StringValue::from(kept.to_string()))
+                },
+            ),
+        )
+        .route_bidi_stream(
+            SVC,
+            "Forgive",
+            bidi_streaming_handler_fn(
+                |_ctx: RequestContext, requests: crate::ServiceStream<StringValue>| async move {
+                    Response::stream_ok(
+                        requests
+                            .map(|req| Ok(req.unwrap_or_else(|_| StringValue::from("skipped")))),
+                    )
+                },
+            ),
+        )
         .route_bidi_stream(
             SVC,
             "Hang",
@@ -517,6 +539,72 @@ async fn an_undecodable_request_is_a_protocol_error() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn a_handler_cannot_swallow_an_undecodable_request() {
+    for method in ["Lenient", "Forgive"] {
+        expect_fault_at(
+            method,
+            "connectrpc.1+json",
+            &[],
+            vec![
+                text("M[]"),
+                text("B\"a\""),
+                text("B5"),
+                text("B\"b\""),
+                text("C"),
+            ],
+            "invalid_argument",
+            1002,
+        )
+        .await;
+    }
+}
+
+/// An interceptor that decodes each request message itself.
+struct Inspect;
+
+#[crate::async_trait]
+impl crate::Interceptor for Inspect {
+    async fn intercept_streaming(
+        &self,
+        req: crate::interceptor::StreamRequest,
+        inbound: crate::interceptor::PayloadStream,
+        next: crate::interceptor::NextStream<'_>,
+    ) -> Result<crate::interceptor::StreamResponse, ConnectError> {
+        let inbound = inbound.map(|item| {
+            item.and_then(|payload| {
+                payload.message::<StringValue>()?;
+                Ok(payload)
+            })
+        });
+        next.run(req, Box::pin(inbound)).await
+    }
+}
+
+#[tokio::test]
+async fn an_interceptor_decode_failure_cannot_be_swallowed() {
+    let service = ConnectRpcService::new(router(Flag::default()))
+        .with_interceptor(Inspect)
+        .with_websocket(WebSocketConfig::new().with_keep_alive(None));
+    let bound = crate::Server::bind("127.0.0.1:0").await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    tokio::spawn(bound.serve_with_service(service));
+    let mut ws = raw_connect_with(addr, &format!("/{SVC}/Lenient"), "connectrpc.1+json", &[])
+        .await
+        .unwrap();
+    for message in [text("M[]"), text("B\"a\""), text("B5"), text("C")] {
+        ws.send(message).await.unwrap();
+    }
+    let (received, close_code) = read_all(&mut ws).await;
+    let last = received.last().expect("an S message");
+    assert_eq!(
+        end_stream(last)["error"]["code"],
+        "invalid_argument",
+        "{received:?}"
+    );
+    assert_eq!(close_code, Some(1002));
 }
 
 #[tokio::test]

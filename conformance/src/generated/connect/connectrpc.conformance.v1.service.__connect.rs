@@ -1059,9 +1059,9 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
             "ClientStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 ::std::boxed::Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_request_stream::<
                         crate::proto::connectrpc::conformance::v1::ClientStreamRequest,
-                    >(requests, format, ctx.decode_options().clone());
+                    >(requests, format, &ctx);
                     svc.client_stream(ctx, req_stream)
                         .await?
                         .encode::<
@@ -1088,9 +1088,9 @@ impl<T: ConformanceService> ::connectrpc::Dispatcher for ConformanceServiceServe
             "BidiStream" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 ::std::boxed::Box::pin(async move {
-                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_request_stream::<
                         crate::proto::connectrpc::conformance::v1::BidiStreamRequest,
-                    >(requests, format, ctx.decode_options().clone());
+                    >(requests, format, &ctx);
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
                     ::std::result::Result::Ok(
                         resp
